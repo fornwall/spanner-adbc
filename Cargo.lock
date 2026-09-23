@@ -8,7 +8,7 @@ version = "0.25.0"
 source = "git+https://github.com/apache/arrow-adbc?rev=2daa02564ddc331eda0f1f280752d11460aed47d#2daa02564ddc331eda0f1f280752d11460aed47d"
 dependencies = [
  "arrow-array",
- "arrow-schema",
+ "arrow-schema 59.3.0",
 ]
 
 [[package]]
@@ -19,7 +19,7 @@ dependencies = [
  "adbc_core",
  "adbc_ffi",
  "arrow-array",
- "arrow-schema",
+ "arrow-schema 59.3.0",
  "libloading 0.8.9",
  "path-slash",
  "regex",
@@ -35,7 +35,7 @@ source = "git+https://github.com/apache/arrow-adbc?rev=2daa02564ddc331eda0f1f280
 dependencies = [
  "adbc_core",
  "arrow-array",
- "arrow-schema",
+ "arrow-schema 59.3.0",
 ]
 
 [[package]]
@@ -119,9 +119,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e5f6adeffdf587d7a31db5d2266189624b526730cd3627f9ff9fedae97ad584"
 dependencies = [
  "ahash",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
+ "arrow-buffer 59.3.0",
+ "arrow-data 59.3.0",
+ "arrow-schema 59.3.0",
  "chrono",
  "half",
  "hashbrown 0.17.1",
@@ -144,13 +144,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-buffer"
+version = "60.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7235b863533e9db3ab86905b4521251de11226275b436ff3cb2d0010558d1c5"
+dependencies = [
+ "bytes",
+ "half",
+ "num-bigint",
+ "num-traits",
+]
+
+[[package]]
 name = "arrow-data"
 version = "59.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ba2f832eaeca24b8f26143dba750e42ee4ab51cf7d65e701ca9607cfda9f358"
 dependencies = [
- "arrow-buffer",
- "arrow-schema",
+ "arrow-buffer 59.3.0",
+ "arrow-schema 59.3.0",
+ "half",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "arrow-data"
+version = "60.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5aa06d5e22786c4966ffc4d2f171d0cb65d95f6bdea108a14e8c335e9faa437f"
+dependencies = [
+ "arrow-buffer 60.0.0",
+ "arrow-schema 60.0.0",
  "half",
  "num-integer",
  "num-traits",
@@ -164,6 +189,12 @@ checksum = "10fab8d4563491417ba801fab29d205104d20d4bdf37bda6cd1cf425cff598cd"
 dependencies = [
  "bitflags 2.13.2",
 ]
+
+[[package]]
+name = "arrow-schema"
+version = "60.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f85a9a58cd03560526b0066487574aacb9008e413504fa0ee23d61141e96c338"
 
 [[package]]
 name = "async-trait"
@@ -2746,9 +2777,9 @@ dependencies = [
  "adbc_ffi",
  "arbitrary",
  "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
+ "arrow-buffer 59.3.0",
+ "arrow-data 60.0.0",
+ "arrow-schema 59.3.0",
  "base64 0.23.1",
  "bytes",
  "chrono",

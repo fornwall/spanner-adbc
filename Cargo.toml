@@ -115,7 +115,7 @@ arrow-schema = ">=58, <60"
 # Offset / null buffers for building Arrow List arrays (ARRAY columns), and `ArrayData`
 # validation for arrays that arrive over the C data interface (`src/ffi/import.rs`).
 arrow-buffer = ">=58, <60"
-arrow-data = ">=58, <60"
+arrow-data = ">=58, <61"
 # `ECANCELED`, `ETIMEDOUT` and friends: the Arrow C Stream Interface reports failures as errnos,
 # and they are platform-specific numbers (ECANCELED is 125 on Linux, 89 on macOS, 105 on MSVC).
 libc = "0.2"
