@@ -110,7 +110,7 @@ adbc_core = { git = "https://github.com/apache/arrow-adbc", rev = "2daa02564ddc3
 # allow (>=58, <60) so the RecordBatch / Schema / RecordBatchReader types unify across them.
 # The `ffi` feature supplies `FFI_ArrowArray`/`FFI_ArrowSchema`/`FFI_ArrowArrayStream`, the C
 # data interface structs `src/ffi/` moves result sets and bound parameters over.
-arrow-array = { version = ">=58, <60", features = ["ffi"] }
+arrow-array = { version = ">=58, <61", features = ["ffi"] }
 arrow-schema = ">=58, <60"
 # Offset / null buffers for building Arrow List arrays (ARRAY columns), and `ArrayData`
 # validation for arrays that arrive over the C data interface (`src/ffi/import.rs`).
