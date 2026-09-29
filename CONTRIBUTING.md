@@ -53,9 +53,11 @@ Its PyPI trusted publisher uses owner `fornwall`, repository `spanner-adbc`, wor
 
 ## Dependency pins
 
-`Cargo.toml` pins the Google Cloud family and `adbc_core`/`adbc_ffi`/`adbc_driver_manager` to git.
-The pinned APIs provide native STRUCT inspection and support for unknown ADBC info codes.
-Either family independently prevents crates.io publishing.
+`Cargo.toml` pins the Google Cloud family and `adbc_core`/`adbc_ffi`/`adbc_driver_manager` to git,
+and patches the `arrow-*` crates to arrow-rs `main` through `[patch.crates-io]`.
+The pinned APIs provide native STRUCT inspection, support for unknown ADBC info codes and the
+`FFI_ArrowArrayStream` constructor and accessors that arrow-rs 60 lacks.
+Each family independently prevents crates.io publishing.
 
 Read revisions from `Cargo.toml`/`Cargo.lock` and follow the
 [revert checklist](CLAUDE.md#revert-checklist) when switching to registry releases. Keep each

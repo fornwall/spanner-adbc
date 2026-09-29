@@ -74,11 +74,11 @@ fn exports_adbc_statuses_as_errno() {
         let mut stream = error_stream(ArrowError::ExternalError(Box::new(error)));
         let mut out = FFI_ArrowArray::empty();
         assert_eq!(
-            unsafe { stream.get_next.unwrap()(&raw mut stream, &raw mut out) },
+            unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
             expected,
             "{status:?}"
         );
-        let message = unsafe { CStr::from_ptr(stream.get_last_error.unwrap()(&raw mut stream)) }
+        let message = unsafe { CStr::from_ptr(stream.get_last_error().unwrap()(&raw mut stream)) }
             .to_str()
             .unwrap();
         assert!(message.contains("ADBC stream failure"), "{message}");
@@ -90,17 +90,17 @@ fn exports_adbc_statuses_as_errno() {
     let mut stream = error_stream(error);
     let mut out = FFI_ArrowArray::empty();
     assert_eq!(
-        unsafe { stream.get_next.unwrap()(&raw mut stream, &raw mut out) },
+        unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
         ECANCELED
     );
 
     // A plain Arrow error keeps arrow's own errno mapping.
     let mut stream = error_stream(ArrowError::NotYetImplemented("not supported".into()));
     assert_eq!(
-        unsafe { stream.get_next.unwrap()(&raw mut stream, &raw mut out) },
+        unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
         ENOSYS
     );
-    let message = unsafe { CStr::from_ptr(stream.get_last_error.unwrap()(&raw mut stream)) }
+    let message = unsafe { CStr::from_ptr(stream.get_last_error().unwrap()(&raw mut stream)) }
         .to_str()
         .unwrap();
     assert!(message.contains("not supported"), "{message}");
@@ -127,11 +127,11 @@ fn a_cancelled_read_reports_ecanceled_for_sql_query_cancel() {
 
     let mut out = FFI_ArrowArray::empty();
     assert_eq!(
-        unsafe { stream.get_next.unwrap()(&raw mut stream, &raw mut out) },
+        unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
         ECANCELED,
         "SqlQueryCancel accepts only ECANCELED or 0 from get_next"
     );
-    let message = unsafe { CStr::from_ptr(stream.get_last_error.unwrap()(&raw mut stream)) }
+    let message = unsafe { CStr::from_ptr(stream.get_last_error().unwrap()(&raw mut stream)) }
         .to_str()
         .unwrap();
     assert!(message.contains("operation cancelled"), "{message}");
@@ -142,7 +142,7 @@ fn a_cancelled_read_reports_ecanceled_for_sql_query_cancel() {
     assert!(!exported.is_null());
     assert_eq!(status, ADBC_STATUS_CANCELLED);
 
-    unsafe { stream.release.unwrap()(&raw mut stream) };
+    unsafe { stream.release().unwrap()(&raw mut stream) };
 }
 
 /// The timeout twin of `a_cancelled_read_reports_ecanceled_for_sql_query_cancel`: an RPC deadline
@@ -161,7 +161,7 @@ fn a_timed_out_read_reports_etimedout() {
 
     let mut out = FFI_ArrowArray::empty();
     assert_eq!(
-        unsafe { stream.get_next.unwrap()(&raw mut stream, &raw mut out) },
+        unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
         ETIMEDOUT
     );
 
@@ -170,7 +170,7 @@ fn a_timed_out_read_reports_etimedout() {
     assert!(!exported.is_null());
     assert_eq!(status, ADBC_STATUS_TIMEOUT);
 
-    unsafe { stream.release.unwrap()(&raw mut stream) };
+    unsafe { stream.release().unwrap()(&raw mut stream) };
 }
 
 /// A nonconforming host may keep the callback pointer and call it after release, when
@@ -178,8 +178,8 @@ fn a_timed_out_read_reports_etimedout() {
 #[test]
 fn get_last_error_tolerates_a_released_or_null_stream() {
     let mut stream = error_stream(ArrowError::ComputeError("boom".to_owned()));
-    let saved = stream.get_last_error.unwrap();
-    unsafe { stream.release.unwrap()(&raw mut stream) };
+    let saved = stream.get_last_error().unwrap();
+    unsafe { stream.release().unwrap()(&raw mut stream) };
     assert!(unsafe { saved(&raw mut stream) }.is_null());
     assert!(unsafe { saved(null()) }.is_null());
 }
@@ -206,7 +206,7 @@ fn error_from_array_stream_exposes_the_pending_error() {
     let mut stream = error_stream(ArrowError::ExternalError(Box::new(error)));
     let mut out = FFI_ArrowArray::empty();
     assert_eq!(
-        unsafe { stream.get_next.unwrap()(&raw mut stream, &raw mut out) },
+        unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
         ECANCELED
     );
 
@@ -238,7 +238,7 @@ fn error_from_array_stream_exposes_the_pending_error() {
     assert_eq!(unsafe { error_get_detail_count(exported) }, 1);
 
     // Releasing the stream invalidates the error and de-recognizes the stream.
-    unsafe { stream.release.unwrap()(&raw mut stream) };
+    unsafe { stream.release().unwrap()(&raw mut stream) };
     let mut status: AdbcStatusCode = 0xEE;
     assert!(unsafe { error_from_array_stream(&raw mut stream, &raw mut status) }.is_null());
     assert_eq!(
@@ -260,7 +260,7 @@ fn error_from_array_stream_reports_ok_when_nothing_failed() {
     assert!(!exported.is_null());
     assert_eq!(status, ADBC_STATUS_OK);
     assert!(unsafe { (*exported).message.is_null() });
-    unsafe { stream.release.unwrap()(&raw mut stream) };
+    unsafe { stream.release().unwrap()(&raw mut stream) };
 }
 
 #[test]
@@ -271,12 +271,14 @@ fn error_from_array_stream_rejects_foreign_and_null_streams() {
     assert!(unsafe { error_from_array_stream(null(), &raw mut status) }.is_null());
 
     // A stream some other library produced: valid pointers, but not this driver's release.
-    let mut foreign = FFI_ArrowArrayStream {
-        get_schema: None,
-        get_next: None,
-        get_last_error: None,
-        release: Some(foreign_release),
-        private_data: (&raw mut status).cast::<c_void>(),
+    let mut foreign = unsafe {
+        FFI_ArrowArrayStream::new_unchecked(
+            None,
+            None,
+            None,
+            Some(foreign_release),
+            (&raw mut status).cast::<c_void>(),
+        )
     };
     assert!(unsafe { error_from_array_stream(&raw mut foreign, &raw mut status) }.is_null());
     assert_eq!(
@@ -293,17 +295,17 @@ fn contains_reader_panics_in_get_next() {
     }));
     let mut out = FFI_ArrowArray::empty();
     assert_eq!(
-        unsafe { stream.get_next.unwrap()(&raw mut stream, &raw mut out) },
+        unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
         EINVAL
     );
-    let message = unsafe { CStr::from_ptr(stream.get_last_error.unwrap()(&raw mut stream)) }
+    let message = unsafe { CStr::from_ptr(stream.get_last_error().unwrap()(&raw mut stream)) }
         .to_str()
         .unwrap();
     assert!(message.contains("next contains a NUL: ?"), "{message}");
 
     // Once a reader has panicked, do not enter its potentially inconsistent state again.
     assert_eq!(
-        unsafe { stream.get_next.unwrap()(&raw mut stream, &raw mut out) },
+        unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
         EINVAL
     );
 }
@@ -317,10 +319,10 @@ fn contains_reader_panics_in_get_schema() {
     }));
     let mut out = FFI_ArrowSchema::empty();
     assert_eq!(
-        unsafe { stream.get_schema.unwrap()(&raw mut stream, &raw mut out) },
+        unsafe { stream.get_schema().unwrap()(&raw mut stream, &raw mut out) },
         EINVAL
     );
-    let message = unsafe { CStr::from_ptr(stream.get_last_error.unwrap()(&raw mut stream)) }
+    let message = unsafe { CStr::from_ptr(stream.get_last_error().unwrap()(&raw mut stream)) }
         .to_str()
         .unwrap();
     assert!(message.contains("schema failed"), "{message}");
@@ -354,9 +356,9 @@ fn contains_reader_panics_in_release() {
         schema: Arc::new(Schema::empty()),
         panic_in_schema: false,
     })));
-    unsafe { stream.release.unwrap()(&raw mut stream) };
-    assert!(stream.release.is_none());
-    assert!(stream.private_data.is_null());
+    unsafe { stream.release().unwrap()(&raw mut stream) };
+    assert!(stream.release().is_none());
+    assert!(stream.private_data().is_null());
 }
 
 /// `AdbcErrorFromArrayStream` hands back an `AdbcError` in the driver's own storage, so nothing
@@ -375,7 +377,7 @@ fn a_stream_error_carries_the_handles_driver_vtable() {
     );
     let mut out = FFI_ArrowArray::empty();
     assert_eq!(
-        unsafe { stream.get_next.unwrap()(&raw mut stream, &raw mut out) },
+        unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
         ENOMEM
     );
 
@@ -384,7 +386,7 @@ fn a_stream_error_carries_the_handles_driver_vtable() {
     assert!(!exported.is_null());
     assert_eq!(unsafe { (*exported).private_driver }, vtable);
     // Present on the empty export too, which is the same storage.
-    unsafe { stream.release.unwrap()(&raw mut stream) };
+    unsafe { stream.release().unwrap()(&raw mut stream) };
 }
 
 /// A nonconforming host may release a stream twice, or keep the callback pointers it copied and
@@ -401,20 +403,20 @@ fn a_released_stream_survives_a_second_release_and_stale_callbacks() {
         schema,
     )));
     let (get_next, get_schema, release) = (
-        stream.get_next.unwrap(),
-        stream.get_schema.unwrap(),
-        stream.release.unwrap(),
+        stream.get_next().unwrap(),
+        stream.get_schema().unwrap(),
+        stream.release().unwrap(),
     );
 
     unsafe { release(&raw mut stream) };
-    assert!(stream.private_data.is_null());
-    assert!(stream.get_next.is_none());
-    assert!(stream.get_schema.is_none());
-    assert!(stream.release.is_none());
+    assert!(stream.private_data().is_null());
+    assert!(stream.get_next().is_none());
+    assert!(stream.get_schema().is_none());
+    assert!(stream.release().is_none());
 
     // A second release is a no-op, not a double free.
     unsafe { release(&raw mut stream) };
-    assert!(stream.private_data.is_null());
+    assert!(stream.private_data().is_null());
 
     // Stale callbacks report EINVAL rather than dereferencing the null they were left with.
     let mut array = FFI_ArrowArray::empty();
@@ -449,25 +451,25 @@ fn a_successful_read_clears_the_previous_failure() {
 
     // A null output is the one failure a caller can provoke without a failing reader.
     assert_eq!(
-        unsafe { stream.get_next.unwrap()(&raw mut stream, null()) },
+        unsafe { stream.get_next().unwrap()(&raw mut stream, null()) },
         EINVAL
     );
-    assert!(!unsafe { stream.get_last_error.unwrap()(&raw mut stream) }.is_null());
+    assert!(!unsafe { stream.get_last_error().unwrap()(&raw mut stream) }.is_null());
 
     let mut array = FFI_ArrowArray::empty();
     assert_eq!(
-        unsafe { stream.get_next.unwrap()(&raw mut stream, &raw mut array) },
+        unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut array) },
         0
     );
-    assert!(unsafe { stream.get_last_error.unwrap()(&raw mut stream) }.is_null());
+    assert!(unsafe { stream.get_last_error().unwrap()(&raw mut stream) }.is_null());
 
     let mut status: AdbcStatusCode = 0xEE;
     let exported = unsafe { error_from_array_stream(&raw mut stream, &raw mut status) };
     assert_eq!(status, ADBC_STATUS_OK);
     assert!(unsafe { (*exported).message.is_null() });
 
-    unsafe { array.release.unwrap()(&raw mut array) };
-    unsafe { stream.release.unwrap()(&raw mut stream) };
+    unsafe { array.release().unwrap()(&raw mut array) };
+    unsafe { stream.release().unwrap()(&raw mut stream) };
 }
 
 /// Reading the schema after a failed `get_next` must not make the failure disappear.
@@ -485,18 +487,18 @@ fn reading_the_schema_after_a_failed_read_keeps_the_failure() {
 
     let mut array = FFI_ArrowArray::empty();
     assert_eq!(
-        unsafe { stream.get_next.unwrap()(&raw mut stream, &raw mut array) },
+        unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut array) },
         ECANCELED
     );
 
     let mut schema = FFI_ArrowSchema::empty();
     assert_eq!(
-        unsafe { stream.get_schema.unwrap()(&raw mut stream, &raw mut schema) },
+        unsafe { stream.get_schema().unwrap()(&raw mut stream, &raw mut schema) },
         0,
         "the schema is still readable after a failed read"
     );
 
-    let pending = unsafe { stream.get_last_error.unwrap()(&raw mut stream) };
+    let pending = unsafe { stream.get_last_error().unwrap()(&raw mut stream) };
     assert!(
         !pending.is_null(),
         "the read failure was cleared by get_schema"
@@ -512,5 +514,5 @@ fn reading_the_schema_after_a_failed_read_keeps_the_failure() {
     );
     assert!(!unsafe { (*exported).message.is_null() });
 
-    unsafe { stream.release.unwrap()(&raw mut stream) };
+    unsafe { stream.release().unwrap()(&raw mut stream) };
 }

@@ -65,6 +65,8 @@ and in `docs/testing.md`; a test checks this, and CI derives its matrix from the
 - Keep `adbc_core`, `adbc_ffi`, `adbc_driver_manager` and CMake's `ARROW_ADBC_TAG` on one revision;
   `src/ffi/abi.rs` transcribes that revision's `c/include/arrow-adbc/adbc.h`.
 - Keep all dependencies from `google-cloud-rust`, including `spanner-grpc-mock`, on one revision.
+- `[patch.crates-io]` pins the `arrow-*` crates to one arrow-rs `main` revision for the
+  `FFI_ArrowArrayStream` constructor and accessors; drop it once a release ships them.
 - Tracking arrow-adbc `main` is deliberate; do not revert that pin merely to use a release.
   The Google Cloud pin supplies `Type::struct_type()` for native STRUCT mapping.
 - Each git dependency family independently blocks crates.io publishing.
@@ -77,7 +79,7 @@ When intentionally moving a family to crates.io, update every affected location 
 - `ARROW_ADBC_TAG` in `adbc-validation/CMakeLists.txt` for arrow-adbc changes.
 - `deny.toml` allow-git entries once a repository has no remaining git dependencies.
 - The type-mapping note in `README.md`, [CONTRIBUTING.md](CONTRIBUTING.md) and this section.
-- Keep release `publish = false` until both families permit publishing; check registry availability
+- Keep release `publish = false` until all families permit publishing; check registry availability
   and publish compatibility of `spanner-grpc-mock` too. Revisit Arrow ranges with `adbc_core`.
 
 ## Releasing

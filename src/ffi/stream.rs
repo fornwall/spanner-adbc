@@ -71,12 +71,16 @@ pub(super) fn export_reader(
         exported_error: None,
         panicked: false,
     });
-    FFI_ArrowArrayStream {
-        get_schema: Some(get_schema),
-        get_next: Some(get_next),
-        get_last_error: Some(get_last_error),
-        release: Some(release),
-        private_data: Box::into_raw(private_data).cast::<c_void>(),
+    // SAFETY: the callbacks below implement the Arrow C Stream contract over a `PrivateData`,
+    // which the stream owns until `release` frees it exactly once and marks the stream released.
+    unsafe {
+        FFI_ArrowArrayStream::new_unchecked(
+            Some(get_schema),
+            Some(get_next),
+            Some(get_last_error),
+            Some(release),
+            Box::into_raw(private_data).cast::<c_void>(),
+        )
     }
 }
 
@@ -141,7 +145,7 @@ unsafe extern "C" fn get_next(
 unsafe extern "C" fn get_last_error(stream: *mut FFI_ArrowArrayStream) -> *const c_char {
     // The null `private_data` check guards a released or zero-initialized stream, which
     // `catch_unwind` could not: dereferencing the null would be undefined behavior, not a panic.
-    if stream.is_null() || unsafe { (*stream).private_data.is_null() } {
+    if stream.is_null() || unsafe { (*stream).private_data().is_null() } {
         return std::ptr::null();
     }
     catch_unwind(AssertUnwindSafe(|| unsafe {
@@ -170,10 +174,10 @@ pub(super) unsafe extern "C" fn error_from_array_stream(
     stream: *mut FFI_ArrowArrayStream,
     status: *mut AdbcStatusCode,
 ) -> *const AdbcError {
-    if stream.is_null() || unsafe { (*stream).private_data.is_null() } {
+    if stream.is_null() || unsafe { (*stream).private_data().is_null() } {
         return std::ptr::null();
     }
-    let ours = unsafe { (*stream).release }.is_some_and(|callback| {
+    let ours = unsafe { (*stream).release() }.is_some_and(|callback| {
         std::ptr::fn_addr_eq(
             callback,
             release as unsafe extern "C" fn(*mut FFI_ArrowArrayStream),
@@ -232,12 +236,10 @@ unsafe extern "C" fn release(stream: *mut FFI_ArrowArrayStream) {
     if stream.is_null() {
         return;
     }
-    let stream = unsafe { &mut *stream };
-    stream.get_schema = None;
-    stream.get_next = None;
-    stream.get_last_error = None;
-    stream.release = None;
-    let private_data = std::mem::replace(&mut stream.private_data, std::ptr::null_mut());
+    let private_data = unsafe { (*stream).private_data() };
+    // Clears every callback and marks the stream released. `write` skips dropping the old
+    // value, whose `Drop` would re-enter this callback.
+    unsafe { std::ptr::write(stream, FFI_ArrowArrayStream::empty()) };
     if !private_data.is_null() {
         // A reader can own arbitrary client code. Its destructor must not unwind through `release`.
         let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -250,7 +252,7 @@ unsafe fn catch_callback(
     stream: *mut FFI_ArrowArrayStream,
     callback: impl FnOnce(&mut PrivateData) -> c_int,
 ) -> c_int {
-    if stream.is_null() || unsafe { (*stream).private_data.is_null() } {
+    if stream.is_null() || unsafe { (*stream).private_data().is_null() } {
         return EINVAL;
     }
     let private = unsafe { private_data(stream) };
@@ -272,7 +274,7 @@ unsafe fn catch_callback(
 }
 
 unsafe fn private_data<'a>(stream: *mut FFI_ArrowArrayStream) -> &'a mut PrivateData {
-    unsafe { &mut *((*stream).private_data.cast::<PrivateData>()) }
+    unsafe { &mut *((*stream).private_data().cast::<PrivateData>()) }
 }
 
 impl PrivateData {

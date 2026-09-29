@@ -27,16 +27,16 @@ impl BoundStreamReader {
         let Some(stream_ref) = (unsafe { stream.as_ref() }) else {
             return Err(invalid_argument("stream must not be null"));
         };
-        if stream_ref.release.is_none() {
+        if stream_ref.release().is_none() {
             return Err(invalid_argument("stream has already been released"));
         }
         let get_schema = stream_ref
-            .get_schema
+            .get_schema()
             .ok_or_else(|| invalid_argument("stream is missing its get_schema callback"))?;
-        if stream_ref.get_next.is_none() {
+        if stream_ref.get_next().is_none() {
             return Err(invalid_argument("stream is missing its get_next callback"));
         }
-        if stream_ref.get_last_error.is_none() {
+        if stream_ref.get_last_error().is_none() {
             return Err(invalid_argument(
                 "stream is missing its get_last_error callback",
             ));
@@ -51,7 +51,7 @@ impl BoundStreamReader {
                 code,
             )));
         }
-        if schema.release.is_none() {
+        if schema.release().is_none() {
             return Err(invalid_argument(
                 "bound stream get_schema returned a released schema",
             ));
@@ -79,7 +79,7 @@ impl Iterator for BoundStreamReader {
         let mut array = FFI_ArrowArray::empty();
         let get_next = self
             .stream
-            .get_next
+            .get_next()
             .expect("validated when the stream was bound");
         let code = unsafe { get_next(&raw mut self.stream, &raw mut array) };
         if code != 0 {
@@ -90,7 +90,7 @@ impl Iterator for BoundStreamReader {
                 code,
             ))));
         }
-        if array.release.is_none() {
+        if array.release().is_none() {
             self.finished = true;
             return None;
         }
@@ -176,7 +176,7 @@ pub(super) fn validate_imported(
 
 fn stream_error(stream: &mut FFI_ArrowArrayStream, callback: &str, code: c_int) -> String {
     let get_last_error = stream
-        .get_last_error
+        .get_last_error()
         .expect("validated when the stream was bound");
     let message = unsafe { get_last_error(stream) };
     let detail = if message.is_null() {

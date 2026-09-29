@@ -151,7 +151,7 @@ Nanosecond timestamps cover roughly 1677–2262; values outside that range fail 
 year 1–9999 range, truncating sub-microsecond digits toward negative infinity. See
 [timestamp precision](docs/options.md#timestamp-precision).
 
-The crate uses git-pinned Google Cloud and ADBC dependencies and is not published to crates.io.
+The crate uses git-pinned Google Cloud, ADBC and Arrow dependencies and is not published to crates.io.
 Downstream Rust users must use the same `adbc_core` revision as `Cargo.toml`. See
 [dependency pins](CONTRIBUTING.md#dependency-pins) before changing them.
 

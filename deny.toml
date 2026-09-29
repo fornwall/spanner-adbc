@@ -41,8 +41,10 @@ wildcards = "allow"
 unknown-registry = "deny"
 unknown-git = "deny"
 # The google-cloud-* crates are pinned to this git repo until Type::struct_type() is released;
-# the adbc_* crates until the error-release / rows_affected / error-compat fixes ship (see Cargo.toml).
+# the adbc_* crates until the error-release / rows_affected / error-compat fixes ship; the arrow-*
+# crates until a release has the FFI_ArrowArrayStream constructor and accessors (see Cargo.toml).
 allow-git = [
     "https://github.com/googleapis/google-cloud-rust",
     "https://github.com/apache/arrow-adbc",
+    "https://github.com/apache/arrow-rs",
 ]

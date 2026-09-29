@@ -166,13 +166,13 @@ pub(super) unsafe extern "C" fn statement_bind(
             let Some(values_ref) = values.as_ref() else {
                 return Err(invalid_argument("values must not be null"));
             };
-            if values_ref.release.is_none() {
+            if values_ref.release().is_none() {
                 return Err(invalid_argument("values has already been released"));
             }
             let Some(schema_ref) = schema.as_ref() else {
                 return Err(invalid_argument("schema must not be null"));
             };
-            if schema_ref.release.is_none() {
+            if schema_ref.release().is_none() {
                 return Err(invalid_argument("schema has already been released"));
             }
             // ADBC transfers both inputs. Moving only the array would leak the caller's schema.

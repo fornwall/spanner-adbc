@@ -6,7 +6,7 @@
 //! everything that comes *before* one: argument validation, the released-handle refusals, the
 //! partition export, and the Arrow C stream/array import a bound stream goes through.
 
-use std::ffi::CString;
+use std::ffi::{CString, c_int};
 use std::sync::Arc;
 
 use adbc_core::error::{AdbcStatusCode, Status};
@@ -34,6 +34,32 @@ fn released_handle() -> AdbcStatement {
 
 fn key(name: &str) -> CString {
     CString::new(name).unwrap()
+}
+
+type GetSchema = unsafe extern "C" fn(*mut FFI_ArrowArrayStream, *mut FFI_ArrowSchema) -> c_int;
+type GetNext = unsafe extern "C" fn(*mut FFI_ArrowArrayStream, *mut FFI_ArrowArray) -> c_int;
+type GetLastError = unsafe extern "C" fn(*mut FFI_ArrowArrayStream) -> *const c_char;
+
+/// Rebuilds `stream` with the given callbacks swapped in, keeping its private data and release.
+fn replace_callbacks(
+    stream: FFI_ArrowArrayStream,
+    get_schema: Option<GetSchema>,
+    get_next: Option<GetNext>,
+    get_last_error: Option<GetLastError>,
+) -> FFI_ArrowArrayStream {
+    // Ownership of the private data moves to the rebuilt stream, so the original must not drop.
+    let stream = std::mem::ManuallyDrop::new(stream);
+    // SAFETY: the replacements only ignore or write their outputs; the retained release still
+    // matches the retained private data.
+    unsafe {
+        FFI_ArrowArrayStream::new_unchecked(
+            get_schema.or(stream.get_schema()),
+            get_next.or(stream.get_next()),
+            get_last_error.or(stream.get_last_error()),
+            stream.release(),
+            stream.private_data(),
+        )
+    }
 }
 
 #[test]
@@ -153,15 +179,14 @@ fn bound_stream_schema_failures_preserve_diagnostics_and_release_ownership() {
         let retained = lifetime.clone();
         let schema = Arc::new(Schema::empty());
         let batch = RecordBatch::new_empty(schema.clone());
-        let mut stream = FFI_ArrowArrayStream::new(Box::new(RecordBatchIterator::new(
+        let stream = FFI_ArrowArrayStream::new(Box::new(RecordBatchIterator::new(
             std::iter::once_with(move || {
                 drop(retained);
                 Ok(batch)
             }),
             schema,
         )));
-        stream.get_schema = Some(get_schema);
-        stream.get_last_error = Some(get_last_error);
+        let mut stream = replace_callbacks(stream, Some(get_schema), None, Some(get_last_error));
         assert_eq!(Arc::strong_count(&lifetime), 2);
         let failure = unsafe { BoundStreamReader::from_raw(&raw mut stream) }.unwrap_err();
         assert_eq!(failure.status, Status::InvalidArguments);
@@ -169,7 +194,7 @@ fn bound_stream_schema_failures_preserve_diagnostics_and_release_ownership() {
         if expected != "released schema" {
             assert!(failure.message.contains(&libc::EIO.to_string()));
         }
-        assert!(stream.release.is_none());
+        assert!(stream.release().is_none());
         assert_eq!(Arc::strong_count(&lifetime), 1);
     }
 }
@@ -205,7 +230,7 @@ fn imported_stream_batches_preserve_schema_rows_and_buffers_after_release() {
             schema.clone(),
         )));
         let mut reader = unsafe { BoundStreamReader::from_raw(&raw mut stream) }.unwrap();
-        assert!(stream.release.is_none());
+        assert!(stream.release().is_none());
         assert_eq!(reader.schema(), schema);
         assert_eq!(reader.next().unwrap().unwrap().num_rows(), 0);
         let found = reader.next().unwrap().unwrap();
@@ -249,11 +274,11 @@ fn imported_streams_reject_null_rows_and_mismatched_column_counts() {
             "top-level null rows",
         ),
     ] {
-        let mut stream = FFI_ArrowArrayStream::new(Box::new(RecordBatchIterator::new(
+        let stream = FFI_ArrowArrayStream::new(Box::new(RecordBatchIterator::new(
             std::iter::empty(),
             Arc::new(Schema::new(fields)),
         )));
-        stream.get_next = Some(null_row);
+        let mut stream = replace_callbacks(stream, None, Some(null_row), None);
         let mut reader = unsafe { BoundStreamReader::from_raw(&raw mut stream) }.unwrap();
         let failure = reader.next().unwrap().unwrap_err();
         assert!(failure.to_string().contains(expected), "{failure}");
@@ -303,11 +328,11 @@ fn imported_arrays_are_validated_and_name_the_column_that_fails() {
     let declared = vec![Field::new("payload", DataType::Utf8View, false)];
 
     // The bound-stream path: every batch the producer yields is checked, not just the first.
-    let mut stream = FFI_ArrowArrayStream::new(Box::new(RecordBatchIterator::new(
+    let stream = FFI_ArrowArrayStream::new(Box::new(RecordBatchIterator::new(
         std::iter::empty(),
         Arc::new(Schema::new(declared)),
     )));
-    stream.get_next = Some(non_utf8_view);
+    let mut stream = replace_callbacks(stream, None, Some(non_utf8_view), None);
     let mut reader = unsafe { BoundStreamReader::from_raw(&raw mut stream) }.unwrap();
     let failure = reader.next().unwrap().unwrap_err().to_string();
     assert!(
