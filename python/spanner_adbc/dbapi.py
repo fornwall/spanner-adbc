@@ -5,7 +5,9 @@ cursors, plus the ADBC Arrow extensions (``fetch_arrow_table``, ``fetch_df``,
 ``adbc_ingest``) that pandas / polars / DuckDB consume directly.
 
     import spanner_adbc.dbapi as spanner
-    with spanner.connect(uri="spanner:///projects/p/instances/i/databases/d") as conn:
+    with spanner.connect(
+        db_kwargs={"uri": "spanner:///projects/p/instances/i/databases/d"}
+    ) as conn:
         df = conn.cursor().execute("SELECT * FROM Singers").fetch_df()
 
 Note: DBAPI is autocommit-off by default, which puts this driver into its
@@ -63,7 +65,7 @@ def connect(
     return adbc_driver_manager.dbapi.connect(
         driver=_driver_path(),
         entrypoint=ENTRYPOINT,
-        db_kwargs=dict(db_kwargs) if db_kwargs else None,
+        db_kwargs=db_kwargs,
         conn_kwargs=conn_kwargs,
         autocommit=autocommit,
     )

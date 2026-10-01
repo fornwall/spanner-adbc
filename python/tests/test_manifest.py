@@ -103,6 +103,67 @@ def test_manifest_escapes_backslashes(tmp_path):
     assert "\\\\" not in shared
 
 
+@pytest.mark.parametrize("name", ['quote"', "tab\t", "line\n", "control\x01", "del\x7f", "snow☃𐐀"])
+def test_manifest_paths_round_trip_through_toml(tmp_path, name):
+    library = tmp_path / name / "libspanner_adbc.so"
+    doc = tomllib.loads(manifest_mod.manifest_text(library))
+    assert doc["Driver"]["shared"] == str(library.resolve())
+
+
+def test_failed_install_preserves_existing_manifest(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    target = tmp_path / manifest_mod.MANIFEST_NAME
+    target.write_text("original manifest", encoding="utf-8")
+
+    def fail_replace(self, target):
+        raise PermissionError("manifest is read-only")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(PermissionError, match="read-only"):
+        manifest_mod.install(tmp_path, library=tmp_path / "driver.so")
+    assert target.read_text(encoding="utf-8") == "original manifest"
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_install_preserves_manifest_permissions(tmp_path):
+    if os.name == "nt":
+        pytest.skip("POSIX permissions")
+    target = manifest_mod.install(tmp_path, library=tmp_path / "driver.so")
+    target.chmod(0o640)
+    manifest_mod.install(tmp_path, library=tmp_path / "updated.so")
+    assert target.stat().st_mode & 0o777 == 0o640
+    assert tomllib.loads(target.read_text())["Driver"]["shared"].endswith("updated.so")
+
+
+def test_new_manifest_respects_creation_permissions(tmp_path):
+    reference = tmp_path / "reference.toml"
+    reference.write_text("", encoding="utf-8")
+    target = manifest_mod.install(tmp_path, library=tmp_path / "driver.so")
+    assert target.stat().st_mode & 0o777 == reference.stat().st_mode & 0o777
+
+
+@pytest.mark.parametrize("error", [RuntimeError("driver library missing"), PermissionError("access denied")])
+def test_cli_reports_install_errors_without_traceback(monkeypatch, capsys, error):
+    def fail_install(directory):
+        raise error
+
+    monkeypatch.setattr(manifest_mod, "install", fail_install)
+    with pytest.raises(SystemExit) as exc:
+        manifest_mod.main(["install"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert str(error) in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_custom_directory_explains_discovery(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(manifest_mod, "_driver_path", lambda: str(tmp_path / "driver.so"))
+    assert manifest_mod.main(["install", "--dir", str(tmp_path)]) == 0
+    assert "ADBC_DRIVER_PATH" in capsys.readouterr().out
+
+
 def test_cli_path_and_print(capsys):
     assert manifest_mod.main(["path"]) == 0
     printed = capsys.readouterr().out.strip()

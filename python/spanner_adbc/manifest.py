@@ -34,11 +34,13 @@ By default it writes to a directory the driver manager already searches (see
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import platform
 import sys
 import sysconfig
+import tempfile
 import typing
 
 from . import ENTRYPOINT, __version__, _driver_path
@@ -124,14 +126,9 @@ def platform_tuple() -> str:
 
 
 def _toml_string(value: str) -> str:
-    """Render a TOML basic string.
-
-    Basic (double-quoted) strings are used rather than literal ones because a
-    Windows install path contains backslashes *and* may contain a single quote,
-    which a TOML literal string cannot escape.
-    """
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+    """Escape paths, including control characters, as TOML basic strings."""
+    # Keep non-BMP Unicode intact: JSON surrogate escapes are invalid in TOML.
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
 def manifest_text(library: typing.Union[str, "os.PathLike[str]", None] = None) -> str:
@@ -230,10 +227,18 @@ def install(
     does not exist. An existing manifest is overwritten, so re-running this
     after an upgrade is the supported way to refresh a stale path.
     """
+    text = manifest_text(library)
     target_dir = pathlib.Path(directory) if directory is not None else default_install_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / MANIFEST_NAME
-    target.write_text(manifest_text(library), encoding="utf-8")
+    # Replace only after writing succeeds, so a failed upgrade leaves the old
+    # manifest usable and concurrent readers never see a partial TOML file.
+    with tempfile.TemporaryDirectory(dir=target_dir, prefix=".spanner-") as temporary:
+        temporary_path = pathlib.Path(temporary) / MANIFEST_NAME
+        temporary_path.write_text(text, encoding="utf-8")
+        if target.exists():
+            temporary_path.chmod(target.stat().st_mode & 0o777)
+        temporary_path.replace(target)
     return target
 
 
@@ -264,19 +269,19 @@ def main(argv: typing.Optional[typing.Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     command = args.command or "install"
 
-    if command == "print":
-        sys.stdout.write(manifest_text())
-        return 0
-    if command == "path":
-        print(default_install_dir() / MANIFEST_NAME)
-        return 0
-
-    written = install(getattr(args, "directory", None))
-    print(f"Wrote {written}")
-    print(
-        'The Spanner driver now resolves as driver="spanner" and from '
-        'uri="spanner:///..." for this environment.'
-    )
+    try:
+        if command == "print":
+            sys.stdout.write(manifest_text())
+        elif command == "path":
+            print(default_install_dir() / MANIFEST_NAME)
+        else:
+            directory = getattr(args, "directory", None)
+            written = install(directory)
+            print(f"Wrote {written}")
+            if directory is not None:
+                print(f"Add {written.parent.resolve()} to ADBC_DRIVER_PATH for discovery.")
+    except (OSError, RuntimeError) as exc:
+        parser.exit(1, f"{parser.prog}: {exc}\n")
     return 0
 
 
