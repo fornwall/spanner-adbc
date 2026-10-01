@@ -143,12 +143,8 @@ fn consume_quoted(
     }
 }
 
-/// A single GoogleSQL lexeme produced by [`lex`]. The pieces partition the input with no gaps or
-/// overlaps: concatenating `Word`/`Quoted`/`Comment` slices and `Other` chars in order reproduces
-/// the source byte-for-byte. That lets a *copying* consumer ([`split_statements`]) rebuild the text
-/// while *skipping* consumers ([`is_dml_returning`], [`named_parameters`], [`first_keyword`])
-/// ignore the lexeme kinds they do not care about — all of them sharing this one lexer instead of
-/// a hand-rolled comment/quote walker each.
+/// A GoogleSQL token. Tokens partition the input with no gaps or overlaps; splitting and
+/// classification share the same quote/comment boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lexeme<'a> {
     /// A maximal run of identifier characters (`[A-Za-z0-9_]`): a keyword, identifier or number.
@@ -270,28 +266,37 @@ fn significant_lexemes(sql: &str) -> std::iter::Peekable<impl Iterator<Item = Le
 /// Split a (possibly multi-statement) SQL string into individual, trimmed, non-empty statements.
 ///
 /// Segments carrying no statement — pure whitespace, or only comments — are dropped rather than
-/// emitted as empty statements (see [`push_statement`]). Callers depend on the resulting *count*:
+/// emitted as empty statements. Callers depend on the resulting count:
 /// it decides the all-DML batch check, the partitioned-DML and `THEN RETURN` single-statement
 /// guards, and whether [`strip_trailing_terminators`] treats the input as one query.
 ///
 /// Splits on top-level `;`, ignoring semicolons inside string/bytes literals and quoted
 /// identifiers — including triple-quoted (`'''…'''`/`"""…"""`) and raw (`r'…'`, `rb'…'`, …) forms,
 /// see [`consume_quoted`] — and comments (`-- …`, `# …`, `/* … */`). Both are handled by the
-/// shared [`lex`] tokenizer, which reproduces every non-`;` lexeme verbatim. This is shared by DDL
+/// shared [`lex`] tokenizer; byte offsets retain each statement verbatim. This is shared by DDL
 /// batching (`UpdateDatabaseDdl`) and multi-statement DML batching (`ExecuteBatchDml`).
 pub(crate) fn split_statements(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
-    let mut current = String::new();
-    for lexeme in lex(sql) {
+    let mut lexer = lex(sql);
+    let mut start = 0;
+    let mut has_statement = false;
+    while let Some(lexeme) = lexer.next() {
         match lexeme {
-            // A top-level `;` ends the current statement (and is itself dropped).
-            Lexeme::Other(';') => push_statement(&mut statements, &mut current),
-            // Every other lexeme is copied through verbatim, so literals/comments survive intact.
-            Lexeme::Word(s) | Lexeme::Quoted(s) | Lexeme::Comment(s) => current.push_str(s),
-            Lexeme::Other(c) => current.push(c),
+            Lexeme::Other(';') => {
+                if has_statement {
+                    statements.push(sql[start..lexer.pos - 1].trim().to_string());
+                }
+                start = lexer.pos;
+                has_statement = false;
+            }
+            Lexeme::Comment(_) => {}
+            Lexeme::Other(c) if c.is_whitespace() => {}
+            _ => has_statement = true,
         }
     }
-    push_statement(&mut statements, &mut current);
+    if has_statement {
+        statements.push(sql[start..].trim().to_string());
+    }
     statements
 }
 
@@ -318,24 +323,6 @@ pub(crate) fn strip_trailing_terminators(sql: &str) -> String {
     } else {
         sql.to_string()
     }
-}
-
-fn push_statement(statements: &mut Vec<String>, current: &mut String) {
-    let trimmed = current.trim();
-    // Drop segments that carry no statement — pure whitespace, or only comments (e.g. a trailing
-    // `-- cleanup` after the last `;`). Emitting those as statements makes Spanner reject the whole
-    // batch with `INVALID_ARGUMENT` (silently buffered until commit in manual mode), and would make
-    // `strip_trailing_terminators` see two statements for `SELECT 1; -- done`. A segment with real
-    // SQL followed by a comment (`SELECT 1 -- done`) still has a leading keyword, so it is kept.
-    let has_statement = lex(trimmed).any(|lexeme| match lexeme {
-        Lexeme::Comment(_) => false,
-        Lexeme::Other(c) => !c.is_whitespace(),
-        Lexeme::Word(_) | Lexeme::Quoted(_) => true,
-    });
-    if has_statement {
-        statements.push(trimmed.to_string());
-    }
-    current.clear();
 }
 
 /// The first SQL keyword — the leading ASCII-alphabetic run of the first word, borrowed from
