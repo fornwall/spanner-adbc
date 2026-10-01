@@ -1,15 +1,5 @@
-# Toolchain for local development AND the single source of truth for the driver's Rust version
-# across CI: the `.github/actions/setup-rust` composite action reads `channel` out of this file
-# and installs exactly that version (dtolnay/rust-toolchain can't read this file itself), so the
-# version lives in exactly one place. Pinned to an exact version (not `stable`) so local and CI
-# builds are reproducible and everyone is on the same Rust; bump it here to move the whole project
-# forward. It also guarantees contributors have the rustfmt + clippy components CI enforces
-# (`cargo fmt --all --check`, `cargo clippy -D warnings`).
-#
-# Kept in lockstep with the crate's MSRV (`rust-version` in Cargo.toml): pinning the dev/CI
-# toolchain to the MSRV means CI builds on the oldest supported Rust, so an accidental use of a
-# newer language/library feature fails here instead of downstream. (fuzz.yml is the one exception
-# — fuzzing needs nightly.)
+# Shared development/CI toolchain; keep aligned with Cargo.toml’s rust-version.
+# Fuzzing uses nightly separately.
 [toolchain]
 channel = "1.99.0"
 components = ["rustfmt", "clippy"]

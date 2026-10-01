@@ -1,6 +1,5 @@
 [build-system]
-# >=77 for the PEP 639 string `license` + `license-files` below; it also vendors
-# bdist_wheel, so the separate `wheel` requirement is gone.
+# PEP 639 license metadata and the bundled bdist_wheel command require setuptools 77.
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
@@ -11,8 +10,7 @@ description = "ADBC (Arrow Database Connectivity) driver for Google Cloud Spanne
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
-# A checked-in copy of the repository's LICENSE (Apache-2.0 §4 requires shipping the
-# license text with the wheel, which bundles the compiled driver).
+# Include the license for the bundled native driver.
 license-files = ["LICENSE"]
 authors = [{ name = "Fredrik Fornwall", email = "fredrik@fornwall.net" }]
 keywords = ["adbc", "arrow", "spanner", "database", "gcp"]
@@ -27,27 +25,15 @@ classifiers = [
     "Programming Language :: Rust",
     "Topic :: Database",
 ]
-# >=1.0 covers everything the wrapper uses (AdbcDatabase/dbapi.connect with
-# driver/entrypoint, dbapi autocommit) and keeps pip off ancient pre-1.0 releases.
+# Minimum driver manager version supported by the wrapper.
 dependencies = ["adbc-driver-manager>=1.0"]
 
 [project.optional-dependencies]
-# Arrow/DataFrame result helpers used by the DBAPI layer (fetch_arrow_table/fetch_df).
-# `spanner_adbc.dbapi` is a thin wrapper over `adbc_driver_manager.dbapi`, so
-# delegate to that package's own `dbapi` extra (pyarrow + pandas) instead of
-# maintaining a second, drifting floor here — the old standalone `pyarrow>=8` sat
-# below the `pyarrow>=14.0.1` the driver manager actually requires. The explicit
-# pyarrow floor is kept so `pip install spanner-adbc[dbapi]` still states the
-# Arrow requirement the docs talk about.
+# Use the driver manager’s Arrow/pandas extra and state the minimum Arrow version.
 dbapi = ["adbc-driver-manager[dbapi]>=1.0", "pyarrow>=14.0.1"]
 
 [project.scripts]
-# Writes an ADBC driver manifest (spanner.toml) pointing at the library bundled in
-# this wheel, so the driver resolves as driver="spanner" / uri="spanner:///...".
-# The manifest cannot simply be shipped as a data file: Driver.shared is handed to
-# the dynamic loader verbatim (no manifest-relative resolution in either the C or
-# the Rust driver manager), so the absolute install path must be filled in after
-# installation. See spanner_adbc/manifest.py.
+# Write a manifest using the installed library’s absolute path.
 spanner-adbc-install-manifest = "spanner_adbc.manifest:main"
 
 [project.urls]
@@ -61,6 +47,5 @@ packages = ["spanner_adbc"]
 version = { attr = "spanner_adbc._version.__version__" }
 
 [tool.setuptools.package-data]
-# The prebuilt shared library is dropped in by CI per platform before the wheel
-# is built. py.typed ships the type-hint marker.
+# CI copies the platform library into the package before building the wheel.
 spanner_adbc = ["*.so", "*.dylib", "*.dll", "py.typed"]
