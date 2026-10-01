@@ -390,8 +390,21 @@ impl Iterator for SpannerBatchReader {
         // Wait for the next prefetched chunk. `block_on_cancellable` checks the sticky signal
         // before polling (biased), so a latched cancel surfaces here even when a chunk is already
         // buffered — a prefetched chunk never masks a cancellation.
-        match block_on_cancellable(&self.runtime, &self.cancel, async { Ok(rx.recv().await) }) {
-            // A closed channel means the prefetch task drained the stream; stop.
+        let task = &mut self.task;
+        match block_on_cancellable(&self.runtime, &self.cancel, async {
+            let chunk = rx.recv().await;
+            if chunk.is_none() {
+                // A task panic also closes the channel. Check completion before reporting EOF
+                // so a failed background fetch cannot silently truncate a result.
+                task.await.map_err(|error| {
+                    err(
+                        format!("background row fetch failed; result is incomplete: {error}"),
+                        Status::Internal,
+                    )
+                })?;
+            }
+            Ok(chunk)
+        }) {
             Ok(None) => {
                 self.chunks = None;
                 None
@@ -1273,6 +1286,39 @@ mod tests {
     use super::*;
     use arrow_array::{Array, StringArray, TimestampMicrosecondArray};
     use google_cloud_spanner::value::ToValue;
+
+    struct PanickingSource;
+
+    impl ChunkSource for PanickingSource {
+        type Row = Row;
+
+        async fn next_chunk(&mut self) -> Result<Vec<Row>> {
+            panic!("row decoder failed");
+        }
+    }
+
+    #[test]
+    fn background_fetch_panic_is_an_error_not_end_of_stream() {
+        let mut reader = SpannerBatchReader::new(
+            crate::runtime::new_runtime().unwrap(),
+            CancelSignal::new(),
+            Arc::new(Schema::empty()),
+            None,
+            PanickingSource,
+        );
+        let error = reader
+            .next()
+            .expect("failed fetch must not report EOF")
+            .unwrap_err();
+        let ArrowError::ExternalError(error) = error else {
+            panic!("expected an ADBC error");
+        };
+        let error = error.downcast_ref::<adbc_core::error::Error>().unwrap();
+        assert_eq!(error.status, Status::Internal);
+        assert!(error.message.contains("result is incomplete"), "{error}");
+        assert!(error.message.contains("row decoder failed"), "{error}");
+        assert!(reader.next().is_none());
+    }
 
     /// A driver error reaching a `RecordBatchReader` consumer must stay a *boxed* ADBC error, not
     /// a stringified one: the C ABI's stream export (`src/ffi/stream.rs`) recovers the ADBC status
