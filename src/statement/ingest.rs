@@ -81,8 +81,8 @@ impl SpannerStatement {
     /// ([`remap_ingest_create_error`](Self::remap_ingest_create_error)).
     ///
     /// A failure that already carries [`Status::AlreadyExists`] — a bound row duplicating a primary
-    /// key — keeps that status and just gets the table name folded in. Any other failure is
-    /// reinterpreted from the [`ingest_table_exists`](Self::ingest_table_exists) probe.
+    /// key — keeps that status and just gets the table name folded in. Only table/data failures
+    /// are reinterpreted; operational failures retain their original status and details.
     fn remap_ingest_append_error(&self, table: &str, error: Error) -> Error {
         if !matches!(
             self.ingest_mode,
@@ -90,10 +90,15 @@ impl SpannerStatement {
         ) {
             return error;
         }
-        // A driver-side transaction-state rejection (ingesting in a manual transaction that began
-        // with a query) is not an insert failure, so the spec's NotFound/AlreadyExists
-        // append contract does not apply — it propagates unchanged.
-        if error.status == Status::InvalidState {
+        // Table existence says nothing about an authorization, cancellation, timeout, quota or
+        // transport failure. Probing those can also delay cancellation and hide retry information.
+        if !matches!(
+            error.status,
+            Status::InvalidArguments
+                | Status::InvalidData
+                | Status::NotFound
+                | Status::AlreadyExists
+        ) {
             return error;
         }
         // Already `AlreadyExists`: a duplicate primary key. The status is the one the contract
@@ -195,6 +200,15 @@ impl SpannerStatement {
     fn remap_ingest_create_error(&self, table: &str, error: Error) -> Error {
         // Unset (`None`) is `create`, the default, so remap its DDL failure too.
         if !matches!(self.ingest_mode, None | Some(IngestMode::Create)) {
+            return error;
+        }
+        if !matches!(
+            error.status,
+            Status::InvalidArguments
+                | Status::InvalidState
+                | Status::NotFound
+                | Status::AlreadyExists
+        ) {
             return error;
         }
         match self.ingest_table_exists(table) {

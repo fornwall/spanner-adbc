@@ -4852,3 +4852,60 @@ fn the_catalog_level_reports_the_database_id_and_filters_round_trip() {
         .expect_err("\"\" is no longer a catalog this connection has");
     assert_eq!(rejected.status, AdbcStatus::NotImplemented);
 }
+
+#[test]
+fn ingest_operational_errors_keep_status_and_details_without_metadata_probes() {
+    let _watchdog = watchdog!();
+    for (code, expected) in [
+        (tonic::Code::PermissionDenied, AdbcStatus::Unauthorized),
+        (tonic::Code::Unauthenticated, AdbcStatus::Unauthenticated),
+        (tonic::Code::Cancelled, AdbcStatus::Cancelled),
+        (tonic::Code::DeadlineExceeded, AdbcStatus::Timeout),
+        (tonic::Code::ResourceExhausted, AdbcStatus::Internal),
+        (tonic::Code::Unavailable, AdbcStatus::IO),
+        (tonic::Code::Aborted, AdbcStatus::IO),
+        (tonic::Code::Internal, AdbcStatus::Internal),
+    ] {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let record_probes = probes.clone();
+        let server = MockServer::start(move |mock| {
+            mock.expect_batch_write().returning(move |_| {
+                let mut response = batch_write_group_already_exists(0);
+                let status = response.status.as_mut().unwrap();
+                status.code = code as i32;
+                status.message = "injected operational failure".into();
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tx.try_send(Ok(response)).unwrap();
+                Ok(tonic::Response::new(rx))
+            });
+            // A successful existence probe used to replace the operational error with
+            // AlreadyExists and discard its vendor code and structured details.
+            mock.expect_execute_streaming_sql().returning(move |_| {
+                record_probes.fetch_add(1, Ordering::SeqCst);
+                Ok(stream_of(vec![Ok(partial_result_set(
+                    true,
+                    &["MockTable"],
+                    b"",
+                    true,
+                ))]))
+            });
+        });
+        let mut connection = server.connect();
+        let mut statement = append_ingest_statement(&mut connection);
+        statement
+            .set_option(
+                OptionStatement::Other(spanner_adbc::OPTION_INGEST_BATCH_WRITE.into()),
+                OptionValue::String("true".into()),
+            )
+            .unwrap();
+        statement.bind(ingest_batch(1)).unwrap();
+        let error = statement.execute_update().unwrap_err();
+        assert_eq!(error.status, expected, "{code:?}: {error}");
+        assert_eq!(error.vendor_code, code as i32, "{error}");
+        assert!(error.message.contains("injected operational failure"));
+        assert!(error.details.as_ref().is_some_and(|details| {
+            details.iter().any(|(key, _)| key == "google.rpc.errorinfo")
+        }));
+        assert_eq!(probes.load(Ordering::SeqCst), 0, "{code:?}");
+    }
+}
