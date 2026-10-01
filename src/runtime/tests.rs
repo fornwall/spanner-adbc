@@ -211,6 +211,31 @@ fn prefetch_cancel_aborts_an_in_flight_fetch() {
     runtime.block_on(task).unwrap();
 }
 
+#[test]
+fn prefetch_cancel_unblocks_a_fetch_error_waiting_on_a_full_channel() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (source, calls) = ScriptedSource::new(vec![
+        Step::Chunk(Ok(vec![1])),
+        Step::Chunk(Err(err("stream broke", Status::IO))),
+    ]);
+    let cancel = CancelSignal::new();
+    let (_rx, task) = spawn_prefetch(&runtime, cancel.clone(), source);
+    runtime.block_on(async {
+        // On one runtime thread the task reaches its blocked send before yielding back here.
+        while calls.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        cancel.signal();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancel must release a task waiting to send an error")
+            .unwrap();
+    });
+}
+
 // Dropping the receiver stops the task at its next send instead of draining the whole source.
 #[test]
 fn prefetch_stops_when_the_receiver_is_dropped() {

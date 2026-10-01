@@ -1,10 +1,5 @@
-//! A shared Tokio runtime used to drive the asynchronous Spanner client from the synchronous
-//! ADBC trait methods.
-//!
-//! The runtime is created once by the [`SpannerDriver`](crate::SpannerDriver) and shared, via an
-//! [`Arc`], with every database, connection and statement it spawns. Holding the [`Arc`] keeps the
-//! runtime — and therefore any background tasks the Spanner client spawns (such as the session
-//! maintainer) — alive for as long as any handle exists.
+//! Bridges synchronous ADBC calls to the async Spanner client. Handles share the driver's
+//! runtime through an [`Arc`], keeping client background tasks alive until the last handle drops.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -21,28 +16,14 @@ use crate::error::err;
 /// A reference-counted handle to the driver's Tokio runtime.
 pub(crate) type SharedRuntime = Arc<Runtime>;
 
-/// A **sticky, per-operation** cancellation signal shared between one operation (and any streamed
-/// reader it produces) and the `cancel()` call aimed at it.
+/// A latched cancellation signal shared by an operation and its streamed readers.
 ///
-/// ADBC's `cancel` must be thread-safe, so this is `Clone` + `Send`/`Sync` interior mutability.
-/// [`CancelSignal::signal`] — invoked from another thread by a `cancel()` call — sets a latched
-/// flag and wakes an operation currently waiting inside [`block_on_cancellable`], which then
-/// returns [`Status::Cancelled`].
-///
-/// Once latched the flag stays set **forever** — there is deliberately no way to clear it. That is
-/// what makes cancelling a streamed result reliable: a query's result is streamed lazily, so a
-/// cancel that lands *between* two chunk fetches must still cancel the *next* fetch rather than
-/// evaporate — `Notify` alone wakes only currently-registered waiters and would lose exactly that
-/// signal. Scoping the signal to one operation is the other half: the owning statement/connection
-/// mints a **fresh** signal per operation via [`CancelSlot::begin_operation`], so a stale cancel
-/// cannot leak into the next operation, and — conversely — a new operation cannot un-cancel a
-/// still-live streamed reader from an earlier one (the reader keeps its own signal).
+/// Cancellation stays set between fetches. [`CancelSlot::begin_operation`] replaces the signal
+/// for new work without reviving older cancelled readers or cancelling the new operation.
 #[derive(Clone)]
 pub(crate) struct CancelSignal(Arc<CancelInner>);
 
 impl std::fmt::Debug for CancelSignal {
-    // `CancelInner` holds a `Notify`, which is not `Debug`; the latched flag is the only meaningful
-    // state to surface.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CancelSignal")
             .field("cancelled", &self.0.cancelled.load(Ordering::Relaxed))
@@ -65,9 +46,7 @@ impl CancelSignal {
         }))
     }
 
-    /// Request cancellation: latch the flag and wake the in-flight operation, if any. The flag
-    /// stays set forever, cancelling any subsequent [`block_on_cancellable`] on this signal —
-    /// such as the next chunk fetch of a streamed result.
+    /// Latch cancellation and wake all waiters, including future fetches on this signal.
     pub(crate) fn signal(&self) {
         // Order matters: latch the flag before waking, so a woken waiter always observes it.
         self.0.cancelled.store(true, Ordering::Release);
@@ -94,15 +73,7 @@ impl CancelSignal {
     }
 }
 
-/// The owner side of per-operation cancellation: a slot holding the [`CancelSignal`] of the
-/// owning ADBC object's **current** operation.
-///
-/// Each entry point that begins a new operation mints a fresh, uncancelled signal via
-/// [`CancelSlot::begin_operation`]; `cancel()` ([`CancelSlot::signal`]) always targets the
-/// current one. A superseded signal is *replaced*, never cleared — once latched it stays latched —
-/// which yields exactly the ADBC contract described on [`CancelSignal`]: a stale cancel cannot leak
-/// into a new operation, and a new operation cannot revive an earlier one's cancelled stream, which
-/// keeps failing with [`Status::Cancelled`] rather than presenting as cleanly complete.
+/// The current operation's cancellation signal, shared with the object's cancel handle.
 #[derive(Debug)]
 pub(crate) struct CancelSlot(std::sync::Mutex<CancelSignal>);
 
@@ -111,17 +82,14 @@ impl CancelSlot {
         Self(std::sync::Mutex::new(CancelSignal::new()))
     }
 
-    /// Begin a new operation: mint a fresh (uncancelled) signal and make it the target of
-    /// subsequent `cancel()` calls. The previous operation's signal keeps its state — a latched
-    /// cancel on it stays latched for any reader still holding it.
+    /// Replace the current signal without changing signals held by earlier readers.
     pub(crate) fn begin_operation(&self) -> CancelSignal {
         let fresh = CancelSignal::new();
         *self.0.lock().unwrap() = fresh.clone();
         fresh
     }
 
-    /// The current operation's signal (a clone sharing the same latch), for the operation's own
-    /// [`block_on_cancellable`] waits and for handing to the streamed readers it produces.
+    /// Clone the current signal for a wait or streamed reader.
     pub(crate) fn current(&self) -> CancelSignal {
         self.0.lock().unwrap().clone()
     }
@@ -132,27 +100,12 @@ impl CancelSlot {
     }
 }
 
-/// The ADBC [`CancelHandle`] over a [`CancelSlot`], returned by the connection's and statement's
-/// `get_cancel_handle`.
+/// A long-lived ADBC cancel handle that always targets the current operation.
 ///
-/// `adbc_core` hands cancellation out as a *separate* handle (the borrow checker cannot express a
-/// `&mut self` `cancel` racing an in-flight `&mut self` execution), and the FFI exporter takes one
-/// **once**, when the connection/statement is created, then keeps it for that object's whole life.
-/// So the handle must stay aimed at whatever operation is current at `try_cancel` time, not at the
-/// one running when it was minted — which is exactly what sharing the owner's [`CancelSlot`]
-/// through an [`Arc`] gives: `signal` always latches the slot's *current* signal, the same target
-/// the deprecated `cancel()` method had.
-///
-/// **Known deviation from adbc.h**, which documents `AdbcStatementCancel`/`AdbcConnectionCancel` as
-/// returning `ADBC_STATUS_INVALID_STATE` "if there is no query to cancel": [`Self::try_cancel`] is
-/// unconditionally `Ok`. The driver does not track whether an operation is in flight, and doing so
-/// accurately is harder than it looks — an operation's lifetime runs past the entry point that
-/// started it, until every reader it produced is released. Only the *streaming* readers hold a
-/// [`CancelSignal`], so any liveness test derived from the signal would call a connection idle right
-/// after `get_objects` (a fully materialized reader) and reject a cancel the C++ validation suite's
-/// `MetadataGetObjectsCancel` requires to succeed. The PostgreSQL reference driver is equally
-/// permissive. A cancel with nothing in flight latches the slot's current signal, which the next
-/// [`CancelSlot::begin_operation`] supersedes — so it is a no-op beyond the `Ok`.
+/// Idle cancellation succeeds, deviating from adbc.h's `InvalidState` requirement. Operation
+/// lifetimes extend through their readers, and materialized metadata readers carry no signal to
+/// track. Accepting cancellation also satisfies the C++ `MetadataGetObjectsCancel` test.
+/// The next operation replaces the idle signal, so it cannot inherit that cancellation.
 #[derive(Debug)]
 pub(crate) struct SlotCancelHandle(Arc<CancelSlot>);
 
@@ -163,16 +116,13 @@ impl SlotCancelHandle {
 }
 
 impl CancelHandle for SlotCancelHandle {
-    /// Always `Ok`, including with nothing in flight — see the type's doc for why the
-    /// `InvalidState`-when-idle the ADBC spec asks for is not implemented.
     fn try_cancel(&self) -> Result<()> {
         self.0.signal();
         Ok(())
     }
 }
 
-/// The error every cancelled operation surfaces, whether it was cancelled while parked in
-/// [`block_on_cancellable`] or inside a background prefetch task ([`spawn_prefetch`]).
+/// Shared diagnostic for synchronous waits and background fetches.
 fn cancelled_err() -> Error {
     err(
         "operation cancelled: the ADBC cancel handle for this connection or statement was \
@@ -181,19 +131,14 @@ fn cancelled_err() -> Error {
     )
 }
 
-/// Run `future` on `runtime`, returning [`Status::Cancelled`] if `cancel` is signalled before it
-/// completes — or if it was already signalled (and not reset) when the call began.
+/// Run `future` on the shared runtime, giving latched cancellation priority over completion.
 pub(crate) fn block_on_cancellable<T>(
     runtime: &Runtime,
     cancel: &CancelSignal,
     future: impl Future<Output = Result<T>>,
 ) -> Result<T> {
-    // Box the operation future onto the heap. `block_on` polls it on the *calling* thread's stack
-    // (in ADBC the application's own thread, whose stack size the driver cannot control), and these
-    // operations compose deep client/timeout/retry/conversion futures whose debug-build state
-    // machines sit right at the default 2 MiB stack — held inline in this frame they overflowed it
-    // on some paths (driver-manager conformance, query/DML round-trips). The heap indirection keeps
-    // the frame flat, at one allocation per bridged call — negligible against the RPC it wraps.
+    // Client/retry/conversion futures can exceed a host thread's 2 MiB stack in debug builds.
+    // Boxing keeps the synchronous bridge's frame small.
     let future = Box::pin(future);
     runtime.block_on(async move {
         tokio::select! {
@@ -219,19 +164,13 @@ pub(crate) trait ChunkSource: Send + 'static {
 /// the error that ended the stream.
 pub(crate) type ChunkReceiver<T> = mpsc::Receiver<Result<Vec<T>>>;
 
-/// Spawn a background task on `runtime` that drains `source` chunk by chunk, sending each over the
-/// returned channel — so the fetch of chunk N+1 overlaps the consumer's processing of chunk N.
+/// Prefetch chunks while the consumer processes earlier rows. The channel holds one chunk;
+/// the task can hold one more while waiting to send it.
 ///
-/// Memory stays bounded at prefetch depth ~1: the channel holds one chunk and the task holds at
-/// most one more (the fetch it is parked on / the send it is waiting to complete). The task ends —
-/// closing the channel, which is how a clean end of stream is signalled — when the source is
-/// drained, when a fetch errors (the error is sent first, to surface on the consumer's next
-/// `recv`), when the receiver is dropped, or when `cancel` is signalled. On cancellation the
-/// in-flight fetch is dropped immediately and a [`Status::Cancelled`] error is sent best-effort;
-/// the consumer's own cancel-aware `recv` (see [`block_on_cancellable`]) observes the same latched
-/// signal anyway, so a buffered-but-undelivered chunk never masks a cancel. Abort the returned
-/// [`JoinHandle`] to stop the task promptly without cancelling (e.g. when the consumer is dropped
-/// mid-stream).
+/// Fetch errors are sent before the task exits. Cancellation stops both fetches and sends;
+/// consumers must check the same signal so buffered rows cannot mask cancellation. After the
+/// channel closes, check the returned task for panic before reporting EOF. Abort it when the
+/// reader drops to stop an in-flight fetch.
 pub(crate) fn spawn_prefetch<S: ChunkSource>(
     runtime: &Runtime,
     cancel: CancelSignal,
@@ -249,7 +188,7 @@ async fn prefetch_loop<S: ChunkSource>(
     cancel: CancelSignal,
 ) {
     loop {
-        let rows = tokio::select! {
+        let chunk = tokio::select! {
             // Check the (sticky) signal before polling the fetch, mirroring `block_on_cancellable`.
             biased;
             _ = cancel.cancelled() => {
@@ -259,24 +198,20 @@ async fn prefetch_loop<S: ChunkSource>(
                 let _ = tx.try_send(Err(cancelled_err()));
                 return;
             }
-            pulled = source.next_chunk() => match pulled {
-                // An empty chunk means the source is drained; closing the channel signals the end.
-                Ok(rows) if rows.is_empty() => return,
-                Ok(rows) => rows,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            },
+            pulled = source.next_chunk() => pulled,
         };
+        if chunk.as_ref().is_ok_and(Vec::is_empty) {
+            return;
+        }
+        let failed = chunk.is_err();
         // Also watch the signal while parked on a full channel, so a cancel is not stalled behind
         // a consumer that has stopped draining.
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return,
-            sent = tx.send(Ok(rows)) => {
-                if sent.is_err() {
-                    return; // The consumer dropped the receiver; nothing left to fetch for.
+            sent = tx.send(chunk) => {
+                if sent.is_err() || failed {
+                    return;
                 }
             }
         }
