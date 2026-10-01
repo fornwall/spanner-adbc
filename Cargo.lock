@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "adbc_core"
 version = "0.25.0"
-source = "git+https://github.com/apache/arrow-adbc?rev=f1378d664b61ce65f25a54c3b863aa62ea9d2480#f1378d664b61ce65f25a54c3b863aa62ea9d2480"
+source = "git+https://github.com/apache/arrow-adbc?rev=a727830d5722262fc7c3e24b6f8edb982c7b9b29#a727830d5722262fc7c3e24b6f8edb982c7b9b29"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -14,7 +14,7 @@ dependencies = [
 [[package]]
 name = "adbc_driver_manager"
 version = "0.25.0"
-source = "git+https://github.com/apache/arrow-adbc?rev=f1378d664b61ce65f25a54c3b863aa62ea9d2480#f1378d664b61ce65f25a54c3b863aa62ea9d2480"
+source = "git+https://github.com/apache/arrow-adbc?rev=a727830d5722262fc7c3e24b6f8edb982c7b9b29#a727830d5722262fc7c3e24b6f8edb982c7b9b29"
 dependencies = [
  "adbc_core",
  "adbc_ffi",
@@ -31,7 +31,7 @@ dependencies = [
 [[package]]
 name = "adbc_ffi"
 version = "0.25.0"
-source = "git+https://github.com/apache/arrow-adbc?rev=f1378d664b61ce65f25a54c3b863aa62ea9d2480#f1378d664b61ce65f25a54c3b863aa62ea9d2480"
+source = "git+https://github.com/apache/arrow-adbc?rev=a727830d5722262fc7c3e24b6f8edb982c7b9b29#a727830d5722262fc7c3e24b6f8edb982c7b9b29"
 dependencies = [
  "adbc_core",
  "arrow-array",
@@ -115,7 +115,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 [[package]]
 name = "arrow-array"
 version = "60.0.0"
-source = "git+https://github.com/apache/arrow-rs?rev=74b630b26d9db5d93671bf62eb702eafddab8c94#74b630b26d9db5d93671bf62eb702eafddab8c94"
+source = "git+https://github.com/apache/arrow-rs?rev=f220d72472e652e555a2d73d4a9cad48c78d7397#f220d72472e652e555a2d73d4a9cad48c78d7397"
 dependencies = [
  "ahash",
  "arrow-buffer",
@@ -133,7 +133,7 @@ dependencies = [
 [[package]]
 name = "arrow-buffer"
 version = "60.0.0"
-source = "git+https://github.com/apache/arrow-rs?rev=74b630b26d9db5d93671bf62eb702eafddab8c94#74b630b26d9db5d93671bf62eb702eafddab8c94"
+source = "git+https://github.com/apache/arrow-rs?rev=f220d72472e652e555a2d73d4a9cad48c78d7397#f220d72472e652e555a2d73d4a9cad48c78d7397"
 dependencies = [
  "bytes",
  "half",
@@ -144,7 +144,7 @@ dependencies = [
 [[package]]
 name = "arrow-data"
 version = "60.0.0"
-source = "git+https://github.com/apache/arrow-rs?rev=74b630b26d9db5d93671bf62eb702eafddab8c94#74b630b26d9db5d93671bf62eb702eafddab8c94"
+source = "git+https://github.com/apache/arrow-rs?rev=f220d72472e652e555a2d73d4a9cad48c78d7397#f220d72472e652e555a2d73d4a9cad48c78d7397"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -156,7 +156,7 @@ dependencies = [
 [[package]]
 name = "arrow-schema"
 version = "60.0.0"
-source = "git+https://github.com/apache/arrow-rs?rev=74b630b26d9db5d93671bf62eb702eafddab8c94#74b630b26d9db5d93671bf62eb702eafddab8c94"
+source = "git+https://github.com/apache/arrow-rs?rev=f220d72472e652e555a2d73d4a9cad48c78d7397#f220d72472e652e555a2d73d4a9cad48c78d7397"
 dependencies = [
  "bitflags 2.13.2",
 ]
@@ -894,7 +894,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-auth"
 version = "1.17.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=b0c24e5fec407931d40b9ea3061b6c46dae93d37#b0c24e5fec407931d40b9ea3061b6c46dae93d37"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612#9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -922,7 +922,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-gax"
 version = "1.15.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=b0c24e5fec407931d40b9ea3061b6c46dae93d37#b0c24e5fec407931d40b9ea3061b6c46dae93d37"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612#9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612"
 dependencies = [
  "bytes",
  "futures",
@@ -940,8 +940,8 @@ dependencies = [
 
 [[package]]
 name = "google-cloud-gax-internal"
-version = "0.7.19"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=b0c24e5fec407931d40b9ea3061b6c46dae93d37#b0c24e5fec407931d40b9ea3061b6c46dae93d37"
+version = "0.7.20"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612#9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612"
 dependencies = [
  "bytes",
  "futures",
@@ -979,7 +979,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-iam-v1"
 version = "1.13.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=b0c24e5fec407931d40b9ea3061b6c46dae93d37#b0c24e5fec407931d40b9ea3061b6c46dae93d37"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612#9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612"
 dependencies = [
  "async-trait",
  "bytes",
@@ -996,7 +996,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-longrunning"
 version = "1.14.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=b0c24e5fec407931d40b9ea3061b6c46dae93d37#b0c24e5fec407931d40b9ea3061b6c46dae93d37"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612#9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1013,7 +1013,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-lro"
 version = "1.11.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=b0c24e5fec407931d40b9ea3061b6c46dae93d37#b0c24e5fec407931d40b9ea3061b6c46dae93d37"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612#9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612"
 dependencies = [
  "google-cloud-gax",
  "google-cloud-gax-internal",
@@ -1028,7 +1028,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-rpc"
 version = "1.6.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=b0c24e5fec407931d40b9ea3061b6c46dae93d37#b0c24e5fec407931d40b9ea3061b6c46dae93d37"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612#9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612"
 dependencies = [
  "bytes",
  "google-cloud-wkt",
@@ -1039,8 +1039,8 @@ dependencies = [
 
 [[package]]
 name = "google-cloud-spanner"
-version = "0.34.6-preview"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=b0c24e5fec407931d40b9ea3061b6c46dae93d37#b0c24e5fec407931d40b9ea3061b6c46dae93d37"
+version = "0.34.7-preview"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612#9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1051,6 +1051,7 @@ dependencies = [
  "google-cloud-rpc",
  "google-cloud-spanner-admin-database-v1",
  "google-cloud-spanner-admin-instance-v1",
+ "google-cloud-type",
  "google-cloud-wkt",
  "http",
  "prost",
@@ -1070,7 +1071,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-spanner-admin-database-v1"
 version = "1.15.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=b0c24e5fec407931d40b9ea3061b6c46dae93d37#b0c24e5fec407931d40b9ea3061b6c46dae93d37"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612#9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1090,7 +1091,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-spanner-admin-instance-v1"
 version = "1.15.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=b0c24e5fec407931d40b9ea3061b6c46dae93d37#b0c24e5fec407931d40b9ea3061b6c46dae93d37"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612#9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1109,7 +1110,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-type"
 version = "1.6.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=b0c24e5fec407931d40b9ea3061b6c46dae93d37#b0c24e5fec407931d40b9ea3061b6c46dae93d37"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612#9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612"
 dependencies = [
  "bytes",
  "google-cloud-wkt",
@@ -1121,7 +1122,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-wkt"
 version = "1.9.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=b0c24e5fec407931d40b9ea3061b6c46dae93d37#b0c24e5fec407931d40b9ea3061b6c46dae93d37"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612#9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -1648,9 +1649,9 @@ dependencies = [
 
 [[package]]
 name = "lazy_static"
-version = "1.5.0"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "libc"
@@ -2087,9 +2088,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.18"
+version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
+checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -2110,9 +2111,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.5.15"
+version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
+checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
 dependencies = [
  "cfg_aliases",
  "libc",
@@ -2783,7 +2784,7 @@ dependencies = [
 [[package]]
 name = "spanner-grpc-mock"
 version = "0.0.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=b0c24e5fec407931d40b9ea3061b6c46dae93d37#b0c24e5fec407931d40b9ea3061b6c46dae93d37"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612#9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3666,9 +3667,9 @@ dependencies = [
 
 [[package]]
 name = "yoke-derive"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33811428bee40dbceb6d545e95754741d17a6aef9a4849f0fd62e2ba4f412a78"
+checksum = "ec8ebde2db3681e8c9980cc27822030e68752690ddfa9473e739aeb4dbde6d71"
 dependencies = [
  "proc-macro2",
  "quote",

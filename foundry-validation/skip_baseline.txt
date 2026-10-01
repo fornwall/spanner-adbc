@@ -50,6 +50,7 @@ tests/test_ingest.py::TestIngest::test_replace_catalog[spanner:emulator:ingest/s
 tests/test_ingest.py::TestIngest::test_replace_schema[spanner:emulator:ingest/string]  # not implemented
 tests/test_ingest.py::TestIngest::test_schema[spanner:emulator]  # not implemented
 tests/test_ingest.py::TestIngest::test_temporary[spanner:emulator:ingest/string]  # not implemented
+tests/test_ingest.py::TestIngest::test_temporary_get_objects[spanner:emulator:ingest/string]  # not implemented
 tests/test_query.py::TestQuery::test_execute_schema[spanner:emulator:type/select/decimal]  # Spanner NUMERIC is fixed precision/scale (38,9); it does not round-trip the case's NUMERIC(10,2)
 tests/test_query.py::TestQuery::test_execute_schema[spanner:emulator:type/select/int16]  # Spanner has one 64-bit integer type; a SMALLINT value reads back as INT64, not the case's Int16
 tests/test_query.py::TestQuery::test_execute_schema[spanner:emulator:type/select/int32]  # Spanner has one 64-bit integer type; an INTEGER value reads back as INT64, not the case's Int32

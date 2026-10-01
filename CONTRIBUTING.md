@@ -55,8 +55,9 @@ Its PyPI trusted publisher uses owner `fornwall`, repository `spanner-adbc`, wor
 
 `Cargo.toml` pins the Google Cloud family and `adbc_core`/`adbc_ffi`/`adbc_driver_manager` to git,
 and patches the `arrow-*` crates to arrow-rs `main` through `[patch.crates-io]`.
-The pinned APIs provide native STRUCT inspection, support for unknown ADBC info codes and the
-`FFI_ArrowArrayStream` constructor and accessors that arrow-rs 60 lacks.
+The Google Cloud pin keeps the client and unpublished `spanner-grpc-mock` on one revision.
+ADBC deliberately tracks upstream `main`, including the C++ validation suite; Arrow supplies
+the `FFI_ArrowArrayStream` constructor and accessors that arrow-rs 60 lacks.
 Each family independently prevents crates.io publishing.
 
 Read revisions from `Cargo.toml`/`Cargo.lock` and follow the

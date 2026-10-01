@@ -101,7 +101,7 @@ jobs:
         # The rust-asan leg needs nightly for -Zsanitizer=address / -Zbuild-std, plus the rust-src
         # component so build-std can recompile+instrument the standard library.
         if: matrix.toolchain == 'nightly'
-        uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly branch, 2026-09-03
+        uses: dtolnay/rust-toolchain@0e28dd9a7764e5f83064112bb1f24025a14c313c # nightly branch, 2026-10-01
         with:
           toolchain: nightly
           components: rust-src
@@ -113,9 +113,9 @@ jobs:
         if: matrix.rust-sanitize != ''
         uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
         with:
-          version: "23.1.1"
+          version: "23.1.2"
           # The action's bundled release list predates LLVM 23.
-          force-url: https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/LLVM-23.1.1-Linux-X64.tar.xz
+          force-url: https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.2/LLVM-23.1.2-Linux-X64.tar.xz
           directory: ${{ runner.temp }}/llvm
           env: true
 

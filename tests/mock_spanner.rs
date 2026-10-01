@@ -686,6 +686,59 @@ fn mock_server_round_trips_a_query() {
     assert_eq!(column.value(1), "v2");
 }
 
+/// A keyed protobuf Struct cannot represent positional Spanner STRUCT fields with duplicate names.
+#[test]
+fn keyed_struct_wire_value_errors() {
+    let _watchdog = watchdog!();
+    let server = MockServer::start(|mock| {
+        mock.expect_execute_streaming_sql().returning(|_| {
+            // STRUCT<x INT64, x INT64>: a map cannot preserve both fields named x.
+            let fields =
+                result_metadata(&[("x", v1::TypeCode::Int64), ("x", v1::TypeCode::Int64)]).row_type;
+            let metadata = v1::ResultSetMetadata {
+                row_type: Some(v1::StructType {
+                    fields: vec![v1::struct_type::Field {
+                        name: "c".into(),
+                        r#type: Some(v1::Type {
+                            code: v1::TypeCode::Struct as i32,
+                            struct_type: fields,
+                            ..Default::default()
+                        }),
+                    }],
+                }),
+                ..Default::default()
+            };
+            let keyed = prost_types::Value {
+                kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
+                    fields: [("x".into(), string_value("1"))].into_iter().collect(),
+                })),
+            };
+            Ok(stream_of(vec![Ok(v1::PartialResultSet {
+                metadata: Some(metadata),
+                values: vec![keyed],
+                last: true,
+                ..Default::default()
+            })]))
+        });
+    });
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().expect("new statement");
+    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+    let mut reader = statement.execute().expect("query metadata");
+    let error = reader
+        .next()
+        .expect("first batch")
+        .expect_err("keyed STRUCT must be rejected");
+    let ArrowError::ExternalError(source) = &error else {
+        panic!("expected the reader to surface the driver error, got: {error}");
+    };
+    let error = source
+        .downcast_ref::<adbc_core::error::Error>()
+        .expect("the reader error wraps the ADBC error");
+    assert_eq!(error.status, AdbcStatus::InvalidData);
+    assert!(error.message.contains("STRUCT"), "{}", error.message);
+}
+
 /// Manual-transaction read-your-writes guard: a data-returning query issued while writes are
 /// buffered in a manual transaction is rejected up front with `InvalidState` (the kind-mixing
 /// rule: the transaction began with DML), instead of silently running against a snapshot that

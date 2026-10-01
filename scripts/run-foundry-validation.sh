@@ -46,7 +46,7 @@ cd "$REPO_ROOT"
 #     `long_value_queries` from the default {string, binary} to all six.
 #   - #294/#301/#302 retry rows-affected DDL, isolate the replacement tables per input
 #     type, and add `test_append_schema_mismatch` (which the driver passes unchanged).
-VALIDATION_REF="${ADBC_VALIDATION_REF:-744481372bd09d04125b977c30e2e178832d7ac6}"
+VALIDATION_REF="${ADBC_VALIDATION_REF:-2e9116fcfe7e5112fec22e970133cbb16d129493}"
 VALIDATION_REPO="${ADBC_VALIDATION_REPO:-adbc-drivers/validation}"
 PYTHON="${PYTHON:-python3}"
 EMULATOR_DATABASE="projects/test-project/instances/test-instance/databases/adbc-test"

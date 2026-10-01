@@ -68,7 +68,7 @@ and in `docs/testing.md`; a test checks this, and CI derives its matrix from the
 - `[patch.crates-io]` pins the `arrow-*` crates to one arrow-rs `main` revision for the
   `FFI_ArrowArrayStream` constructor and accessors; drop it once a release ships them.
 - Tracking arrow-adbc `main` is deliberate; do not revert that pin merely to use a release.
-  The Google Cloud pin supplies `Type::struct_type()` for native STRUCT mapping.
+  The Google Cloud pin keeps the client and unpublished `spanner-grpc-mock` on one revision.
 - Each git dependency family independently blocks crates.io publishing.
 
 ### Revert checklist

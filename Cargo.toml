@@ -20,7 +20,7 @@ exclude = [".claude"]
 name = "spanner-adbc"
 version = "0.8.0"
 edition = "2024"
-rust-version = "1.98.1"
+rust-version = "1.99.0"
 license = "Apache-2.0"
 description = "ADBC (Arrow Database Connectivity) driver for Google Cloud Spanner"
 repository = "https://github.com/fornwall/spanner-adbc"
@@ -96,16 +96,15 @@ harness = false
 # pins" — it enumerates every location (all these Cargo.toml lines, deny.toml, README.md, the
 # `publish = false` release gate) and the invariant that the three arrow-adbc crates share one rev.
 # --- adbc_core pinned to a git revision (temporary) ---
-# The abstract ADBC driver traits. Pinned to apache/arrow-adbc `main` rather than the latest
-# crates.io release (0.23) for `InfoCode::Other(u32)` (arrow-adbc#4510), the catch-all variant
-# that lets an unrecognized `get_info` code reach `Connection::get_info` — which is what makes
-# this driver's "omit unrecognized codes" behaviour (required by adbc.h) expressible at all.
-# Revert to a versioned crates.io release once that ships in one.
+# The abstract ADBC driver traits. Track apache/arrow-adbc `main` deliberately, together
+# with the driver manager, FFI definitions and C++ validation suite. `InfoCode::Other(u32)`
+# lets an unrecognized `get_info` code reach this driver's "omit unrecognized codes"
+# handling, as required by adbc.h.
 #
 # The C ABI itself is NOT taken from a crate: `src/ffi/` is this driver's own export layer, so
 # there is no `adbc_ffi` dependency here (it stays a dev-dependency, for the FFI struct
 # definitions the raw-`libloading` lifecycle test drives the library through).
-adbc_core = { git = "https://github.com/apache/arrow-adbc", rev = "f1378d664b61ce65f25a54c3b863aa62ea9d2480" }
+adbc_core = { git = "https://github.com/apache/arrow-adbc", rev = "a727830d5722262fc7c3e24b6f8edb982c7b9b29" }
 # Arrow types the ADBC traits are expressed in. Kept in the range the (git) adbc crates
 # allow (>=58, <61) so the RecordBatch / Schema / RecordBatchReader types unify across them.
 # The `ffi` feature supplies `FFI_ArrowArray`/`FFI_ArrowSchema`/`FFI_ArrowArrayStream`, the C
@@ -120,14 +119,12 @@ arrow-data = ">=58, <61"
 # and they are platform-specific numbers (ECANCELED is 125 on Linux, 89 on macOS, 105 on MSVC).
 libc = "0.2"
 # --- google-cloud-* pinned to a git revision (temporary) ---
-# We map Spanner STRUCT columns to native Arrow Struct types, which needs
-# `Type::struct_type()` to introspect struct field names/types. That accessor
-# exists on google-cloud-rust `main` but is NOT in a crates.io release yet (the
-# latest, 0.34.2-preview, lacks it). Until a release ships it, we pin the whole
-# google-cloud family (spanner + auth + lro + admin) to the SAME git revision so
-# their shared internal crates (gax, gaxi, ...) resolve to one compatible copy.
-# NOTE: git dependencies cannot be published to crates.io — switch these back to
-# versioned releases once `Type::struct_type()` is published.
+# Keep the whole Google Cloud family on the same upstream revision, including the
+# unpublished `spanner-grpc-mock` used by integration tests, so shared internal crates
+# and generated wire types stay compatible. `Type::struct_type()` for native STRUCT
+# mapping is now published, but the mock still requires git.
+# NOTE: git dependencies cannot be published to crates.io; revisit the entire family
+# together once the mock is published or replaced.
 # `default-features = false` drops the default `builtin-metrics` feature: a background pipeline
 # that auto-exports Spanner client latency metrics to Cloud Monitoring. The driver never configures
 # or reads an OpenTelemetry MeterProvider, so it is pure weight — it pulls in `google-cloud-api`,
@@ -135,15 +132,15 @@ libc = "0.2"
 # `gaxi/_internal-http-client`, measured at ~1.25 MB (-6.9%) of the shipped cdylib.
 # `default-rustls-provider` is the *other* default and must stay: it installs the aws-lc rustls
 # crypto provider the TLS stack is hardwired to.
-google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "b0c24e5fec407931d40b9ea3061b6c46dae93d37", default-features = false, features = ["default-rustls-provider"] }
+google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612", default-features = false, features = ["default-rustls-provider"] }
 # Anonymous / service-account credentials.
-google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "b0c24e5fec407931d40b9ea3061b6c46dae93d37" }
+google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612" }
 # The `Poller` trait, to await the admin `UpdateDatabaseDdl` long-running operation used for DDL.
-google-cloud-lro = { git = "https://github.com/googleapis/google-cloud-rust", rev = "b0c24e5fec407931d40b9ea3061b6c46dae93d37" }
+google-cloud-lro = { git = "https://github.com/googleapis/google-cloud-rust", rev = "9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612" }
 # Well-known-types `Duration`, the type `set_max_commit_delay` takes for the `spanner.commit.max_delay`
 # option. Already in the graph (google-cloud-spanner depends on it as `wkt`); naming it directly lets
 # `src/request.rs` build the commit-delay value. Same git pin as the google-cloud family above.
-google-cloud-wkt = { git = "https://github.com/googleapis/google-cloud-rust", rev = "b0c24e5fec407931d40b9ea3061b6c46dae93d37" }
+google-cloud-wkt = { git = "https://github.com/googleapis/google-cloud-rust", rev = "9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612" }
 # The Spanner client is async; we bridge it to the synchronous ADBC traits with a
 # dedicated multi-thread runtime.
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
@@ -171,7 +168,7 @@ arbitrary = { version = "1", features = ["derive"], optional = true }
 # `details`. Already in the dependency graph — google-cloud-spanner re-exports this crate's
 # `Error` — so this adds no new code, it only names the types. Same git pin as the
 # google-cloud family above (see the note there).
-google-cloud-gax = { git = "https://github.com/googleapis/google-cloud-rust", rev = "b0c24e5fec407931d40b9ea3061b6c46dae93d37" }
+google-cloud-gax = { git = "https://github.com/googleapis/google-cloud-rust", rev = "9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612" }
 
 # Lints applied in local dev too (CI additionally runs `clippy -D warnings`).
 [lints.rust]
@@ -236,22 +233,22 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"
 proptest = "1"
 # Driver manager: loads the built cdylib through the C ABI for the FFI smoke test.
 # Same git pin as adbc_core above (the three arrow-adbc crates must share one revision).
-adbc_driver_manager = { git = "https://github.com/apache/arrow-adbc", rev = "f1378d664b61ce65f25a54c3b863aa62ea9d2480" }
+adbc_driver_manager = { git = "https://github.com/apache/arrow-adbc", rev = "a727830d5722262fc7c3e24b6f8edb982c7b9b29" }
 # The `FFI_Adbc*` C struct definitions, so the raw-`libloading` lifecycle test in
 # tests/integration.rs can drive the cdylib's entrypoint directly, bypassing the driver manager
 # (and so `src/ffi/roundtrip.rs` can name the init-function type `ManagedDriver::load_static`
 # wants). An independent transcription of the same header `src/ffi/abi.rs` transcribes, so the
 # test cannot agree with the layer it is checking by construction.
 # Same git pin as adbc_core above (the three arrow-adbc crates must share one revision).
-adbc_ffi = { git = "https://github.com/apache/arrow-adbc", rev = "f1378d664b61ce65f25a54c3b863aa62ea9d2480" }
+adbc_ffi = { git = "https://github.com/apache/arrow-adbc", rev = "a727830d5722262fc7c3e24b6f8edb982c7b9b29" }
 # Loads the built cdylib directly (bypassing the driver manager) so the raw-FFI lifecycle test
 # can drive double-release / error-struct-reuse paths the managed wrappers never hit. Already in
 # the dependency graph via adbc_driver_manager; same version range.
 libloading = "0.9"
 # Admin clients, used by the emulator integration test to create the test instance and database.
 # Pinned to the same git revision as the google-cloud family above (see the note there).
-google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "b0c24e5fec407931d40b9ea3061b6c46dae93d37" }
-google-cloud-spanner-admin-database-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "b0c24e5fec407931d40b9ea3061b6c46dae93d37" }
+google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612" }
+google-cloud-spanner-admin-database-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612" }
 # Benchmark harness for benches/conversion.rs. Slim feature set: `cargo_bench_support` is what
 # `cargo bench` needs; the default plotters/rayon extras are skipped.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
@@ -261,7 +258,7 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 # tests/RESILIENCE.md). This is the same mock the pinned client uses for its own end-to-end tests,
 # so its request/response protos match what the client sends on the wire.
 # Same git pin as the google-cloud family above (see the note there).
-spanner-grpc-mock = { git = "https://github.com/googleapis/google-cloud-rust", rev = "b0c24e5fec407931d40b9ea3061b6c46dae93d37" }
+spanner-grpc-mock = { git = "https://github.com/googleapis/google-cloud-rust", rev = "9bcf6ec6574b05f5e7e0a8cb01e3bfbc014ed612" }
 # Used by tests/mock_spanner.rs to script the mock server: gRPC statuses (tonic), hand-encoded
 # `google.rpc.Status`/`RetryInfo` error details (prost/prost-types/bytes). Versions track what
 # the google-cloud family already pulls in, so these add no new major dependency lines.
@@ -276,7 +273,7 @@ bytes = "1"
 # so `adbc_core`'s crates.io arrow requirement resolves to the same copy and the types unify.
 # Revert once a release ships the accessors (see the CLAUDE.md "Temporary git pins" section).
 [patch.crates-io]
-arrow-array = { git = "https://github.com/apache/arrow-rs", rev = "74b630b26d9db5d93671bf62eb702eafddab8c94" }
-arrow-buffer = { git = "https://github.com/apache/arrow-rs", rev = "74b630b26d9db5d93671bf62eb702eafddab8c94" }
-arrow-data = { git = "https://github.com/apache/arrow-rs", rev = "74b630b26d9db5d93671bf62eb702eafddab8c94" }
-arrow-schema = { git = "https://github.com/apache/arrow-rs", rev = "74b630b26d9db5d93671bf62eb702eafddab8c94" }
+arrow-array = { git = "https://github.com/apache/arrow-rs", rev = "f220d72472e652e555a2d73d4a9cad48c78d7397" }
+arrow-buffer = { git = "https://github.com/apache/arrow-rs", rev = "f220d72472e652e555a2d73d4a9cad48c78d7397" }
+arrow-data = { git = "https://github.com/apache/arrow-rs", rev = "f220d72472e652e555a2d73d4a9cad48c78d7397" }
+arrow-schema = { git = "https://github.com/apache/arrow-rs", rev = "f220d72472e652e555a2d73d4a9cad48c78d7397" }

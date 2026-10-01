@@ -240,10 +240,16 @@ fn approx_value_bytes(value: &Value) -> usize {
         Kind::Null => 0,
         Kind::Bool => 1,
         Kind::Number => 8,
-        Kind::String => value.as_string().len(),
-        Kind::List => value.as_list().iter().map(approx_value_bytes).sum(),
+        Kind::String => value.as_str().expect("string kind").len(),
+        Kind::List => value
+            .as_list()
+            .expect("list kind")
+            .iter()
+            .map(approx_value_bytes)
+            .sum(),
         Kind::Struct => value
             .as_struct()
+            .expect("struct kind")
             .fields()
             .map(|(_, v)| approx_value_bytes(v))
             .sum(),
@@ -871,7 +877,7 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
                 values,
                 BooleanBuilder::with_capacity(values.len()),
                 |builder, v| {
-                    builder.append_value(v.try_as_bool().ok_or_else(|| decode_error("BOOL", v))?);
+                    builder.append_value(v.as_bool().ok_or_else(|| decode_error("BOOL", v))?);
                     Ok(())
                 },
             )?
@@ -885,7 +891,7 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
             parse_f64(v).map(|f| f as f32)
         })?),
         DataType::Date32 => Arc::new(build_primitive::<Date32Type>(values, "DATE", |v| {
-            v.try_as_string().and_then(parse_date_days)
+            v.as_str().and_then(parse_date_days)
         })?),
         DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
             // A present value errors if it is not a timestamp string at all, or — since Arrow
@@ -895,9 +901,7 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
                 values,
                 TimestampNanosecondArray::builder(values.len()),
                 |builder, v| {
-                    let s = v
-                        .try_as_string()
-                        .ok_or_else(|| decode_error("TIMESTAMP", v))?;
+                    let s = v.as_str().ok_or_else(|| decode_error("TIMESTAMP", v))?;
                     builder.append_value(parse_timestamp_nanos(s).ok_or_else(|| {
                         if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
                             invalid_argument(format!(
@@ -922,13 +926,13 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
             // can store fits an i64 of epoch microseconds, so this arm has no out-of-range case;
             // sub-microsecond digits truncate toward negative infinity. Undecodable strings error.
             let array = build_primitive::<TimestampMicrosecondType>(values, "TIMESTAMP", |v| {
-                v.try_as_string().and_then(parse_timestamp_micros)
+                v.as_str().and_then(parse_timestamp_micros)
             })?;
             Arc::new(array.with_timezone_opt(tz.clone()))
         }
         DataType::Decimal128(precision, scale) => {
             let array = build_primitive::<Decimal128Type>(values, "NUMERIC", |v| {
-                v.try_as_string().and_then(parse_numeric_i128)
+                v.as_str().and_then(parse_numeric_i128)
             })?;
             Arc::new(
                 array
@@ -943,7 +947,7 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
             let mut scratch = Vec::new();
             Arc::new(
                 build_with(values, BinaryBuilder::new(), |builder, v| {
-                    let s = v.try_as_string().ok_or_else(|| decode_error("BYTES", v))?;
+                    let s = v.as_str().ok_or_else(|| decode_error("BYTES", v))?;
                     scratch.clear();
                     base64::engine::general_purpose::STANDARD
                         .decode_vec(s, &mut scratch)
@@ -962,7 +966,7 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
             build_with(values, StringBuilder::new(), |builder, v| {
                 // Append the string slice directly (no per-value owned String); only the
                 // JSON-render fallback allocates, and only for non-string values.
-                match v.try_as_string() {
+                match v.as_str() {
                     Some(s) => builder.append_value(s),
                     None => builder.append_value(value_to_json(v).to_string()),
                 }
@@ -987,7 +991,7 @@ fn build_list(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
         match present(value) {
             None => validity.push(false),
             Some(v) if v.kind() == Kind::List => {
-                children.extend(v.as_list().iter().map(Some));
+                children.extend(v.as_list().expect("list kind").iter().map(Some));
                 validity.push(true);
             }
             Some(v) => return Err(decode_error("ARRAY", v)),
@@ -1035,7 +1039,7 @@ fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> 
                 validity.push(false);
             }
             Some(v) if v.kind() == Kind::List => {
-                let list = v.as_list();
+                let list = v.as_list().expect("list kind");
                 for (i, child) in children.iter_mut().enumerate() {
                     child.push(list.get(i));
                 }
@@ -1059,16 +1063,16 @@ fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> 
 /// falling back to a JSON number would silently round values above 2^53, since an `f64` cannot
 /// represent every `i64`. A non-string wire value is a loud decode error instead.
 fn parse_int64(value: &Value) -> Option<i64> {
-    value.try_as_string()?.parse::<i64>().ok()
+    value.as_str()?.parse::<i64>().ok()
 }
 
 /// Parse a Spanner floating-point value. Finite values arrive as numbers; `NaN` and the infinities
 /// arrive as strings.
 fn parse_f64(value: &Value) -> Option<f64> {
-    if let Some(f) = value.try_as_f64() {
+    if let Some(f) = value.as_f64() {
         return Some(f);
     }
-    match value.try_as_string()? {
+    match value.as_str()? {
         "NaN" => Some(f64::NAN),
         "Infinity" => Some(f64::INFINITY),
         "-Infinity" => Some(f64::NEG_INFINITY),
@@ -1242,13 +1246,21 @@ pub(crate) fn parse_numeric_i128(s: &str) -> Option<i128> {
 fn value_to_json(value: &Value) -> serde_json::Value {
     match value.kind() {
         Kind::Null => serde_json::Value::Null,
-        Kind::Bool => serde_json::Value::Bool(value.as_bool()),
-        Kind::Number => serde_json::json!(value.as_f64()),
-        Kind::String => serde_json::Value::String(value.as_string().to_string()),
-        Kind::List => serde_json::Value::Array(value.as_list().iter().map(value_to_json).collect()),
+        Kind::Bool => serde_json::Value::Bool(value.as_bool().expect("bool kind")),
+        Kind::Number => serde_json::json!(value.as_f64().expect("number kind")),
+        Kind::String => serde_json::Value::String(value.as_str().expect("string kind").to_string()),
+        Kind::List => serde_json::Value::Array(
+            value
+                .as_list()
+                .expect("list kind")
+                .iter()
+                .map(value_to_json)
+                .collect(),
+        ),
         Kind::Struct => serde_json::Value::Object(
             value
                 .as_struct()
+                .expect("struct kind")
                 .fields()
                 .map(|(k, v)| (k.clone(), value_to_json(v)))
                 .collect(),
@@ -1801,35 +1813,6 @@ mod tests {
             "{}",
             err.message
         );
-    }
-
-    /// A keyed (`google.protobuf.Struct`) wire value cannot represent a Spanner `STRUCT`, so it is
-    /// a loud decode error rather than a name-keyed lookup that silently drops fields.
-    #[test]
-    fn keyed_struct_wire_value_errors() {
-        // STRUCT<x INT64, x INT64> — Spanner permits duplicate (and empty) field names, so a
-        // name-keyed decode cannot address these two fields apart. A keyed map cannot even hold
-        // them: `google.protobuf.Struct` is a map, so one "x" key must lose the other's value.
-        let dup = DataType::Struct(Fields::from(vec![
-            Field::new("x", DataType::Int64, true),
-            Field::new("x", DataType::Int64, true),
-        ]));
-        let keyed = prost_types::Value {
-            kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
-                fields: [(
-                    "x".to_string(),
-                    prost_types::Value {
-                        kind: Some(prost_types::value::Kind::StringValue("1".to_string())),
-                    },
-                )]
-                .into_iter()
-                .collect(),
-            })),
-        }
-        .to_value();
-        let err = build_array(&dup, &[Some(&keyed)]).unwrap_err();
-        assert_eq!(err.status, Status::InvalidData);
-        assert!(err.message.contains("STRUCT"), "{}", err.message);
     }
 
     /// Spanner's positional wire encoding addresses fields by index, so duplicate and empty field

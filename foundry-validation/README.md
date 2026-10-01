@@ -12,7 +12,7 @@ scripts/run-foundry-validation.sh
 scripts/run-foundry-validation.sh -k ingest  # extra arguments go to pytest
 ```
 
-Use Python 3.13+ with pip (the [pinned suite's requirement](https://github.com/adbc-drivers/validation/blob/744481372bd09d04125b977c30e2e178832d7ac6/pyproject.toml)),
+Use Python 3.13+ with pip (the [pinned suite's requirement](https://github.com/adbc-drivers/validation/blob/2e9116fcfe7e5112fec22e970133cbb16d129493/pyproject.toml)),
 Rust, git and curl, plus Docker when starting an emulator. `PYTHON` selects the interpreter.
 The script builds the driver, installs the pinned suite if needed, creates the emulator
 instance/database and runs pytest. The upstream revision is selected by `ADBC_VALIDATION_REF`
