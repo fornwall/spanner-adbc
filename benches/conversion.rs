@@ -158,6 +158,21 @@ fn bench_conversion(c: &mut Criterion) {
         });
     }
 
+    {
+        let fields = (0..32)
+            .map(|i| Field::new(format!("c{i}"), DataType::Int64, true))
+            .collect::<Fields>();
+        let structs = column(|i| {
+            if i % 16 == 0 {
+                None::<i64>.to_value()
+            } else {
+                Value::from((0..32).map(|j| (i * 32 + j) as i64).collect::<Vec<_>>())
+            }
+        });
+        let columns = [(DataType::Struct(fields), refs(&structs))];
+        group.bench_function("wide_struct_32_int64", |b| b.iter(|| convert(&columns)));
+    }
+
     group.finish();
 }
 
