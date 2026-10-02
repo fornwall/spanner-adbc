@@ -12,6 +12,11 @@ if [ "$#" -eq 0 ]; then
   echo "usage: $0 <command> [args...]" >&2
   exit 2
 fi
+if [ "$GRPC_PORT" != 9010 ] || [ "$REST_PORT" != 9020 ]; then
+  echo "the pinned Spanner client requires emulator ports 9010 (gRPC) and 9020 (REST)" >&2
+  echo "unset SPANNER_EMULATOR_GRPC_PORT and SPANNER_EMULATOR_REST_PORT; for parallel emulators, use separate Docker-network IPs (docs/testing.md)" >&2
+  exit 2
+fi
 for dependency in docker curl; do
   command -v "$dependency" >/dev/null 2>&1 || {
     echo "required command not found: $dependency" >&2

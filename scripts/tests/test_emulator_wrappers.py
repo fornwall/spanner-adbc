@@ -25,6 +25,8 @@ class EmulatorWrappers(unittest.TestCase):
         self.env.pop("FAIL_AFTER_CREATE", None)
         self.env.update(
             SPANNER_EMULATOR_CONTAINER="existing-emulator",
+            SPANNER_EMULATOR_GRPC_PORT="9010",
+            SPANNER_EMULATOR_REST_PORT="9020",
             TOXIPROXY_CONTAINER="existing-proxy",
         )
         self.tool("docker", '''
@@ -64,7 +66,10 @@ print("200", end="")
             text=True,
             timeout=10,
         )
-        self.calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.calls = (
+            [json.loads(line) for line in self.log.read_text().splitlines()]
+            if self.log.exists() else []
+        )
         # The temporary Docker config (including cidfiles) must always be removed.
         self.assertFalse(any(path.is_dir() for path in self.root.iterdir()))
         return result
@@ -76,6 +81,21 @@ print("200", end="")
         self.env["FAIL_CONTAINER"] = "existing-emulator"
         self.assertEqual(self.run_wrapper("with-emulator.sh").returncode, 125)
         self.assertEqual(self.removed_ids(), [])
+
+    def test_emulator_rejects_unusable_port_mapping_before_starting_docker(self):
+        for variable, port in (
+            ("SPANNER_EMULATOR_GRPC_PORT", "19010"),
+            ("SPANNER_EMULATOR_REST_PORT", "19020"),
+        ):
+            with self.subTest(variable=variable):
+                previous = self.env[variable]
+                self.env[variable] = port
+                result = self.run_wrapper("with-emulator.sh")
+                self.env[variable] = previous
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("requires emulator ports 9010", result.stderr)
+                self.assertIn("unset", result.stderr)
+                self.assertEqual(self.calls, [])
 
     def test_proxy_emulator_collision_preserves_existing_container(self):
         self.env["FAIL_CONTAINER"] = "existing-emulator"
