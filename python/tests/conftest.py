@@ -53,20 +53,24 @@ def _post(url, body):
 
 def _await_operation(op):
     """Poll a long-running operation to completion (emulator ops are near-instant)."""
-    if not op or op.get("done"):
+    if op is None:  # Resource already exists (HTTP 409).
         return
     name = op.get("name")
-    if not name:
-        return
-    for _ in range(120):
-        with urllib.request.urlopen(f"{_rest_base()}/v1/{name}", timeout=30) as resp:
-            got = json.loads(resp.read() or b"{}")
-        if got.get("done"):
-            if "error" in got:
-                raise RuntimeError(f"operation {name} failed: {got['error']}")
+    deadline = time.monotonic() + 60
+    while True:
+        if "error" in op:
+            raise RuntimeError(f"operation {name or '<unnamed>'} failed: {op['error']}")
+        if op.get("done"):
             return
-        time.sleep(0.5)
-    raise RuntimeError(f"operation {name} did not complete in time")
+        if not name:
+            raise RuntimeError(f"emulator returned an incomplete operation without a name: {op}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"operation {name} did not complete within 60s")
+        with urllib.request.urlopen(f"{_rest_base()}/v1/{name}", timeout=min(30, remaining)) as resp:
+            op = json.loads(resp.read() or b"{}")
+        if not op.get("done") and "error" not in op:
+            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
 
 
 def _require_target():
@@ -85,9 +89,8 @@ def emulator_database():
     if not os.environ.get("SPANNER_EMULATOR_HOST"):
         if _require_target():
             pytest.fail(
-                "ADBC_TEST_REQUIRE_TARGET is set but SPANNER_EMULATOR_HOST is not configured — "
-                "the emulator env wiring is missing, so the end-to-end suite would skip all "
-                "behavioral coverage. Refusing to pass vacuously."
+                "ADBC_TEST_REQUIRE_TARGET is set but SPANNER_EMULATOR_HOST is not configured; "
+                "run through scripts/with-emulator.sh or set the emulator endpoint."
             )
         pytest.skip("SPANNER_EMULATOR_HOST not set; skipping emulator end-to-end tests")
 
