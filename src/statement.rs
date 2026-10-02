@@ -301,14 +301,11 @@ impl SpannerStatement {
     }
 
     /// Run a `QueryMode::Plan` probe of `sql` and return its result schema without scanning any
-    /// rows. Binds parameter values from the first bound batch when it has rows (irrelevant to the
-    /// schema, but they let `@param` references resolve). Shared by [`Statement::execute_schema`]
+    /// rows. Binds the first available parameter row so `@param` references resolve.
+    /// Shared by [`Statement::execute_schema`]
     /// and the zero-row arm of [`execute_bound_query`](Self::execute_bound_query).
     fn plan_query_schema(&self, sql: &str) -> Result<SchemaRef> {
         let client = self.client.clone();
-        let bound = self.bound.clone();
-        let bind_by_name = self.bind_by_name;
-        let sql = sql.to_string();
         // Schema is itself versioned, so the PLAN probe honours the statement's read staleness:
         // a stale bound must observe the structure as of that timestamp, matching the data read.
         let read_bound = self.config.read_staleness.timestamp_bound()?;
@@ -317,7 +314,7 @@ impl SpannerStatement {
         let precision = self.config.timestamp_precision;
         // QueryMode::Plan returns column metadata without scanning any data, so dbt can
         // introspect a model's output columns without a `SELECT ... WHERE false` wrapper.
-        let plan_builder = self.read_sql_builder(&sql).set_query_mode(QueryMode::Plan);
+        let statement = self.build_query_statement(sql, true)?;
         // The schema probe is a query execution, so the query timeout bounds it.
         block_on_cancellable(
             &self.runtime,
@@ -327,17 +324,8 @@ impl SpannerStatement {
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
                     let transaction = crate::staleness::single_use(&client, read_bound);
-                    let mut builder = plan_builder;
-                    // Bind parameters if any were provided (values are irrelevant to the schema) so
-                    // that `@param` references resolve.
-                    if let Some(batch) = bound.first()
-                        && batch.num_rows() > 0
-                    {
-                        let names = bind::resolve_parameter_names(&sql, batch, bind_by_name)?;
-                        builder = bind::bind_params(builder, &names, batch, 0)?;
-                    }
                     let result_set = transaction
-                        .execute_query(builder.build())
+                        .execute_query(statement)
                         .await
                         .map_err(from_spanner)?;
                     let (schema, _batch) = result_set_to_batch(result_set, precision).await?;
@@ -788,10 +776,9 @@ impl SpannerStatement {
     }
 
     /// Build a Spanner query statement for `sql`, binding the single bound parameter row (if any)
-    /// as named parameters; `plan = true` sets `QueryMode::Plan`. Used by `execute_partitions` for
-    /// both the schema probe and the partitioned query itself. Its caller has already rejected more
-    /// than one bound row ([`check_single_bound_row`](Self::check_single_bound_row)), so the row
-    /// bound here is *the* bound row, wherever it sits in the bound batches.
+    /// as named parameters; `plan = true` sets `QueryMode::Plan`. Schema probes use the first
+    /// available row; partitioned queries first reject multiple rows via
+    /// [`check_single_bound_row`](Self::check_single_bound_row).
     fn build_query_statement(&self, sql: &str, plan: bool) -> Result<SpannerSql> {
         let mut builder = self.read_sql_builder(sql);
         if plan {
@@ -1194,13 +1181,23 @@ impl Statement for SpannerStatement {
         // bound", when it should create the table from the schema and commit zero rows.
         let schema = reader.schema();
         let mut batches = Vec::new();
-        for batch in reader {
-            batches.push(batch.map_err(|e| {
+        for (index, batch) in reader.enumerate() {
+            let batch = batch.map_err(|e| {
                 err(
-                    format!("failed to read bound stream: {e}"),
+                    format!("failed to read bound stream batch {}: {e}", index + 1),
                     Status::InvalidData,
                 )
-            })?);
+            })?;
+            if batch.schema() != schema {
+                return Err(err(
+                    format!(
+                        "bound stream batch {} does not match the stream's declared schema",
+                        index + 1
+                    ),
+                    Status::InvalidData,
+                ));
+            }
+            batches.push(batch);
         }
         // Kept *separately*, not as a synthetic zero-row batch in `bound` — that would make the
         // parameter-binding paths see bound rows and silently no-op. A non-empty stream clears it.

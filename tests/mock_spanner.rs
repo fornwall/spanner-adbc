@@ -1076,6 +1076,97 @@ fn execute_partitions_rejects_multiple_bound_rows_and_consumes_them() {
     );
 }
 
+#[test]
+fn execute_schema_binds_the_first_nonempty_batch() {
+    let _watchdog = watchdog!();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server = MockServer::start({
+        let requests = requests.clone();
+        move |mock| {
+            mock.expect_execute_streaming_sql()
+                .returning(move |request| {
+                    requests.lock().unwrap().push(request.into_inner());
+                    Ok(stream_of(vec![Ok(partial_result_set(
+                        true,
+                        &[],
+                        b"",
+                        true,
+                    ))]))
+                });
+        }
+    });
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().unwrap();
+    statement.set_sql_query("SELECT @p AS c").unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("p", DataType::Utf8, false)]));
+    let row = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec!["bound value"]))],
+    )
+    .unwrap();
+    statement
+        .bind_stream(Box::new(arrow_array::RecordBatchIterator::new(
+            vec![Ok(RecordBatch::new_empty(schema.clone())), Ok(row)],
+            schema.clone(),
+        )))
+        .unwrap();
+
+    let result = statement.execute_schema().unwrap();
+    assert_eq!(result.field(0).name(), "c");
+    assert_eq!(result.field(0).data_type(), &DataType::Utf8);
+    // Planning preserves the bindings for the later execution.
+    assert_eq!(statement.get_parameter_schema().unwrap(), *schema);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].query_mode,
+        v1::execute_sql_request::QueryMode::Plan as i32
+    );
+    assert_eq!(
+        requests[0].params.as_ref().unwrap().fields["p"],
+        string_value("bound value")
+    );
+}
+
+#[test]
+fn bind_stream_rejects_schema_changes_without_replacing_previous_bindings() {
+    let _watchdog = watchdog!();
+    let server = MockServer::start(|_| {});
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().unwrap();
+    let original = Arc::new(Schema::new(vec![Field::new(
+        "original",
+        DataType::Int64,
+        false,
+    )]));
+    statement
+        .bind(RecordBatch::new_empty(original.clone()))
+        .unwrap();
+
+    let declared = Arc::new(Schema::new(vec![Field::new("p", DataType::Utf8, false)]));
+    for mismatched in [
+        Arc::new(Schema::new(vec![Field::new("p", DataType::Int64, false)])),
+        Arc::new(Schema::new(vec![Field::new(
+            "renamed",
+            DataType::Utf8,
+            false,
+        )])),
+    ] {
+        let reader = arrow_array::RecordBatchIterator::new(
+            vec![
+                Ok(RecordBatch::new_empty(declared.clone())),
+                Ok(RecordBatch::new_empty(mismatched)),
+            ],
+            declared.clone(),
+        );
+        let error = statement.bind_stream(Box::new(reader)).unwrap_err();
+        assert_eq!(error.status, AdbcStatus::InvalidData);
+        assert!(error.message.contains("batch 2"), "{error}");
+        assert!(error.message.contains("declared schema"), "{error}");
+        assert_eq!(statement.get_parameter_schema().unwrap(), *original);
+    }
+}
+
 /// Regression: a **failed** parameterized (bound) query must still consume its bound rows,
 /// exactly like the DML/ingest/partition paths — otherwise a reused statement handle would silently
 /// re-apply the stale bound rows to a later, unrelated execution. The old bound-query path cleared
