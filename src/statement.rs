@@ -246,6 +246,17 @@ impl SpannerStatement {
     /// [`execute_bound_query`](Self::execute_bound_query)), one at a time, rather than materialising
     /// the whole `Vec` up front.
     fn build_bound_statements(&self, sql: &str) -> Result<Vec<SpannerSql>> {
+        let parts = crate::sql::split_statements(sql);
+        check_all_dml_batch(&parts)?;
+        if parts.len() > 1 {
+            return Err(invalid_argument(
+                "bound parameters require a single DML statement; execute each statement separately",
+            ));
+        }
+        let Some(sql) = parts.first() else {
+            return Ok(Vec::new());
+        };
+        let builder = self.sql_builder(sql);
         let mut statements = Vec::new();
         for batch in &self.bound {
             if batch.num_rows() == 0 {
@@ -255,8 +266,7 @@ impl SpannerStatement {
             // for every row instead of re-lexing the SQL per bound row.
             let names = bind::resolve_parameter_names(sql, batch, self.bind_by_name)?;
             for row in 0..batch.num_rows() {
-                statements
-                    .push(bind::bind_params(self.sql_builder(sql), &names, batch, row)?.build());
+                statements.push(bind::bind_params(builder.clone(), &names, batch, row)?.build());
             }
         }
         Ok(statements)

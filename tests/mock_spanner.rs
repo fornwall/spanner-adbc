@@ -639,6 +639,52 @@ fn serve_begin_transaction(mock: &mut MockSpanner) {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[test]
+fn bound_dml_strips_trailing_terminators() {
+    let _watchdog = watchdog!();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    let server = MockServer::start(move |mock| {
+        serve_batch_dml(mock, recorded);
+        mock.expect_commit().returning(|_| commit_ok());
+    });
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().unwrap();
+    statement
+        .set_sql_query("INSERT INTO MockTable (c) VALUES (@p);; -- trailing comment")
+        .unwrap();
+    statement.bind(ingest_batch(2)).unwrap();
+    assert_eq!(statement.execute_update().unwrap(), Some(2));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].statements.len(), 2);
+    for statement in &requests[0].statements {
+        assert_eq!(statement.sql, "INSERT INTO MockTable (c) VALUES (@p)");
+    }
+}
+
+#[test]
+fn bound_dml_rejects_batches_before_buffering_manual_work() {
+    let _watchdog = watchdog!();
+    let server = MockServer::start(|_| {});
+    let mut connection = server.connect();
+    connection
+        .set_option(OptionConnection::AutoCommit, "false".into())
+        .unwrap();
+    for sql in [
+        "INSERT INTO MockTable (c) VALUES (@p); SELECT 1",
+        "INSERT INTO MockTable (c) VALUES (@p); DELETE FROM MockTable WHERE c = @p",
+    ] {
+        let mut statement = connection.new_statement().unwrap();
+        statement.set_sql_query(sql).unwrap();
+        statement.bind(ingest_batch(1)).unwrap();
+        let error = statement.execute_update().unwrap_err();
+        assert_eq!(error.status, AdbcStatus::InvalidArguments, "{error}");
+        // No RPCs are scripted: committing succeeds only if the invalid batch was not buffered.
+        connection.commit().unwrap();
+    }
+}
+
 /// Harness proof: a scripted query round-trips through the real driver stack (session creation,
 /// `ExecuteStreamingSql`, PartialResultSet → Arrow conversion) against the mock server.
 #[test]
