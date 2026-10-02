@@ -191,6 +191,9 @@ jobs:
         # trailing comment names the tag the digest was resolved from.
         run: docker run --rm -v "${PWD}:/repo" --workdir /repo rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color # 1.7.12
 
+      - name: Test emulator wrapper cleanup
+        run: python3 -m unittest discover -s scripts/tests -v
+
   # Supply-chain + hygiene checks (no build / emulator needed):
   # cargo-deny — security advisories (RUSTSEC), license compliance, banned/duplicate
   #   crates and allowed sources (see deny.toml).

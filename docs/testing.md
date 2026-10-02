@@ -11,6 +11,7 @@ targets or shared libraries fail instead; leave it unset for ordinary local runs
 | Emulator integration | `scripts/with-emulator.sh cargo test` | [CI](../.github/workflows/ci.yml) |
 | Python package | See [Python setup](#python-package) below | [Python README](../python/README.md), [CI](../.github/workflows/ci.yml) |
 | Transport faults | `scripts/with-toxiproxy.sh cargo test --test resilience -- --test-threads=1` | [Resilience guide](../tests/RESILIENCE.md) |
+| Emulator helper cleanup | `python3 -m unittest discover -s scripts/tests -v` | Offline; no Docker required |
 | ADBC C++ conformance | `scripts/run-adbc-validation.sh` | [Harness guide](../adbc-validation/README.md) |
 | Foundry type/feature coverage | `scripts/run-foundry-validation.sh` | [Harness guide](../foundry-validation/README.md) |
 | Fuzzing | `cargo +nightly fuzz run <target>` | [Fuzz workflow](../.github/workflows/fuzz.yml) |
@@ -45,9 +46,10 @@ cargo build  # required for tests that load the shared library
 scripts/with-emulator.sh cargo test
 ```
 
-The emulator helper needs Docker, starts a disposable container, waits for readiness and removes
-it after the command. With curl installed it checks the admin REST API, otherwise it uses a short
-delay after the gRPC port opens. Tests use `test-project/test-instance/adbc-test`.
+The emulator helpers require Docker and curl, wait for the admin REST API, and remove only
+containers they created. A container-name collision fails without disturbing the existing
+container; choose another `SPANNER_EMULATOR_CONTAINER` (and `TOXIPROXY_CONTAINER` for fault tests)
+if needed. Published ports bind to localhost. Tests use `test-project/test-instance/adbc-test`.
 
 Keep the emulator's gRPC/admin ports at **9010/9020**: the pinned Rust client derives the admin
 endpoint from the gRPC endpoint. Changing the helper's port variables does not change that

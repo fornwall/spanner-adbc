@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
-#
-# Run a command with a throwaway Cloud Spanner emulator available.
-#
-# Starts the official emulator in Docker, waits for its gRPC port, exports
-# SPANNER_EMULATOR_HOST, runs the command passed as arguments, then tears the
-# emulator down again.
-#
-# Usage:
-#   scripts/with-emulator.sh cargo test --test integration -- --nocapture
-#   scripts/with-emulator.sh cargo test        # run the whole suite against the emulator
-#
+# Run a command against a disposable Cloud Spanner emulator.
+# Usage: scripts/with-emulator.sh cargo test
 set -euo pipefail
 
 IMAGE="${SPANNER_EMULATOR_IMAGE:-gcr.io/cloud-spanner-emulator/emulator}"
@@ -21,70 +12,50 @@ if [ "$#" -eq 0 ]; then
   echo "usage: $0 <command> [args...]" >&2
   exit 2
 fi
+for dependency in docker curl; do
+  command -v "$dependency" >/dev/null 2>&1 || {
+    echo "required command not found: $dependency" >&2
+    exit 1
+  }
+done
 
-# Some environments configure a broken Docker credential helper for gcr.io; the
-# emulator image is public, so use a clean, empty Docker config to bypass it.
+# Public images need no registry credentials; bypass broken credential helpers.
 DOCKER_CONFIG="$(mktemp -d)"
 export DOCKER_CONFIG
 echo '{}' > "$DOCKER_CONFIG/config.json"
 
 cleanup() {
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  # Docker writes the ID after creation, even if starting the container fails.
+  # A name collision creates no ID, so it cannot remove someone else's container.
+  if [ -s "$DOCKER_CONFIG/emulator.cid" ]; then
+    docker rm -f "$(cat "$DOCKER_CONFIG/emulator.cid")" >/dev/null 2>&1 || true
+  fi
   rm -rf "$DOCKER_CONFIG"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-# `--pull always`: the image reference is the floating `:latest` tag, so without this
-# docker keeps running whatever `latest` resolved to the first time it was cached —
-# months-stale locally, while CI (ephemeral runners) always gets the newest emulator.
-# That divergence is exactly the kind that makes a local run green and CI red.
 echo ">> starting Spanner emulator ($IMAGE) as '$CONTAINER'"
-docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-docker run -d --pull always --name "$CONTAINER" \
-  -p "${GRPC_PORT}:9010" -p "${REST_PORT}:9020" \
+docker run -d --pull always --name "$CONTAINER" --cidfile "$DOCKER_CONFIG/emulator.cid" \
+  -p "127.0.0.1:${GRPC_PORT}:9010" -p "127.0.0.1:${REST_PORT}:9020" \
   "$IMAGE" >/dev/null
 
-# Surface why the emulator never became ready (image pull failure, port clash,
-# container crash) instead of running the command against a dead port and letting
-# it fail with confusing gRPC connect errors.
-die_not_ready() {
-  echo "!! $1" >&2
-  echo "!! container logs ($CONTAINER):" >&2
-  docker logs "$CONTAINER" >&2 2>&1 || true
-  exit 1
-}
-
-echo ">> waiting for gRPC port ${GRPC_PORT}"
+# TCP-open precedes admin readiness; wait for a successful API response.
+echo ">> waiting for the emulator admin API (REST port ${REST_PORT})"
 ready=0
-for _ in $(seq 1 30); do
-  if bash -c "echo > /dev/tcp/127.0.0.1/${GRPC_PORT}" >/dev/null 2>&1; then
+for ((deadline=SECONDS+60; SECONDS<deadline; )); do
+  if [ "$(curl --noproxy '*' --max-time 1 -s -o /dev/null -w '%{http_code}' \
+      "http://127.0.0.1:${REST_PORT}/v1/projects/emulator/instanceConfigs" 2>/dev/null)" = "200" ]; then
     ready=1
     break
   fi
-  sleep 1
+  sleep 0.5
 done
-[ "$ready" -eq 1 ] || die_not_ready "emulator gRPC port ${GRPC_PORT} did not open within 30s"
-
-# The forwarded TCP port opens ~1s before the emulator's admin API is actually
-# serving RPCs. Proceeding at TCP-open makes the test's `create_instance` fire too
-# early, fail, and (being best-effort) get silently dropped — leaving no instance
-# and a confusing "Instance not found" later. Gate on a real admin response instead:
-# the emulator's REST API returns 200 for a config listing only once it is ready.
-if command -v curl >/dev/null 2>&1; then
-  echo ">> waiting for the emulator admin API (REST port ${REST_PORT})"
-  ready=0
-  for _ in $(seq 1 120); do
-    if [ "$(curl -s -o /dev/null -w '%{http_code}' \
-        "http://127.0.0.1:${REST_PORT}/v1/projects/emulator/instanceConfigs" 2>/dev/null)" = "200" ]; then
-      ready=1
-      break
-    fi
-    sleep 0.5
-  done
-  [ "$ready" -eq 1 ] || die_not_ready "emulator admin API (REST port ${REST_PORT}) not serving within 60s"
-else
-  echo ">> curl not found; sleeping briefly for the admin API to come up" >&2
-  sleep 3
+if [ "$ready" -ne 1 ]; then
+  echo "emulator admin API (REST port ${REST_PORT}) not serving within 60s" >&2
+  docker logs "$(cat "$DOCKER_CONFIG/emulator.cid")" >&2 2>&1 || true
+  exit 1
 fi
 
 export SPANNER_EMULATOR_HOST="localhost:${GRPC_PORT}"
