@@ -913,7 +913,7 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
                 |builder, v| {
                     let s = v.as_str().ok_or_else(|| decode_error("TIMESTAMP", v))?;
                     builder.append_value(parse_timestamp_nanos(s).ok_or_else(|| {
-                        if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+                        if scan_timestamp_utc(s).is_some() {
                             invalid_argument(format!(
                                 "TIMESTAMP value {s:?} is outside the range representable as an \
                                  Arrow Timestamp(Nanosecond) (~1677-09-21 to 2262-04-11); set \
@@ -1119,6 +1119,9 @@ pub(crate) fn parse_date_days(s: &str) -> Option<i32> {
         (d < 10).then_some(u32::from(d))
     };
     let year = digit(0)? * 1000 + digit(1)? * 100 + digit(2)? * 10 + digit(3)?;
+    if year == 0 {
+        return None;
+    }
     let month = digit(5)? * 10 + digit(6)?;
     let day = digit(8)? * 10 + digit(9)?;
     let date = chrono::NaiveDate::from_ymd_opt(year as i32, month, day)?;
@@ -1155,6 +1158,9 @@ fn scan_timestamp_utc(s: &str) -> Option<chrono::NaiveDateTime> {
         return None;
     }
     let year = two_digits(b, 0)? * 100 + two_digits(b, 2)?;
+    if year == 0 {
+        return None;
+    }
     let month = two_digits(b, 5)?;
     let day = two_digits(b, 8)?;
     let hour = two_digits(b, 11)?;
@@ -1216,7 +1222,7 @@ pub(crate) fn parse_timestamp_micros(s: &str) -> Option<i64> {
 }
 
 /// Parse a Spanner `NUMERIC` (decimal string) into an unscaled `i128` at scale 9 (Arrow
-/// `Decimal128(38, 9)`). Returns `None` on malformed input or i128 overflow.
+/// `Decimal128(38, 9)`). Returns `None` on malformed input or values exceeding precision 38.
 pub(crate) fn parse_numeric_i128(s: &str) -> Option<i128> {
     // Spanner emits NUMERIC in one canonical shape: a bare decimal `[-]digits[.digits]` with fixed
     // scale 9 — no leading `+`, no surrounding whitespace, at most nine fractional digits, and
@@ -1260,6 +1266,10 @@ pub(crate) fn parse_numeric_i128(s: &str) -> Option<i128> {
     }
     frac_val *= 10_i128.pow(NUMERIC_SCALE as u32 - frac_part.len() as u32);
     let unscaled = int_val.checked_mul(1_000_000_000)?.checked_add(frac_val)?;
+    // i128 also holds some 39-digit values, which Decimal128(38, 9) cannot represent.
+    if unscaled >= 10_i128.pow(u32::from(NUMERIC_PRECISION)) {
+        return None;
+    }
     Some(if negative { -unscaled } else { unscaled })
 }
 

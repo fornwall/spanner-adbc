@@ -938,3 +938,75 @@ fn empty_structs_preserve_length_and_validity() {
     assert!(!array.is_null(3));
     assert_eq!(build_array(&ty, &[]).unwrap().len(), 0);
 }
+
+#[test]
+fn numeric_precision_limits_preserve_extrema_and_reject_overflow() {
+    let maximum = 10_i128.pow(38) - 1;
+    for (text, expected) in [
+        ("99999999999999999999999999999.999999999", maximum),
+        ("-99999999999999999999999999999.999999999", -maximum),
+    ] {
+        assert_eq!(parse_numeric_i128(text), Some(expected));
+    }
+    for text in [
+        "100000000000000000000000000000",
+        "-100000000000000000000000000000",
+        "100000000000000000000000000000.000000001",
+        "-100000000000000000000000000000.000000001",
+    ] {
+        assert_eq!(parse_numeric_i128(text), None, "{text}");
+    }
+}
+
+#[test]
+fn temporal_domain_excludes_year_zero_and_preserves_spanner_extrema() {
+    assert_eq!(parse_date_days("0000-01-01"), None);
+    assert_eq!(parse_timestamp_micros("0000-01-01T00:00:00Z"), None);
+    assert_eq!(
+        parse_timestamp_micros("0001-01-01T00:00:00Z"),
+        Some(-62_135_596_800_000_000)
+    );
+    assert_eq!(
+        parse_timestamp_micros("9999-12-31T23:59:59.999999999Z"),
+        Some(253_402_300_799_999_999)
+    );
+}
+
+#[test]
+fn values_outside_spanner_domain_report_the_column_and_value() {
+    for (ty, text) in [
+        (DataType::Date32, "0000-01-01"),
+        (
+            DataType::Timestamp(TimeUnit::Microsecond, Some(TIMESTAMP_TZ.into())),
+            "0000-01-01T00:00:00Z",
+        ),
+        (
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(TIMESTAMP_TZ.into())),
+            "0000-01-01T00:00:00Z",
+        ),
+        (
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(TIMESTAMP_TZ.into())),
+            "2024-01-01T00:00:00+00:00",
+        ),
+        (
+            DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
+            "100000000000000000000000000000",
+        ),
+        (
+            DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
+            "-100000000000000000000000000000",
+        ),
+    ] {
+        let field = Arc::new(Field::new("bad_value", ty, true));
+        let value = text.to_value();
+        let error = build_column(&field, &[Some(&value)]).unwrap_err();
+        assert_eq!(error.status, Status::InvalidData, "{}", error.message);
+        assert!(error.message.contains("bad_value"), "{}", error.message);
+        assert!(error.message.contains(text), "{}", error.message);
+        assert!(
+            !error
+                .message
+                .contains(crate::OPTION_MAX_TIMESTAMP_PRECISION)
+        );
+    }
+}
