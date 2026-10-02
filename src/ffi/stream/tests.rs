@@ -516,3 +516,52 @@ fn reading_the_schema_after_a_failed_read_keeps_the_failure() {
 
     unsafe { stream.release().unwrap()(&raw mut stream) };
 }
+
+#[test]
+fn contains_panicking_payloads_in_callbacks_and_release() {
+    use crate::ffi::test_support::PanicOnDrop;
+
+    struct Reader;
+
+    impl Iterator for Reader {
+        type Item = Result<RecordBatch, ArrowError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            std::panic::panic_any(PanicOnDrop)
+        }
+    }
+
+    impl RecordBatchReader for Reader {
+        fn schema(&self) -> SchemaRef {
+            std::panic::panic_any(PanicOnDrop)
+        }
+    }
+
+    impl Drop for Reader {
+        fn drop(&mut self) {
+            std::panic::panic_any(PanicOnDrop)
+        }
+    }
+
+    for schema_callback in [false, true] {
+        let mut stream = exported(Box::new(Reader));
+        let code = if schema_callback {
+            let mut out = FFI_ArrowSchema::empty();
+            unsafe { stream.get_schema().unwrap()(&raw mut stream, &raw mut out) }
+        } else {
+            let mut out = FFI_ArrowArray::empty();
+            unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) }
+        };
+        assert_eq!(code, EINVAL);
+        let message = unsafe { CStr::from_ptr(stream.get_last_error().unwrap()(&raw mut stream)) }
+            .to_str()
+            .unwrap();
+        assert!(message.contains("unknown panic payload"), "{message}");
+        let mut status = ADBC_STATUS_OK;
+        assert!(!unsafe { error_from_array_stream(&raw mut stream, &raw mut status) }.is_null());
+        assert_eq!(status, AdbcStatusCode::from(Status::Internal));
+        unsafe { stream.release().unwrap()(&raw mut stream) };
+        assert!(stream.release().is_none());
+        assert!(stream.private_data().is_null());
+    }
+}

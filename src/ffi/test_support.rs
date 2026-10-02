@@ -40,3 +40,12 @@ pub(super) fn error_message(error: &AdbcError) -> Option<String> {
 pub(super) fn null<T>() -> *mut T {
     std::ptr::null_mut()
 }
+
+/// Every attempted cleanup panics with another payload of the same kind.
+pub(super) struct PanicOnDrop;
+
+impl Drop for PanicOnDrop {
+    fn drop(&mut self) {
+        std::panic::panic_any(Self);
+    }
+}

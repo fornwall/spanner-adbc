@@ -333,3 +333,22 @@ fn cancel_without_an_installed_handle_is_an_invalid_state() {
     let mut slot = slot;
     unsafe { release::<u32>(&mut slot, "connection", null()) };
 }
+
+#[test]
+fn a_panicking_payload_still_poisons_the_handle() {
+    let mut slot = Exported::into_private_data(0_u32);
+    let status = unsafe {
+        dispatch::<u32, _>(slot, "statement", null(), |_| {
+            std::panic::panic_any(crate::ffi::test_support::PanicOnDrop)
+        })
+    };
+    assert_eq!(status, AdbcStatusCode::from(Status::Internal));
+    assert_eq!(
+        unsafe { dispatch::<u32, _>(slot, "statement", null(), |_| Ok(())) },
+        AdbcStatusCode::from(Status::Internal)
+    );
+    assert_eq!(
+        unsafe { release::<u32>(&mut slot, "statement", null()) },
+        ADBC_STATUS_OK
+    );
+}

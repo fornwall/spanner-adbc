@@ -19,7 +19,7 @@ use super::abi::{
     ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA, ADBC_STATUS_OK, AdbcDriver, AdbcError, AdbcStatusCode,
 };
 use super::error::export_error;
-use super::guard::{panic_message, sanitized_cstring};
+use super::guard::{drop_panic_payload, panic_message, sanitized_cstring};
 use crate::error::chain;
 
 /// A failed callback, kept in both the shapes the ABI can ask for it in: the C string
@@ -148,13 +148,10 @@ unsafe extern "C" fn get_last_error(stream: *mut FFI_ArrowArrayStream) -> *const
     if stream.is_null() || unsafe { (*stream).private_data().is_null() } {
         return std::ptr::null();
     }
-    catch_unwind(AssertUnwindSafe(|| unsafe {
-        private_data(stream)
-            .last_error
-            .as_ref()
-            .map_or(std::ptr::null(), |error| error.message.as_ptr())
-    }))
-    .unwrap_or(std::ptr::null())
+    unsafe { private_data(stream) }
+        .last_error
+        .as_ref()
+        .map_or(std::ptr::null(), |error| error.message.as_ptr())
 }
 
 /// The ADBC 1.1.0 `ErrorFromArrayStream` entry point: expose the structured error behind a
@@ -229,7 +226,10 @@ pub(super) unsafe extern "C" fn error_from_array_stream(
         }
         std::ptr::from_ref::<AdbcError>(&**exported)
     }))
-    .unwrap_or(std::ptr::null())
+    .unwrap_or_else(|cause| {
+        drop_panic_payload(cause);
+        std::ptr::null()
+    })
 }
 
 unsafe extern "C" fn release(stream: *mut FFI_ArrowArrayStream) {
@@ -242,9 +242,11 @@ unsafe extern "C" fn release(stream: *mut FFI_ArrowArrayStream) {
     unsafe { std::ptr::write(stream, FFI_ArrowArrayStream::empty()) };
     if !private_data.is_null() {
         // A reader can own arbitrary client code. Its destructor must not unwind through `release`.
-        let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Err(cause) = catch_unwind(AssertUnwindSafe(|| {
             drop(unsafe { Box::from_raw(private_data.cast::<PrivateData>()) });
-        }));
+        })) {
+            drop_panic_payload(cause);
+        }
     }
 }
 
@@ -267,6 +269,7 @@ unsafe fn catch_callback(
                 "Uncaught panic in the Spanner Arrow stream: {}",
                 panic_message(cause.as_ref())
             );
+            drop_panic_payload(cause);
             private.set_error(Error::with_message_and_status(message, Status::Internal));
             EINVAL
         }
