@@ -34,9 +34,6 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Fixed emulator identifiers, matching tests/integration.rs.
-EMULATOR_DATABASE="projects/test-project/instances/test-instance/databases/adbc-test"
-
 # Sanitizers for the C++ side (harness + arrow-adbc + driver manager), e.g.
 # ADBC_VALIDATION_SANITIZE=address,undefined. The Rust cdylib stays uninstrumented (see
 # adbc-validation/CMakeLists.txt), but ASan's process-wide malloc/free/memcpy interceptors
@@ -325,41 +322,7 @@ if [ "$FULL" -eq 0 ]; then
   run_stale_guard
 fi
 
-# Resolve the target database, creating it on the emulator (which starts empty).
-if [ -n "${SPANNER_EMULATOR_HOST:-}" ]; then
-  export ADBC_SPANNER_URI="spanner:///$EMULATOR_DATABASE"
-  rest_host="${SPANNER_EMULATOR_HOST%:*}"
-  rest="http://${rest_host}:${SPANNER_EMULATOR_REST_PORT:-9020}"
-  echo ">> creating emulator instance/database via the admin REST API ($rest)"
-  curl -sf -X POST "$rest/v1/projects/test-project/instances" \
-    -H 'Content-Type: application/json' \
-    -d '{"instanceId":"test-instance","instance":{"config":"projects/test-project/instanceConfigs/emulator-config","displayName":"adbc","nodeCount":1}}' \
-    >/dev/null 2>&1 || true
-  # shellcheck disable=SC2016  # the backticks are literal Spanner DDL inside JSON, not a subshell.
-  curl -sf -X POST "$rest/v1/projects/test-project/instances/test-instance/databases" \
-    -H 'Content-Type: application/json' \
-    -d '{"createStatement":"CREATE DATABASE `adbc-test`"}' >/dev/null 2>&1 || true
-  # The creation calls above are deliberately idempotent (|| true), so this wait is the
-  # actual gate: fail loudly rather than run the suite against a database that isn't there.
-  ready=0
-  for _ in $(seq 1 40); do
-    if curl -sf "$rest/v1/projects/test-project/instances/test-instance/databases" 2>/dev/null \
-        | grep -q 'adbc-test'; then
-      ready=1
-      break
-    fi
-    sleep 0.25
-  done
-  if [ "$ready" -ne 1 ]; then
-    echo "!! emulator database adbc-test did not become listable at $rest within 10s" >&2
-    echo "!! (is the emulator at SPANNER_EMULATOR_HOST=$SPANNER_EMULATOR_HOST healthy?)" >&2
-    exit 1
-  fi
-else
-  # Real Cloud Spanner target: project.instance.database -> the driver's URI form.
-  IFS='.' read -r p i d <<<"$SPANNER_GCP_DATABASE"
-  export ADBC_SPANNER_URI="spanner:///projects/$p/instances/$i/databases/$d"
-fi
+source "$REPO_ROOT/scripts/validation-target.sh"
 
 # The instrumented leg builds with an explicit --target, so its artifact lives under
 # target/<triple>/debug/ rather than target/debug/.
