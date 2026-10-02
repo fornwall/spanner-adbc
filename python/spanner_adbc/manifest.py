@@ -1,34 +1,15 @@
-"""Generate and install an ADBC *driver manifest* for the bundled Spanner driver.
+"""Register the bundled library for ADBC discovery by name or URI scheme.
 
-A driver manifest is a small TOML file that lets any ADBC driver manager find a
-driver **by name** instead of by an explicit path to a shared library::
-
-    adbc_driver_manager.dbapi.connect(driver="spanner", uri="spanner:///...")
-
-and — because a driver manager with no ``driver`` option falls back to the
-*scheme* of the ``uri`` option, and this driver's connection URIs already use
-the ``spanner://`` scheme — by URI alone::
-
-    adbc_driver_manager.dbapi.connect(uri="spanner:///projects/p/instances/i/databases/d")
-
-See the ADBC specification, ``docs/source/format/driver_manifests.rst``.
-
-Why this is not a plain data file in the wheel
-----------------------------------------------
-
-The manifest's ``Driver.shared`` value is passed to ``dlopen``/``LoadLibraryExW``
-**verbatim**: neither the C nor the Rust driver manager resolves it relative to
-the manifest file. So a manifest must contain the *absolute* path of the shared
-library, which is only known once the wheel is installed. A manifest shipped
-pre-baked in the wheel would therefore point nowhere. Instead this module writes
-one at install time::
+Run after installing, upgrading, or moving the Python environment::
 
     python -m spanner_adbc.manifest install
-    # or, equivalently, the console script:
+    # Equivalent console command:
     spanner-adbc-install-manifest
 
-By default it writes to a directory the driver manager already searches (see
-:func:`default_install_dir`).
+The TOML manifest contains the installed library's absolute path: driver managers
+pass ``Driver.shared`` directly to the dynamic loader, without resolving it
+relative to the manifest. The default destination is a directory the driver
+manager searches; see :func:`default_install_dir`.
 """
 
 from __future__ import annotations

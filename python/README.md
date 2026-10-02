@@ -166,7 +166,6 @@ bulk-ingest and partitioned-DML behavior.
 
 ```python
 import spanner_adbc.dbapi as spanner
-from adbc_driver_manager import ProgrammingError
 from spanner_adbc import DatabaseOptions
 
 with spanner.connect(
@@ -177,14 +176,8 @@ with spanner.connect(
         cur.execute("DROP TABLE IF EXISTS Albums")
         cur.execute("CREATE TABLE Albums (Id INT64 NOT NULL) PRIMARY KEY (Id)")
 
-        cur.execute("INSERT INTO Albums (Id) VALUES (1)")  # a DML transaction: buffered
-        # Commit before querying the inserted row.
-        try:
-            cur.execute("SELECT COUNT(*) FROM Albums")
-            raise AssertionError("expected the guarded query to raise")
-        except ProgrammingError:
-            pass
-    conn.commit()
+        cur.execute("INSERT INTO Albums (Id) VALUES (1)")  # buffered until commit
+    conn.commit()  # Commit writes before starting a query transaction.
 
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM Albums")

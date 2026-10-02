@@ -1,18 +1,9 @@
-"""ADBC driver for Google Cloud Spanner.
+"""ADBC driver for Google Cloud Spanner, including the native shared library.
 
-This package bundles the prebuilt Spanner ADBC driver shared library and exposes
-a thin Python wrapper around it. The heavy lifting lives in the Rust cdylib; this
-module just locates the bundled library and hands it to ``adbc_driver_manager``,
-which loads it over the ADBC C ABI.
-
-For a DBAPI 2.0 (PEP 249) connection with pandas/polars/Arrow helpers, use
-:func:`spanner_adbc.dbapi.connect` instead of the low-level
-:func:`connect` here.
-
-To reach the driver through the *generic* ``adbc_driver_manager`` instead — as
-``driver="spanner"``, or by URI scheme alone from ``uri="spanner:///..."`` —
-install an ADBC driver manifest once with ``python -m
-spanner_adbc.manifest install`` (see :mod:`spanner_adbc.manifest`).
+Use :func:`connect` for a low-level ADBC database handle or
+:func:`spanner_adbc.dbapi.connect` for DBAPI cursors and Arrow/DataFrame helpers.
+To load by name through ``adbc_driver_manager`` (``driver="spanner"``), register
+the library with ``python -m spanner_adbc.manifest install``.
 """
 
 import functools
@@ -33,7 +24,7 @@ __all__ = [
     "__version__",
 ]
 
-#: C entrypoint exported by the shared library (see src/ffi.rs).
+#: C entrypoint exported by the shared library (see src/ffi/mod.rs).
 ENTRYPOINT = "AdbcSpannerInit"
 
 
