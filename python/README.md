@@ -155,7 +155,7 @@ staleness and a fixed read timestamp respectively. Set `ConnectionOptions.READON
 ## Transactions
 
 DBAPI defaults to `autocommit=False`. A manual transaction accepts either queries or writes,
-chosen by its first query or write; mixing them raises `adbc_driver_manager.ProgrammingError` until
+chosen by its first query or write; mixing them raises `spanner.ProgrammingError` until
 commit or rollback. Queries share a snapshot. DML is buffered until `conn.commit()`, so queries
 cannot read buffered writes.
 

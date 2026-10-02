@@ -18,6 +18,18 @@ Pass ``autocommit=True`` to keep the driver's default single-statement mode.
 import typing
 
 import adbc_driver_manager.dbapi
+from adbc_driver_manager import (
+    DataError,
+    DatabaseError,
+    Error,
+    IntegrityError,
+    InterfaceError,
+    InternalError,
+    NotSupportedError,
+    OperationalError,
+    ProgrammingError,
+    Warning,
+)
 
 from . import (
     ENTRYPOINT,
@@ -32,6 +44,16 @@ __all__ = [
     "DatabaseOptions",
     "ConnectionOptions",
     "StatementOptions",
+    "Warning",
+    "Error",
+    "InterfaceError",
+    "DatabaseError",
+    "DataError",
+    "OperationalError",
+    "IntegrityError",
+    "InternalError",
+    "ProgrammingError",
+    "NotSupportedError",
 ]
 
 

@@ -2,6 +2,8 @@
 
 import spanner_adbc
 import spanner_adbc.dbapi
+import adbc_driver_manager
+import pytest
 
 
 def test_entrypoint_constant():
@@ -15,6 +17,28 @@ def test_version_is_present():
 
 def test_dbapi_exposes_connect():
     assert callable(spanner_adbc.dbapi.connect)
+
+
+@pytest.mark.parametrize("name", [
+    "Warning", "Error", "InterfaceError", "DatabaseError", "DataError",
+    "OperationalError", "IntegrityError", "InternalError", "ProgrammingError",
+    "NotSupportedError",
+])
+def test_dbapi_exports_driver_manager_exceptions(name):
+    assert getattr(spanner_adbc.dbapi, name) is getattr(adbc_driver_manager, name)
+    assert name in spanner_adbc.dbapi.__all__
+
+
+def test_dbapi_errors_can_be_caught_through_the_driver_module(monkeypatch):
+    def fail_connect(**kwargs):
+        raise adbc_driver_manager.OperationalError(
+            "connection unavailable", status_code=adbc_driver_manager.AdbcStatusCode.IO
+        )
+
+    monkeypatch.setattr(spanner_adbc.dbapi, "_driver_path", lambda: "/driver.so")
+    monkeypatch.setattr(adbc_driver_manager.dbapi, "connect", fail_connect)
+    with pytest.raises(spanner_adbc.dbapi.Error, match="connection unavailable"):
+        spanner_adbc.dbapi.connect()
 
 
 def test_missing_library_raises_clearly():
