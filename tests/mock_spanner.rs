@@ -4909,3 +4909,80 @@ fn ingest_operational_errors_keep_status_and_details_without_metadata_probes() {
         assert_eq!(probes.load(Ordering::SeqCst), 0, "{code:?}");
     }
 }
+
+#[test]
+fn cancel_before_first_batch_discards_rows_fetched_by_execute() {
+    let _watchdog = watchdog!();
+    let server = MockServer::start(|mock| {
+        mock.expect_execute_streaming_sql().returning(|_| {
+            Ok(stream_of(vec![Ok(partial_result_set(
+                true,
+                &["first", "second"],
+                b"rt",
+                true,
+            ))]))
+        });
+    });
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().unwrap();
+    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+    let mut reader = statement.execute().unwrap();
+    statement.get_cancel_handle().try_cancel().unwrap();
+
+    let error = reader
+        .next()
+        .expect("cancel must yield an error")
+        .unwrap_err();
+    let ArrowError::ExternalError(error) = error else {
+        panic!("expected an ADBC error");
+    };
+    assert_eq!(
+        error
+            .downcast_ref::<adbc_core::error::Error>()
+            .unwrap()
+            .status,
+        AdbcStatus::Cancelled,
+    );
+    assert!(reader.next().is_none());
+}
+
+#[test]
+fn conversion_error_ends_the_reader_in_first_and_later_batches() {
+    let _watchdog = watchdog!();
+    for bad_row in 0..2 {
+        let server = MockServer::start(move |mock| {
+            mock.expect_execute_streaming_sql().returning(move |_| {
+                let mut values = vec![string_value("1"), string_value("2"), string_value("3")];
+                values[bad_row] = string_value("invalid integer");
+                Ok(stream_of(vec![Ok(v1::PartialResultSet {
+                    metadata: Some(result_metadata(&[("c", v1::TypeCode::Int64)])),
+                    values,
+                    last: true,
+                    ..Default::default()
+                })]))
+            });
+        });
+        let mut connection = server.connect();
+        let mut statement = connection.new_statement().unwrap();
+        statement
+            .set_option(
+                OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
+                OptionValue::Int(1),
+            )
+            .unwrap();
+        statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+        let mut reader = statement.execute().unwrap();
+        for _ in 0..bad_row {
+            assert_eq!(reader.next().unwrap().unwrap().num_rows(), 1);
+        }
+        let error = reader
+            .next()
+            .expect("invalid row must yield an error")
+            .unwrap_err();
+        assert!(error.to_string().contains("INT64"), "{error}");
+        assert!(
+            reader.next().is_none(),
+            "rows after a conversion error must not be returned"
+        );
+    }
+}

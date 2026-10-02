@@ -377,21 +377,16 @@ impl Iterator for SpannerBatchReader {
     type Item = std::result::Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Emit the prefetched first chunk (which settled the schema) before pulling any more. An
-        // *empty* first chunk means an empty result set, so skip it and end the stream: an empty
-        // result yields zero batches (its schema still reaches `schema()`), the Arrow-standard
-        // end-of-stream shape the ADBC contract expects.
-        if let Some(rows) = self.first.take()
-            && !rows.is_empty()
-        {
-            return Some(build_batch(self.schema.clone(), &rows).map_err(to_arrow_error));
-        }
         let rx = self.chunks.as_mut()?;
-        // Wait for the next prefetched chunk. `block_on_cancellable` checks the sticky signal
-        // before polling (biased), so a latched cancel surfaces here even when a chunk is already
-        // buffered — a prefetched chunk never masks a cancellation.
+        let first = &mut self.first;
         let task = &mut self.task;
-        match block_on_cancellable(&self.runtime, &self.cancel, async {
+        // Check cancellation before yielding any rows, including the chunk fetched by execute().
+        let rows = block_on_cancellable(&self.runtime, &self.cancel, async {
+            if let Some(rows) = first.take()
+                && !rows.is_empty()
+            {
+                return Ok(Some(rows));
+            }
             let chunk = rx.recv().await;
             if chunk.is_none() {
                 // A task panic also closes the channel. Check completion before reporting EOF
@@ -403,19 +398,21 @@ impl Iterator for SpannerBatchReader {
                     )
                 })?;
             }
-            Ok(chunk)
+            chunk.transpose()
+        });
+        match rows.and_then(|rows| {
+            rows.map(|rows| build_batch(self.schema.clone(), &rows))
+                .transpose()
         }) {
             Ok(None) => {
                 self.chunks = None;
                 None
             }
-            Ok(Some(Ok(rows))) => {
-                Some(build_batch(self.schema.clone(), &rows).map_err(to_arrow_error))
-            }
-            // A fetch error forwarded by the task, or a cancel observed while waiting. Dropping
-            // the receiver also makes a still-running task stop at its next send.
-            Ok(Some(Err(e))) | Err(e) => {
+            Ok(Some(batch)) => Some(Ok(batch)),
+            Err(e) => {
+                self.first = None;
                 self.chunks = None;
+                self.task.abort();
                 Some(Err(to_arrow_error(e)))
             }
         }
