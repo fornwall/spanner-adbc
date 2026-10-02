@@ -62,7 +62,7 @@ use arrow_array::{
     ArrayRef, ListArray, PrimitiveArray, RecordBatch, RecordBatchReader, StructArray,
     TimestampNanosecondArray,
 };
-use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{NullBufferBuilder, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 use base64::Engine;
 use google_cloud_spanner::result::{ResultSet, ResultSetMetadata, Row};
@@ -996,13 +996,13 @@ fn build_list(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
     let mut children: Vec<Option<&Value>> = Vec::new();
     let mut offsets: Vec<i32> = Vec::with_capacity(values.len() + 1);
     offsets.push(0);
-    let mut validity: Vec<bool> = Vec::with_capacity(values.len());
+    let mut validity = NullBufferBuilder::new(values.len());
     for &value in values {
         match present(value) {
-            None => validity.push(false),
+            None => validity.append_null(),
             Some(v) if v.kind() == Kind::List => {
                 children.extend(v.as_list().expect("list kind").iter().map(Some));
-                validity.push(true);
+                validity.append_non_null();
             }
             Some(v) => return Err(decode_error("ARRAY", v)),
         }
@@ -1022,7 +1022,7 @@ fn build_list(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
         field.clone(),
         OffsetBuffer::new(ScalarBuffer::from(offsets)),
         child,
-        Some(NullBuffer::from(validity)),
+        validity.finish(),
     )
     .map_err(arrow_err)?;
     Ok(Arc::new(list))
@@ -1038,12 +1038,12 @@ fn build_list(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
 /// is an error, never a silent null, at any nesting depth.
 fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> {
     let mut rows = Vec::with_capacity(values.len());
-    let mut validity: Vec<bool> = Vec::with_capacity(values.len());
+    let mut validity = NullBufferBuilder::new(values.len());
     for &value in values {
         match present(value) {
             None => {
                 rows.push(None);
-                validity.push(false);
+                validity.append_null();
             }
             Some(v) if v.kind() == Kind::List => {
                 let list = v.as_list().expect("list kind");
@@ -1058,7 +1058,7 @@ fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> 
                     ));
                 }
                 rows.push(Some(list));
-                validity.push(true);
+                validity.append_non_null();
             }
             Some(v) => return Err(decode_error("STRUCT", v)),
         }
@@ -1074,13 +1074,9 @@ fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> 
             build_array(field.data_type(), &scratch)
         })
         .collect::<Result<Vec<_>>>()?;
-    let array = StructArray::try_new_with_length(
-        fields.clone(),
-        arrays,
-        Some(NullBuffer::from(validity)),
-        values.len(),
-    )
-    .map_err(arrow_err)?;
+    let array =
+        StructArray::try_new_with_length(fields.clone(), arrays, validity.finish(), values.len())
+            .map_err(arrow_err)?;
     Ok(Arc::new(array))
 }
 
