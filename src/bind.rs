@@ -260,11 +260,7 @@ fn cell_value(
             _ => unreachable!("downcast_dictionary_array dispatched a non-dictionary {data_type:?}")
         ),
         _ => {
-            let bind = scalar_binder(data_type).ok_or_else(|| {
-                invalid_argument(format!(
-                    "cannot bind parameter {name:?}: unsupported Arrow type {data_type:?}"
-                ))
-            })?;
+            let bind = scalar_binder(name, data_type)?;
             let value = bind(name, data_type, column, row)?;
             // JSON is the only type needing an explicit param type; `is_json_field` is true only
             // for `arrow.json`-tagged string columns, so this is `None` for every other type.
@@ -276,7 +272,8 @@ fn cell_value(
 /// The per-element Arrow→Spanner scalar encoder returned by [`scalar_binder`]: given the parameter
 /// `name` (for error messages), the element's Arrow [`DataType`] (equal to the array's own type —
 /// consulted for the `Timestamp` unit / `Decimal128` scale), the array, and an element index, it
-/// produces that element's Spanner [`Value`]. A plain `fn` (the arms capture nothing), so
+/// produces that element's Spanner [`Value`]. The data type must match the validated type passed
+/// to [`scalar_binder`]. A plain `fn` (the arms capture nothing), so
 /// dispatching once per cell and reusing the result across an array's elements costs no allocation.
 type ScalarBinder = fn(&str, &DataType, &dyn Array, usize) -> Result<Value>;
 
@@ -284,9 +281,9 @@ type ScalarBinder = fn(&str, &DataType, &dyn Array, usize) -> Result<Value>;
 /// lives.
 ///
 /// Returns the [`ScalarBinder`] for a scalar Arrow `data_type` (reading element `i` of an array of
-/// that type into a Spanner scalar [`Value`], nulls preserved), or `None` if the type has no
-/// Spanner mapping. Both binding paths funnel through it — [`cell_value`] for a scalar `@param`,
-/// and [`list_cell_value`] for every `ARRAY<...>` element — so the two cannot drift.
+/// that type into a Spanner scalar [`Value`], nulls preserved), rejecting unsupported types and
+/// decimal scales before examining values. Both binding paths use it: [`cell_value`] for scalar
+/// parameters and [`list_cell_value`] for array elements.
 ///
 /// **Adding a new Arrow scalar type touches these sites** (keep them in lockstep):
 ///   1. **here** (`scalar_binder`) — the Arrow→Spanner *value* mapping, shared by the scalar and
@@ -298,7 +295,7 @@ type ScalarBinder = fn(&str, &DataType, &dyn Array, usize) -> Result<Value>;
 ///   5. the module-level doc list of supported types (top of this file).
 ///
 /// (A new *container* kind — beyond `List`/`LargeList` — is instead added to [`cell_value`].)
-fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
+fn scalar_binder(name: &str, data_type: &DataType) -> Result<ScalarBinder> {
     let bind: ScalarBinder = match data_type {
         // Spanner's only integer type is INT64, so every Arrow int width widens to it; both Arrow
         // floats map to FLOAT64 (f32 widens losslessly).
@@ -377,17 +374,18 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
                 timestamp_string(name, unit, timestamp_value(a, unit, i))
             })
         },
-        DataType::Decimal128(_, _) => |name, dt, a, i| {
-            let DataType::Decimal128(_, scale) = dt else {
-                unreachable!("scalar_binder dispatched a Decimal128 arm on {dt:?}")
-            };
-            // Format the full i128 directly; no narrower decimal type in the way. The scale is
-            // validated even for a null so a bad schema fails loudly on every row.
-            let scale = numeric_scale(name, *scale)?;
-            Ok(scalar_value(a.is_null(i), || {
-                numeric_string(a.as_primitive::<Decimal128Type>().value(i), scale)
-            }))
-        },
+        DataType::Decimal128(_, scale) => {
+            // Validate once per array cell, including null and empty arrays.
+            numeric_scale(name, *scale)?;
+            |_, dt, a, i| {
+                let DataType::Decimal128(_, scale) = dt else {
+                    unreachable!("scalar_binder dispatched a Decimal128 arm on {dt:?}")
+                };
+                Ok(scalar_value(a.is_null(i), || {
+                    numeric_string(a.as_primitive::<Decimal128Type>().value(i), *scale as u32)
+                }))
+            }
+        }
         // A `Null`-typed column has no values by definition: every cell binds as NULL. This is
         // the shape ADBC's own contract produces — `get_parameter_schema` types an undetermined
         // parameter `Null` (adbc.h: "the type of the corresponding field will be NA"), so a
@@ -398,9 +396,13 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
         // typed column. Deliberately not `a.is_null(i)`: a `NullArray` carries no validity
         // buffer, so Arrow's *physical* `is_null` reports `false` for its all-null cells.
         DataType::Null => |_, _, _, _| Ok(null_value()),
-        _ => return None,
+        _ => {
+            return Err(invalid_argument(format!(
+                "cannot bind parameter {name:?}: unsupported Arrow type {data_type:?}"
+            )));
+        }
     };
-    Some(bind)
+    Ok(bind)
 }
 
 /// The [`ScalarBinder`] for an Arrow primitive type `T` whose values bind as the Spanner-native
@@ -432,16 +434,15 @@ where
 fn null_dictionary_value(
     name: &str,
     field: &Field,
-    value_type: &DataType,
+    mut value_type: &DataType,
 ) -> Result<(Value, Option<Type>)> {
+    while let DataType::Dictionary(_, value) = value_type {
+        value_type = value;
+    }
     match value_type {
         DataType::List(item) | DataType::LargeList(item) => list_cell_value(name, item, None),
         _ => {
-            scalar_binder(value_type).ok_or_else(|| {
-                invalid_argument(format!(
-                    "cannot bind parameter {name:?}: unsupported Arrow type {value_type:?}"
-                ))
-            })?;
+            scalar_binder(name, value_type)?;
             Ok((null_value(), is_json_field(field).then(types::json)))
         }
     }
@@ -494,11 +495,8 @@ fn list_cell_value(
     elem: Option<(&dyn Array, Range<usize>)>,
 ) -> Result<(Value, Option<Type>)> {
     let item_type = item.data_type();
-    let bind = scalar_binder(item_type).ok_or_else(|| {
-        invalid_argument(format!(
-            "cannot bind ARRAY parameter {name:?}: unsupported element type {item_type:?}"
-        ))
-    })?;
+    let bind = scalar_binder(name, item_type)
+        .map_err(|error| crate::error::annotate(error, |m| format!("ARRAY element: {m}")))?;
     let value = match elem {
         // A null cell is a null array; each present element keeps its own null via `scalar_binder`.
         None => null_value(),

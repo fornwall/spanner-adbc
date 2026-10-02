@@ -637,10 +637,10 @@ fn arrow_field_at(
 /// `Dictionary` looks through to its **value** type — the Arrow spec allows an extension array to be
 /// dictionary-encoded, and the bind path decodes that transparently.
 pub(crate) fn is_json_field(field: &Field) -> bool {
-    let storage = match field.data_type() {
-        DataType::Dictionary(_, value) => value.as_ref(),
-        other => other,
-    };
+    let mut storage = field.data_type();
+    while let DataType::Dictionary(_, value) = storage {
+        storage = value;
+    }
     matches!(
         storage,
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View

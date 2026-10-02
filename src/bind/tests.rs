@@ -1356,7 +1356,7 @@ fn rejects_nested_array_element_type() {
     );
     let err = bind_row(Statement::builder("SELECT @x"), &b, 0).unwrap_err();
     assert!(
-        err.message.contains("unsupported element type"),
+        err.message.contains("unsupported Arrow type"),
         "unexpected error: {}",
         err.message
     );
@@ -1549,4 +1549,63 @@ fn by_name_binding_rejects_case_insensitive_duplicate_columns() {
     let error = resolve_parameter_names("SELECT @NaMe", &batch, true).unwrap_err();
     assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
     assert!(error.message.contains("same query parameter"), "{error}");
+}
+
+#[test]
+fn nested_dictionary_json_preserves_type_for_values_and_both_null_kinds() {
+    let values = arrow_array::DictionaryArray::new(
+        arrow_array::Int8Array::from(vec![Some(0), None]),
+        Arc::new(StringArray::from(vec![r#"{"a":1}"#])),
+    );
+    let dictionary = arrow_array::DictionaryArray::new(
+        arrow_array::Int8Array::from(vec![Some(0), Some(1), None]),
+        Arc::new(values),
+    );
+    let field = json_field("doc", dictionary.data_type().clone());
+    assert_eq!(spanner_field_type(&field).unwrap(), "JSON");
+    for row in 0..3 {
+        let (value, param_type) = cell_value("doc", &field, &dictionary, row).unwrap();
+        assert_eq!(param_type, Some(types::json()));
+        if row == 0 {
+            assert_eq!(value.as_str(), Some(r#"{"a":1}"#));
+        } else {
+            assert_eq!(value.kind(), google_cloud_spanner::value::Kind::Null);
+        }
+    }
+}
+
+#[test]
+fn invalid_decimal_scale_is_rejected_including_null_and_empty_containers() {
+    use arrow_array::builder::{Decimal128Builder, ListBuilder};
+
+    let decimal = Decimal128Array::from(vec![Some(1), None])
+        .with_precision_and_scale(38, -1)
+        .unwrap();
+    let dictionary = arrow_array::DictionaryArray::new(
+        arrow_array::Int8Array::from(vec![Some(0), None]),
+        Arc::new(decimal.clone()),
+    );
+    let mut lists = ListBuilder::new(
+        Decimal128Builder::new()
+            .with_precision_and_scale(38, -1)
+            .unwrap(),
+    );
+    lists.values().append_value(1);
+    lists.append(true);
+    lists.append(true);
+    lists.append(false);
+    let arrays: Vec<Arc<dyn Array>> = vec![
+        Arc::new(decimal),
+        Arc::new(dictionary),
+        Arc::new(lists.finish()),
+    ];
+    for array in arrays {
+        let field = Field::new("amount", array.data_type().clone(), true);
+        for row in 0..array.len() {
+            let error = cell_value("amount", &field, array.as_ref(), row).unwrap_err();
+            assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+            assert!(error.message.contains("amount"), "{error}");
+            assert!(error.message.contains("unsupported scale -1"), "{error}");
+        }
+    }
 }
