@@ -519,3 +519,63 @@ fn chain_walks_from_the_outermost_error_to_the_innermost() {
     let alone = err("no source", Status::Internal);
     assert_eq!(chain(&alone).count(), 1);
 }
+
+#[test]
+fn bare_http_rpc_status_preserves_code_message_and_details() {
+    for (code, expected) in [
+        (9, Status::InvalidState),
+        (7, Status::Unauthorized),
+        (16, Status::Unauthenticated),
+        (4, Status::Timeout),
+        (8, Status::Internal),
+        (14, Status::IO),
+    ] {
+        let payload = serde_json::json!({
+            "code": code,
+            "message": "admin request failed",
+            "details": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "ADMIN_FAILURE",
+                "domain": "spanner.googleapis.com"
+            }]
+        });
+        let error = google_cloud_gax::error::Error::http(
+            400,
+            Default::default(),
+            serde_json::to_vec(&payload).unwrap().into(),
+        );
+        let mapped = from_spanner(error);
+        assert_eq!(mapped.status, expected);
+        assert_eq!(mapped.vendor_code, code);
+        assert!(mapped.message.contains("admin request failed"));
+        assert!(mapped.details.as_ref().unwrap().iter().any(|(key, value)| {
+            key == "google.rpc.errorinfo"
+                && String::from_utf8_lossy(value).contains("ADMIN_FAILURE")
+        }));
+        if code == 7 {
+            assert!(mapped.message.contains("grant an IAM role"));
+        }
+    }
+}
+
+#[test]
+fn malformed_http_payload_is_not_treated_as_an_rpc_status() {
+    for payload in [
+        "<html>Bad gateway</html>",
+        "{}",
+        r#"{"code":400,"message":"HTTP status, not RPC status"}"#,
+        r#"{"code":0,"message":"not an error"}"#,
+        r#"{"code":9}"#,
+        r#"{"code":"9","message":"invalid code type"}"#,
+    ] {
+        let error = google_cloud_gax::error::Error::http(
+            400,
+            Default::default(),
+            payload.to_owned().into(),
+        );
+        let mapped = from_spanner(error);
+        assert_eq!(mapped.status, Status::Internal, "{payload}");
+        assert_eq!(mapped.vendor_code, 0, "{payload}");
+        assert!(mapped.message.contains(payload));
+    }
+}

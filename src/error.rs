@@ -126,22 +126,36 @@ pub(crate) fn chain<'a>(
 /// as binary protobuf), so a consumer written to that convention won't interoperate — the pinned
 /// preview client offers no binary-protobuf encoding of details. `RetryInfo` on `ABORTED` rarely
 /// surfaces, the client's transaction runner having already consumed its `retryDelay` retrying
-/// internally. Errors without a gRPC status, and statuses without details, leave `details` as
-/// `None` (never `Some(vec![])`).
+/// internally. Bare `google.rpc.Status` HTTP bodies from the emulator's admin API use the same
+/// mapping. Errors without a usable RPC status, and statuses without details, leave `details`
+/// as `None` (never `Some(vec![])`).
 pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
+    // The emulator's admin API returns a bare google.rpc.Status, while gax's REST decoder
+    // expects an {"error": ...} envelope. Recover the structured status from that payload.
+    let http_status = error
+        .http_payload()
+        .filter(|_| error.status().is_none())
+        .and_then(|payload| {
+            let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+            let code = value.get("code")?.as_i64()?;
+            if !(1..=16).contains(&code) || !value.get("message")?.is_string() {
+                return None;
+            }
+            serde_json::from_value::<google_cloud_gax::error::rpc::Status>(value).ok()
+        });
     // Match the structured status' `Code` enum directly — no string round-trip, and every mapped
     // arm is compile-checked rather than a stringly-typed match on a `Display` message.
-    let (status, vendor_code, details, code) =
-        error
-            .status()
-            .map_or((Status::Internal, 0, None, None), |status| {
-                (
-                    status_for_grpc_code(status.code),
-                    status.code as i32,
-                    details_for_adbc(&status.details),
-                    Some(status.code),
-                )
-            });
+    let (status, vendor_code, details, code) = error.status().or(http_status.as_ref()).map_or(
+        (Status::Internal, 0, None, None),
+        |status| {
+            (
+                status_for_grpc_code(status.code),
+                status.code as i32,
+                details_for_adbc(&status.details),
+                Some(status.code),
+            )
+        },
+    );
     let mut message = format!("Spanner error: {error}");
     // Appended only; the original message, status, vendor_code and details are untouched.
     if code == Some(Code::PermissionDenied) {
