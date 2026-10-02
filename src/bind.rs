@@ -46,6 +46,8 @@
 //! workaround is `PARSE_JSON(@doc)`). So tagged values round-trip. The tag is honoured through
 //! dictionary encoding too.
 
+use std::ops::Range;
+
 use adbc_core::error::Result;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
@@ -54,7 +56,7 @@ use arrow_array::types::{
     TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type,
     UInt32Type,
 };
-use arrow_array::{Array, ArrayRef, RecordBatch, downcast_dictionary_array};
+use arrow_array::{Array, RecordBatch, downcast_dictionary_array};
 use arrow_schema::{DataType, Field, TimeUnit};
 use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
 use google_cloud_spanner::mutation::Mutation;
@@ -111,7 +113,6 @@ pub(crate) fn resolve_parameter_names(
     bind_by_name: bool,
 ) -> Result<Vec<String>> {
     let schema = batch.schema();
-    let column_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     let params = named_parameters(sql);
 
     // Strict by-name: every bound column must correspond to a query parameter. Spanner matches
@@ -123,9 +124,10 @@ pub(crate) fn resolve_parameter_names(
             .iter()
             .map(|p| (p.to_ascii_lowercase(), p.as_str()))
             .collect();
-        let mut resolved = Vec::with_capacity(column_names.len());
-        let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for column in &column_names {
+        let mut resolved = Vec::with_capacity(batch.num_columns());
+        let mut bound = std::collections::HashSet::with_capacity(batch.num_columns());
+        for field in schema.fields() {
+            let column = field.name();
             let Some(param) = param_set.get(&column.to_ascii_lowercase()) else {
                 return Err(invalid_argument(format!(
                     "cannot bind column {column:?}: adbc.statement.bind_by_name is true, so every \
@@ -136,7 +138,7 @@ pub(crate) fn resolve_parameter_names(
             };
             // Two columns differing only in case name one parameter; Spanner would reject the
             // resulting request with "Duplicate parameter name", so say so here instead.
-            if !bound.insert((*param).to_ascii_lowercase()) {
+            if !bound.insert(*param) {
                 return Err(invalid_argument(format!(
                     "cannot bind column {column:?}: it names the same query parameter {param:?} as \
                      an earlier column (parameter names are case-insensitive); bind one column per \
@@ -149,12 +151,12 @@ pub(crate) fn resolve_parameter_names(
     }
 
     // Positional (the default): i-th column -> i-th parameter. Counts must line up.
-    if params.len() != column_names.len() {
+    if params.len() != batch.num_columns() {
         return Err(invalid_argument(format!(
             "parameter count mismatch: query references {} parameter(s) {:?} but {} column(s) were bound",
             params.len(),
             params,
-            column_names.len(),
+            batch.num_columns(),
         )));
     }
     Ok(params)
@@ -223,11 +225,25 @@ fn cell_value(
         // ARRAY<...>: an Arrow `List`/`LargeList` maps to a Spanner array. See
         // [`list_cell_value`] — nested arrays and STRUCT elements are rejected there.
         DataType::List(item) => {
-            let elem = (!column.is_null(row)).then(|| column.as_list::<i32>().value(row));
+            let list = column.as_list::<i32>();
+            let offsets = list.value_offsets();
+            let elem = (!column.is_null(row)).then(|| {
+                (
+                    list.values().as_ref(),
+                    offsets[row] as usize..offsets[row + 1] as usize,
+                )
+            });
             list_cell_value(name, item, elem)
         }
         DataType::LargeList(item) => {
-            let elem = (!column.is_null(row)).then(|| column.as_list::<i64>().value(row));
+            let list = column.as_list::<i64>();
+            let offsets = list.value_offsets();
+            let elem = (!column.is_null(row)).then(|| {
+                (
+                    list.values().as_ref(),
+                    offsets[row] as usize..offsets[row + 1] as usize,
+                )
+            });
             list_cell_value(name, item, elem)
         }
         // A dictionary-encoded column is an index encoding of the same logical values, not a
@@ -467,14 +483,15 @@ fn try_scalar_value<T: Into<Value>>(
 ///
 /// `item` is the list's element field: its data type selects the [`scalar_binder`] mapping (an
 /// `arrow.json` tag on a string element types the whole array as `ARRAY<JSON>`), and `elem` is the
-/// child slice for this row, or `None` when the whole cell is null (→ a typed null array). Every
-/// element runs through the same `scalar_binder` as a scalar bind, keeping its own null. The
+/// child array and index range for this row, or `None` for a null cell. Borrowing the range avoids
+/// allocating a sliced array for each bound cell. Elements use the same scalar encoder, preserving
+/// nulls. The
 /// element type is validated up front, so an unsupported element — including a nested
 /// `ARRAY<ARRAY<…>>` or `ARRAY<STRUCT>` — is rejected even for an empty or null array.
 fn list_cell_value(
     name: &str,
     item: &Field,
-    elem: Option<ArrayRef>,
+    elem: Option<(&dyn Array, Range<usize>)>,
 ) -> Result<(Value, Option<Type>)> {
     let item_type = item.data_type();
     let bind = scalar_binder(item_type).ok_or_else(|| {
@@ -487,9 +504,9 @@ fn list_cell_value(
         None => null_value(),
         // `Value::from(Vec<Value>)` consumes the elements (`impl<T: Into<Value>> From<Vec<T>>`);
         // `Vec::to_value` would deep-copy every one of them instead.
-        Some(a) => Value::from(
-            (0..a.len())
-                .map(|i| bind(name, item_type, a.as_ref(), i))
+        Some((values, range)) => Value::from(
+            range
+                .map(|i| bind(name, item_type, values, i))
                 .collect::<Result<Vec<Value>>>()?,
         ),
     };

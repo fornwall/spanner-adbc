@@ -18,16 +18,8 @@ use crate::retry::RetryConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::timeout::with_timeout;
 
-/// Apply the connection's isolation level to a read/write transaction runner builder.
-///
-/// [`IsolationLevel::Unspecified`] leaves the builder untouched, so no level rides the
-/// `TransactionOptions` and Spanner applies its own default, `SERIALIZABLE` (there is no
-/// database- or client-level isolation default to inherit). A specific level is forwarded to
-/// [`TransactionRunnerBuilder::set_isolation_level`].
-///
-/// This is the only place an isolation level enters the driver, and it is reached only from the
-/// read/write (DML) paths: queries take a [timestamp bound](crate::staleness) instead, and the
-/// write-only builder has no isolation setter.
+/// Apply an explicit isolation level; unspecified leaves Spanner's SERIALIZABLE default.
+/// Only read/write transactions use this setting. Read-only queries use timestamp bounds.
 #[must_use]
 pub(super) fn apply_isolation(
     builder: TransactionRunnerBuilder,
@@ -57,36 +49,13 @@ pub(crate) async fn build_runner(
         .map_err(from_spanner)
 }
 
-/// Map the standard ADBC `adbc.connection.transaction.isolation_level` value to the Spanner client's
-/// [`IsolationLevel`]. Spanner exposes two levels, `SERIALIZABLE` and `REPEATABLE_READ`; the
-/// `default` value sends none, which Spanner reads as `SERIALIZABLE`.
+/// Map ADBC isolation levels to Spanner's SERIALIZABLE or REPEATABLE_READ.
+/// Spanner's REPEATABLE_READ provides snapshot isolation, so weaker levels are promoted to it.
+/// SERIALIZABLE is externally consistent and satisfies linearizable requests. Getters report the
+/// effective level, or `default` when no level is sent.
 ///
-/// Spanner implements `REPEATABLE_READ` as *snapshot isolation* — its proto definition matches
-/// ADBC's [`snapshot`] almost verbatim — so `snapshot` is an exact match, not a promotion, and
-/// Spanner's `REPEATABLE_READ` is *stronger* than the ANSI level of the same name. The remaining
-/// two levels are **promoted upward** to the weakest supported level that still satisfies their
-/// guarantees rather than rejected: isolation levels are minimum-guarantee contracts, so a stronger
-/// level always satisfies a weaker one's request, and the spec's "return an appropriate error"
-/// targets the opposite case, a driver that can only offer something *weaker*.
-///
-/// | requested          | mapped to         | rationale                                                  |
-/// |--------------------|-------------------|------------------------------------------------------------|
-/// | `serializable`     | `SERIALIZABLE`    | native                                                      |
-/// | `repeatable_read`  | `REPEATABLE_READ` | native (Spanner's RR is snapshot isolation, stronger than ANSI RR, so it satisfies the request) |
-/// | `snapshot`         | `REPEATABLE_READ` | native — Spanner's `REPEATABLE_READ` *is* snapshot isolation |
-/// | `read_uncommitted` | `REPEATABLE_READ` | promoted: weakest supported level that satisfies it          |
-/// | `read_committed`   | `REPEATABLE_READ` | promoted: weakest supported level that satisfies it          |
-/// | `linearizable`     | `SERIALIZABLE`    | promoted: Spanner R/W txns are externally consistent (strict serializable = linearizable) |
-///
-/// `get_option` reports the stored (effective) level, so callers see what will actually run. A
-/// truly unknown level string is rejected with `InvalidArguments`.
-///
-/// Note that under `REPEATABLE_READ` Spanner detects **write-write conflicts only**, so a DML
-/// statement that reads rows it does not write (a subquery guard, a join, `INSERT … SELECT`) can
-/// commit against a stale snapshot and produce write skew — including for a single autocommit
-/// statement, not just a multi-statement transaction.
-///
-/// [`snapshot`]: adbc_core::constants::ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT
+/// REPEATABLE_READ detects write-write conflicts only: DML that reads rows it does not write can
+/// exhibit write skew, even in a single autocommit statement.
 pub(super) fn parse_isolation_level(value: OptionValue) -> Result<IsolationLevel> {
     use adbc_core::constants::*;
     let OptionValue::String(s) = value else {
@@ -102,7 +71,7 @@ pub(super) fn parse_isolation_level(value: OptionValue) -> Result<IsolationLevel
         // native match rather than a promotion (see this function's rustdoc).
         ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT => Ok(IsolationLevel::RepeatableRead),
         // Promote levels Spanner does not natively expose to the weakest supported level that
-        // still satisfies their guarantees (see the table in this function's rustdoc).
+        // still satisfies their guarantees.
         ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED
         | ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED => Ok(IsolationLevel::RepeatableRead),
         ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE => Ok(IsolationLevel::Serializable),

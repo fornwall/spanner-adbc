@@ -1383,3 +1383,52 @@ fn binds_string_list_cells_of_a_sliced_batch_at_their_offset() {
         "row 0 was read from the unsliced buffer: {row0}"
     );
 }
+
+#[test]
+fn binds_sliced_large_lists_with_sliced_child_values() {
+    use arrow_array::LargeListArray;
+    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+
+    // Both the list and its child array start at nonzero offsets.
+    let values = Int64Array::from(vec![Some(99), Some(1), Some(2), None, Some(4)]).slice(1, 4);
+    let lists = LargeListArray::new(
+        Arc::new(Field::new("item", DataType::Int64, true)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i64, 1, 4, 4, 4])),
+        Arc::new(values),
+        Some(NullBuffer::from(vec![true, true, true, false])),
+    );
+    let batch = batch(
+        vec![Field::new("items", lists.data_type().clone(), true)],
+        vec![Arc::new(lists)],
+    )
+    .slice(1, 3);
+    let row = bound_params_debug(&batch, 0);
+    for value in [r#"StringValue("2")"#, "NullValue", r#"StringValue("4")"#] {
+        assert!(row.contains(value), "{row}");
+    }
+    assert!(!row.contains(r#"StringValue("1")"#), "{row}");
+    assert!(!row.contains(r#"StringValue("99")"#), "{row}");
+    let empty = bound_params_debug(&batch, 1);
+    assert!(empty.contains("ListValue"), "{empty}");
+    assert!(!empty.contains("NullValue"), "{empty}");
+    let null = bound_params_debug(&batch, 2);
+    assert!(null.contains("NullValue"), "{null}");
+    assert!(!null.contains("ListValue"), "{null}");
+}
+
+#[test]
+fn by_name_binding_rejects_case_insensitive_duplicate_columns() {
+    let batch = batch(
+        vec![
+            Field::new("name", DataType::Int64, false),
+            Field::new("NAME", DataType::Int64, false),
+        ],
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![2])),
+        ],
+    );
+    let error = resolve_parameter_names("SELECT @NaMe", &batch, true).unwrap_err();
+    assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+    assert!(error.message.contains("same query parameter"), "{error}");
+}
