@@ -664,6 +664,60 @@ fn bound_dml_strips_trailing_terminators() {
 }
 
 #[test]
+fn bound_dml_returning_and_partitioned_preserve_parameters() {
+    let _watchdog = watchdog!();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    let server = MockServer::start(move |mock| {
+        serve_begin_transaction(mock);
+        mock.expect_execute_streaming_sql()
+            .returning(move |request| {
+                let request = request.into_inner();
+                let returning = request.sql.ends_with("THEN RETURN c");
+                recorded.lock().unwrap().push(request);
+                let mut result = partial_result_set(true, &["v"], b"dml-1", true);
+                result.metadata.as_mut().unwrap().transaction = Some(v1::Transaction {
+                    id: b"dml-txn".to_vec(),
+                    ..Default::default()
+                });
+                result.stats = Some(v1::ResultSetStats {
+                    row_count: Some(if returning {
+                        v1::result_set_stats::RowCount::RowCountExact(1)
+                    } else {
+                        v1::result_set_stats::RowCount::RowCountLowerBound(1)
+                    }),
+                    ..Default::default()
+                });
+                Ok(stream_of(vec![Ok(result)]))
+            });
+        mock.expect_commit().returning(|_| commit_ok());
+    });
+    let mut connection = server.connect();
+    for (sql, partitioned) in [
+        ("INSERT INTO MockTable (c) VALUES (@p) THEN RETURN c", false),
+        ("UPDATE MockTable SET c = @p WHERE TRUE", true),
+    ] {
+        let mut statement = connection.new_statement().unwrap();
+        statement
+            .set_sql_query(format!("{sql};; -- comment"))
+            .unwrap();
+        statement.bind(ingest_batch(1)).unwrap();
+        statement
+            .set_option(
+                OptionStatement::Other(spanner_adbc::OPTION_DML_PARTITIONED.into()),
+                partitioned.to_string().into(),
+            )
+            .unwrap();
+        assert_eq!(statement.execute_update().unwrap(), Some(1));
+        let requests = requests.lock().unwrap();
+        let request = requests.last().unwrap();
+        assert_eq!(request.sql, sql);
+        assert!(request.params.as_ref().unwrap().fields.contains_key("p"));
+    }
+    assert_eq!(requests.lock().unwrap().len(), 2);
+}
+
+#[test]
 fn bound_dml_rejects_batches_before_buffering_manual_work() {
     let _watchdog = watchdog!();
     let server = MockServer::start(|_| {});
