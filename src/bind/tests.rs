@@ -282,6 +282,40 @@ fn maps_arrow_to_spanner_column_types() {
 }
 
 #[test]
+fn dictionary_json_arrays_keep_their_type_when_creating_ingest_tables() {
+    use arrow_array::builder::{GenericListBuilder, StringBuilder};
+
+    fn check<O: arrow_array::OffsetSizeTrait>() {
+        let mut lists = GenericListBuilder::<O, _>::new(StringBuilder::new())
+            .with_field(Arc::new(json_field("item", DataType::Utf8)));
+        lists.values().append_value(r#"{"a":1}"#);
+        lists.append(true);
+        let dictionary = arrow_array::DictionaryArray::new(
+            Int32Array::from(vec![Some(0), None]),
+            Arc::new(lists.finish()),
+        );
+        let b = batch(
+            vec![Field::new("docs", dictionary.data_type().clone(), true)],
+            vec![Arc::new(dictionary)],
+        );
+        assert_eq!(
+            create_table_sql("events", None, b.schema().as_ref(), false).unwrap(),
+            "CREATE TABLE `events` (`docs` ARRAY<JSON>)"
+        );
+        for row in 0..2 {
+            let statement = bind_row(Statement::builder("SELECT @p0"), &b, row)
+                .unwrap()
+                .build();
+            assert!(
+                format!("{statement:?}").contains("array_element_type: Some(Type { code: Json")
+            );
+        }
+    }
+    check::<i32>();
+    check::<i64>();
+}
+
+#[test]
 fn builds_create_table_sql() {
     let schema = Schema::new(vec![
         Field::new("idx", DataType::Int64, true),

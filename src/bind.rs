@@ -665,7 +665,12 @@ fn spanner_field_type(field: &Field) -> Result<String> {
     if is_json_field(field) {
         return Ok("JSON".to_string());
     }
-    match field.data_type() {
+    // Keep list element metadata when looking through dictionary encoding.
+    let mut data_type = field.data_type();
+    while let DataType::Dictionary(_, value) = data_type {
+        data_type = value;
+    }
+    match data_type {
         DataType::List(item) | DataType::LargeList(item) => {
             Ok(format!("ARRAY<{}>", spanner_field_type(item)?))
         }
