@@ -134,30 +134,13 @@ impl RecordBatchReader for BoundStreamReader {
     }
 }
 
-/// Checks the invariants an array that arrived over the C data interface is only assumed to hold,
-/// naming the column that violates one.
+/// Validate imported buffers once, reporting the offending column. Arrow's C importer uses
+/// `ArrayData::new_unchecked`; offsets, view indices, UTF-8 and null counts must be checked before
+/// safe Arrow accessors can rely on them. Native Rust batches already satisfy these invariants.
 ///
-/// Arrow's importer ends in `ArrayData::new_unchecked`, so nothing a producer put in the buffers
-/// has been looked at: offsets, view buffer indices, UTF-8 and declared null counts are all still
-/// the producer's word. Downstream is ordinary safe Rust trusting arrow-rs's invariants, and two of
-/// those reads are unchecked by design -- `GenericByteViewArray::value` resolves a view through
-/// `buffers.get_unchecked`, and both byte array families make a `&str` with
-/// `from_bytes_unchecked`. A malformed array is therefore undefined behavior in the consumer
-/// rather than a reportable panic, and no consumer can defend itself: this driver's own
-/// `crate::bind::cell_value` reads every bound value that way. The boundary the arrays enter
-/// through is the one place that covers all of them at once.
-///
-/// It covers an honest producer's bug, not a dishonest producer's lie. `FFI_ArrowArray` transmits
-/// buffer pointers and no lengths, so for the byte-array types the values-buffer length *is* the
-/// last offset, which `from_ffi` reads out of the producer's own offset buffer before this function
-/// is reached; a last offset that lies yields a `Buffer` spanning memory the producer does not own,
-/// and the validation below is then itself the out-of-bounds read. That is the `unsafe` contract
-/// `from_ffi` documents, and it is not much of a security boundary either way -- the producer
-/// shares this address space.
-///
-/// The cost is one linear pass per buffer, paid once at the boundary, against per-row conversion
-/// work of the same order plus a gRPC round trip. Only arrays that arrive over the C data interface
-/// pay it -- the Rust trait API takes an already-validated `RecordBatch`.
+/// This does not validate pointer ownership: the C interface supplies pointers without allocation
+/// lengths, and the importer infers some buffer lengths from offsets. Producers must still uphold
+/// `from_ffi`'s unsafe contract so importing and validating the buffers stays within allocated memory.
 pub(super) fn validate_imported(
     data: &ArrayData,
     fields: &Fields,

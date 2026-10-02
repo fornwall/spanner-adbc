@@ -58,7 +58,7 @@ use arrow_array::types::{
 };
 use arrow_array::{Array, RecordBatch, downcast_dictionary_array};
 use arrow_schema::{DataType, Field, TimeUnit};
-use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, SecondsFormat, Utc};
 use google_cloud_spanner::mutation::Mutation;
 use google_cloud_spanner::statement::StatementBuilder;
 use google_cloud_spanner::types::{self, Type};
@@ -532,9 +532,10 @@ fn date_string(name: &str, days: i32) -> Result<String> {
     let date = NaiveDate::from_ymd_opt(1970, 1, 1)
         .unwrap()
         .checked_add_signed(Duration::days(i64::from(days)))
+        .filter(|date| (1..=9999).contains(&date.year()))
         .ok_or_else(|| {
             invalid_argument(format!(
-                "cannot bind DATE parameter {name:?}: {days} is out of range"
+                "cannot bind DATE parameter {name:?}: {days} days since 1970-01-01 is out of range; Spanner supports 0001-01-01 through 9999-12-31"
             ))
         })?;
     Ok(date.format("%Y-%m-%d").to_string())
@@ -591,9 +592,9 @@ fn timestamp_string(name: &str, unit: &TimeUnit, value: i64) -> Result<String> {
             SecondsFormat::Nanos,
         ),
     };
-    let ts = ts.ok_or_else(|| {
+    let ts = ts.filter(|ts| (1..=9999).contains(&ts.year())).ok_or_else(|| {
         invalid_argument(format!(
-            "cannot bind TIMESTAMP parameter {name:?}: {value} ({unit:?}) is out of range"
+            "cannot bind TIMESTAMP parameter {name:?}: {value} ({unit:?}) is out of range; Spanner supports years 0001 through 9999"
         ))
     })?;
     Ok(ts.to_rfc3339_opts(format, true))

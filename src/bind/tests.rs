@@ -609,6 +609,90 @@ fn timestamp_string_preserves_full_precision() {
 }
 
 #[test]
+fn temporal_binding_accepts_spanner_range_boundaries() {
+    for date in ["0001-01-01", "9999-12-31"] {
+        let days = crate::conversion::parse_date_days(date).unwrap();
+        assert_eq!(date_string("d", days).unwrap(), date);
+    }
+    for (unit, multiplier, fraction) in [
+        (TimeUnit::Second, 1, ""),
+        (TimeUnit::Millisecond, 1_000, ".999"),
+        (TimeUnit::Microsecond, 1_000_000, ".999999"),
+    ] {
+        assert_eq!(
+            timestamp_string("t", &unit, -62_135_596_800 * multiplier).unwrap(),
+            match unit {
+                TimeUnit::Second => "0001-01-01T00:00:00Z",
+                TimeUnit::Millisecond => "0001-01-01T00:00:00.000Z",
+                _ => "0001-01-01T00:00:00.000000Z",
+            }
+        );
+        assert_eq!(
+            timestamp_string("t", &unit, 253_402_300_800 * multiplier - 1).unwrap(),
+            format!("9999-12-31T23:59:59{fraction}Z")
+        );
+    }
+    for value in [i64::MIN, i64::MAX] {
+        assert!(timestamp_string("t", &TimeUnit::Nanosecond, value).is_ok());
+    }
+}
+
+#[test]
+fn temporal_binding_rejects_values_outside_spanner_range() {
+    use adbc_core::error::Status;
+    use arrow_array::{ArrayRef, Date64Array};
+
+    let mut arrays: Vec<ArrayRef> = vec![
+        Arc::new(Date32Array::from(vec![-719_163, 2_932_897])),
+        Arc::new(Date64Array::from(vec![
+            -719_163 * 86_400_000_i64,
+            2_932_897 * 86_400_000_i64,
+        ])),
+        Arc::new(TimestampSecondArray::from(vec![
+            -62_135_596_801,
+            253_402_300_800,
+        ])),
+        Arc::new(TimestampMillisecondArray::from(vec![
+            -62_135_596_800_001,
+            253_402_300_800_000,
+        ])),
+        Arc::new(TimestampMicrosecondArray::from(vec![
+            -62_135_596_800_000_001,
+            253_402_300_800_000_000,
+        ])),
+    ];
+    arrays.push(Arc::new(
+        ListArray::from_iter_primitive::<Date32Type, _, _>([
+            Some(vec![Some(-719_163)]),
+            Some(vec![Some(2_932_897)]),
+        ]),
+    ));
+    for array in arrays {
+        let b = batch(
+            vec![Field::new("created_at", array.data_type().clone(), false)],
+            vec![array],
+        );
+        for row in 0..2 {
+            let error = bind_params(
+                Statement::builder("SELECT @created_at"),
+                &["created_at".into()],
+                &b,
+                row,
+            )
+            .unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert!(error.message.contains("created_at"), "{error}");
+            assert!(error.message.contains("0001"), "{error}");
+            assert!(error.message.contains("9999"), "{error}");
+            assert_eq!(
+                insert_mutation("events", &b, row).unwrap_err().message,
+                error.message
+            );
+        }
+    }
+}
+
+#[test]
 fn binds_timestamp_at_every_unit() {
     // Every Arrow TimestampArray unit binds without error.
     let ns = 1_705_322_096_789_012_999i64;
