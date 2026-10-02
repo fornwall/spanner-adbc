@@ -2,8 +2,6 @@
 //! metadata read goes through, the shared `table_exists` probe and catalog check, the
 //! `StringArray` column accessor its consumers decode with, and the ADBC `LIKE` matcher.
 
-use std::time::Duration;
-
 use adbc_core::error::{Error, Result, Status};
 use arrow_array::{RecordBatch, StringArray};
 use google_cloud_spanner::client::DatabaseClient;
@@ -62,7 +60,7 @@ pub(crate) fn table_exists(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
     cancel: &CancelSignal,
-    timeout: Option<Duration>,
+    config: &SharedConfig,
     db_schema: &str,
     table_name: &str,
 ) -> Result<bool> {
@@ -73,24 +71,29 @@ pub(crate) fn table_exists(
     block_on_cancellable(
         runtime,
         cancel,
-        with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
-            let statement = SpannerSql::builder(
-                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
+        with_timeout(
+            config.timeouts.query_timeout(),
+            crate::OPTION_RPC_TIMEOUT_QUERY,
+            async move {
+                let statement = metadata_sql_builder(
+                    config,
+                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
                  WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table",
-            )
-            .add_param("schema", &schema)
-            .add_param("table", &table)
-            .build();
-            let transaction = client.single_use().build();
-            let result_set = transaction
-                .execute_query(statement)
-                .await
-                .map_err(from_spanner)?;
-            // A TABLE_NAME probe returns only strings, so the timestamp precision is irrelevant.
-            let (_schema, batch) =
-                result_set_to_batch(result_set, TimestampPrecision::default()).await?;
-            Ok::<bool, Error>(batch.num_rows() > 0)
-        }),
+                )
+                .add_param("schema", &schema)
+                .add_param("table", &table)
+                .build();
+                let transaction = client.single_use().build();
+                let result_set = transaction
+                    .execute_query(statement)
+                    .await
+                    .map_err(from_spanner)?;
+                // A TABLE_NAME probe returns only strings, so the timestamp precision is irrelevant.
+                let (_schema, batch) =
+                    result_set_to_batch(result_set, TimestampPrecision::default()).await?;
+                Ok::<bool, Error>(batch.num_rows() > 0)
+            },
+        ),
     )
 }
 

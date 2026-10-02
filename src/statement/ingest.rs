@@ -65,7 +65,7 @@ impl SpannerStatement {
             &self.runtime,
             &self.client,
             &self.cancel.current(),
-            self.config.timeouts.query_timeout(),
+            &self.config,
             self.target_db_schema.as_deref().unwrap_or(""),
             table,
         )
@@ -454,29 +454,13 @@ impl SpannerStatement {
         }
     }
 
-    /// Apply one ingest chunk through Spanner's **BatchWrite** RPC (the
-    /// `spanner.ingest.batch_write` autocommit path), returning the number of rows applied.
-    ///
-    /// Each row's insert mutation is sent as its own [`MutationGroup`], applied **independently
-    /// and non-atomically** — not atomic as a whole even within a chunk, which is what makes it the
-    /// cheaper firehose transport. Each streamed [`BatchWriteResponse`] reports, per group index,
-    /// whether it applied: an `OK`/absent status counts those rows as applied, and the first
-    /// non-`OK` group status — code, message *and* its `google.rpc.Status` details — becomes the
-    /// returned error via [`from_status_parts`], so a duplicate primary key still surfaces as
-    /// `AlreadyExists` and the append/create remaps fire exactly as on the write-only path. Because
-    /// a non-atomic batch may have applied some groups before the failing one, any error is
-    /// annotated via [`note_rows_already_committed`], folding this chunk's `applied` groups (one row
-    /// each) into `prior_total`.
-    ///
-    /// Which options reach this path is documented on
-    /// [`OPTION_INGEST_BATCH_WRITE`](crate::OPTION_INGEST_BATCH_WRITE); they are applied by
-    /// [`RequestConfig::apply_to_batch_write`](crate::request::RequestConfig::apply_to_batch_write).
+    /// Apply one mutation group per row through the non-atomic BatchWrite RPC.
+    /// Keep draining after a group failure to count all confirmed writes. Annotate errors outside
+    /// the cancellation/timeout boundary so interrupted streams also report confirmed rows.
     fn batch_write_chunk(&self, mutations: Vec<Mutation>, prior_total: i64) -> Result<i64> {
         if mutations.is_empty() {
             return Ok(0);
         }
-        // One mutation group per row: groups are applied independently, so per-row insert failures
-        // (e.g. a duplicate key) do not roll back the rest of the chunk.
         let groups: Vec<MutationGroup> = mutations
             .into_iter()
             .map(|m| MutationGroup::new(vec![m]))
@@ -486,36 +470,21 @@ impl SpannerStatement {
             .request
             .apply_to_batch_write(self.client.batch_write_transaction())
             .build();
+        let mut applied = 0_i64;
         block_on_cancellable(
             &self.runtime,
             &self.cancel.current(),
             with_timeout(
                 self.config.timeouts.update_timeout(),
                 crate::OPTION_RPC_TIMEOUT_UPDATE,
-                async move {
-                    let mut stream = match transaction.execute_streaming(groups).await {
-                        Ok(stream) => stream,
-                        // Nothing streamed yet, so only earlier chunks are committed.
-                        Err(e) => {
-                            return Err(note_rows_already_committed(from_spanner(e), prior_total));
-                        }
-                    };
-                    let mut applied = 0_i64;
-                    let mut first_error: Option<Error> = None;
+                async {
+                    let mut stream = transaction
+                        .execute_streaming(groups)
+                        .await
+                        .map_err(from_spanner)?;
+                    let mut first_error = None;
                     while let Some(response) = stream.next().await {
-                        // A mid-stream transport error: the groups reported OK so far stay
-                        // committed (BatchWrite is non-atomic), so fold `applied` into the count.
-                        let response = match response {
-                            Ok(response) => response,
-                            Err(e) => {
-                                return Err(note_rows_already_committed(
-                                    from_spanner(e),
-                                    prior_total + applied,
-                                ));
-                            }
-                        };
-                        // An `OK` (or absent) status means the referenced groups applied; any other
-                        // status marks them failed — capture the first such failure to return.
+                        let response = response.map_err(from_spanner)?;
                         match response.status.as_ref().filter(|s| s.code != 0) {
                             None => applied += response.indexes.len() as i64,
                             Some(status) if first_error.is_none() => {
@@ -529,16 +498,13 @@ impl SpannerStatement {
                         }
                     }
                     match first_error {
-                        // A failing group is non-atomic with the rest, so the groups that did apply
-                        // (this chunk's `applied`, plus earlier chunks) are folded into the count.
-                        Some(error) => {
-                            Err(note_rows_already_committed(error, prior_total + applied))
-                        }
+                        Some(error) => Err(error),
                         None => Ok(applied),
                     }
                 },
             ),
         )
+        .map_err(|error| note_rows_already_committed(error, prior_total + applied))
     }
 }
 

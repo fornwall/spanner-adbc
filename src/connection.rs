@@ -189,7 +189,7 @@ impl SpannerConnection {
             &self.runtime,
             &self.client,
             &self.cancel.current(),
-            self.config.timeouts.query_timeout(),
+            &self.config,
             db_schema,
             table_name,
         )

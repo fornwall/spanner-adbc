@@ -4986,3 +4986,148 @@ fn conversion_error_ends_the_reader_in_first_and_later_batches() {
         );
     }
 }
+
+#[test]
+fn interrupted_batch_write_reports_confirmed_rows_and_unknown_outcome() {
+    let _watchdog = watchdog!();
+    for cancel_operation in [false, true] {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let server = MockServer::start(move |mock| {
+            mock.expect_batch_write().returning(move |_| {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tx.try_send(Ok(batch_write_groups_ok(vec![0, 1]))).unwrap();
+                started_tx.send(()).unwrap();
+                // Keep the stream open after two confirmed writes; group 2 has no outcome yet.
+                tokio::spawn(async move { tx.closed().await });
+                Ok(tonic::Response::new(rx))
+            });
+        });
+        let mut connection = server.connect();
+        let mut statement = append_ingest_statement(&mut connection);
+        statement
+            .set_option(
+                OptionStatement::Other(spanner_adbc::OPTION_INGEST_BATCH_WRITE.into()),
+                OptionValue::String("true".into()),
+            )
+            .unwrap();
+        statement
+            .set_option(
+                OptionStatement::Other(spanner_adbc::OPTION_RPC_TIMEOUT_UPDATE.into()),
+                OptionValue::Double(1.0),
+            )
+            .unwrap();
+        statement.bind(ingest_batch(3)).unwrap();
+        let cancel = statement.get_cancel_handle();
+        let canceller = std::thread::spawn(move || {
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if cancel_operation {
+                // Allow the first response to reach the driver before interrupting its next read.
+                std::thread::sleep(Duration::from_millis(200));
+                cancel.try_cancel().unwrap();
+            }
+        });
+        let error = statement.execute_update().unwrap_err();
+        canceller.join().unwrap();
+        assert_eq!(
+            error.status,
+            if cancel_operation {
+                AdbcStatus::Cancelled
+            } else {
+                AdbcStatus::Timeout
+            },
+            "{error}"
+        );
+        assert!(
+            error
+                .message
+                .contains("2 row(s) from this bulk ingest were already committed"),
+            "{error}"
+        );
+        assert!(error.message.contains("outcome is unknown"), "{error}");
+    }
+}
+
+#[test]
+fn ingest_table_probe_inherits_read_options_without_tags() {
+    let _watchdog = watchdog!();
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let recorded = queries.clone();
+    let server = MockServer::start(move |mock| {
+        mock.expect_execute_streaming_sql()
+            .returning(move |request| {
+                recorded.lock().unwrap().push(request.into_inner());
+                Ok(stream_of(vec![Ok(partial_result_set(
+                    true,
+                    &["MockTable"],
+                    b"t",
+                    true,
+                ))]))
+            });
+    });
+    let mut connection = server.connect();
+    for (key, value) in [
+        (spanner_adbc::OPTION_REQUEST_PRIORITY, "high"),
+        (spanner_adbc::OPTION_REQUEST_TAG, "user-request"),
+        (spanner_adbc::OPTION_TRANSACTION_TAG, "user-transaction"),
+        (spanner_adbc::OPTION_DIRECTED_READ, "include:us-east1"),
+    ] {
+        connection
+            .set_option(
+                OptionConnection::Other(key.into()),
+                OptionValue::String(value.into()),
+            )
+            .unwrap();
+    }
+    let mut statement = append_ingest_statement(&mut connection);
+    statement.bind(ingest_batch(0)).unwrap();
+    assert_eq!(statement.execute_update().unwrap(), Some(0));
+    let queries = queries.lock().unwrap();
+    assert_eq!(queries.len(), 1);
+    let query = &queries[0];
+    assert!(query.sql.contains("INFORMATION_SCHEMA.TABLES"));
+    let options = query.request_options.as_ref().unwrap();
+    assert_eq!(options.priority, v1::request_options::Priority::High as i32);
+    assert!(options.request_tag.is_empty());
+    assert!(options.transaction_tag.is_empty());
+    let Some(v1::directed_read_options::Replicas::IncludeReplicas(replicas)) = query
+        .directed_read_options
+        .as_ref()
+        .and_then(|options| options.replicas.as_ref())
+    else {
+        panic!("missing directed-read options")
+    };
+    assert_eq!(replicas.replica_selections[0].location, "us-east1");
+}
+
+#[test]
+fn ingest_table_probe_honors_retry_limit() {
+    let _watchdog = watchdog!();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let recorded = attempts.clone();
+    let server = MockServer::start(move |mock| {
+        mock.expect_execute_streaming_sql().returning(move |_| {
+            if recorded.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(tonic::Status::unavailable("probe unavailable"))
+            } else {
+                Ok(stream_of(vec![Ok(partial_result_set(
+                    true,
+                    &["MockTable"],
+                    b"t",
+                    true,
+                ))]))
+            }
+        });
+    });
+    let mut connection = server.connect();
+    connection
+        .set_option(
+            OptionConnection::Other(spanner_adbc::OPTION_RETRY_MAX_ATTEMPTS.into()),
+            OptionValue::Int(1),
+        )
+        .unwrap();
+    let mut statement = append_ingest_statement(&mut connection);
+    statement.bind(ingest_batch(0)).unwrap();
+    // A failed existence probe preserves the empty ingest's success, but must not retry.
+    assert_eq!(statement.execute_update().unwrap(), Some(0));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}

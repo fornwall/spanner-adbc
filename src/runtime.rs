@@ -125,8 +125,7 @@ impl CancelHandle for SlotCancelHandle {
 /// Shared diagnostic for synchronous waits and background fetches.
 fn cancelled_err() -> Error {
     err(
-        "operation cancelled: the ADBC cancel handle for this connection or statement was \
-         signalled; execute the operation again to retry it",
+        "operation cancelled by the ADBC cancel handle for this connection or statement",
         Status::Cancelled,
     )
 }
