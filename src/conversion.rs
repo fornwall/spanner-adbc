@@ -630,12 +630,8 @@ fn arrow_field_at(
     })
 }
 
-/// Whether an Arrow [`Field`] carries the canonical `arrow.json` extension on a string storage
-/// type. The bind path uses this to send such values as Spanner `JSON`-typed parameters, and ingest
-/// create modes to create `JSON` columns. The storage check matters: `arrow.json` is only defined
-/// over utf8-family storage, so a tag on any other type is ignored rather than mis-bound. A
-/// `Dictionary` looks through to its **value** type — the Arrow spec allows an extension array to be
-/// dictionary-encoded, and the bind path decodes that transparently.
+/// Recognize `arrow.json` only on string storage, looking through dictionary encoding.
+/// Binding and ingest DDL use this to preserve JSON types without accepting invalid tags.
 pub(crate) fn is_json_field(field: &Field) -> bool {
     let mut storage = field.data_type();
     while let DataType::Dictionary(_, value) = storage {

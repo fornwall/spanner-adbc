@@ -1,50 +1,15 @@
-//! Binding Arrow parameter data to Spanner statements — and converting Arrow rows to Spanner
-//! **mutations** for bulk ingest.
+//! Convert Arrow parameter rows and bulk-ingest rows to Spanner values.
 //!
-//! ADBC supplies statement parameters (and bulk-ingest rows) as an Arrow [`RecordBatch`]: each
-//! column is one parameter, and each row is one set of bindings. Spanner uses **named** query
-//! parameters (`@name`), so a bind column named `id` binds to `@id` in the SQL — how the
-//! column→parameter pairing is decided (positionally by default, or by name via the
-//! `adbc.statement.bind_by_name` option) is documented on [`resolve_parameter_names`]. Bulk ingest
-//! does not go through SQL at all: each bound row becomes one insert [`Mutation`] (see
-//! [`insert_mutation`]), whose cells use the exact same Arrow→Spanner value mapping
-//! ([`cell_value`]) as parameter binding.
+//! [`resolve_parameter_names`] maps columns to named SQL parameters; [`cell_value`] supplies the
+//! shared encoding for queries and mutations. Dictionaries are decoded before binding. Lists of
+//! supported scalars become arrays; nested arrays and structs are rejected.
 //!
-//! Supported Arrow parameter types are `Int8`/`Int16`/`Int32`/`Int64` and the unsigned widths that
-//! fit `i64` losslessly, `UInt8`/`UInt16`/`UInt32` (all → Spanner `INT64`; `UInt64` is unsupported
-//! — `u64::MAX` exceeds `i64::MAX`),
-//! `Float64`, `Float32`, `Float16` (→ Spanner `FLOAT32`; every `f16` is exactly representable in
-//! `f32`), `Boolean`, `Utf8`/`LargeUtf8`/`Utf8View`,
-//! `Binary`/`LargeBinary`/`BinaryView`/`FixedSizeBinary` (all → Spanner `BYTES`),
-//! `Date32`/`Date64` (→ `DATE`), `Timestamp` at any `TimeUnit`
-//! (Second/Millisecond/Microsecond/Nanosecond, → `TIMESTAMP`), `Decimal128` (→ `NUMERIC`), and
-//! their nulls. `List`/`LargeList` of any of those scalar element types binds to a Spanner
-//! `ARRAY<...>` (`ARRAY<INT64|FLOAT64|BOOL|STRING|BYTES|DATE|TIMESTAMP|NUMERIC>`), preserving
-//! per-element nulls and typed null arrays; `ARRAY<ARRAY<…>>` and `ARRAY<STRUCT>` element types are
-//! rejected. A `Dictionary` column of any key type binds transparently as its **value** type —
-//! dictionary encoding is a representation of the same logical values, not a different logical
-//! type (it is what pandas categorical columns produce over the C data interface), so
-//! `Dictionary(Int32, Utf8)` binds exactly like `Utf8`, each cell's key selecting the dictionary
-//! value to bind. Other Arrow types are rejected with an `InvalidArguments` error.
+//! Integers widen to INT64, except UInt64, which can exceed its range. Float16/Float32 widen
+//! losslessly. Strings, bytes, booleans, dates, timestamps and Decimal128 retain their values and
+//! nulls. Timestamps preserve the source unit's precision; decimal formatting uses the full i128.
 //!
-//! Spanner `TIMESTAMP` has **nanosecond** precision, so a `Timestamp` parameter is bound at its
-//! full source precision — nothing is truncated — and the default read path is symmetric, mapping
-//! Spanner `TIMESTAMP` back to Arrow `Timestamp(Nanosecond, "UTC")`. See
-//! [`spanner.max_timestamp_precision`](crate::OPTION_MAX_TIMESTAMP_PRECISION) for the range
-//! trade-off that mode carries.
-//!
-//! Spanner encodes `DATE` / `TIMESTAMP` / `NUMERIC` values on the wire as strings, and query
-//! parameters are sent untyped (Spanner infers the type from the SQL). So these three are formatted
-//! straight to their Spanner string forms — `YYYY-MM-DD`, RFC 3339, and a plain decimal — which
-//! keeps the full `Decimal128` (`i128`) range rather than routing through a narrower decimal type.
-//!
-//! **JSON.** A string column tagged with the canonical `arrow.json` extension (the metadata this
-//! driver emits when reading a `JSON` column) binds as a Spanner `JSON`-typed parameter instead of
-//! `STRING`, and a `List` whose element carries the tag binds as `ARRAY<JSON>`. This matters
-//! because Spanner does not coerce `STRING` parameters into `JSON` columns: without the explicit
-//! type, `INSERT … VALUES (@doc)` into a `JSON` column fails with a type mismatch (the untagged
-//! workaround is `PARSE_JSON(@doc)`). So tagged values round-trip. The tag is honoured through
-//! dictionary encoding too.
+//! Spanner infers parameter types except for `arrow.json`-tagged strings and list elements, which
+//! explicitly bind as `JSON` and `ARRAY<JSON>`. Mutations use the target column's type instead.
 
 use std::ops::Range;
 
@@ -68,11 +33,7 @@ use crate::conversion::is_json_field;
 use crate::error::invalid_argument;
 use crate::sql::{named_parameters, qualified_table, quote_ident};
 
-/// Bind the columns of `batch` at `row` to the query parameters named by `names`.
-///
-/// `names[i]` is the parameter that column `i` binds to; it is computed once per (sql, batch) by
-/// [`resolve_parameter_names`] and passed in, so binding many rows does not re-lex the SQL per row
-/// (an O(rows × |sql|) cost that dominated large bound DML).
+/// Bind one row using parameter names resolved once for the SQL and batch schema.
 pub(crate) fn bind_params(
     builder: StatementBuilder,
     names: &[String],
@@ -93,20 +54,11 @@ pub(crate) fn bind_params(
     Ok(builder)
 }
 
-/// Work out which parameter name each column of `batch` binds to for `sql`.
+/// Map bound columns to query parameters, resolving names once for reuse across rows.
 ///
-/// Selected by the `adbc.statement.bind_by_name` statement option, following the ADBC SQLite
-/// reference driver's convention (apache/arrow-adbc#3362):
-///
-/// - **Positionally** (`false`, the default — the ADBC ordinal contract): the *i*-th column binds
-///   to the *i*-th distinct `@name` parameter in query order; the counts must line up, and column
-///   names are ignored. This is what positional clients expect.
-/// - **By name** (`true`): each column binds to `@<its own name>`, order-independent. A column
-///   naming no query parameter is rejected with `InvalidArguments` (a parameter no column names is
-///   left unbound, which Spanner rejects at execution time).
-///
-/// Lexing the SQL to find its `@name` parameters is the expensive part, so callers resolve once per
-/// (sql, batch) and reuse the result across every row via [`bind_params`].
+/// Positional binding pairs columns with distinct parameters in query order and requires equal
+/// counts. By-name binding matches case-insensitively, rejecting unknown or duplicate columns;
+/// omitted query parameters remain unbound for Spanner to report.
 pub(crate) fn resolve_parameter_names(
     sql: &str,
     batch: &RecordBatch,
@@ -115,10 +67,7 @@ pub(crate) fn resolve_parameter_names(
     let schema = batch.schema();
     let params = named_parameters(sql);
 
-    // Strict by-name: every bound column must correspond to a query parameter. Spanner matches
-    // parameter names case-insensitively (`@p` binds from `P`), so the column->parameter lookup
-    // is case-insensitive too, and each column binds under the *query's* spelling — sending a
-    // second spelling of a name Spanner already knows buys nothing.
+    // Spanner matches case-insensitively; send each name using the query's spelling.
     if bind_by_name {
         let param_set: std::collections::HashMap<String, &str> = params
             .iter()
@@ -136,8 +85,7 @@ pub(crate) fn resolve_parameter_names(
                      bind positionally",
                 )));
             };
-            // Two columns differing only in case name one parameter; Spanner would reject the
-            // resulting request with "Duplicate parameter name", so say so here instead.
+            // Reject duplicate bindings before Spanner sees the request.
             if !bound.insert(*param) {
                 return Err(invalid_argument(format!(
                     "cannot bind column {column:?}: it names the same query parameter {param:?} as \
@@ -150,7 +98,6 @@ pub(crate) fn resolve_parameter_names(
         return Ok(resolved);
     }
 
-    // Positional (the default): i-th column -> i-th parameter. Counts must line up.
     if params.len() != batch.num_columns() {
         return Err(invalid_argument(format!(
             "parameter count mismatch: query references {} parameter(s) {:?} but {} column(s) were bound",
@@ -162,8 +109,7 @@ pub(crate) fn resolve_parameter_names(
     Ok(params)
 }
 
-/// Bind a single `column` value at `row` as parameter `name`. `field` is the column's schema
-/// field, consulted for the `arrow.json` extension tag (see the module doc's JSON section).
+/// Bind one cell, adding an explicit type when its field carries JSON metadata.
 fn bind_one(
     builder: StatementBuilder,
     name: &str,
@@ -178,15 +124,8 @@ fn bind_one(
     })
 }
 
-/// Build the **insert [`Mutation`]** that ingests `row` of `batch` into `table` (the
-/// mutation-form table name from [`mutation_table`]).
-///
-/// Every cell goes through the exact same Arrow→Spanner mapping as parameter binding
-/// ([`cell_value`]), so ingest and parameter binding cannot drift. Mutation values carry no
-/// per-value type — Spanner coerces each from the target *column's* declared type — so the
-/// explicit JSON parameter type that DML binding needs is unnecessary here: an
-/// `arrow.json`-tagged string lands in a `JSON` column as its plain string encoding. Column names
-/// travel as raw proto strings (no SQL, no quoting), so any valid Spanner column name works.
+/// Build an insert mutation using the same value encoding as query parameters.
+/// Mutation values take their type from the target column; column names are unquoted.
 pub(crate) fn insert_mutation(table: &str, batch: &RecordBatch, row: usize) -> Result<Mutation> {
     let mut builder = Mutation::new_insert_builder(table);
     for (i, field) in batch.schema().fields().iter().enumerate() {
@@ -196,10 +135,7 @@ pub(crate) fn insert_mutation(table: &str, batch: &RecordBatch, row: usize) -> R
     Ok(builder.build())
 }
 
-/// The table name a [`Mutation`] targets. Mutations name the table directly in the `Commit` RPC —
-/// there is no surrounding SQL, so no backtick quoting (unlike [`qualified_table`]) — and a named
-/// schema qualifies it with a plain dot. An empty/absent schema targets Spanner's default, unnamed
-/// schema.
+/// Qualify a mutation table with its schema, without SQL identifier quoting.
 pub(crate) fn mutation_table(db_schema: Option<&str>, table_name: &str) -> String {
     match db_schema.filter(|s| !s.is_empty()) {
         Some(schema) => format!("{schema}.{table_name}"),
@@ -207,13 +143,7 @@ pub(crate) fn mutation_table(db_schema: Option<&str>, table_name: &str) -> Strin
     }
 }
 
-/// Convert one Arrow cell to its Spanner wire [`Value`], plus the explicit parameter [`Type`] that
-/// must accompany it when bound as a query parameter (`Some` only for `JSON` / `ARRAY<JSON>` — see
-/// the module doc's JSON section; mutation values ignore it).
-///
-/// This is the single Arrow→Spanner value mapping, shared by parameter binding ([`bind_one`]) and
-/// mutation-based bulk ingest ([`insert_mutation`]). `name` labels the column/parameter in error
-/// messages only.
+/// Encode a cell for a query or mutation. Only JSON parameters need an explicit wire type.
 fn cell_value(
     name: &str,
     field: &Field,
@@ -222,8 +152,6 @@ fn cell_value(
 ) -> Result<(Value, Option<Type>)> {
     let data_type = column.data_type();
     match data_type {
-        // ARRAY<...>: an Arrow `List`/`LargeList` maps to a Spanner array. See
-        // [`list_cell_value`] — nested arrays and STRUCT elements are rejected there.
         DataType::List(item) => {
             let list = column.as_list::<i32>();
             let offsets = list.value_offsets();
@@ -246,12 +174,7 @@ fn cell_value(
             });
             list_cell_value(name, item, elem)
         }
-        // A dictionary-encoded column is an index encoding of the same logical values, not a
-        // different logical type (see the module doc), so it binds as its *value* type: the key at
-        // `row` selects the dictionary value, which re-enters this same mapping — every bindable
-        // type, scalar or `ARRAY<...>`, is thereby accepted encoded, and an unsupported value type
-        // is rejected with the same error as its plain form. A null cell binds as NULL, its value
-        // type still validated so a bad schema fails loudly on every row.
+        // Decode recursively, validating the logical type for null keys too.
         DataType::Dictionary(_, _) => downcast_dictionary_array!(
             column => match column.key(row) {
                 Some(value_row) => cell_value(name, field, column.values().as_ref(), value_row),
@@ -262,73 +185,40 @@ fn cell_value(
         _ => {
             let bind = scalar_binder(name, data_type)?;
             let value = bind(name, data_type, column, row)?;
-            // JSON is the only type needing an explicit param type; `is_json_field` is true only
-            // for `arrow.json`-tagged string columns, so this is `None` for every other type.
             Ok((value, is_json_field(field).then(types::json)))
         }
     }
 }
 
-/// The per-element Arrow→Spanner scalar encoder returned by [`scalar_binder`]: given the parameter
-/// `name` (for error messages), the element's Arrow [`DataType`] (equal to the array's own type —
-/// consulted for the `Timestamp` unit / `Decimal128` scale), the array, and an element index, it
-/// produces that element's Spanner [`Value`]. The data type must match the validated type passed
-/// to [`scalar_binder`]. A plain `fn` (the arms capture nothing), so
-/// dispatching once per cell and reusing the result across an array's elements costs no allocation.
+/// Allocation-free scalar encoder. The data type must match the validated type supplied to
+/// [`scalar_binder`]; arrays reuse the encoder across all their elements.
 type ScalarBinder = fn(&str, &DataType, &dyn Array, usize) -> Result<Value>;
 
-/// The **single** Arrow→Spanner scalar-value mapping — the one place a scalar type's encoding
-/// lives.
-///
-/// Returns the [`ScalarBinder`] for a scalar Arrow `data_type` (reading element `i` of an array of
-/// that type into a Spanner scalar [`Value`], nulls preserved), rejecting unsupported types and
-/// decimal scales before examining values. Both binding paths use it: [`cell_value`] for scalar
-/// parameters and [`list_cell_value`] for array elements.
-///
-/// **Adding a new Arrow scalar type touches these sites** (keep them in lockstep):
-///   1. **here** (`scalar_binder`) — the Arrow→Spanner *value* mapping, shared by the scalar and
-///      array-element binds;
-///   2. [`spanner_column_type`] — the Arrow→Spanner *column* type for the ingest `CREATE TABLE`;
-///   3. [`spanner_field_type`] — only if the type needs field-aware handling (as `arrow.json` does);
-///   4. the read path in [`crate::conversion`] — the reverse Spanner→Arrow mapping, so values
-///      round-trip;
-///   5. the module-level doc list of supported types (top of this file).
-///
-/// (A new *container* kind — beyond `List`/`LargeList` — is instead added to [`cell_value`].)
+/// Select the shared scalar encoder, rejecting unsupported types and decimal scales even for
+/// null values. Keep new type support aligned with [`spanner_column_type`] and the read mapping.
 fn scalar_binder(name: &str, data_type: &DataType) -> Result<ScalarBinder> {
     let bind: ScalarBinder = match data_type {
-        // Spanner's only integer type is INT64, so every Arrow int width widens to it; both Arrow
-        // floats map to FLOAT64 (f32 widens losslessly).
+        // Spanner uses INT64; smaller integer and float widths widen losslessly.
         DataType::Int64 => primitive_binder::<Int64Type, i64>(),
         DataType::Int32 => primitive_binder::<Int32Type, i64>(),
         DataType::Int16 => primitive_binder::<Int16Type, i64>(),
         DataType::Int8 => primitive_binder::<Int8Type, i64>(),
-        // The unsigned integer widths that fit `i64` losslessly (`u8`/`u16`/`u32`, whose max
-        // 4_294_967_295 < `i64::MAX`) widen to Spanner INT64 via `i64::from`, exactly like the
-        // signed widths. `UInt64` is deliberately absent: `u64::MAX` (1.8e19) exceeds `i64::MAX`
-        // (9.2e18), so there is no lossless `From<u64>` for `i64` and no INT64 mapping for it.
+        // UInt64 is excluded because its range exceeds INT64.
         DataType::UInt32 => primitive_binder::<UInt32Type, i64>(),
         DataType::UInt16 => primitive_binder::<UInt16Type, i64>(),
         DataType::UInt8 => primitive_binder::<UInt8Type, i64>(),
         DataType::Float64 => primitive_binder::<Float64Type, f64>(),
         DataType::Float32 => primitive_binder::<Float32Type, f64>(),
-        // Spanner has no 16-bit float, but every `f16` is exactly representable in `f32` (and so
-        // in `f64`), so a half-float widens losslessly the way the narrow integers widen to INT64.
         DataType::Float16 => primitive_binder::<Float16Type, f64>(),
         DataType::Boolean => {
             |_, _, a, i| Ok(scalar_value(a.is_null(i), || a.as_boolean().value(i)))
         }
-        // `Utf8`/`LargeUtf8` differ only in offset width; both map to Spanner STRING (LargeUtf8 is
-        // what Arrow-native producers commonly emit, e.g. `pyarrow.Table.from_pandas`). JSON typing
-        // is applied by the caller, not here.
         DataType::Utf8 => {
             |_, _, a, i| Ok(scalar_value(a.is_null(i), || a.as_string::<i32>().value(i)))
         }
         DataType::LargeUtf8 => {
             |_, _, a, i| Ok(scalar_value(a.is_null(i), || a.as_string::<i64>().value(i)))
         }
-        // `Utf8View`/`BinaryView` are the German-string layouts newer Arrow producers (polars,
-        // pyarrow 16+ with view types) emit by default; same Spanner mapping as their offset kin.
         DataType::Utf8View => {
             |_, _, a, i| Ok(scalar_value(a.is_null(i), || a.as_string_view().value(i)))
         }
@@ -341,9 +231,6 @@ fn scalar_binder(name: &str, data_type: &DataType) -> Result<ScalarBinder> {
         DataType::BinaryView => {
             |_, _, a, i| Ok(scalar_value(a.is_null(i), || a.as_binary_view().value(i)))
         }
-        // `FixedSizeBinary(n)` is a byte string of a fixed width; it maps to Spanner BYTES exactly
-        // like the variable-width binary kinds (the width is a layout detail Spanner does not carry
-        // — a BYTES column has no fixed length — so the read path returns plain `Binary`).
         DataType::FixedSizeBinary(_) => |_, _, a, i| {
             Ok(scalar_value(a.is_null(i), || {
                 a.as_fixed_size_binary().value(i)
@@ -363,9 +250,6 @@ fn scalar_binder(name: &str, data_type: &DataType) -> Result<ScalarBinder> {
                 )
             })
         },
-        // Spanner `TIMESTAMP` is UTC with nanosecond precision, so every Arrow timestamp unit is
-        // accepted; `timestamp_value` reads the raw i64 from the unit's typed array and
-        // `timestamp_string` formats the Spanner value at the unit's full precision.
         DataType::Timestamp(_, _) => |name, dt, a, i| {
             let DataType::Timestamp(unit, _) = dt else {
                 unreachable!("scalar_binder dispatched a Timestamp arm on {dt:?}")
@@ -386,15 +270,7 @@ fn scalar_binder(name: &str, data_type: &DataType) -> Result<ScalarBinder> {
                 }))
             }
         }
-        // A `Null`-typed column has no values by definition: every cell binds as NULL. This is
-        // the shape ADBC's own contract produces — `get_parameter_schema` types an undetermined
-        // parameter `Null` (adbc.h: "the type of the corresponding field will be NA"), so a
-        // client that builds its bind batch from the reported schema hands back `Null`-typed
-        // columns; pyarrow likewise infers `Null` for an all-None parameter set. The NULL goes
-        // on the wire untyped — `add_param` declares no parameter types for *any* bind — and
-        // Spanner infers the type from the SQL context, exactly as it does for a NULL cell of a
-        // typed column. Deliberately not `a.is_null(i)`: a `NullArray` carries no validity
-        // buffer, so Arrow's *physical* `is_null` reports `false` for its all-null cells.
+        // NullArray has no validity buffer, so its physical `is_null` returns false.
         DataType::Null => |_, _, _, _| Ok(null_value()),
         _ => {
             return Err(invalid_argument(format!(
@@ -405,14 +281,7 @@ fn scalar_binder(name: &str, data_type: &DataType) -> Result<ScalarBinder> {
     Ok(bind)
 }
 
-/// The [`ScalarBinder`] for an Arrow primitive type `T` whose values bind as the Spanner-native
-/// `V` they convert into — `i64` for every Arrow integer width, `f64` for both float widths. The
-/// conversion is [`From`], so it is always lossless (and the identity for `Int64`/`Float64`), and
-/// nulls are preserved by [`scalar_value`] as for every other scalar.
-///
-/// The returned closure captures nothing — `T`/`V` are generic parameters, not captures — so it
-/// coerces to the plain `fn` pointer a [`ScalarBinder`] is, keeping [`scalar_binder`]'s dispatch
-/// table allocation-free.
+/// Widen a primitive through `From`, preserving nulls and returning a plain function pointer.
 fn primitive_binder<T, V>() -> ScalarBinder
 where
     T: ArrowPrimitiveType,
@@ -425,12 +294,7 @@ where
     }
 }
 
-/// The NULL bind for a null dictionary-encoded cell. The dictionary's *value* type is still
-/// validated — an unsupported value type is rejected on every row, null or not, matching the other
-/// arms of [`cell_value`] (the `Decimal128` scale precedent) — and a `List`-valued dictionary
-/// keeps [`list_cell_value`]'s typed-null-array handling. `field` is the dictionary column's own
-/// field: an `arrow.json` tag on it keeps the explicit `JSON` param type on the null, exactly as
-/// the plain scalar arm does for a typed null.
+/// Validate a null dictionary cell's logical type and retain its JSON parameter type.
 fn null_dictionary_value(
     name: &str,
     field: &Field,
@@ -453,13 +317,7 @@ fn null_value() -> Value {
     None::<bool>.to_value()
 }
 
-/// Convert a scalar (or a null) to its Spanner wire [`Value`].
-///
-/// The bound is [`Into<Value>`] rather than [`ToValue`] deliberately: `Into` **consumes** the
-/// scalar, so an owned `String` (the `DATE`/`TIMESTAMP`/`NUMERIC` encodings) moves into the wire
-/// value, where `ToValue` takes `&self` and would copy it. Borrowed scalars (`&str`, `&[u8]`) still
-/// convert through the client's blanket `impl<T: ToValue + ?Sized> From<&T> for Value`, so every
-/// type a [`ScalarBinder`] produces is accepted either way.
+/// Encode a scalar or null. `Into<Value>` consumes owned strings; `ToValue` would copy them.
 fn scalar_value<T: Into<Value>>(is_null: bool, value: impl FnOnce() -> T) -> Value {
     if is_null {
         null_value()
@@ -480,15 +338,8 @@ fn try_scalar_value<T: Into<Value>>(
     })
 }
 
-/// Convert an Arrow `List`/`LargeList` cell to a Spanner `ARRAY<...>` wire [`Value`].
-///
-/// `item` is the list's element field: its data type selects the [`scalar_binder`] mapping (an
-/// `arrow.json` tag on a string element types the whole array as `ARRAY<JSON>`), and `elem` is the
-/// child array and index range for this row, or `None` for a null cell. Borrowing the range avoids
-/// allocating a sliced array for each bound cell. Elements use the same scalar encoder, preserving
-/// nulls. The
-/// element type is validated up front, so an unsupported element — including a nested
-/// `ARRAY<ARRAY<…>>` or `ARRAY<STRUCT>` — is rejected even for an empty or null array.
+/// Encode a list cell from its borrowed child range, avoiding a sliced array allocation.
+/// `None` means a null array. Validate element types even for empty and null arrays.
 fn list_cell_value(
     name: &str,
     item: &Field,
@@ -498,10 +349,8 @@ fn list_cell_value(
     let bind = scalar_binder(name, item_type)
         .map_err(|error| crate::error::annotate(error, |m| format!("ARRAY element: {m}")))?;
     let value = match elem {
-        // A null cell is a null array; each present element keeps its own null via `scalar_binder`.
         None => null_value(),
-        // `Value::from(Vec<Value>)` consumes the elements (`impl<T: Into<Value>> From<Vec<T>>`);
-        // `Vec::to_value` would deep-copy every one of them instead.
+        // Consume the elements; `ToValue` would deep-copy them.
         Some((values, range)) => Value::from(
             range
                 .map(|i| bind(name, item_type, values, i))
@@ -561,15 +410,8 @@ fn numeric_scale(name: &str, scale: i8) -> Result<u32> {
         })
 }
 
-/// Convert an Arrow timestamp `value` in `unit` to the Spanner `TIMESTAMP` wire form — an RFC 3339
-/// string in UTC, carrying the source unit's **full** precision so nothing is lost.
-///
-/// Spanner `TIMESTAMP` has nanosecond precision (up to nine fractional digits), so the fractional
-/// second is formatted to exactly as many digits as the unit carries: nine for `Nanosecond`, six
-/// for `Microsecond`, three for `Millisecond`, none for `Second`. A `Nanosecond` value is decoded
-/// via [`DateTime::from_timestamp_nanos`], preserving its sub-microsecond digits (a negative value
-/// therefore renders as its exact instant, e.g. `-1 ns` → `…59.999999999Z`, not truncated toward
-/// zero). `name` is used only for the out-of-range error message.
+/// Format a UTC timestamp at its source precision, rejecting years outside Spanner's range.
+/// Negative subsecond values retain their exact instant (for example, -1 ns ends in .999999999Z).
 fn timestamp_string(name: &str, unit: &TimeUnit, value: i64) -> Result<String> {
     let (ts, format) = match unit {
         TimeUnit::Second => (
@@ -616,19 +458,11 @@ fn numeric_string(unscaled: i128, scale: u32) -> String {
     )
 }
 
-/// Map an Arrow parameter/ingest type to the Spanner column type used when creating a table.
-///
-/// This mirrors the read path's Spanner→Arrow mapping. Narrower integers collapse to `INT64`
-/// (Spanner's only integer type); `List` becomes a Spanner `ARRAY<...>`. Types with no Spanner
-/// column representation are rejected.
+/// Map an Arrow ingest type to its Spanner column type, rejecting unsupported types.
 pub(crate) fn spanner_column_type(data_type: &DataType) -> Result<String> {
     Ok(match data_type {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "INT64".to_string(),
-        // The unsigned widths that fit `i64` losslessly widen to INT64 too (see `scalar_binder`);
-        // `UInt64` has no INT64 mapping and is rejected below.
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => "INT64".to_string(),
-        // `Float16` has no Spanner counterpart, but widens losslessly into FLOAT32 (see
-        // `scalar_binder`), so it creates the same column as `Float32`.
         DataType::Float16 | DataType::Float32 => "FLOAT32".to_string(),
         DataType::Float64 => "FLOAT64".to_string(),
         DataType::Boolean => "BOOL".to_string(),
@@ -643,8 +477,6 @@ pub(crate) fn spanner_column_type(data_type: &DataType) -> Result<String> {
         DataType::List(field) | DataType::LargeList(field) => {
             format!("ARRAY<{}>", spanner_column_type(field.data_type())?)
         }
-        // The encoding is transparent (see [`cell_value`]): a dictionary-encoded ingest column
-        // creates a column of its value type.
         DataType::Dictionary(_, value) => spanner_column_type(value)?,
         other => {
             return Err(invalid_argument(format!(
@@ -655,10 +487,7 @@ pub(crate) fn spanner_column_type(data_type: &DataType) -> Result<String> {
     })
 }
 
-/// Map an Arrow ingest field to the Spanner column type used when creating a table — like
-/// [`spanner_column_type`], but field-aware: a string field tagged with the `arrow.json` extension
-/// becomes a `JSON` column (and a tagged list element `ARRAY<JSON>`), matching how [`bind_one`]
-/// binds such values as `JSON`-typed parameters (which Spanner would reject in a `STRING` column).
+/// Preserve JSON field and list-element metadata when choosing an ingest column type.
 fn spanner_field_type(field: &Field) -> Result<String> {
     if is_json_field(field) {
         return Ok("JSON".to_string());
@@ -676,19 +505,11 @@ fn spanner_field_type(field: &Field) -> Result<String> {
     }
 }
 
-/// Build a `CREATE TABLE` statement for bulk ingest from the data's Arrow `schema`.
+/// Build ingest DDL, optionally qualified by schema and guarded by `IF NOT EXISTS`.
 ///
-/// Every data column maps to its Spanner type via [`spanner_field_type`], and the statement carries
-/// **no `PRIMARY KEY` clause**: Spanner creates such a table with an implicit hidden `rowid` key of
-/// its own
-/// (<https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys>),
-/// which no `SELECT *` returns — so the created table reads back as exactly the Arrow schema that
-/// built it. Arrow ingest data carries no key, and inventing one is not the driver's call: a
-/// primary key fixes Spanner's physical row layout, so choosing it belongs in the `CREATE TABLE`
-/// the user writes, followed by an `append` ingest.
-///
-/// Pass `if_not_exists` for `create_append` mode. `db_schema` (the `adbc.ingest.target_db_schema`
-/// option) optionally qualifies the created table with a named schema.
+/// With no primary key in the Arrow schema, omit `PRIMARY KEY` so Spanner supplies its hidden
+/// rowid key (<https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys>).
+/// Callers needing a specific key should create the table themselves and ingest in append mode.
 pub(crate) fn create_table_sql(
     table: &str,
     db_schema: Option<&str>,
@@ -697,8 +518,6 @@ pub(crate) fn create_table_sql(
 ) -> Result<String> {
     let mut columns: Vec<String> = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
-        // Name the offending column: the rejection is per-field, and a wide ingest schema gives
-        // the caller no other way to find which of its columns has no Spanner type.
         let column_type = spanner_field_type(field).map_err(|e| {
             crate::error::annotate(e, |m| format!("ingest column {:?}: {m}", field.name()))
         })?;
