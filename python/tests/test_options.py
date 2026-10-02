@@ -187,15 +187,54 @@ def test_option_enum_values_are_usable_as_kwargs_keys():
     assert StatementOptions.ROWS_PER_BATCH.value == "spanner.rows_per_batch"
 
 
+@pytest.mark.parametrize("enum_cls", [DatabaseOptions, ConnectionOptions, StatementOptions])
+def test_option_members_behave_as_wire_strings(enum_cls):
+    for member in enum_cls:
+        assert isinstance(member, str)
+        assert member == member.value
+        assert hash(member) == hash(member.value)
+        assert str(member) == member.value
+        assert "%s" % member == member.value
+        assert f"{member}" == member.value
+        assert "{}".format(member) == member.value
+        assert f"{member:>80}" == f"{member.value:>80}"
+        assert dict(**{member: "configured"}) == {member.value: "configured"}
+
+
+def test_low_level_connect_accepts_option_members_directly(monkeypatch):
+    calls = []
+    database = object()
+
+    def make_database(**kwargs):
+        calls.append(kwargs)
+        return database
+
+    monkeypatch.setattr(spanner_adbc, "_driver_path", lambda: "/driver.so")
+    monkeypatch.setattr(spanner_adbc.adbc_driver_manager, "AdbcDatabase", make_database)
+    options = {
+        DatabaseOptions.URI: "spanner:///projects/p/instances/i/databases/d",
+        DatabaseOptions.EMULATOR: "true",
+    }
+    assert spanner_adbc.connect(db_kwargs=options) is database
+    assert calls == [
+        {
+            "driver": "/driver.so",
+            "entrypoint": spanner_adbc.ENTRYPOINT,
+            "uri": "spanner:///projects/p/instances/i/databases/d",
+            "spanner.emulator": "true",
+        }
+    ]
+
+
 def test_connection_option_round_trips_through_kwargs(emulator_database):
     """A ``spanner.*`` vendor option passed via ``conn_kwargs`` takes effect
     end-to-end: it round-trips through ``get_option`` and a query runs under it."""
     conn = spanner.connect(
         db_kwargs={
-            DatabaseOptions.URI.value: f"spanner:///{emulator_database}",
-            DatabaseOptions.EMULATOR.value: "true",
+            DatabaseOptions.URI: f"spanner:///{emulator_database}",
+            DatabaseOptions.EMULATOR: "true",
         },
-        conn_kwargs={ConnectionOptions.REQUEST_TAG.value: "adbc-py-e2e"},
+        conn_kwargs={ConnectionOptions.REQUEST_TAG: "adbc-py-e2e"},
         autocommit=True,
     )
     try:
@@ -205,7 +244,7 @@ def test_connection_option_round_trips_through_kwargs(emulator_database):
             == "adbc-py-e2e"
         )
         # And a query still runs with the option in effect.
-        with conn.cursor() as cur:
+        with conn.cursor(adbc_stmt_kwargs={StatementOptions.ROWS_PER_BATCH: "1024"}) as cur:
             cur.execute("SELECT 1 AS one")
             assert cur.fetchone()[0] == 1
     finally:

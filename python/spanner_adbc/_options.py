@@ -1,8 +1,9 @@
 """Typed option-key constants for the Spanner ADBC driver.
 
-These enums mirror the style of the BigQuery ADBC driver's ``DatabaseOptions`` /
-``StatementOptions``: each member's ``.value`` is the raw option-key string the
-driver understands. Every driver setting is passed as one of these keys — through
+These ``StrEnum`` members are the raw option-key strings the driver understands.
+They can be used directly as dictionary keys, and ``str()`` and formatting return
+the option key on every supported Python version. ``.value`` also remains usable.
+Every driver setting is passed as one of these keys — through
 ``db_kwargs=`` / ``conn_kwargs=`` on :func:`spanner_adbc.dbapi.connect`, or
 ``adbc_stmt_kwargs=`` on ``conn.cursor(...)`` — and these enums make that
 discoverable and typo-safe.
@@ -13,11 +14,11 @@ Example::
     from spanner_adbc import ConnectionOptions, DatabaseOptions, StatementOptions
 
     with spanner.connect(
-        db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d"},
-        conn_kwargs={ConnectionOptions.READ_STALENESS.value: "max:10s"},
+        db_kwargs={DatabaseOptions.URI: "spanner:///projects/p/instances/i/databases/d"},
+        conn_kwargs={ConnectionOptions.READ_STALENESS: "max:10s"},
     ) as conn:
         cur = conn.cursor(
-            adbc_stmt_kwargs={StatementOptions.ROWS_PER_BATCH.value: "1024"}
+            adbc_stmt_kwargs={StatementOptions.ROWS_PER_BATCH: "1024"}
         )
 
 Standard ADBC option keys (``adbc.*``) live in ``adbc_driver_manager``; a few that
@@ -30,12 +31,12 @@ import enum
 __all__ = ["DatabaseOptions", "ConnectionOptions", "StatementOptions"]
 
 
-class DatabaseOptions(enum.Enum):
+class DatabaseOptions(enum.StrEnum):
     """Database-level options (set before connecting, via ``db_kwargs``)."""
 
     #: **Standard ADBC.** A ``spanner://`` connection URI whose path is the fully-qualified
     #: database path, ``spanner:///projects/<p>/instances/<i>/databases/<d>``. The scheme is
-    #: required; a bare path is rejected. Also settable as the ``uri`` kwarg on ``connect``.
+    #: required; a bare path is rejected. Pass it through ``db_kwargs`` on ``connect``.
     URI = "uri"
     #: Override the Spanner gRPC endpoint (e.g. an emulator ``host:port``).
     ENDPOINT = "spanner.endpoint"
@@ -64,7 +65,7 @@ class DatabaseOptions(enum.Enum):
     QUOTA_PROJECT = "spanner.auth.quota_project"
 
 
-class ConnectionOptions(enum.Enum):
+class ConnectionOptions(enum.StrEnum):
     """Connection-level options (set via ``conn_kwargs``)."""
 
     #: Standard ADBC. ``"false"`` enters buffer-and-commit manual-transaction mode.
@@ -114,7 +115,7 @@ class ConnectionOptions(enum.Enum):
     RETRY_BACKOFF_MULTIPLIER = "spanner.retry.backoff.multiplier"
 
 
-class StatementOptions(enum.Enum):
+class StatementOptions(enum.StrEnum):
     """Statement-level options (set via ``conn.cursor(adbc_stmt_kwargs=...)``).
 
     The options shared with :class:`ConnectionOptions` are per-statement overrides

@@ -96,7 +96,7 @@ Pass explicit credentials in `db_kwargs` alongside `DatabaseOptions.URI.value`:
 | `DatabaseOptions.ACCESS_TOKEN` | OAuth bearer token; never refreshed |
 | `DatabaseOptions.IMPERSONATE_TARGET_PRINCIPAL` | Service account to impersonate using ADC or explicit base credentials |
 
-Use each enum member's `.value` as the key. `ACCESS_TOKEN` cannot be combined with key-file
+Use each enum member directly as the key, or use its `.value`. `ACCESS_TOKEN` cannot be combined with key-file
 credentials or impersonation. See the [option reference][options] for scopes and other auth settings.
 
 For the [Spanner emulator](https://cloud.google.com/spanner/docs/emulator), use anonymous mode:
@@ -124,6 +124,10 @@ Emulator mode rejects explicit credential options; ambient ADC is ignored.
 | `autocommit` | `False` by default; see [Transactions](#transactions) |
 
 Use `DatabaseOptions`, `ConnectionOptions`, and `StatementOptions` enums, or raw option keys.
+These are `StrEnum` members: `str(DatabaseOptions.URI)` and `f"{DatabaseOptions.URI}"`
+both produce `"uri"` on every supported Python version. Members work directly as dictionary
+keys; `.value` remains useful for driver-manager getters whose Cython arguments require an
+exact `str` rather than a subclass.
 The [option reference][options] lists types, defaults, and accepted values. Set cursor options with
 `conn.cursor(adbc_stmt_kwargs={...})` or `cur.adbc_statement.set_options(**{...})`.
 
@@ -134,12 +138,12 @@ import spanner_adbc.dbapi as spanner
 from spanner_adbc import ConnectionOptions, DatabaseOptions, StatementOptions
 
 with spanner.connect(
-    db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d"},
-    conn_kwargs={ConnectionOptions.READ_STALENESS.value: "max:10s"},
+    db_kwargs={DatabaseOptions.URI: "spanner:///projects/p/instances/i/databases/d"},
+    conn_kwargs={ConnectionOptions.READ_STALENESS: "max:10s"},
     autocommit=True,  # bounded staleness on a single-use read
 ) as conn:
     with conn.cursor(
-        adbc_stmt_kwargs={StatementOptions.ROWS_PER_BATCH.value: "1024"}
+        adbc_stmt_kwargs={StatementOptions.ROWS_PER_BATCH: "1024"}
     ) as cur:
         cur.execute("SELECT * FROM Singers")
 ```
