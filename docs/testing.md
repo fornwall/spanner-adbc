@@ -51,10 +51,9 @@ containers they created. A container-name collision fails without disturbing the
 container; choose another `SPANNER_EMULATOR_CONTAINER` (and `TOXIPROXY_CONTAINER` for fault tests)
 if needed. Published ports bind to localhost. Tests use `test-project/test-instance/adbc-test`.
 
-Keep the emulator's gRPC/admin ports at **9010/9020**: the pinned Rust client derives the admin
-endpoint from the gRPC endpoint. Changing the helper's port variables does not change that
-mapping. Parallel emulators can use distinct Docker-network IPs with their internal ports and
-unique container names.
+The emulator wrapper rejects gRPC/admin ports other than **9010/9020**: the pinned Rust client
+derives the admin endpoint from the gRPC endpoint. Parallel emulators can use distinct
+Docker-network IPs with their internal ports and unique container names.
 
 For a real database, unset `SPANNER_EMULATOR_HOST` and use Application Default Credentials:
 
