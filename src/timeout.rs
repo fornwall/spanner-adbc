@@ -1,18 +1,6 @@
-//! RPC timeout options (`spanner.rpc.timeout_seconds.{query,update,fetch}`).
-//!
-//! The ADBC traits are synchronous and every driver call bridges into the async Spanner client via
-//! `block_on` (see [`crate::runtime`]), so without a deadline a hung RPC blocks the calling thread
-//! indefinitely, with `cancel` as the only escape. These three options bound the driver's
-//! Spanner-facing operations; which sites each one covers, and their value grammar and defaults,
-//! are documented on the `OPTION_RPC_TIMEOUT_*` constants and in `docs/options.md`.
-//!
-//! Enforcement is an **overall deadline** per operation via [`tokio::time::timeout`]
-//! ([`with_timeout`]), not a per-attempt gax timeout: the bound covers the whole driver-side
-//! operation, including any retries the client performs inside it. An expired deadline surfaces as
-//! [`Status::Timeout`]. Unlike the request tag/priority options — which deliberately leave the
-//! driver-internal metadata queries untouched — these timeouts bound every driver-side network
-//! path, DDL (an admin long-running operation) and the metadata queries included, so none can hang
-//! unboundedly.
+//! Overall deadlines for query, update and fetch operations, including internal metadata and
+//! DDL. Each deadline covers the operation's retries and returns [`Status::Timeout`] on expiry.
+//! Unset or zero values disable the deadline. See `docs/options.md` for option details.
 
 use std::future::Future;
 use std::time::Duration;

@@ -1,18 +1,5 @@
-//! Request priority and request/transaction tag options, plus the related commit-batching,
-//! commit-stats and change-stream-exclusion knobs.
-//!
-//! Spanner lets every request carry [`RequestOptions`](google_cloud_spanner::model::RequestOptions):
-//! a **priority** that Spanner's scheduler uses to arbitrate CPU between workloads, a free-form
-//! **request tag** surfaced in query and transaction statistics, and a **transaction tag** attached
-//! to every operation of a read/write transaction. This module parses the driver options that
-//! expose them and applies the stored values onto the client's builders; their grammar, defaults,
-//! level and round-trip behaviour are documented on the `OPTION_*` constants and in
-//! `docs/options.md`.
-//!
-//! Driver-internal metadata queries (`get_objects`, `get_statistics`, `get_table_schema`) do carry
-//! the **priority** — a user who deprioritized their workload meant the driver's own full-table
-//! scans too — but are deliberately left **untagged**: tags attribute the user's own statements in
-//! Spanner's introspection tables (see [`RequestConfig::apply_priority_to_statement`]).
+//! Request priority, tags and commit options. See `docs/options.md` for the option contract.
+//! Internal metadata queries inherit priority but omit tags, which attribute user statements.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,34 +22,11 @@ use crate::staleness::parse_duration;
 /// validate the same bound at set time for a clean `InvalidArguments` instead of a commit error.
 const MAX_COMMIT_DELAY_CAP: Duration = Duration::from_millis(500);
 
-/// A parsed `spanner.request.priority` value. A driver-owned enum (rather than the client's
-/// non-exhaustive [`Priority`]) so the parsing is unit-testable offline; the option string
-/// `get_option` reports is the raw one kept beside it (see [`RawParsed`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RequestPriority {
-    Low,
-    Medium,
-    High,
-}
-
-impl RequestPriority {
-    /// The client's [`Priority`] for this value.
-    fn to_client(self) -> Priority {
-        match self {
-            RequestPriority::Low => Priority::Low,
-            RequestPriority::Medium => Priority::Medium,
-            RequestPriority::High => Priority::High,
-        }
-    }
-}
-
-/// Parse a `spanner.request.priority` value: exactly `low` / `medium` / `high` (lowercase, like
-/// every option value in this driver — ADBC option values are exact-match canonical strings).
-fn parse_priority(value: &str) -> Result<RequestPriority> {
+fn parse_priority(value: &str) -> Result<Priority> {
     match value {
-        "low" => Ok(RequestPriority::Low),
-        "medium" => Ok(RequestPriority::Medium),
-        "high" => Ok(RequestPriority::High),
+        "low" => Ok(Priority::Low),
+        "medium" => Ok(Priority::Medium),
+        "high" => Ok(Priority::High),
         other => Err(invalid_argument(format!(
             "unknown request priority {other:?}; expected \"low\", \"medium\" or \"high\" \
              (or an empty string to unset)"
@@ -70,16 +34,14 @@ fn parse_priority(value: &str) -> Result<RequestPriority> {
     }
 }
 
-/// Emit an `apply_to_*` method applying the request priority and request tag to one of the client's
-/// request builders — [`StatementBuilder`] and [`BatchDmlBuilder`], which take the same two setters
-/// but share no common trait, exactly as for [`apply_to_commit_builder`] below.
+// Client request builders share setters but no common trait.
 macro_rules! apply_to_request_builder {
     ($(#[$attr:meta])* $name:ident($builder:ty)) => {
         $(#[$attr])*
         #[must_use]
         pub(crate) fn $name(&self, mut builder: $builder) -> $builder {
             if let Some(priority) = self.priority.parsed() {
-                builder = builder.set_priority(priority.to_client());
+                builder = builder.set_priority(priority.clone());
             }
             if let Some(tag) = &self.request_tag {
                 builder = builder.set_request_tag(tag.as_str());
@@ -89,19 +51,14 @@ macro_rules! apply_to_request_builder {
     };
 }
 
-/// Emit an `apply_to_*` method applying the commit priority, transaction tag, commit delay and
-/// commit-stats flag to one of the client's commit builders.
-///
-/// [`TransactionRunnerBuilder`] and [`WriteOnlyTransactionBuilder`] expose these four setters with
-/// identical signatures but share no common trait, so the body lives here once rather than as two
-/// byte-identical copies naming different types.
+// The read/write and write-only builders share these commit options.
 macro_rules! apply_to_commit_builder {
     ($(#[$attr:meta])* $name:ident($builder:ty)) => {
         $(#[$attr])*
         #[must_use]
         pub(crate) fn $name(&self, mut builder: $builder) -> $builder {
             if let Some(priority) = self.priority.parsed() {
-                builder = builder.set_commit_priority(priority.to_client());
+                builder = builder.set_commit_priority(priority.clone());
             }
             if let Some(tag) = &self.transaction_tag {
                 builder = builder.set_transaction_tag(tag.as_str());
@@ -128,7 +85,7 @@ macro_rules! apply_to_commit_builder {
 pub(crate) struct RequestConfig {
     /// Parsed `spanner.request.priority`, with the raw option string kept for `get_option`
     /// round-trip (`None` leaves the client/service default).
-    priority: RawParsed<RequestPriority>,
+    priority: RawParsed<Priority>,
     /// Raw `spanner.request.tag` value, when set.
     request_tag: Option<String>,
     /// Raw `spanner.transaction.tag` value, when set (connection-level only).
@@ -246,20 +203,14 @@ impl RequestConfig {
         apply_to_statement(StatementBuilder)
     }
 
-    /// Apply **only** the priority to a statement builder, for the driver's own internal metadata
-    /// reads (`get_objects`, `get_statistics`, `get_table_schema`).
-    ///
-    /// The tags are deliberately left off: they exist to attribute a *user* statement in Spanner's
-    /// introspection tables, so tagging a query the user never wrote would corrupt that
-    /// attribution. The priority is the opposite — a connection set to `low` wants its heavy
-    /// per-table scans deprioritized too.
+    /// Apply priority without attributing internal metadata queries to user tags.
     #[must_use]
     pub(crate) fn apply_priority_to_statement(
         &self,
         builder: StatementBuilder,
     ) -> StatementBuilder {
         match self.priority.parsed() {
-            Some(priority) => builder.set_priority(priority.to_client()),
+            Some(priority) => builder.set_priority(priority.clone()),
             None => builder,
         }
     }
@@ -272,20 +223,15 @@ impl RequestConfig {
         apply_to_batch_dml(BatchDmlBuilder)
     }
 
-    /// Apply the priority and transaction tag to a `BatchWrite` builder (the
-    /// `spanner.ingest.batch_write` firehose ingest path).
-    ///
-    /// The **request** tag is deliberately not applied: Spanner ignores per-request tags on
-    /// `BatchWrite`, so the client's builder exposes no setter. Nor is there a commit delay or
-    /// commit-stats setter — BatchWrite carries no per-request commit options — so this is not one
-    /// of the `apply_to_commit_builder!` sites. The change-stream exclusion flag *is* applied.
+    /// Apply BatchWrite options. The service ignores request tags on this path, and the
+    /// builder has no commit-delay or commit-stats setters.
     #[must_use]
     pub(crate) fn apply_to_batch_write(
         &self,
         mut builder: BatchWriteTransactionBuilder,
     ) -> BatchWriteTransactionBuilder {
         if let Some(priority) = self.priority.parsed() {
-            builder = builder.set_priority(priority.to_client());
+            builder = builder.set_priority(priority.clone());
         }
         if let Some(tag) = &self.transaction_tag {
             builder = builder.set_transaction_tag(tag.as_str());
@@ -309,14 +255,8 @@ impl RequestConfig {
     }
 }
 
-/// A shared cell holding the mutation count from the most recent commit that returned commit
-/// statistics (i.e. one built while [`OPTION_COMMIT_STATS`](crate::OPTION_COMMIT_STATS) was set).
-///
-/// Interior-mutable and `Arc`-shared so the driver's commit paths (which take `&self`) can record
-/// into it while `get_option_int` (also `&self`) reads it back. Each connection and statement owns
-/// its **own** cell, because the count belongs to whichever object actually ran the commit. Unset
-/// until such a commit has run, which `get_option` surfaces as
-/// [`Status::NotFound`](adbc_core::error::Status::NotFound).
+/// The latest mutation count returned by a commit with statistics enabled.
+/// Connections and statements each own a cell, shared with their execution paths.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CommitStats {
     mutation_count: Arc<Mutex<Option<i64>>>,
@@ -351,292 +291,4 @@ fn parse_max_commit_delay(value: &str) -> Result<Duration> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use adbc_core::error::Status;
-
-    fn s(v: &str) -> OptionValue {
-        OptionValue::String(v.to_string())
-    }
-
-    #[test]
-    fn parses_exact_lowercase_priorities() {
-        for (input, expected) in [
-            ("low", RequestPriority::Low),
-            ("medium", RequestPriority::Medium),
-            ("high", RequestPriority::High),
-        ] {
-            assert_eq!(parse_priority(input).unwrap(), expected, "{input}");
-        }
-    }
-
-    #[test]
-    fn rejects_unknown_priorities() {
-        // Case variants of valid priorities are rejected too: values are exact lowercase.
-        for bad in [
-            "urgent",
-            "0",
-            "priority_high",
-            "hi gh",
-            "médium",
-            "HIGH",
-            "High",
-            "Medium",
-            "LOW",
-        ] {
-            let error = parse_priority(bad).unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments, "{bad}");
-        }
-    }
-
-    #[test]
-    fn priority_round_trips_and_unsets() {
-        let mut config = RequestConfig::default();
-        assert_eq!(config.priority_string(), None);
-
-        // Set (exact lowercase, surrounding whitespace tolerated), reported canonically.
-        config.set_priority(s(" high ")).unwrap();
-        assert_eq!(config.priority_string(), Some("high"));
-        config.set_priority(s("medium")).unwrap();
-        assert_eq!(config.priority_string(), Some("medium"));
-
-        // A bad value is rejected and leaves the stored value untouched.
-        let error = config.set_priority(s("urgent")).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-        assert_eq!(config.priority_string(), Some("medium"));
-
-        // An empty string unsets.
-        config.set_priority(s("")).unwrap();
-        assert_eq!(config.priority_string(), None);
-    }
-
-    #[test]
-    fn tags_round_trip_verbatim_and_unset_on_empty() {
-        let mut config = RequestConfig::default();
-        assert_eq!(config.request_tag_string(), None);
-        assert_eq!(config.transaction_tag_string(), None);
-
-        // Free-form values are stored verbatim (no trimming or case folding).
-        config.set_request_tag(s(" my-App/query=1 ")).unwrap();
-        assert_eq!(config.request_tag_string(), Some(" my-App/query=1 "));
-        config.set_transaction_tag(s("nightly-etl")).unwrap();
-        assert_eq!(config.transaction_tag_string(), Some("nightly-etl"));
-
-        // The two tags are independent.
-        config.set_request_tag(s("")).unwrap();
-        assert_eq!(config.request_tag_string(), None);
-        assert_eq!(config.transaction_tag_string(), Some("nightly-etl"));
-        config.set_transaction_tag(s("")).unwrap();
-        assert_eq!(config.transaction_tag_string(), None);
-    }
-
-    #[test]
-    fn non_string_values_are_rejected() {
-        let mut config = RequestConfig::default();
-        for value in [OptionValue::Int(1), OptionValue::Double(1.0)] {
-            let error = config.set_priority(value.clone()).unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments);
-            let error = config.set_request_tag(value.clone()).unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments);
-            let error = config.set_transaction_tag(value.clone()).unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments);
-            let error = config.set_max_commit_delay(value).unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments);
-        }
-    }
-
-    #[test]
-    fn parses_max_commit_delay_with_units_and_enforces_the_500ms_cap() {
-        // The staleness duration grammar (default seconds plus unit suffixes) applies.
-        assert_eq!(
-            parse_max_commit_delay("0.2s").unwrap(),
-            Duration::from_millis(200)
-        );
-        assert_eq!(
-            parse_max_commit_delay("200ms").unwrap(),
-            Duration::from_millis(200)
-        );
-        assert_eq!(parse_max_commit_delay("0").unwrap(), Duration::ZERO);
-        // The boundary is inclusive.
-        assert_eq!(
-            parse_max_commit_delay("500ms").unwrap(),
-            Duration::from_millis(500)
-        );
-        // Above 500ms, negative, and malformed values are all rejected.
-        for bad in ["501ms", "1s", "0.6s", "-1ms", "abc", "1x"] {
-            let error = parse_max_commit_delay(bad).unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments, "{bad}");
-        }
-    }
-
-    /// A duration too large for `std::time::Duration` must be `InvalidArguments`, not a panic:
-    /// the shared `parse_duration` conversion runs *before* the 500ms cap check, so the cap alone
-    /// cannot catch it.
-    #[test]
-    fn rejects_oversized_max_commit_delay_instead_of_panicking() {
-        let error = parse_max_commit_delay("1e30").unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-    }
-
-    #[test]
-    fn max_commit_delay_round_trips_and_unsets() {
-        let mut config = RequestConfig::default();
-        assert_eq!(config.max_commit_delay_string(), None);
-        assert!(config.commit_delay().is_none());
-
-        // The raw value round-trips verbatim (surrounding whitespace trimmed), and a client
-        // WktDuration is produced.
-        config.set_max_commit_delay(s(" 100ms ")).unwrap();
-        assert_eq!(config.max_commit_delay_string(), Some("100ms"));
-        assert_eq!(
-            config.commit_delay(),
-            Some(WktDuration::try_from(Duration::from_millis(100)).unwrap())
-        );
-
-        // A rejected value leaves the stored one untouched.
-        let error = config.set_max_commit_delay(s("2s")).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-        assert_eq!(config.max_commit_delay_string(), Some("100ms"));
-
-        // An empty string unsets.
-        config.set_max_commit_delay(s("")).unwrap();
-        assert_eq!(config.max_commit_delay_string(), None);
-        assert!(config.commit_delay().is_none());
-    }
-
-    #[test]
-    fn commit_stats_flag_round_trips_and_unsets() {
-        let mut config = RequestConfig::default();
-        // Default is off, always reported as an effective boolean.
-        assert_eq!(config.commit_stats_string(), "false");
-
-        // Accepts exactly the strings "true"/"false"; lenient spellings ("1", "yes", "TRUE", …)
-        // are rejected.
-        config.set_commit_stats(s("true")).unwrap();
-        assert_eq!(config.commit_stats_string(), "true");
-        // An int-typed set is rejected and leaves the stored value untouched.
-        let error = config.set_commit_stats(OptionValue::Int(1)).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-        assert_eq!(config.commit_stats_string(), "true");
-        config.set_commit_stats(s("false")).unwrap();
-        assert_eq!(config.commit_stats_string(), "false");
-        for lenient in ["1", "yes", "TRUE", "0", "no", "False"] {
-            let error = config.set_commit_stats(s(lenient)).unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments, "{lenient}");
-        }
-
-        // An empty string unsets (back to the default of not requesting stats).
-        config.set_commit_stats(s("true")).unwrap();
-        assert_eq!(config.commit_stats_string(), "true");
-        config.set_commit_stats(s("")).unwrap();
-        assert_eq!(config.commit_stats_string(), "false");
-
-        // A non-bool string is rejected and leaves the stored value untouched.
-        config.set_commit_stats(s("true")).unwrap();
-        let error = config.set_commit_stats(s("maybe")).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-        assert_eq!(config.commit_stats_string(), "true");
-    }
-
-    #[test]
-    fn exclude_txn_from_change_streams_flag_round_trips_and_unsets() {
-        let mut config = RequestConfig::default();
-        // Default is off, always reported as an effective boolean.
-        assert_eq!(config.exclude_txn_from_change_streams_string(), "false");
-
-        // Accepts exactly the strings "true"/"false"; lenient spellings are rejected.
-        config
-            .set_exclude_txn_from_change_streams(s("true"))
-            .unwrap();
-        assert_eq!(config.exclude_txn_from_change_streams_string(), "true");
-        // An int-typed set is rejected and leaves the stored value untouched.
-        let error = config
-            .set_exclude_txn_from_change_streams(OptionValue::Int(1))
-            .unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-        assert_eq!(config.exclude_txn_from_change_streams_string(), "true");
-        config
-            .set_exclude_txn_from_change_streams(s("false"))
-            .unwrap();
-        assert_eq!(config.exclude_txn_from_change_streams_string(), "false");
-        for lenient in ["1", "yes", "TRUE", "0", "no", "False"] {
-            let error = config
-                .set_exclude_txn_from_change_streams(s(lenient))
-                .unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments, "{lenient}");
-        }
-
-        // An empty string unsets (back to the default of not excluding).
-        config
-            .set_exclude_txn_from_change_streams(s("true"))
-            .unwrap();
-        assert_eq!(config.exclude_txn_from_change_streams_string(), "true");
-        config.set_exclude_txn_from_change_streams(s("")).unwrap();
-        assert_eq!(config.exclude_txn_from_change_streams_string(), "false");
-    }
-
-    #[test]
-    fn commit_stats_sink_records_most_recent_and_ignores_none() {
-        let sink = CommitStats::default();
-        assert_eq!(sink.mutation_count(), None);
-
-        // A `None` (stats not returned) leaves it unset.
-        sink.record(None);
-        assert_eq!(sink.mutation_count(), None);
-
-        // A recorded value is readable; a later commit overwrites, but a `None` afterwards does not.
-        sink.record(Some(5));
-        assert_eq!(sink.mutation_count(), Some(5));
-        sink.record(Some(9));
-        assert_eq!(sink.mutation_count(), Some(9));
-        sink.record(None);
-        assert_eq!(sink.mutation_count(), Some(9));
-
-        // Clones share the same cell (Arc-backed).
-        let clone = sink.clone();
-        sink.record(Some(11));
-        assert_eq!(clone.mutation_count(), Some(11));
-    }
-
-    /// Statement inheritance is a plain clone of the connection's config (mirroring
-    /// `ReadStaleness`): the clone starts with the connection's values and overrides independently.
-    #[test]
-    fn cloned_config_inherits_then_overrides_independently() {
-        let mut connection = RequestConfig::default();
-        connection.set_priority(s("low")).unwrap();
-        connection.set_request_tag(s("conn-tag")).unwrap();
-        connection.set_transaction_tag(s("txn-tag")).unwrap();
-        connection.set_max_commit_delay(s("100ms")).unwrap();
-        connection.set_commit_stats(s("true")).unwrap();
-        connection
-            .set_exclude_txn_from_change_streams(s("true"))
-            .unwrap();
-
-        let mut statement = connection.clone();
-        assert_eq!(statement.priority_string(), Some("low"));
-        assert_eq!(statement.request_tag_string(), Some("conn-tag"));
-        assert_eq!(statement.transaction_tag_string(), Some("txn-tag"));
-        assert_eq!(statement.max_commit_delay_string(), Some("100ms"));
-        assert_eq!(statement.commit_stats_string(), "true");
-        assert_eq!(statement.exclude_txn_from_change_streams_string(), "true");
-
-        statement.set_priority(s("high")).unwrap();
-        statement.set_request_tag(s("")).unwrap();
-        statement.set_max_commit_delay(s("250ms")).unwrap();
-        statement.set_commit_stats(s("false")).unwrap();
-        statement
-            .set_exclude_txn_from_change_streams(s("false"))
-            .unwrap();
-        assert_eq!(statement.priority_string(), Some("high"));
-        assert_eq!(statement.request_tag_string(), None);
-        assert_eq!(statement.max_commit_delay_string(), Some("250ms"));
-        assert_eq!(statement.commit_stats_string(), "false");
-        assert_eq!(statement.exclude_txn_from_change_streams_string(), "false");
-        // The connection is unaffected by statement-level overrides.
-        assert_eq!(connection.priority_string(), Some("low"));
-        assert_eq!(connection.request_tag_string(), Some("conn-tag"));
-        assert_eq!(connection.max_commit_delay_string(), Some("100ms"));
-        assert_eq!(connection.commit_stats_string(), "true");
-        assert_eq!(connection.exclude_txn_from_change_streams_string(), "true");
-    }
-}
+mod tests;
