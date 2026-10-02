@@ -81,7 +81,8 @@ The path identifies the database. An authority (`host:port`) supplies `spanner.e
 three slashes when there is no authority. An endpoint alone does not enable anonymous credentials.
 Query keys must be database options above, except `uri`, `spanner.auth.keyfile_json` and
 `spanner.auth.access_token`; unknown or forbidden keys return `InvalidArguments`. Values are
-percent-decoded, with `+` kept as a literal plus. URI fragments are rejected.
+percent-decoded, with `+` kept as a literal plus. URI fragments and userinfo (`user:password@host`)
+are rejected; supply credentials through the `spanner.auth.*` options.
 
 Setting a URI expands its options immediately. The last writer wins per option, and the URI
 changes only the options it contains. `get_option("uri")` returns the last accepted URI verbatim;

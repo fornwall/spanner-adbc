@@ -12,12 +12,50 @@ fn set_uri(db: &mut SpannerDatabase, uri: &str) -> Result<()> {
 
 #[test]
 fn a_bare_database_path_is_rejected() {
-    // The `uri` option requires the `spanner://` scheme; a bare path is no longer accepted, and
-    // the error echoes back the wrapped form so the fix is obvious.
     let mut db = new_database();
     let error = set_uri(&mut db, DB_PATH).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
-    assert!(error.message.contains(&format!("spanner:///{DB_PATH}")));
+    assert!(error.message.contains("spanner:///projects/"));
+}
+
+#[test]
+fn malformed_uris_do_not_echo_credentials() {
+    let secret = "ya29.private-token";
+    for uri in [
+        format!("postgres:///{DB_PATH}?{OPTION_ACCESS_TOKEN}={secret}"),
+        format!("{DB_PATH}?{OPTION_ACCESS_TOKEN}={secret}"),
+        format!("spanner:/{DB_PATH}?{OPTION_ACCESS_TOKEN}={secret}"),
+        format!("spanner:///{secret}?{OPTION_ACCESS_TOKEN}={secret}"),
+        format!("spanner:///{DB_PATH}?{OPTION_ACCESS_TOKEN}={secret}"),
+        format!("spanner:///{DB_PATH}?{OPTION_ACCESS_TOKEN}%={secret}"),
+        format!("spanner:///{DB_PATH}?{OPTION_KEYFILE_JSON}={secret}%"),
+        format!("spanner:///{DB_PATH}?spanner.auth.keyfile={secret}%"),
+    ] {
+        let mut db = new_database();
+        let error = set_uri(&mut db, &uri).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(!error.message.contains(secret), "{}", error.message);
+        assert_eq!(db.uri, None);
+    }
+}
+
+#[test]
+fn uri_userinfo_is_rejected_without_storing_or_echoing_it() {
+    let mut db = new_database();
+    let original = format!("spanner:///{DB_PATH}");
+    set_uri(&mut db, &original).unwrap();
+    let error = set_uri(
+        &mut db,
+        &format!("spanner://user:private-password@localhost:9010/{DB_PATH}"),
+    )
+    .unwrap_err();
+    assert_eq!(error.status, Status::InvalidArguments);
+    assert!(error.message.contains("userinfo"));
+    assert!(error.message.contains("spanner.auth."));
+    assert!(!error.message.contains("private-password"));
+    assert_eq!(db.uri.as_deref(), Some(original.as_str()));
+    assert_eq!(db.endpoint, None);
+    assert!(!format!("{db:?}").contains("private-password"));
 }
 
 #[test]
