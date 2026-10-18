@@ -1,1 +1,1 @@
-{"v": 1, "partition": {"inner": {"Query": {"con[": 44444444444444444444444444444444444444444444444444444444444444444444444444444440, "/s%n": "prns/s", "so/s%n": "p"}}}}
+{"v":1,"partition":{"inner":{"Query":{"con[":44444444444444444444444444444444444444444444444444444444444444444444444444444440,"/s%n":"prns/s","so/s%n":"p","session":"projects/p/instances/i/databases/d/sessions/s","transaction":{"id":"dHg="},"partitionToken":"dG9rZW4=","sql":"SELECT 1"}},"version":1}}

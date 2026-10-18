@@ -22,7 +22,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 # Pin the upstream query corpus and test behavior for reproducible runs.
-VALIDATION_REF="${ADBC_VALIDATION_REF:-2e9116fcfe7e5112fec22e970133cbb16d129493}"
+VALIDATION_REF="${ADBC_VALIDATION_REF:-68242ee13524e8f2b36038764e2f439d4cb49f33}"
 VALIDATION_REPO="${ADBC_VALIDATION_REPO:-adbc-drivers/validation}"
 PYTHON="${PYTHON:-python3}"
 

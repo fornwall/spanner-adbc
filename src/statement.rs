@@ -700,7 +700,7 @@ impl SpannerStatement {
                 self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
-                    let runner = build_runner(&client, isolation, &request, retry).await?;
+                    let runner = build_runner(&client, isolation, &request, retry);
                     let outcome = runner
                         .run(move |transaction: ReadWriteTransaction| {
                             let statement = plan_stmt.clone();
@@ -1195,11 +1195,9 @@ fn string_option(key: &OptionStatement, value: OptionValue) -> Result<String> {
 /// Metadata is delivered with the first partial result set and retained by the `ResultSet`, so it
 /// is available as soon as `execute_query` returns — a PLAN returns no rows to drain.
 fn undeclared_parameter_types(
-    metadata: Option<&google_cloud_spanner::result::ResultSetMetadata>,
+    metadata: &google_cloud_spanner::result::ResultSetMetadata,
 ) -> BTreeMap<String, google_cloud_spanner::value::Type> {
-    metadata
-        .map(|m| m.undeclared_parameters().clone())
-        .unwrap_or_default()
+    metadata.undeclared_parameters().clone()
 }
 
 /// Shared guard for the query-only entry points (`execute_schema`, `execute_partitions`): both run

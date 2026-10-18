@@ -34,19 +34,17 @@ pub(super) fn apply_isolation(
 /// Build the read/write transaction runner every DML path shares: the connection's isolation
 /// level, its commit priority and transaction tag, and its retry/backoff bounds, applied in that
 /// order. The one place a read/write transaction is opened from driver-owned code.
-pub(crate) async fn build_runner(
+pub(crate) fn build_runner(
     client: &DatabaseClient,
     isolation: IsolationLevel,
     request: &RequestConfig,
     retry: RetryConfig,
-) -> Result<TransactionRunner> {
+) -> TransactionRunner {
     retry
         .apply_to_runner(
             request.apply_to_runner(apply_isolation(client.read_write_transaction(), isolation)),
         )
         .build()
-        .await
-        .map_err(from_spanner)
 }
 
 /// Map ADBC isolation levels to Spanner's SERIALIZABLE or REPEATABLE_READ.
@@ -131,7 +129,7 @@ pub(crate) fn run_batch_txn(
     let transaction = async move {
         // The commit priority and transaction tag ride on the runner; the request tag rides on the
         // ExecuteBatchDml batch inside the (retryable) closure.
-        let runner = build_runner(&client, isolation, &request, retry).await?;
+        let runner = build_runner(&client, isolation, &request, retry);
         let outcome = runner
             .run(move |transaction: ReadWriteTransaction| {
                 let statements = statements.clone();

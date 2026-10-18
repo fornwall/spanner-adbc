@@ -37,7 +37,7 @@ runs:
       # tag) — a hijacked mutable tag would otherwise run in CI with repo read access. dtolnay/
       # rust-toolchain reads the toolchain from its ref name, so pinning the SHA requires selecting
       # the toolchain explicitly (done here from rust-toolchain.toml). Trailing comment names the ref.
-      uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable branch, 2026-10-01
+      uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
       with:
         toolchain: ${{ steps.version.outputs.channel }}
         components: ${{ inputs.components }}

@@ -2,7 +2,7 @@ use std::ffi::CStr;
 use std::sync::Arc;
 
 use adbc_core::error::Error;
-use arrow_array::ffi_stream::ArrowArrayStreamReader;
+use arrow_array::ffi_stream::RecordBatchStreamReader;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
@@ -46,7 +46,7 @@ fn exports_an_ordinary_reader() {
         std::iter::once(Ok(batch.clone())),
         schema,
     )));
-    let mut reader = unsafe { ArrowArrayStreamReader::from_raw(&raw mut stream) }.unwrap();
+    let mut reader = unsafe { RecordBatchStreamReader::from_raw(&raw mut stream) }.unwrap();
     assert_eq!(reader.next().unwrap().unwrap(), batch);
     assert!(reader.next().is_none());
 }

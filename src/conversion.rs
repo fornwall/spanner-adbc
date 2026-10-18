@@ -172,7 +172,7 @@ pub(crate) async fn result_set_to_batch(
     }
     // Metadata (including the row type) is delivered with the first partial result set and retained
     // by the ResultSet, so it is available here even for empty results.
-    rows_to_batch(rs.metadata(), &rows, precision)
+    rows_to_batch(Some(rs.metadata()), &rows, precision)
 }
 
 /// Materialise already-drained Spanner rows (plus their result-set metadata) as a single Arrow
@@ -247,12 +247,8 @@ fn approx_value_bytes(value: &Value) -> usize {
             .iter()
             .map(approx_value_bytes)
             .sum(),
-        Kind::Struct => value
-            .as_struct()
-            .expect("struct kind")
-            .fields()
-            .map(|(_, v)| approx_value_bytes(v))
-            .sum(),
+        // Unexpected wire kinds are rejected during conversion.
+        Kind::Unknown => 0,
     }
 }
 
@@ -276,7 +272,7 @@ pub(crate) async fn stream_query(
     fetch_timeout: Option<Duration>,
 ) -> Result<SpannerBatchReader> {
     let first = pull_chunk(&mut rs, batch_size).await?;
-    let schema = build_schema(rs.metadata(), first.first(), precision)?;
+    let schema = build_schema(Some(rs.metadata()), first.first(), precision)?;
     let source = ResultSetChunks {
         result_set: rs,
         batch_size,
@@ -467,7 +463,7 @@ pub(crate) async fn stream_bound_query(
     let (first, schema) = match result_set.as_mut() {
         Some(rs) => {
             let rows = pull_chunk(rs, batch_size).await?;
-            let schema = build_schema(rs.metadata(), rows.first(), precision)?;
+            let schema = build_schema(Some(rs.metadata()), rows.first(), precision)?;
             (Some(rows), schema)
         }
         None => (None, Arc::new(Schema::empty())),
@@ -694,7 +690,7 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision, depth: usize) -> Result<
             Some(element) if !matches!(element.code(), TypeCode::Array | TypeCode::Unspecified) => {
                 DataType::List(Arc::new(arrow_field_at(
                     LIST_ITEM,
-                    &element,
+                    element,
                     true,
                     precision,
                     depth + 1,
@@ -801,7 +797,7 @@ fn decode_error(spanner_type: &str, value: &Value) -> adbc_core::error::Error {
     err(
         format!(
             "cannot decode Spanner {spanner_type} wire value {}",
-            value_to_json(value)
+            value_to_json(value).map_or_else(|_| format!("{value:?}"), |json| json.to_string())
         ),
         Status::InvalidData,
     )
@@ -974,7 +970,7 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
                 // JSON-render fallback allocates, and only for non-string values.
                 match v.as_str() {
                     Some(s) => builder.append_value(s),
-                    None => builder.append_value(value_to_json(v).to_string()),
+                    None => builder.append_value(value_to_json(v)?.to_string()),
                 }
                 Ok(())
             })?
@@ -1271,8 +1267,8 @@ pub(crate) fn parse_numeric_i128(s: &str) -> Option<i128> {
 
 /// Recursively convert a Spanner [`Value`] into a [`serde_json::Value`], used to render arrays and
 /// structs as text.
-fn value_to_json(value: &Value) -> serde_json::Value {
-    match value.kind() {
+fn value_to_json(value: &Value) -> Result<serde_json::Value> {
+    Ok(match value.kind() {
         Kind::Null => serde_json::Value::Null,
         Kind::Bool => serde_json::Value::Bool(value.as_bool().expect("bool kind")),
         Kind::Number => serde_json::json!(value.as_f64().expect("number kind")),
@@ -1283,17 +1279,15 @@ fn value_to_json(value: &Value) -> serde_json::Value {
                 .expect("list kind")
                 .iter()
                 .map(value_to_json)
-                .collect(),
+                .collect::<Result<_>>()?,
         ),
-        Kind::Struct => serde_json::Value::Object(
-            value
-                .as_struct()
-                .expect("struct kind")
-                .fields()
-                .map(|(k, v)| (k.clone(), value_to_json(v)))
-                .collect(),
-        ),
-    }
+        Kind::Unknown => {
+            return Err(err(
+                format!("cannot decode unexpected Spanner wire value {value:?}"),
+                Status::InvalidData,
+            ));
+        }
+    })
 }
 
 #[cfg(test)]

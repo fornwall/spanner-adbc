@@ -12,7 +12,6 @@ use google_cloud_spanner::builder::{
 };
 use google_cloud_spanner::model::request_options::Priority;
 use google_cloud_spanner::statement::StatementBuilder;
-use google_cloud_wkt::Duration as WktDuration;
 
 use crate::error::invalid_argument;
 use crate::options::{RawParsed, bool_option_unsettable, non_empty_string_option};
@@ -190,12 +189,9 @@ impl RequestConfig {
         self.max_commit_delay.raw()
     }
 
-    /// The commit delay as the client's [`WktDuration`], when set. The conversion cannot fail — the
-    /// stored value was validated to `0..=500ms` at set time.
-    fn commit_delay(&self) -> Option<WktDuration> {
-        self.max_commit_delay
-            .parsed()
-            .and_then(|d| WktDuration::try_from(*d).ok())
+    /// The commit delay, validated to `0..=500ms` at set time.
+    fn commit_delay(&self) -> Option<Duration> {
+        self.max_commit_delay.parsed().copied()
     }
 
     apply_to_request_builder! {

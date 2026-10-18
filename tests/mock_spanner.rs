@@ -786,6 +786,49 @@ fn mock_server_round_trips_a_query() {
     assert_eq!(column.value(1), "v2");
 }
 
+/// Unknown wire kinds must fail even on the UTF-8 fallback, including inside lists.
+#[test]
+fn unknown_wire_values_are_not_rendered_as_json() {
+    let _watchdog = watchdog!();
+    for nested in [false, true] {
+        let server = MockServer::start(move |mock| {
+            mock.expect_execute_streaming_sql().returning(move |_| {
+                let mut value = prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
+                        fields: [("x".into(), string_value("1"))].into_iter().collect(),
+                    })),
+                };
+                if nested {
+                    value = prost_types::Value {
+                        kind: Some(prost_types::value::Kind::ListValue(
+                            prost_types::ListValue {
+                                values: vec![value],
+                            },
+                        )),
+                    };
+                }
+                Ok(stream_of(vec![Ok(v1::PartialResultSet {
+                    metadata: Some(result_metadata(&[("c", v1::TypeCode::String)])),
+                    values: vec![value],
+                    last: true,
+                    ..Default::default()
+                })]))
+            });
+        });
+        let mut connection = server.connect();
+        let mut statement = connection.new_statement().unwrap();
+        statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+        let mut reader = statement.execute().expect("query metadata");
+        let error = reader.next().unwrap().expect_err("unknown wire kind");
+        let ArrowError::ExternalError(source) = &error else {
+            panic!("expected the driver error, got: {error}");
+        };
+        let error = source.downcast_ref::<adbc_core::error::Error>().unwrap();
+        assert_eq!(error.status, AdbcStatus::InvalidData);
+        assert!(error.message.contains("column \"c\""), "{error}");
+    }
+}
+
 /// A keyed protobuf Struct cannot represent positional Spanner STRUCT fields with duplicate names.
 #[test]
 fn keyed_struct_wire_value_errors() {

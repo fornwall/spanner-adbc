@@ -483,7 +483,7 @@ fn cancel_interrupts_in_flight_query() {
 }
 
 /// A `reset_peer` toxic makes RPCs fail at the transport layer. Assert the driver surfaces a clean
-/// ADBC error (no panic, and — enforced by a watchdog — no unbounded hang), and that once the toxic
+/// ADBC error after the configured retry limit (no panic or watchdog expiry), and that once the toxic
 /// is removed a subsequent query **recovers** (the gRPC channel re-establishes through the proxy).
 #[test]
 fn reset_peer_surfaces_error_then_recovers() {
@@ -495,8 +495,17 @@ fn reset_peer_surfaces_error_then_recovers() {
     let _serial = SerialGuard::new();
     ensure_setup();
 
+    // Initial streaming failures now retry in the client. Bound attempts explicitly so this
+    // test exercises retry exhaustion without waiting for the client's default retry budget.
+    let mut connection = connect();
+    connection
+        .set_option(
+            OptionConnection::Other(spanner_adbc::OPTION_RETRY_MAX_ATTEMPTS.into()),
+            2i64.into(),
+        )
+        .unwrap();
     // Wrap the connection so a watchdog thread can drive a query and we can bound its wall-clock.
-    let connection = Arc::new(Mutex::new(connect()));
+    let connection = Arc::new(Mutex::new(connection));
 
     // Sanity: with no faults, a trivial query succeeds.
     assert!(

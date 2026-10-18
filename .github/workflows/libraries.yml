@@ -203,8 +203,7 @@ jobs:
       # musl base toolchain (gcc/libgcc + apk packages) — the *Rust* version is still
       # rust-toolchain.toml's single pin, which rustup honours inside the container (it
       # auto-installs that toolchain over the image's default when `cargo build` runs).
-      # Image: rust:1.98.1-alpine3.24 (latest published Alpine image; rustup installs
-      # the repository toolchain because a Rust 1.99.0 image is not yet available).
+      # Image: rust:1.99.1-alpine3.24.
       - name: Build shared library (Alpine/musl)
         run: |
           set -euo pipefail
@@ -212,7 +211,7 @@ jobs:
             -v "$PWD":/work -w /work \
             -e CARGO_TARGET_DIR=/work/target \
             -e RUSTFLAGS="-C target-feature=-crt-static" \
-            rust@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f \
+            rust@sha256:557a94c82b485a14b569120e00867267108c734efe33f10cc31ca0cd5dd1eca9 \
             sh -euc '
               apk add --no-cache build-base cmake perl git
               cargo build --release
@@ -459,7 +458,7 @@ jobs:
           # Only drives `setup.py bdist_wheel` to repackage the prebuilt libraries;
           # the wheel tag is forced to py3-none-<platform>, so this version does not
           # affect the artifact. Pinned (not "3.x") for a reproducible release host.
-          python-version: "3.14.8"
+          python-version: "3.15.0"
 
       - name: Install build tooling
         # setuptools only: it has vendored the `bdist_wheel` command since v70.1, and

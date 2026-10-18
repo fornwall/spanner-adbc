@@ -130,14 +130,10 @@ fn max_commit_delay_round_trips_and_unsets() {
     assert_eq!(config.max_commit_delay_string(), None);
     assert!(config.commit_delay().is_none());
 
-    // The raw value round-trips verbatim (surrounding whitespace trimmed), and a client
-    // WktDuration is produced.
+    // The raw value round-trips verbatim (surrounding whitespace trimmed).
     config.set_max_commit_delay(s(" 100ms ")).unwrap();
     assert_eq!(config.max_commit_delay_string(), Some("100ms"));
-    assert_eq!(
-        config.commit_delay(),
-        Some(WktDuration::try_from(Duration::from_millis(100)).unwrap())
-    );
+    assert_eq!(config.commit_delay(), Some(Duration::from_millis(100)));
 
     // A rejected value leaves the stored one untouched.
     let error = config.set_max_commit_delay(s("2s")).unwrap_err();

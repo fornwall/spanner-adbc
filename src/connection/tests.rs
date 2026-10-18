@@ -179,7 +179,7 @@ fn garbage_partition_descriptors_error_cleanly() {
 /// fixed point.
 #[test]
 fn partition_descriptor_envelope_round_trips() {
-    let descriptor: &[u8] = br#"{"v":1,"partition":{"inner":{"Query":{"sql":"SELECT 1"}}}}"#;
+    let descriptor = include_bytes!("../../fuzz/seeds/partition/enveloped-query-descriptor");
     let partition = decode_partition(descriptor).expect("enveloped descriptor decodes");
 
     let encoded = encode_partition(&partition).expect("encode");
@@ -274,7 +274,7 @@ fn partition_descriptor_round_trips_large_floats() {
     //
     // The unknown keys land in the generated request's `_unknown_fields` as `serde_json::Value`
     // numbers, exercising exactly that float path.
-    let descriptor = br#"{"v": 1, "partition": {"inner": {"Query": {"con[": 44444424444444444249, "/+%n":4444440000000000000000074074764, "/s%n": "prns/s"}}}}"#;
+    let descriptor = br#"{"v": 1, "partition": {"version": 1, "inner": {"Query": {"session":"projects/p/instances/i/databases/d/sessions/s","transaction":{"id":"dHg="},"partitionToken":"dG9rZW4=","sql":"SELECT 1","con[": 44444424444444444249, "/+%n":4444440000000000000000074074764, "/s%n": "prns/s"}}}}"#;
 
     let partition = decode_partition(descriptor).expect("descriptor decodes");
     let first = encode_partition(&partition).expect("a decoded partition re-encodes");

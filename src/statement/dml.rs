@@ -109,7 +109,7 @@ impl SpannerStatement {
         // DML with THEN RETURN is a write path: the update timeout bounds the whole transaction.
         let update_timeout = self.config.timeouts.update_timeout();
         let transaction = async move {
-            let runner = build_runner(&client, isolation, &request, retry).await?;
+            let runner = build_runner(&client, isolation, &request, retry);
             let outcome = runner
                 .run(move |transaction: ReadWriteTransaction| {
                     let statements = statements.clone();
@@ -125,7 +125,7 @@ impl SpannerStatement {
                             // the stream. `THEN RETURN` yields one row per affected row, so the
                             // drained row count is the fallback.
                             let count = result_set.update_count().unwrap_or(rows.len() as i64);
-                            results.push((result_set.metadata().cloned(), rows, count));
+                            results.push((result_set.metadata().clone(), rows, count));
                         }
                         Ok(results)
                     }
@@ -155,7 +155,7 @@ impl SpannerStatement {
         let mut affected = 0i64;
         for (metadata, rows, count) in &results {
             let (sch, batch) = crate::conversion::rows_to_batch(
-                metadata.as_ref(),
+                Some(metadata),
                 rows,
                 self.config.timestamp_precision,
             )?;
@@ -232,10 +232,8 @@ impl SpannerStatement {
                 async move {
                     let transaction = client
                         .partitioned_dml_transaction()
-                        .with_exclude_txn_from_change_streams(exclude_from_change_streams)
-                        .build()
-                        .await
-                        .map_err(from_spanner)?;
+                        .set_exclude_txn_from_change_streams(exclude_from_change_streams)
+                        .build();
                     transaction
                         .execute_update(statement)
                         .await

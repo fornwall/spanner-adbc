@@ -84,7 +84,7 @@ endif()
 # exists, so a stale `CMakeCache.txt` (e.g. one restored from a run on the old
 # rev) would silently keep the previous tag and rebuild against the wrong
 # arrow-adbc source. FORCE makes a rev bump here authoritative.
-set(ARROW_ADBC_TAG "a727830d5722262fc7c3e24b6f8edb982c7b9b29"
+set(ARROW_ADBC_TAG "0a40cf30d0458867cea48d0fbc5283340b59b40f"
     CACHE STRING "arrow-adbc revision (apache/arrow-adbc main, see above)" FORCE)
 
 include(FetchContent)

@@ -24,7 +24,7 @@ name is `Resilience harness (emulator + Toxiproxy)`; merge enforcement depends o
 | Fault | Test | Required behavior |
 | --- | --- | --- |
 | Downstream `bandwidth` throttle | `cancel_interrupts_in_flight_query` | Cancelling a blocked stream fetch returns `Cancelled` within the test's bound. |
-| TCP `reset_peer` | `reset_peer_surfaces_error_then_recovers` | A query reports a transport error; a fresh query succeeds after the reset is removed. |
+| TCP `reset_peer` | `reset_peer_surfaces_error_then_recovers` | A query reports a transport error after two attempts; a fresh query succeeds after the reset is removed. |
 | TCP `reset_peer` | `commit_under_transport_fault_never_loses_the_write` | A buffered idempotent update survives the fault, either through client retries or a retried commit. |
 | TCP `reset_peer` | `update_timeout_bounds_a_faulted_write_then_recovers_when_unset` | An update deadline returns `Timeout`; clearing it and removing the reset allows the next write. |
 | TCP `reset_peer` after initial batches | `mid_stream_disconnect_after_batches_surfaces_error_then_recovers` | A partially consumed stream reports an error before all rows arrive, then a fresh query recovers. |

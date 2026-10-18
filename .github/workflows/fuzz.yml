@@ -66,11 +66,11 @@ jobs:
         # major tag) — a hijacked mutable tag would otherwise run in CI with repo read access.
         # dtolnay/rust-toolchain reads the toolchain from its ref name, so pinning the SHA
         # requires selecting the toolchain explicitly below.
-        uses: dtolnay/rust-toolchain@0e28dd9a7764e5f83064112bb1f24025a14c313c # nightly branch, 2026-10-01
+        uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly branch, 2026-10-16
         with:
           toolchain: nightly
 
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-fuzz@0.13.2
 
