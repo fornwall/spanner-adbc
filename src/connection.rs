@@ -19,8 +19,6 @@ use arrow_schema::{DataType, Field, Schema};
 use google_cloud_spanner::batch::Partition;
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::model::StructType;
-use google_cloud_spanner::mutation::Mutation;
-use google_cloud_spanner::statement::Statement as SpannerSql;
 
 use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
 use crate::driver::{Connected, SharedDatabaseAdmin};
@@ -132,37 +130,23 @@ impl SpannerConnection {
     /// the transaction stays replayable exactly as after any other failed commit.
     fn apply_manual_txn(&self, work: &ManualTxn) -> Result<()> {
         check_commit_writable(self.config.is_read_only(), work)?;
-        match work {
-            ManualTxn::Unset | ManualTxn::Read(_) => Ok(()),
-            ManualTxn::Dml {
-                statements,
-                mutations,
-            } => self.apply_transaction(statements.clone(), mutations.clone()),
-        }
-    }
-
-    /// Apply the buffered DML statements and mutations atomically in one transaction, discarding
-    /// the affected-row count (a commit reports no count).
-    ///
-    /// A transaction with DML runs through the read/write runner ([`run_batch_txn`]); a
-    /// **mutations-only** transaction (bulk ingests that buffered no DML) commits through the
-    /// write-only path ([`write_mutations_txn`]) instead, whose commit is replay-protected —
-    /// applied exactly once even across ambiguous transport failures, where a replayed
-    /// read/write commit could double-apply (the module-doc caveat).
-    fn apply_transaction(
-        &self,
-        statements: Vec<SpannerSql>,
-        mutations: Vec<Mutation>,
-    ) -> Result<()> {
+        let ManualTxn::Dml {
+            statements,
+            mutations,
+        } = work
+        else {
+            return Ok(());
+        };
         // Mint a fresh cancel signal for this operation (see `CancelSlot`).
         self.cancel.begin_operation();
         if statements.is_empty() {
+            // Mutations-only commits use the client's replay protection.
             return write_mutations_txn(
                 &self.runtime,
                 &self.client,
                 &self.cancel.current(),
                 &self.config,
-                mutations,
+                mutations.clone(),
             );
         }
         run_batch_txn(

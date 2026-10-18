@@ -2,9 +2,9 @@
 //! [`SpannerRetryPolicy`], preserving its transport-error retries on idempotent requests.
 //! Unset options retain client defaults; see `docs/options.md` for the option contract.
 //!
-//! The pinned client's streaming retry loop resets its start time on each attempt, so
-//! `max_elapsed_seconds` only bounds unary RPC retries. Use the query/fetch RPC timeouts for
-//! a streaming deadline. `max_attempts` works on both paths; `tests/mock_spanner.rs` covers this.
+//! The pinned client's query and BatchWrite streaming retry loops reset their start time on
+//! each attempt, so `max_elapsed_seconds` only bounds unary retries. Use the query/fetch/update
+//! timeouts for streaming deadlines. `max_attempts` works on all three paths.
 
 use std::time::Duration;
 
@@ -14,7 +14,8 @@ use google_cloud_gax::backoff_policy::BackoffPolicyArg;
 use google_cloud_gax::exponential_backoff::ExponentialBackoffBuilder;
 use google_cloud_gax::retry_policy::{RetryPolicyArg, RetryPolicyExt as _};
 use google_cloud_spanner::builder::{
-    BatchDmlBuilder, TransactionRunnerBuilder, WriteOnlyTransactionBuilder,
+    BatchDmlBuilder, BatchWriteTransactionBuilder, TransactionRunnerBuilder,
+    WriteOnlyTransactionBuilder,
 };
 use google_cloud_spanner::retry_policy::SpannerRetryPolicy;
 use google_cloud_spanner::statement::StatementBuilder;
@@ -42,7 +43,7 @@ macro_rules! apply_to_commit_builder {
     };
 }
 
-// Statement and batch-DML builders each accept one retry and backoff policy.
+// Statement and batch builders each accept one retry and backoff policy.
 macro_rules! apply_to_request_builder {
     ($(#[$attr:meta])* $name:ident($builder:ty)) => {
         $(#[$attr])*
@@ -156,6 +157,11 @@ impl RetryConfig {
     apply_to_request_builder! {
         /// Apply the retry and backoff policies to an `ExecuteBatchDml` batch builder.
         apply_to_batch_dml(BatchDmlBuilder)
+    }
+
+    apply_to_request_builder! {
+        /// Bound retries of unacknowledged BatchWrite mutation groups.
+        apply_to_batch_write(BatchWriteTransactionBuilder)
     }
 
     apply_to_commit_builder! {

@@ -79,11 +79,7 @@ use crate::timeout::with_timeout;
 /// Field name used for the element of an Arrow `List` (the Arrow convention).
 const LIST_ITEM: &str = "item";
 
-/// Maximum nesting depth the server-provided `STRUCT`/`ARRAY` type walk ([`arrow_type`]) will
-/// descend before failing loudly — defense-in-depth against a hostile endpoint returning
-/// pathological `STRUCT<STRUCT<…>>` metadata, making the guarantee local to the driver's own
-/// recursion rather than resting on prost's decode limit. `100` matches that limit; no legitimate
-/// result type nests remotely this deep.
+/// Bound the server-provided type walk to avoid stack exhaustion. Matches prost's decode limit.
 const MAX_TYPE_NESTING_DEPTH: usize = 100;
 
 /// Precision and scale of Spanner's `NUMERIC` type (GoogleSQL `NUMERIC` is fixed at 38 / 9).
@@ -188,17 +184,11 @@ pub(crate) fn rows_to_batch(
     Ok((schema, batch))
 }
 
-/// Additional per-chunk byte budget for [`pull_chunk`], on top of the `max` (row-count) cap.
-///
-/// The row cap alone bounds rows, not bytes: 8192 rows of `STRING(MAX)`/`BYTES(MAX)` would be tens
-/// of GB per chunk, and a chunk is held roughly twice during conversion. So `pull_chunk` also cuts a
-/// chunk once its accumulated (approximate) wire size crosses this budget. A single row larger than
-/// the whole budget still forms its own one-row chunk (the check runs *after* the row is buffered),
-/// so streaming never stalls or emits an empty chunk.
+/// Approximate retained row memory per chunk, in addition to its row-count cap.
+/// One oversized row still forms a one-row chunk; conversion needs additional memory.
 const CHUNK_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 
-/// Pull up to `max` rows from a Spanner result set, stopping early when the stream ends — or, as an
-/// additional cap, once the accumulated rows exceed [`CHUNK_BYTE_BUDGET`] approximate bytes.
+/// Pull up to `max` rows, stopping at EOF or [`CHUNK_BYTE_BUDGET`] approximate bytes.
 ///
 /// `rows` is deliberately not pre-reserved to `max`: `max` is a *cap*, not a prediction, and
 /// reserving it would allocate for the cap regardless — unbounded for a large
@@ -210,8 +200,6 @@ async fn pull_chunk(rs: &mut ResultSet, max: usize) -> Result<Vec<Row>> {
         match rs.next().await {
             Some(row) => {
                 let row = row.map_err(from_spanner)?;
-                // Approximate (see `approx_row_bytes`); base64 BYTES over-estimate the decoded
-                // size, which only makes the budget slightly more conservative.
                 bytes = bytes.saturating_add(approx_row_bytes(&row));
                 rows.push(row);
                 // The row is already buffered, so an oversized single row still yields a one-row
@@ -226,20 +214,20 @@ async fn pull_chunk(rs: &mut ResultSet, max: usize) -> Result<Vec<Row>> {
     Ok(rows)
 }
 
-/// Roughly estimate a row's byte size, used only to drive the [`CHUNK_BYTE_BUDGET`] early-cut —
-/// never for correctness.
+/// Estimate retained memory, excluding shared metadata and unused allocation capacity.
 fn approx_row_bytes(row: &Row) -> usize {
-    row.raw_values().iter().map(approx_value_bytes).sum()
+    size_of::<Row>()
+        + row
+            .raw_values()
+            .iter()
+            .map(approx_value_bytes)
+            .sum::<usize>()
 }
 
-/// Approximate the byte size of a single Spanner [`Value`] (see [`approx_row_bytes`]). Strings —
-/// how Spanner ships most types over the wire — count their UTF-8 length; nested lists/structs
-/// recurse; other scalars count as a small fixed size.
+/// Include each value's storage, even for nulls and empty containers. Counting only payload
+/// bytes would leave large arrays of nulls or small scalars effectively unbounded.
 fn approx_value_bytes(value: &Value) -> usize {
-    match value.kind() {
-        Kind::Null => 0,
-        Kind::Bool => 1,
-        Kind::Number => 8,
+    let payload = match value.kind() {
         Kind::String => value.as_str().expect("string kind").len(),
         Kind::List => value
             .as_list()
@@ -247,9 +235,9 @@ fn approx_value_bytes(value: &Value) -> usize {
             .iter()
             .map(approx_value_bytes)
             .sum(),
-        // Unexpected wire kinds are rejected during conversion.
-        Kind::Unknown => 0,
-    }
+        _ => 0,
+    };
+    size_of::<Value>() + payload
 }
 
 /// Wrap a Spanner [`ResultSet`] as a streaming Arrow [`RecordBatchReader`].
@@ -559,10 +547,8 @@ async fn next_bound_chunk(
     }
 }
 
-/// Build the Arrow schema for a result set from Spanner's column metadata, falling back to
-/// all-`Utf8` columns inferred from the first row's width when metadata is unavailable. Returns
-/// `Result` (naming the offending column) so an unmappable type can be rejected cleanly; today
-/// every Spanner type maps to some Arrow type.
+/// Build the result schema from column metadata, falling back to `Utf8` and the first row's
+/// width when metadata is unavailable. Type errors include the column name.
 pub(crate) fn build_schema(
     metadata: Option<&ResultSetMetadata>,
     first_row: Option<&Row>,
@@ -602,9 +588,7 @@ pub(crate) fn build_schema(
 /// The storage type stays `Utf8` (the value bytes are the JSON text); only the field metadata marks
 /// it as logical JSON. Only `TypeCode::Json` is tagged — the other Utf8-backed codes stay untagged.
 ///
-/// Never fails today (every Spanner type maps to some Arrow type), but stays fallible so a future
-/// unmappable type can be rejected here without a signature change rippling through the
-/// schema-build path.
+/// Rejects types exceeding [`MAX_TYPE_NESTING_DEPTH`].
 pub(crate) fn arrow_field(
     name: impl Into<String>,
     ty: &Type,
@@ -895,7 +879,10 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
             values, "FLOAT64", parse_f64,
         )?),
         DataType::Float32 => Arc::new(build_primitive::<Float32Type>(values, "FLOAT32", |v| {
-            parse_f64(v).map(|f| f as f32)
+            let wide = parse_f64(v)?;
+            let narrow = wide as f32;
+            // Preserve explicit infinities, but never turn a finite wire value into one.
+            (!wide.is_finite() || narrow.is_finite()).then_some(narrow)
         })?),
         DataType::Date32 => Arc::new(build_primitive::<Date32Type>(values, "DATE", |v| {
             v.as_str().and_then(parse_date_days)
@@ -1095,7 +1082,7 @@ fn parse_f64(value: &Value) -> Option<f64> {
         "NaN" => Some(f64::NAN),
         "Infinity" => Some(f64::INFINITY),
         "-Infinity" => Some(f64::NEG_INFINITY),
-        s => s.parse::<f64>().ok(),
+        s => s.parse::<f64>().ok().filter(|f| f.is_finite()),
     }
 }
 

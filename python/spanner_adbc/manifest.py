@@ -6,10 +6,8 @@ Run after installing, upgrading, or moving the Python environment::
     # Equivalent console command:
     spanner-adbc-install-manifest
 
-The TOML manifest contains the installed library's absolute path: driver managers
-pass ``Driver.shared`` directly to the dynamic loader, without resolving it
-relative to the manifest. The default destination is a directory the driver
-manager searches; see :func:`default_install_dir`.
+The manifest uses an absolute library path and is installed in a directory the
+driver manager searches; see :func:`default_install_dir`.
 """
 
 from __future__ import annotations
@@ -22,7 +20,7 @@ import platform
 import sys
 import sysconfig
 import tempfile
-import typing
+from collections.abc import Sequence
 
 from . import ENTRYPOINT, __version__, _driver_path
 
@@ -34,15 +32,10 @@ __all__ = [
     "platform_tuple",
 ]
 
-#: The manifest's file name. The *base name* is what a driver manager matches
-#: against the driver name (and against a connection URI's scheme), so calling
-#: it anything else breaks ``driver="spanner"``.
+#: Matches ``driver="spanner"`` and the ``spanner://`` URI scheme.
 MANIFEST_NAME = "spanner.toml"
 
-# Architecture names from the spec's authoritative platform-tuple table, keyed by
-# the values `platform.machine()` reports. Only the architectures this project
-# builds for are listed; anything else is reported as an error rather than
-# guessed at.
+# ADBC architecture names for the platforms with published wheels.
 _ARCHES = {
     "x86_64": "amd64",
     "amd64": "amd64",
@@ -61,19 +54,10 @@ _OSES = {
 
 
 def _is_musl() -> bool:
-    """Whether this interpreter runs against musl libc rather than glibc.
-
-    The driver manager appends ``_musl`` to the platform tuple when *it* was
-    compiled against musl. The driver manager reaching this code is the
-    ``adbc_driver_manager`` wheel installed next to this package, so it matches
-    the interpreter's own libc.
-    """
+    """Infer the driver manager wheel's libc from the interpreter's platform."""
     if sys.platform != "linux":
         return False
-    # The platform tag is the most direct signal: CPython built on Alpine
-    # reports e.g. "linux-x86_64" but its wheel tags are musllinux_*, and
-    # `sysconfig.get_platform()` on a musl build carries "musl" on the
-    # distributions that set it.
+    # Some distributions include musl in the platform tag; Alpine does not.
     if "musl" in (sysconfig.get_platform() or ""):
         return True
     try:
@@ -112,7 +96,7 @@ def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
-def manifest_text(library: typing.Union[str, "os.PathLike[str]", None] = None) -> str:
+def manifest_text(library: str | os.PathLike[str] | None = None) -> str:
     """Render a driver manifest for this installation.
 
     Parameters
@@ -150,16 +134,9 @@ shared = {_toml_string(str(path))}
 
 
 def default_install_dir() -> pathlib.Path:
-    """The directory to install the manifest into by default.
+    """A directory searched by the driver manager under its default load flags.
 
-    Inside a virtual environment this is ``<sys.prefix>/etc/adbc/drivers``,
-    which the Python driver manager adds to its search paths automatically
-    (``adbc_driver_manager/_lib.pyx`` does this whenever
-    ``sys.prefix != sys.base_prefix``). That keeps the manifest scoped to the
-    same environment as the wheel it points into.
-
-    Outside a venv it is the driver manager's *user* config directory, which is
-    searched when the ``SEARCH_USER`` load flag is set (it is, by default):
+    Virtual environments use ``<sys.prefix>/etc/adbc/drivers``. Otherwise:
 
     * Linux: ``$XDG_CONFIG_HOME/adbc/drivers``, else ``~/.config/adbc/drivers``
     * macOS: ``~/Library/Application Support/ADBC/Drivers``
@@ -187,9 +164,9 @@ def default_install_dir() -> pathlib.Path:
 
 
 def install(
-    directory: typing.Union[str, "os.PathLike[str]", None] = None,
+    directory: str | os.PathLike[str] | None = None,
     *,
-    library: typing.Union[str, "os.PathLike[str]", None] = None,
+    library: str | os.PathLike[str] | None = None,
 ) -> pathlib.Path:
     """Write ``spanner.toml`` into *directory* and return the path written.
 
@@ -212,7 +189,7 @@ def install(
     return target
 
 
-def main(argv: typing.Optional[typing.Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m spanner_adbc.manifest",
         description=(

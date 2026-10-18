@@ -1,9 +1,7 @@
 //! Criterion benchmarks for the driver's hottest path: decoding Spanner wire values into Arrow
 //! arrays (`src/conversion.rs`), reached through the `#[doc(hidden)]` `bench_support` module.
 //!
-//! Everything runs offline — the synthetic [`Value`]s below mirror exactly what the unit tests in
-//! `src/conversion.rs` construct (Spanner ships `INT64`/`DATE`/`TIMESTAMP`/`NUMERIC` as strings,
-//! `BOOL`/`FLOAT64` natively, `ARRAY`/`STRUCT` as nested lists) — no network, no emulator.
+//! Uses synthetic wire values without a network or emulator.
 //!
 //! Run with `cargo bench` (or `cargo bench -- --test` for a fast single-pass sanity run). Each
 //! benchmark converts one default-size streaming chunk (`spanner.rows_per_batch` = 8192 rows), so
@@ -95,9 +93,7 @@ fn bench_conversion(c: &mut Criterion) {
         });
     }
 
-    // DATE-only chunk: `YYYY-MM-DD` → Date32 epoch-days, isolated from the combined temporal bench
-    // so the per-cell DATE conversion cost (PERF-3) reads directly. A sprinkle of SQL NULLs keeps
-    // the null path honest.
+    // Isolate DATE parsing from the combined temporal benchmark, including nulls.
     {
         let dates = column(|i| {
             if i % 16 == 0 {
@@ -110,9 +106,7 @@ fn bench_conversion(c: &mut Criterion) {
         group.bench_function("dates_date32", |b| b.iter(|| convert(&columns)));
     }
 
-    // BYTES chunk: base64-encoded payloads (48 decoded bytes per cell) — the per-cell decode arm
-    // (which reuses one scratch buffer across cells, PERF-2). A sprinkle of SQL NULLs keeps the
-    // null path honest.
+    // Base64 decoding with 48 decoded bytes per cell, including nulls.
     {
         use base64::Engine as _;
         let bytes = column(|i| {

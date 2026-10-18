@@ -110,18 +110,8 @@ unsafe extern "C" fn get_next(
 ) -> c_int {
     unsafe {
         catch_callback(stream, |private| {
-            // Only this callback clears what a previous failure left behind, and it does so by
-            // superseding it: `error_from_array_stream` promises "the ADBC status code, or
-            // ADBC_STATUS_OK if there is no error" (adbc.h:398-399), so a `get_next` that
-            // succeeded must not still be reporting the failure of an earlier one. Every exit
-            // below that returns non-zero records its own error first, so this clear is only
-            // observable on success.
-            //
-            // `get_schema` deliberately does not clear: it reads a schema this driver already
-            // holds and consumes nothing, so its success says nothing about the read. Clearing
-            // there would let a caller that asked for the schema after a failed `get_next` --
-            // which the Arrow C Stream Interface permits, `get_schema` being callable at any
-            // time -- see the query failure replaced by ADBC_STATUS_OK.
+            // Each read supersedes the previous error; every failing path records a new one.
+            // `get_schema` leaves it intact so inspecting the schema cannot hide a read failure.
             private.last_error = None;
             if out.is_null() {
                 return private.fail("Arrow C Stream array output must not be null");
@@ -297,11 +287,7 @@ impl PrivateData {
     }
 
     fn arrow_error(&mut self, error: &ArrowError) -> c_int {
-        // The errno and the status are read off one table but are deliberately not the same
-        // mapping: an Arrow variant the driver did not raise gets the errno the Arrow C Stream
-        // Interface expects for it -- `NotYetImplemented` is ENOSYS, the callback not being
-        // implemented at all, rather than the ENOTSUP `adbc_status_to_errno` gives
-        // `Status::NotImplemented` for.
+        // Plain Arrow errors use Arrow's errno mapping; embedded ADBC errors retain their status.
         let (errno, status) = match error {
             ArrowError::NotYetImplemented(_) => (ENOSYS, Status::NotImplemented),
             ArrowError::MemoryError(_) => (ENOMEM, Status::Internal),

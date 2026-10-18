@@ -98,7 +98,7 @@ impl ManualTxn {
 /// Transaction state shared between a connection and the statements it creates.
 #[derive(Debug)]
 pub(crate) struct TxnState {
-    /// When false, the connection is in manual transaction mode: DML and DDL buffer into
+    /// When false, the connection is in manual transaction mode: DML buffers into
     /// [`Self::txn`] and queries run on its shared read-only transaction.
     pub(super) autocommit: bool,
     /// The manual transaction's state. Always [`ManualTxn::Unset`] in autocommit mode (ending a
@@ -164,7 +164,7 @@ impl TxnState {
     /// `txn` itself.
     ///
     /// Re-checks the transaction kind first: the caller built `txn` outside the lock (the build
-    /// is async), so a concurrent statement may have fixed the transaction to DML/DDL in the
+    /// is async), so a concurrent statement may have fixed the transaction to DML in the
     /// window — re-checking here, under the same lock the buffer paths write under, closes that
     /// race with the same rejection the caller's up-front guard produces.
     pub(crate) fn start_read_txn(

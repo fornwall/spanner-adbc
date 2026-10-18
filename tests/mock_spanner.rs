@@ -5581,3 +5581,97 @@ fn ingest_table_probe_honors_retry_limit() {
     assert_eq!(statement.execute_update().unwrap(), Some(0));
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn batch_write_honors_retry_attempt_limit() {
+    let _watchdog = watchdog!();
+    for limit in [1, 3] {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let recorded = attempts.clone();
+        let server = MockServer::start(move |mock| {
+            mock.expect_batch_write().returning(move |_| {
+                recorded.fetch_add(1, Ordering::SeqCst);
+                Err(tonic::Status::unavailable("batch write unavailable"))
+            });
+        });
+        let mut connection = server.connect();
+        let mut statement = append_ingest_statement(&mut connection);
+        for (key, value) in [
+            (
+                spanner_adbc::OPTION_INGEST_BATCH_WRITE,
+                OptionValue::String("true".into()),
+            ),
+            (
+                spanner_adbc::OPTION_RETRY_MAX_ATTEMPTS,
+                OptionValue::Int(limit as i64),
+            ),
+            (
+                spanner_adbc::OPTION_RETRY_BACKOFF_INITIAL_SECONDS,
+                OptionValue::Double(0.001),
+            ),
+            (
+                spanner_adbc::OPTION_RPC_TIMEOUT_UPDATE,
+                OptionValue::Double(2.0),
+            ),
+        ] {
+            statement
+                .set_option(OptionStatement::Other(key.into()), value)
+                .unwrap();
+        }
+        statement.bind(ingest_batch(1)).unwrap();
+        let error = statement.execute_update().unwrap_err();
+        assert_eq!(error.status, AdbcStatus::IO, "{error}");
+        assert_eq!(attempts.load(Ordering::SeqCst), limit);
+    }
+}
+
+#[test]
+fn query_consumes_empty_stream_ingest_schema() {
+    let _watchdog = watchdog!();
+    let server = MockServer::start(|mock| {
+        mock.expect_execute_streaming_sql().returning(|_| {
+            Ok(stream_of(vec![Ok(partial_result_set(
+                true,
+                &["row"],
+                b"",
+                true,
+            ))]))
+        });
+    });
+    let mut connection = server.connect();
+    for discard in [false, true] {
+        let mut statement = connection.new_statement().unwrap();
+        statement
+            .bind_stream(Box::new(arrow_array::RecordBatchIterator::new(
+                std::iter::empty::<Result<RecordBatch, ArrowError>>(),
+                ingest_batch(0).schema(),
+            )))
+            .unwrap();
+        statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+        if discard {
+            assert_eq!(statement.execute_update().unwrap(), None);
+        } else {
+            let batches = statement
+                .execute()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        }
+        statement
+            .set_option(
+                OptionStatement::TargetTable,
+                OptionValue::String("MockTable".into()),
+            )
+            .unwrap();
+        statement
+            .set_option(
+                OptionStatement::IngestMode,
+                OptionValue::String("append".into()),
+            )
+            .unwrap();
+        let error = statement.execute_update().unwrap_err();
+        assert_eq!(error.status, AdbcStatus::InvalidState, "{error}");
+        assert!(error.message.contains("no data has been bound"), "{error}");
+    }
+}

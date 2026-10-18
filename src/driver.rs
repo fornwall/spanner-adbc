@@ -50,9 +50,8 @@ impl SpannerDriver {
 impl Default for SpannerDriver {
     /// Create a driver with a fresh runtime.
     ///
-    /// Required by the C FFI driver exporter, which cannot surface a fallible constructor. Panics
-    /// only if the Tokio runtime cannot be created (catastrophic OS resource exhaustion); prefer
-    /// [`SpannerDriver::try_new`] in Rust code.
+    /// Panics if the Tokio runtime cannot be created. Prefer [`SpannerDriver::try_new`] to
+    /// handle initialization errors; the C ABI uses that fallible constructor too.
     fn default() -> Self {
         Self::try_new().expect("failed to initialize the Spanner ADBC driver Tokio runtime")
     }

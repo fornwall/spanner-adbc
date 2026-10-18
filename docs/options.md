@@ -146,7 +146,7 @@ own effective values after inheritance or overrides.
 | `spanner.rpc.timeout_seconds.update` | non-negative fractional seconds | unset | set | DML, manual commit, each ingest chunk, BatchWrite, partitioned DML, and DDL plus operation polling. |
 | `spanner.rpc.timeout_seconds.fetch` | non-negative fractional seconds | unset | set | Each later streamed chunk. |
 | `spanner.retry.max_attempts` | integer `1..=4294967295` | client default | set | Attempt cap including the first try; `1` disables retries. See [retry tuning](#retry-tuning). |
-| `spanner.retry.max_elapsed_seconds` | positive fractional seconds | unset | set | Retry elapsed-time limit; ineffective for streaming query resumption. |
+| `spanner.retry.max_elapsed_seconds` | positive fractional seconds | unset | set | Retry elapsed-time limit; ineffective for streaming query and BatchWrite resumption. |
 | `spanner.retry.backoff.initial_seconds` | positive fractional seconds | `1` | explicitly set only | Initial backoff delay, clamped at execution. |
 | `spanner.retry.backoff.max_seconds` | positive fractional seconds | `60` | explicitly set only | Maximum backoff delay, clamped at execution. |
 | `spanner.retry.backoff.multiplier` | positive finite number | `2` | explicitly set only | Backoff growth factor, clamped at execution. |
@@ -176,8 +176,8 @@ supplies a hidden row id. Create the table yourself and use `append` to choose i
 DDL is immediate even in manual mode. See [primary keys](https://docs.cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys).
 
 BatchWrite uses one mutation group per row, so a chunk can partially succeed. Priority,
-transaction tag, change-stream exclusion and the update timeout apply; request tags, commit
-delay/stats and retry tuning do not. Ordinary autocommit ingest is atomic per chunk, while manual
+transaction tag, change-stream exclusion, retry tuning and the update timeout apply; request tags
+and commit delay/stats do not. Ordinary autocommit ingest is atomic per chunk, while manual
 ingest buffers mutations for one commit.
 
 [Partitioned DML](https://docs.cloud.google.com/spanner/docs/dml-partitioned) requires an idempotent
@@ -253,15 +253,15 @@ See [timeout coverage](transactions.md#timeouts).
 
 ## Retry tuning
 
-`spanner.retry.*` configures query/DML statement requests, batch DML and the begin/commit RPCs
-of read/write and write-only transactions. It preserves the client's retryable-error policy.
-It does not configure session creation, `PartitionQuery`, BatchWrite or admin DDL requests.
+`spanner.retry.*` configures query/DML statement requests, batch DML, BatchWrite and the
+begin/commit RPCs of read/write and write-only transactions. It preserves the client's retryable-error policy.
+It does not configure session creation, `PartitionQuery` or admin DDL requests.
 Whole-transaction retries on `ABORTED` use a separate, uncapped default policy; use an RPC timeout
 to bound the enclosing operation.
 
 ### Attempt and elapsed limits
 
-| Setting | Unary RPCs | Streaming query resumption |
+| Setting | Unary RPCs | Query/BatchWrite stream resumption |
 | --- | --- | --- |
 | `max_attempts=N` | At most N attempts | At most N attempts |
 | `max_elapsed_seconds` | Bounds retry decisions | Ineffective: client resets the retry state's start time. |
@@ -269,8 +269,9 @@ to bound the enclosing operation.
 
 The query stream's initial open can fail without reaching its resumption retry loop. Setting
 only `max_elapsed_seconds` replaces the default streaming policy, so set `max_attempts` too if
-you need an attempt cap. Use `query`/`fetch` timeouts for streaming wall-clock bounds. These
-behaviors are covered by `retry_max_*` tests in [mock_spanner.rs](../tests/mock_spanner.rs).
+you need an attempt cap. Use `query`/`fetch` timeouts for query wall-clock bounds and the `update`
+timeout for BatchWrite. See `retry_max_*` and `batch_write_honors_retry_attempt_limit` in
+[mock_spanner.rs](../tests/mock_spanner.rs) for regression coverage.
 
 ### Backoff
 

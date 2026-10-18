@@ -109,8 +109,8 @@ pub(crate) fn run_batch_txn(
     client: &DatabaseClient,
     cancel: &CancelSignal,
     config: &SharedConfig,
-    statements: Vec<SpannerSql>,
-    mutations: Vec<Mutation>,
+    statements: &[SpannerSql],
+    mutations: &[Mutation],
     last_statements: bool,
 ) -> Result<i64> {
     if statements.is_empty() && mutations.is_empty() {
@@ -128,11 +128,9 @@ pub(crate) fn run_batch_txn(
         let runner = runner_builder(&client, isolation, &request, retry).build();
         let outcome = runner
             .run(move |transaction: ReadWriteTransaction| {
-                let statements = statements.clone();
-                let mutations = mutations.clone();
                 let request = request.clone();
                 async move {
-                    transaction.buffer(mutations)?;
+                    transaction.buffer(mutations.iter().cloned())?;
                     if statements.is_empty() {
                         return Ok(0);
                     }
@@ -140,7 +138,7 @@ pub(crate) fn run_batch_txn(
                         .apply_to_batch_dml(request.apply_to_batch_dml(BatchDmlBuilder::new()))
                         .set_last_statements(last_statements);
                     for statement in statements {
-                        batch = batch.add_statement(statement);
+                        batch = batch.add_statement(statement.clone());
                     }
                     let counts = transaction.execute_batch_update(batch.build()).await?;
                     Ok(counts.into_iter().sum::<i64>())

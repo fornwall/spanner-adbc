@@ -34,7 +34,7 @@ import spanner_adbc.dbapi as spanner
 from spanner_adbc import DatabaseOptions
 
 with spanner.connect(
-    db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
+    db_kwargs={DatabaseOptions.URI: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers")
@@ -103,7 +103,7 @@ With no credential options, the driver uses
 run `gcloud auth application-default login` locally, set `GOOGLE_APPLICATION_CREDENTIALS`, or use
 an attached service account on Google Cloud.
 
-Pass explicit credentials in `db_kwargs` alongside `DatabaseOptions.URI.value`:
+Pass explicit credentials in `db_kwargs` alongside `DatabaseOptions.URI`:
 
 | Option | Value |
 | --- | --- |
@@ -122,9 +122,9 @@ import spanner_adbc.dbapi as spanner
 from spanner_adbc import DatabaseOptions
 
 with spanner.connect(db_kwargs={
-    DatabaseOptions.URI.value: "spanner:///projects/p/instances/i/databases/d",
-    DatabaseOptions.ENDPOINT.value: "localhost:9010",
-    DatabaseOptions.EMULATOR.value: "true",
+    DatabaseOptions.URI: "spanner:///projects/p/instances/i/databases/d",
+    DatabaseOptions.ENDPOINT: "localhost:9010",
+    DatabaseOptions.EMULATOR: "true",
 }) as conn:
     ...
 ```
@@ -170,7 +170,7 @@ with spanner.connect(
 ```
 
 In manual query transactions, `max:<duration>` and `min:<timestamp>` bounds become exact
-staleness and a fixed read timestamp respectively. Set `ConnectionOptions.READONLY.value` to
+staleness and a fixed read timestamp respectively. Set `ConnectionOptions.READONLY` to
 `"true"` to reject DML, DDL, and ingest; rollback remains available.
 
 ## Transactions
@@ -193,7 +193,7 @@ import spanner_adbc.dbapi as spanner
 from spanner_adbc import DatabaseOptions
 
 with spanner.connect(
-    db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
+    db_kwargs={DatabaseOptions.URI: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:
     with conn.cursor() as cur:
         # DDL applies immediately.
@@ -221,7 +221,7 @@ import spanner_adbc.dbapi as spanner
 from spanner_adbc import DatabaseOptions
 
 with spanner.connect(
-    db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
+    db_kwargs={DatabaseOptions.URI: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers ORDER BY SingerId")
@@ -253,7 +253,7 @@ import spanner_adbc.dbapi as spanner
 from spanner_adbc import DatabaseOptions
 
 with spanner.connect(
-    db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
+    db_kwargs={DatabaseOptions.URI: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:
     df = pl.read_database(
         "SELECT SingerId, FirstName FROM Singers ORDER BY SingerId",
@@ -269,7 +269,7 @@ import spanner_adbc.dbapi as spanner
 from spanner_adbc import DatabaseOptions
 
 with spanner.connect(
-    db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
+    db_kwargs={DatabaseOptions.URI: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers")
@@ -293,7 +293,7 @@ from spanner_adbc import DatabaseOptions
 frame = pd.DataFrame({"SingerId": [10, 11], "FirstName": ["Carol", "Dave"]})
 
 with spanner.connect(
-    db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
+    db_kwargs={DatabaseOptions.URI: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
     autocommit=True,                         # apply immediately; returns the row count
 ) as conn:
     with conn.cursor() as cur:
@@ -325,7 +325,7 @@ import spanner_adbc.dbapi as spanner
 from spanner_adbc import DatabaseOptions
 
 with spanner.connect(
-    db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
+    db_kwargs={DatabaseOptions.URI: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:
     with conn.cursor() as cur:
         partitions, schema = cur.adbc_execute_partitions("SELECT SingerId FROM Singers")

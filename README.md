@@ -146,6 +146,8 @@ tables use the Arrow storage types for these columns.
 
 Binding and ingest widen `UInt8`/`UInt16`/`UInt32` to `INT64` and `Float16` to `FLOAT32`;
 `UInt64` is unsupported. `FixedSizeBinary` maps to `BYTES`.
+`Date64` values must contain whole days (multiples of 86,400,000 milliseconds); use an
+Arrow timestamp to preserve a time of day.
 `Decimal128` binding and ingest preserve values with negative scales (for example, `99` at
 scale `-2` is `9900`); Spanner validates the `NUMERIC` range, and readback uses scale 9.
 

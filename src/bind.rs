@@ -24,7 +24,7 @@ use arrow_array::types::{
 };
 use arrow_array::{Array, RecordBatch, downcast_dictionary_array};
 use arrow_schema::{DataType, Field, TimeUnit};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, SecondsFormat, Utc};
 use google_cloud_spanner::mutation::Mutation;
 use google_cloud_spanner::statement::StatementBuilder;
 use google_cloud_spanner::types::{self, Type};
@@ -397,10 +397,15 @@ fn list_cell_value(
     ))
 }
 
-/// Convert an Arrow `Date64` value (milliseconds since the Unix epoch, at a whole-day boundary
-/// per the Arrow spec) to `Date32` days, erroring on values outside the `Date32` range.
+/// Convert Date64 milliseconds to Date32 days, rejecting non-day values and overflow.
+/// Arrow constructors do not enforce Date64's whole-day requirement.
 fn date64_days(name: &str, millis: i64) -> Result<i32> {
-    i32::try_from(millis.div_euclid(86_400_000)).map_err(|_| {
+    if millis % 86_400_000 != 0 {
+        return Err(invalid_argument(format!(
+            "cannot bind DATE parameter {name:?}: Date64 value {millis}ms is not a whole number of days; use a timestamp type to retain time of day"
+        )));
+    }
+    i32::try_from(millis / 86_400_000).map_err(|_| {
         invalid_argument(format!(
             "cannot bind DATE parameter {name:?}: {millis}ms is out of range"
         ))
@@ -410,9 +415,10 @@ fn date64_days(name: &str, millis: i64) -> Result<i32> {
 /// Format an Arrow `Date32` (days since the Unix epoch) as the Spanner `DATE` wire form,
 /// `YYYY-MM-DD`. `name` is used only for the out-of-range error message.
 fn date_string(name: &str, days: i32) -> Result<String> {
-    let date = NaiveDate::from_ymd_opt(1970, 1, 1)
-        .unwrap()
-        .checked_add_signed(Duration::days(i64::from(days)))
+    // Chrono counts 0001-01-01 as day 1; 1970-01-01 is day 719_163.
+    let date = days
+        .checked_add(719_163)
+        .and_then(NaiveDate::from_num_days_from_ce_opt)
         .filter(|date| (1..=9999).contains(&date.year()))
         .ok_or_else(|| {
             invalid_argument(format!(

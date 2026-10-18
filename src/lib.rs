@@ -699,7 +699,7 @@ pub const OPTION_RPC_TIMEOUT_FETCH: &str = "spanner.rpc.timeout_seconds.fetch";
 /// Driver-specific connection **and** statement option: the **maximum number of attempts** the
 /// Spanner client makes for a retryable RPC — the first try plus retries — as a positive integer.
 /// `1` disables retrying; unset (the default) leaves the client's own policy, uncapped on the unary
-/// RPC paths and capped at 10 attempts on the streaming query path. Exact on both.
+/// RPC paths and capped at 10 attempts on streaming query and BatchWrite paths. Exact on all three.
 ///
 /// Accepted as an integer, a whole-valued double or a numeric string, round-tripping through
 /// `get_option` / `get_option_int`; `""` unsets it. Setting it and/or
@@ -716,9 +716,9 @@ pub const OPTION_RETRY_MAX_ATTEMPTS: &str = "spanner.retry.max_attempts";
 /// and inheritance are as that option; round-trips through `get_option` / `get_option_double`.
 ///
 /// **Unary RPCs only.** It bounds the unary retry loops (DML, `ExecuteBatchDml`, begin, commit) but
-/// is **inert on the streaming query path**, an upstream defect the driver cannot correct (see
-/// `src/retry.rs`'s module docs). To bound a query's wall-clock time use the
-/// [`OPTION_RPC_TIMEOUT_QUERY`] / [`OPTION_RPC_TIMEOUT_FETCH`] family, which does cover it.
+/// is **inert on streaming query and BatchWrite paths** (see `src/retry.rs`'s module docs).
+/// Use [`OPTION_RPC_TIMEOUT_QUERY`] / [`OPTION_RPC_TIMEOUT_FETCH`] for query deadlines and
+/// [`OPTION_RPC_TIMEOUT_UPDATE`] for BatchWrite.
 pub const OPTION_RETRY_MAX_ELAPSED_SECONDS: &str = "spanner.retry.max_elapsed_seconds";
 
 /// Driver-specific connection **and** statement option: the **initial delay**, in seconds, of the

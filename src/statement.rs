@@ -415,6 +415,8 @@ impl SpannerStatement {
         // in a manual transaction that began with DML — the buffered work only executes at
         // commit, so the query would not observe it (no read-your-writes).
         self.ensure_query_allowed()?;
+        // Consume an empty bound stream's schema so it cannot leak into a later ingest.
+        self.ingest_schema = None;
         // Parameterized query: run once per bound row. The attempt consumes the bound rows on
         // every exit path — following the DML/ingest/partition convention (see `clear_bound`), a
         // failed bound query must not leave stale rows for a later, unrelated `execute`.
@@ -789,7 +791,7 @@ impl SpannerStatement {
             return Ok(None);
         }
         // Install under the lock, re-checking the kind: a concurrent statement may have fixed the
-        // transaction to DML/DDL (rejected here) or installed its own read transaction (returned
+        // transaction to DML (rejected here) or installed its own read transaction (returned
         // instead) in the unlocked window.
         st.start_read_txn(Arc::new(built)).map(Some)
     }

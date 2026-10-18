@@ -12,8 +12,8 @@ use adbc_core::error::{Error, Result, Status};
 
 use crate::error::invalid_argument;
 /// Run `f`, converting a panic into an `Internal` error rather than letting it cross the ABI.
-pub(crate) fn catch<T>(f: impl FnOnce() -> Result<T>) -> std::result::Result<Result<T>, Error> {
-    std::panic::catch_unwind(AssertUnwindSafe(f)).map_err(caught_panic)
+pub(crate) fn catch<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|cause| Err(caught_panic(cause)))
 }
 
 // The payload formatting is independent of the callback and result types. Keep one copy
@@ -42,10 +42,7 @@ pub(crate) fn drop_panic_payload(cause: Box<dyn Any + Send>) {
     }
 }
 
-/// What a caught panic said, for the two boundaries that report one: entry points through
-/// [`catch`], and the Arrow stream callbacks in [`super::stream`].
-///
-/// A payload that is neither of the two shapes `panic!` produces carries nothing renderable.
+/// Extract a string panic payload for entry-point and stream diagnostics.
 pub(crate) fn panic_message(cause: &(dyn Any + Send)) -> &str {
     cause
         .downcast_ref::<&str>()
@@ -56,10 +53,7 @@ pub(crate) fn panic_message(cause: &(dyn Any + Send)) -> &str {
 
 /// Renders text as a C string, replacing interior NULs rather than losing what follows them.
 ///
-/// Driver messages are NUL-free by construction, but one that reached the driver from a vendor
-/// library need not be, and no C string can carry a NUL. Truncating at it would silently drop the
-/// rest of a diagnostic, so each one becomes `?`: a character that reads as "something was
-/// replaced here", where a space would blend in and quietly turn one identifier into two words.
+/// Replacing NULs with `?` preserves the rest of vendor diagnostics.
 pub(crate) fn sanitized_cstring(text: &str) -> CString {
     let mut bytes = text.as_bytes().to_vec();
     for byte in &mut bytes {
@@ -137,19 +131,11 @@ pub(crate) unsafe fn byte_slice<'a>(ptr: *const u8, len: usize, name: &str) -> R
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
-/// The space a GetOption caller says it has, or the rejection for a buffer it described
-/// inconsistently.
-///
-/// adbc.h states the protocol as a postcondition on the caller's buffer -- "If output length <=
-/// input length, value will contain a value with length bytes" (adbc.h:1185-1189) -- so a null
-/// buffer advertised as having room would make the driver report a success it did not deliver.
-/// A null buffer of length zero is the legitimate way to ask only for the required size. This is
-/// the reference C++ framework's rule (`!out && *length > 0` in `base_driver.h`'s `CGet`).
+/// Validate GetOption's buffer capacity. A null buffer is valid only for a zero-length size
+/// probe: reporting success with sufficient capacity promises that the value was written.
 ///
 /// # Safety
 /// `length` must be null or point to a readable, writable `usize`.
-// Takes the buffer as an untyped address: the two callers differ only in pointee type, and this
-// check does not read through it.
 unsafe fn available_space(dst: *const c_void, length: *mut usize) -> Result<usize> {
     if length.is_null() {
         return Err(missing_argument("length"));
@@ -197,9 +183,7 @@ pub(crate) unsafe fn write_string(value: &str, dst: *mut c_char, length: *mut us
 /// `length` must be non-null, and `dst` null or point to at least `*length` writable bytes.
 pub(crate) unsafe fn write_bytes(value: &[u8], dst: *mut u8, length: *mut usize) -> Result<()> {
     let available = unsafe { available_space(dst.cast::<c_void>(), length) }?;
-    // The null check is load-bearing here, where [`write_string`] needs none: without a NUL to
-    // make room for, an empty value fits the size probe's zero-length null buffer, and
-    // `copy_nonoverlapping` demands a non-null destination even for zero bytes.
+    // `copy_nonoverlapping` requires a non-null destination even for zero bytes.
     if !dst.is_null() && value.len() <= available {
         unsafe { std::ptr::copy_nonoverlapping(value.as_ptr(), dst, value.len()) };
     }

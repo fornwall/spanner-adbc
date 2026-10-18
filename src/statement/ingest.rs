@@ -467,8 +467,12 @@ impl SpannerStatement {
             .collect();
         let transaction = self
             .config
-            .request
-            .apply_to_batch_write(self.client.batch_write_transaction())
+            .retry
+            .apply_to_batch_write(
+                self.config
+                    .request
+                    .apply_to_batch_write(self.client.batch_write_transaction()),
+            )
             .build();
         let mut applied = 0_i64;
         block_on_cancellable(

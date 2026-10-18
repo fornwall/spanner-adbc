@@ -10,13 +10,14 @@ Three upstream items remain. Verified against the pinned `google-cloud-rust` `41
   `ReadWriteTransaction` has no public constructor, commit or rollback. A public handle would
   let the driver replace buffered manual transactions and support reads after writes.
   Sources: `src/spanner/src/{transaction_runner,read_write_transaction}.rs`.
-- [ ] **UP-14 — Streaming retry elapsed-time limit.** `ResultSet::check_retry` constructs a fresh
+- [ ] **UP-14 — Streaming retry elapsed-time limit.** Query and BatchWrite `check_retry` construct a fresh
   `RetryState` on each retry decision, resetting its start time. Thus
   `spanner.retry.max_elapsed_seconds` does not bound streaming retries. Attempt counting is now
   correct (`1 + retry_count`). Preserve the loop start with `RetryState::set_start` upstream;
-  use query/fetch timeouts for a driver-side wall-clock bound. Sources:
-  `src/spanner/src/result_set.rs`, `src/gax/src/retry_state.rs` and local [src/retry.rs](src/retry.rs).
-  Regression coverage: the `retry_max_*` tests in [tests/mock_spanner.rs](tests/mock_spanner.rs).
+  use query/fetch/update timeouts for a driver-side wall-clock bound. Sources:
+  `src/spanner/src/{result_set,batch_write_transaction}.rs`, `src/gax/src/retry_state.rs` and local
+  [src/retry.rs](src/retry.rs). Regression coverage: `retry_max_*` and
+  `batch_write_honors_retry_attempt_limit` in [tests/mock_spanner.rs](tests/mock_spanner.rs).
 
 ## apache/arrow-adbc
 

@@ -87,8 +87,7 @@ pub(super) unsafe extern "C" fn statement_new(
         // taking the statement's dispatch turn.
         let cancel = state.get_cancel_handle();
         Ok((state, cancel))
-    })
-    .unwrap_or_else(Err);
+    });
     match created {
         Ok((state, cancel)) => {
             statement.private_data = Exported::into_private_data_with_cancel(state, Some(cancel));

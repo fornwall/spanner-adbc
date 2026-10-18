@@ -89,8 +89,8 @@ impl SpannerStatement {
             &self.client,
             &self.cancel.current(),
             &self.config,
-            statements,
-            Vec::new(),
+            &statements,
+            &[],
             true,
         )?;
         Ok(Some(count))

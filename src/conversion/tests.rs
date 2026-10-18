@@ -406,21 +406,86 @@ fn numerics_to_unscaled_i128() {
     assert_eq!(parse_numeric_i128("-"), None); // bare sign
 }
 
-/// The chunk byte-budget estimate: strings count their UTF-8 length, SQL NULLs contribute
-/// nothing, lists recurse, and a single wide value dominates (so it drives the one-row early
-/// cut in `pull_chunk`). The estimate is approximate — only its rough magnitude matters.
 #[test]
-fn approx_value_bytes_sums_string_lengths() {
-    assert_eq!(approx_value_bytes(&"hello".to_value()), 5);
-    assert_eq!(approx_value_bytes(&"".to_value()), 0);
-    // A SQL NULL contributes nothing to the budget.
-    assert_eq!(approx_value_bytes(&None::<&str>.to_value()), 0);
-    // Lists recurse over their elements.
-    assert_eq!(approx_value_bytes(&vec!["a", "bb", "ccc"].to_value()), 6);
-    // A single wide value dominates the estimate — this is what makes an oversized row cut the
-    // chunk after one row.
-    let wide = "x".repeat(2 * CHUNK_BYTE_BUDGET);
-    assert!(approx_value_bytes(&wide.as_str().to_value()) >= CHUNK_BYTE_BUDGET);
+fn chunk_budget_counts_strings_and_nested_value_storage() {
+    let nulls = Value::from(vec![None::<bool>; 4096]);
+    let bools = Value::from(vec![false; 4096]);
+    let empty_strings = Value::from(vec![""; 4096]);
+    for value in [&nulls, &bools, &empty_strings] {
+        assert!(approx_value_bytes(value) >= 4096 * size_of::<Value>());
+    }
+    let nested = Value::from(vec![nulls, bools, empty_strings]);
+    assert!(approx_value_bytes(&nested) >= 3 * 4096 * size_of::<Value>());
+
+    let short = Value::from("hello");
+    let empty = Value::from("");
+    assert_eq!(approx_value_bytes(&short) - approx_value_bytes(&empty), 5);
+
+    let wide = Value::from("x".repeat(CHUNK_BYTE_BUDGET));
+    assert!(approx_value_bytes(&wide) >= CHUNK_BYTE_BUDGET);
+}
+
+#[test]
+fn float32_preserves_extrema_and_special_values_but_rejects_finite_overflow() {
+    let values: Vec<Value> = [
+        f64::from(f32::MIN),
+        f64::from(f32::MAX),
+        f64::from(f32::from_bits(1)),
+        -0.0,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ]
+    .into_iter()
+    .map(Value::from)
+    .collect();
+    let array = build_array(
+        &DataType::Float32,
+        &values.iter().map(Some).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let array = array
+        .as_any()
+        .downcast_ref::<PrimitiveArray<Float32Type>>()
+        .unwrap();
+    assert_eq!(array.value(0), f32::MIN);
+    assert_eq!(array.value(1), f32::MAX);
+    assert_eq!(array.value(2).to_bits(), 1);
+    assert_eq!(array.value(3).to_bits(), (-0.0f32).to_bits());
+    assert!(array.value(4).is_nan());
+    assert_eq!(array.value(5), f32::INFINITY);
+    assert_eq!(array.value(6), f32::NEG_INFINITY);
+
+    for value in [
+        Value::from(f64::MAX),
+        Value::from(-f64::MAX),
+        Value::from("1e39"),
+    ] {
+        let error = build_array(&DataType::Float32, &[Some(&value)]).unwrap_err();
+        assert_eq!(error.status, Status::InvalidData);
+        assert!(error.message.contains("FLOAT32"), "{error}");
+    }
+}
+
+#[test]
+fn floating_point_strings_reject_overflow_and_preserve_explicit_special_values() {
+    for data_type in [DataType::Float32, DataType::Float64] {
+        for text in ["1e999", "-1e999"] {
+            let value = Value::from(text);
+            let error = build_array(&data_type, &[Some(&value)]).unwrap_err();
+            assert_eq!(error.status, Status::InvalidData);
+            assert!(error.message.contains(text), "{error}");
+        }
+    }
+    for (text, expected) in [
+        ("1.25", 1.25),
+        ("1e30", 1e30),
+        ("Infinity", f64::INFINITY),
+        ("-Infinity", f64::NEG_INFINITY),
+    ] {
+        assert_eq!(parse_f64(&Value::from(text)), Some(expected));
+    }
+    assert!(parse_f64(&Value::from("NaN")).unwrap().is_nan());
 }
 
 /// A present wire value that cannot be decoded as the column's type must error (naming the

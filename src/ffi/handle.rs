@@ -208,7 +208,7 @@ where
         // The guard must unwind before `catch` handles a panic so the mutex records poisoning.
         f(&mut state)
     });
-    finish(outcome.unwrap_or_else(Err), error)
+    finish(outcome, error)
 }
 
 /// Cancel the object's in-flight operation without taking its dispatch turn.
@@ -236,7 +236,7 @@ pub(crate) unsafe fn cancel<S>(
             None => Err(uninitialized(kind)),
         }
     });
-    finish(outcome.unwrap_or_else(Err), error)
+    finish(outcome, error)
 }
 
 /// Install cancellation before publishing an initialized state. Statements supply the cancel
@@ -291,7 +291,7 @@ pub(crate) unsafe fn release<S>(
         drop(unsafe { Arc::from_raw(taken.cast_const().cast::<Exported<S>>()) });
         Ok(())
     });
-    finish(outcome.unwrap_or_else(Err), error)
+    finish(outcome, error)
 }
 
 /// Convert a driver result into a status code, exporting the error when there is one.

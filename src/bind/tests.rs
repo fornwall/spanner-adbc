@@ -1004,11 +1004,43 @@ fn binds_int8_and_date64() {
 fn date64_converts_to_days() {
     assert_eq!(date64_days("d", 0).unwrap(), 0);
     assert_eq!(date64_days("d", 19_737i64 * 86_400_000).unwrap(), 19737);
-    // Negative dates land on the correct (floored) day.
     assert_eq!(date64_days("d", -86_400_000).unwrap(), -1);
-    assert_eq!(date64_days("d", -1).unwrap(), -1);
     // Out of Date32 range errors instead of wrapping.
-    assert!(date64_days("d", i64::MAX).is_err());
+    assert!(date64_days("d", (i64::from(i32::MAX) + 1) * 86_400_000).is_err());
+    assert!(date64_days("d", (i64::from(i32::MIN) - 1) * 86_400_000).is_err());
+}
+
+#[test]
+fn date64_binding_rejects_time_of_day_in_scalars_and_lists() {
+    let arrays: Vec<arrow_array::ArrayRef> = vec![
+        Arc::new(arrow_array::Date64Array::from(vec![1, -1])),
+        Arc::new(ListArray::from_iter_primitive::<Date64Type, _, _>([
+            Some(vec![Some(1)]),
+            Some(vec![Some(-1)]),
+        ])),
+    ];
+    for array in arrays {
+        let b = batch(
+            vec![Field::new("created_at", array.data_type().clone(), false)],
+            vec![array],
+        );
+        for row in 0..2 {
+            for error in [
+                bind_params(
+                    Statement::builder("SELECT @created_at"),
+                    &["created_at".into()],
+                    &b,
+                    row,
+                )
+                .unwrap_err(),
+                insert_mutation("events", &b, row).unwrap_err(),
+            ] {
+                assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+                assert!(error.message.contains("created_at"), "{error}");
+                assert!(error.message.contains("whole number of days"), "{error}");
+            }
+        }
+    }
 }
 
 #[test]
