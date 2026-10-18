@@ -41,8 +41,7 @@ SANITIZE="${ADBC_VALIDATION_SANITIZE:-}"
 # the C++ side and clang so both sides share the compiler-rt runtime.
 RUST_SANITIZE="${ADBC_VALIDATION_RUST_SANITIZE:-}"
 
-# Host target triple. `-Zbuild-std` needs an explicit --target, which relocates the cdylib to
-# target/<triple>/debug/; resolved once here and reused for both the build and the library path.
+# -Zbuild-std needs an explicit --target, placing the cdylib in target/<triple>/debug/.
 RUST_TARGET="$(rustc -vV | sed -n 's/host: //p')"
 
 # Default to clang for runtime compatibility; respect explicit compiler choices.
@@ -51,9 +50,7 @@ if [ -n "$RUST_SANITIZE" ]; then
   export CXX="${CXX:-clang++}"
 fi
 
-# One build tree per flag combination, so switching legs doesn't force a full arrow-adbc
-# rebuild and a cached CI tree can't mix flags. The Rust-instrumented leg compiles the C++ side
-# with clang rather than gcc, so it needs a tree of its own distinct from the C-side-only one.
+# Separate build trees keep sanitizer modes and compilers from sharing a CMake cache.
 build_suffix=""
 [ -n "$SANITIZE" ] && build_suffix="-san"
 [ -n "$RUST_SANITIZE" ] && build_suffix="-rustsan"
@@ -80,7 +77,6 @@ for arg in "$@"; do
   esac
 done
 
-# ---------------------------------------------------------------------------
 # Excluded cases must still exist and fail or skip. All other cases run in the gate.
 # Adapt dialect-specific SQL in SpannerQuirks::RewriteSql when possible.
 EXCLUDED=(
@@ -93,12 +89,8 @@ EXCLUDED=(
 
 )
 
-# The colon-joined --gtest_filter value for the EXCLUDED set. Prefixed with `-`
-# it negates (the gate: run everything else); bare it selects only these (the
-# expected-failure guard).
+# A leading '-' excludes these cases from gtest; without it, only these cases run.
 EXCLUDED_FILTER="$(IFS=:; printf '%s' "${EXCLUDED[*]}")"
-
-# ---------------------------------------------------------------------------
 
 # Verify Rust instrumentation by writing past a C++-allocated buffer.
 # The test-only canary must trigger an ASan heap-buffer-overflow report.
@@ -109,15 +101,13 @@ run_rust_asan_canary() {
   mkdir -p "$BUILD_DIR"
 
   echo ">> ASan canary: compiling the cross-boundary tripwire (${CXX:-clang++} -fsanitize=address)"
-  # Same warning hygiene as the CMake target (this compile is deliberately not a CMake
-  # target, so the flags are repeated here rather than inherited).
+  # Match the CMake harness's warning flags.
   "${CXX:-clang++}" -std=c++17 -g -O0 -fsanitize=address -fno-omit-frame-pointer \
     -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Werror \
     "$src" -o "$bin" -ldl
 
   echo ">> ASan canary: running it against $lib (expecting a heap-buffer-overflow)"
-  # ASAN_OPTIONS carries abort_on_error=1, so a detected overflow aborts the process (non-zero
-  # exit); capture that rather than letting `set -e` kill the script before we can assert on it.
+  # Capture the expected abort so set -e does not stop the report check.
   local out rc=0
   out="$("$bin" "$lib" 2>&1)" || rc=$?
 
@@ -211,12 +201,9 @@ run_gate() {
   "$BUILD_DIR/spanner_validation" --gtest_filter="-$EXCLUDED_FILTER"
 }
 
-# Expected-failure guard (xfail-strict): run ONLY the excluded cases and assert none
-# PASSED — one that starts passing must be removed from EXCLUDED so the gate enforces it.
-# The run exits non-zero by design, so its status is captured, not propagated. The
-# discriminator comes from the JUnit XML (gtest writes each <testcase> opening tag on one
-# line): passed = result="completed" with no <failure> child, skipped = result="skipped" —
-# so a skipped excluded case does not count as passing.
+# Unexpected passes must be removed from EXCLUDED so the normal run enforces them.
+# gtest writes each <testcase> opening tag on one line. A pass has result="completed"
+# and no <failure> child; skipped cases use result="skipped".
 run_xfail_guard() {
   echo ">> expected-failure guard: no EXCLUDED case may actually pass"
   local bin="$BUILD_DIR/spanner_validation"
@@ -293,9 +280,7 @@ echo ">> ADBC_SPANNER_URI=$ADBC_SPANNER_URI"
 
 if [ "$FULL" -eq 1 ]; then
   echo ">> running the FULL validation suite (expect Spanner-specific failures/skips)"
-  # Per-test process isolation via ctest, so a failing assertion (which aborts the process
-  # — see the README note on the upstream non-idempotent error release) only fails that one
-  # test rather than hiding the rest.
+  # Isolate each case so an abort cannot prevent the remaining cases from running.
   ctest --test-dir "$BUILD_DIR" --output-on-failure || true
 else
   # Gate first (must pass), then assert the excluded set still all fails/skips.

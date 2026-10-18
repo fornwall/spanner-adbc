@@ -337,7 +337,6 @@ fn manual_transaction_kinds_round_trip() {
     autocommit_insert(&mut writer, 2);
 
     // ...and the manual transaction must NOT see it: every query shares the pinned snapshot.
-    // (The old per-query fresh snapshots would return 2 here.)
     assert_eq!(
         count_rows(connection, "AdbcReadTxn"),
         1,
@@ -2558,7 +2557,7 @@ fn get_objects_reports_catalog_schema_table_columns() {
     assert_eq!(type_names, ["INT64", "STRING(MAX)", "BOOL", "FLOAT64"]);
 }
 
-/// The `get_objects` depth and filter contract, which is where peer drivers have shipped bugs:
+/// The `get_objects` depth and filter contract:
 ///
 /// - **`Catalogs` depth** reports the connection's single catalog — the database id — with a NULL
 ///   `db_schemas` list (this depth needs no `INFORMATION_SCHEMA` data and issues no queries at
@@ -2570,8 +2569,7 @@ fn get_objects_reports_catalog_schema_table_columns() {
 ///   vocabularies must agree.
 /// - **Depth boundary**: a `table_type` filter matching nothing must still return the catalog +
 ///   db_schema skeleton with each schema's `db_schema_tables` an EMPTY list — never NULL, which is
-///   reserved for levels strictly below the requested depth. (The adbc-drivers validation suite
-///   caught DuckDB shipping NULL here; see duckdb/duckdb PR #21018.)
+///   reserved for levels strictly below the requested depth.
 #[test]
 fn get_objects_depth_and_filter_boundaries() {
     let Some(mut fx) = fixture_unguarded() else {
@@ -3162,14 +3160,10 @@ fn timestamp_precision_modes_round_trip() {
     drop_tables(connection, &["AdbcTsPrecision"]);
 }
 
-/// Edge cases of the bulk-ingest surface, each mapped to a bug a peer ADBC driver shipped:
-/// zero-row batches inside a bound stream (the Snowflake driver silently lost the rows after a
-/// mid-stream empty batch, apache/arrow-adbc#1866), binding before setting the ingest options
-/// (Flight SQL's `TestBulkIngestBindBeforeOptions`, fixed for all drivers in driver-manager
-/// apache/arrow-adbc#4308), bound data with no destination at all, an ingest target with no bound
-/// data, full reuse of one statement handle across ingest → DML → ingest (the DuckDB ADBC suite's
-/// reuse chain), and a duplicate primary key surfacing as `AlreadyExists` naming the target table
-/// (DuckDB's ingest errors shipped table-less until duckdb/duckdb#22146).
+/// Bulk-ingest edge cases: zero-row batches within a stream must not discard later rows;
+/// binding may precede ingest options; missing destinations or bound data must be diagnosed;
+/// a statement can be reused across ingest → DML → ingest; and duplicate primary keys must
+/// surface as `AlreadyExists` with the target table's name.
 #[test]
 fn bulk_ingest_edge_cases() {
     let Some(mut fx) = fixture() else {
@@ -4208,10 +4202,10 @@ fn run(connection: &mut SpannerConnection, sql: &str) {
 
 /// Property: arbitrary values bound as parameters (the `bind.rs` write path) survive a round trip
 /// through Spanner and come back byte-for-byte via the Arrow read path (`conversion.rs`), nulls
-/// included. Covers every Arrow type the bind path supports: Int64, Float64, Bool, Utf8, Binary,
+/// included. Covers scalar Arrow types: Int64, Float64, Bool, Utf8, Binary,
 /// Date32, Timestamp (bound as Microsecond, read back as Nanosecond), and Decimal128 across
 /// NUMERIC's full range. Timestamps are confined to the Arrow nanosecond-representable window
-/// (~1678–2261) since the read path now returns `Timestamp(Nanosecond)`.
+/// (~1678–2261) since the default read path returns `Timestamp(Nanosecond)`.
 #[test]
 fn prop_bind_round_trip() {
     let Some(target) = test_target() else {
@@ -4473,12 +4467,12 @@ fn prop_temporal_round_trip() {
     });
 }
 
-/// Regression guard: bound rows must not survive a DDL statement on a reused statement handle.
+/// Bound rows must not survive a DDL statement on a reused statement handle.
 ///
 /// Both DDL branches of `execute`/`execute_update` must clear `self.bound`; if they return after
 /// `run_ddl(...)` without doing so, `bind(rows)` → `CREATE TABLE …` → an `INSERT … VALUES(@id)`
 /// query without rebinding silently inserts the stale rows. Here the unbound `@id` INSERT is
-/// expected to error instead; the row-count assertion is what actually guards the fix.
+/// expected to error instead; the row-count assertion checks that no stale rows were inserted.
 #[test]
 fn ddl_execute_clears_stale_bound_rows() {
     let Some(mut fx) = fixture() else {
@@ -4502,19 +4496,19 @@ fn ddl_execute_clears_stale_bound_rows() {
     .unwrap();
     stmt.bind(bound).expect("bind two stale @id rows");
 
-    // DDL through the SAME handle — this is where the fix clears `self.bound`.
+    // DDL through the same handle must consume the bound rows.
     stmt.set_sql_query("CREATE TABLE BoundLeak (id INT64) PRIMARY KEY (id)")
         .unwrap();
     stmt.execute_update()
         .expect("create BoundLeak via the bound handle");
 
-    // Without rebinding, reuse the handle for a parameterized INSERT. Either outcome is tolerated
-    // here — the assertion below is what guards the fix.
+    // Without rebinding, reuse the handle for a parameterized INSERT. The row-count assertion
+    // below checks for stale rows independently of the error returned for an unbound parameter.
     stmt.set_sql_query("INSERT INTO BoundLeak (id) VALUES (@id)")
         .unwrap();
     let _ = stmt.execute_update();
 
-    // The regression guard: the stale 900001/900002 rows must NOT have leaked into the INSERT.
+    // The stale 900001/900002 rows must not have leaked into the INSERT.
     assert_eq!(
         count_rows(connection, "BoundLeak"),
         0,
@@ -6050,7 +6044,7 @@ fn bound_query_streams_in_batches() {
 /// A cancel that lands while the streamed reader is *between* chunk fetches — no `block_on` parked
 /// on the signal — must still cancel the next fetch: the signal is sticky rather than a transient
 /// wake-up. And a subsequent execute on the same statement must run normally, because starting a
-/// new operation resets the latch.
+/// new operation gets its own cancellation signal.
 #[test]
 fn cancel_between_stream_chunks_cancels_the_next_fetch() {
     let Some(mut fx) = fixture() else {
@@ -6089,7 +6083,7 @@ fn cancel_between_stream_chunks_cancels_the_next_fetch() {
         .expect("first batch is ok");
     assert_eq!(first.num_rows(), 100);
 
-    // Cancel with no fetch in flight — exactly the window where a non-sticky signal was lost.
+    // Cancel between reader fetches to check that the signal remains latched.
     query.get_cancel_handle().try_cancel().expect("cancel");
 
     // The next chunk fetch must observe the latched cancel instead of streaming to completion.
@@ -6102,7 +6096,7 @@ fn cancel_between_stream_chunks_cancels_the_next_fetch() {
         "expected a cancellation error, got: {error}"
     );
 
-    // Starting a new operation on the same statement clears the latch and runs normally.
+    // Starting a new operation on the same statement uses a fresh signal and runs normally.
     let batches = query
         .execute()
         .expect("re-execute after cancel")
@@ -7004,7 +6998,7 @@ fn connection_cancel_is_sticky_until_the_next_operation() {
         .unwrap();
     let partitioned = statement.execute_partitions().expect("execute_partitions");
     // The emulator may split the 200 rows across several partitions and leave some — possibly the
-    // first — empty; an empty partition now streams zero batches (no spurious 0-row batch), so its
+    // first — empty; an empty partition streams zero batches, so its
     // reader's first `next()` is `None` and there is nothing to cancel between. Probe for a
     // partition that actually yields rows to exercise the mid-stream cancel on (the descriptors are
     // re-executable, so a probe read does not consume them).
@@ -7328,9 +7322,7 @@ fn schema_fidelity_cases() -> Vec<SchemaFidelityCase> {
     ]
 }
 
-/// Zero-row / metadata schema fidelity across every mapped Spanner type (the Snowflake ADBC
-/// driver's recurring "schema rot" bug class: zero-row and metadata paths deriving a schema
-/// differently from the data path).
+/// Zero-row and metadata schemas must match the data path across every mapped Spanner type.
 ///
 /// The driver has two schema sources that could drift: the `QueryMode::Plan` probe behind
 /// `execute_schema`, and the result-set-metadata schema the streaming readers build
@@ -7550,7 +7542,7 @@ fn rpc_timeouts() {
     );
     drop(statement);
 
-    // End-to-end with generous deadlines on the connection: DDL (now the update deadline, covering
+    // End-to-end with generous deadlines on the connection: DDL (the update deadline, covering
     // its long-running-operation poll loop), DML (the update deadline) and a multi-chunk streamed
     // query (query deadline for the first chunk, fetch deadline for each later chunk inside the
     // prefetch task) all succeed under 30-second limits.

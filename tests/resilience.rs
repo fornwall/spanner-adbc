@@ -494,7 +494,7 @@ fn reset_peer_surfaces_error_then_recovers() {
     let _serial = SerialGuard::new();
     ensure_setup();
 
-    // Initial streaming failures now retry in the client. Bound attempts explicitly so this
+    // Initial streaming failures retry in the client. Bound attempts explicitly so this
     // test exercises retry exhaustion without waiting for the client's default retry budget.
     let mut connection = connect();
     connection

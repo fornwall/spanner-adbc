@@ -1,7 +1,6 @@
 //! The ADBC C ABI export layer.
 //!
-//! This is the whole boundary between the driver and a C driver manager. It is organized so that
-//! each concern can be reviewed on its own:
+//! This module connects C driver managers to the Rust driver:
 //!
 //! * [`abi`] — the C header transcribed. Declarations only, no logic.
 //! * [`error`] — writing a driver error back through the caller's `AdbcError`, at whichever ABI
@@ -12,8 +11,6 @@
 //!   once as generic `extern "C"` functions the vtable instantiates per object.
 //! * [`database`], [`connection`], [`statement`] — the entry points themselves, one module per
 //!   ADBC object, each a thin translation onto the driver's own types.
-//!
-//! Nothing outside this module is aware that the driver is exported over C.
 //!
 //! The shared library (`libspanner_adbc.so` / `.dylib` / `spanner_adbc.dll`) exports
 //! [`AdbcSpannerInit`] — the driver-specific init symbol, named per the ADBC convention — and

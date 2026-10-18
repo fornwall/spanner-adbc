@@ -12,6 +12,7 @@ An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver f
 [loadable shared library](#shared-library-loadable-driver). CI tests against both the Spanner
 emulator and Omni; managed-cloud and authentication tests run locally. See [testing](docs/testing.md).
 
+The driver supports GoogleSQL databases; PostgreSQL-dialect databases are not supported.
 For Python installation and examples, see [python/README.md](python/README.md).
 
 ## Supported functionality
@@ -54,6 +55,8 @@ returned nested records map to Arrow lists and structs.
   [schema-update operation](https://docs.cloud.google.com/spanner/docs/schema-updates), **not an
   atomic transaction**. DDL runs immediately, before buffered writes, and rollback cannot undo it.
 - Large autocommit ingests can span multiple commits. BatchWrite ingest is also non-atomic.
+- `bind_stream()` collects all input batches in memory before execution. For large ingests,
+  use separate autocommit calls in append mode with bounded batches.
 - Partition descriptors contain SQL and session/transaction identity. They are unauthenticated
   and execute with the receiving connection's credentials; exchange them only over trusted channels.
 - Substrait plans, incremental partitioning and temporary ingest tables are unsupported.
@@ -147,7 +150,7 @@ own descriptors, or use `CAST(col AS STRING)` for server-formatted enum/proto te
 tables use the Arrow storage types for these columns.
 
 Binding and ingest widen `UInt8`/`UInt16`/`UInt32` to `INT64` and `Float16` to `FLOAT32`;
-`UInt64` is unsupported. `FixedSizeBinary` maps to `BYTES`.
+`UInt64`, structs and nested lists are unsupported inputs. `FixedSizeBinary` maps to `BYTES`.
 `Date64` values must contain whole days (multiples of 86,400,000 milliseconds); use an
 Arrow timestamp to preserve a time of day.
 `Decimal128` binding and ingest preserve values with negative scales (for example, `99` at

@@ -5,13 +5,11 @@ on:
     branches: [main]
   pull_request:
 
-# Cancel superseded PR runs (a rapid re-push cancels the in-flight run for the same
-# ref); pushes to main are never cancelled.
+# Cancel superseded PR runs; let main-branch runs complete.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Least privilege: nothing in this workflow needs to write to the repository.
 permissions:
   contents: read
 
@@ -74,8 +72,7 @@ jobs:
 
       - name: Doctests
         if: matrix.backend == 'emulator'
-        # Neither `--lib` nor `--all-targets` runs doctests, so run them
-        # explicitly. --all-features so feature-gated examples compile too.
+        # Doctests are excluded from --lib and --all-targets.
         run: cargo test --doc --all-features
 
       - name: Integration tests (${{ matrix.backend }})
@@ -86,10 +83,7 @@ jobs:
     name: Python package (${{ matrix.backend }}, py${{ matrix.python-version }})
     runs-on: ubuntu-latest
 
-    # Run against the minimum supported Python (pyproject `requires-python`) and
-    # the latest stable release, so both ends of the supported range stay green.
-    # "3.x" is resolved by setup-python to the newest Python 3 available, so this
-    # tracks new releases automatically without hardcoding the current version.
+    # Cover the minimum supported Python and the latest stable release.
     strategy:
       fail-fast: false
       matrix:
@@ -129,17 +123,13 @@ jobs:
           set -euo pipefail
           cp target/debug/libspanner_adbc.so python/spanner_adbc/
           python -m pip install --upgrade pip
-          # pyarrow/pandas/polars/duckdb exercise the Arrow + DataFrame paths, including the
-          # README cookbook snippets that import them. google-cloud-spanner is the oracle for the
-          # differential type-mapping test (test_differential_oracle.py).
+          # Include DataFrame/cookbook dependencies and the official client for differential tests.
           python -m pip install --upgrade ./python pyarrow pandas polars duckdb pytest google-cloud-spanner 'setuptools>=77'
 
       - name: End-to-end tests
         run: scripts/with-${{ matrix.backend }}.sh python -m pytest python/tests -v
 
-  # Lint the workflow files themselves. The pinned Docker image bundles
-  # actionlint plus its shellcheck/pyflakes integrations, so `run:` scripts are
-  # checked too.
+  # The image includes shellcheck and pyflakes to lint embedded scripts too.
   actionlint:
     name: actionlint
     runs-on: ubuntu-latest
@@ -147,17 +137,12 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Lint GitHub Actions workflows
-        # Third-party Docker image pinned to its digest (a tag is mutable and could be re-pushed);
-        # trailing comment names the tag the digest was resolved from.
         run: docker run --rm -v "${PWD}:/repo" --workdir /repo rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color # 1.7.12
 
       - name: Test backend wrappers and setup
         run: python3 -m unittest discover -s scripts/tests -v
 
-  # Supply-chain + hygiene checks (no build / emulator needed):
-  # cargo-deny — security advisories (RUSTSEC), license compliance, banned/duplicate
-  #   crates and allowed sources (see deny.toml).
-  # cargo-machete — unused dependencies.
+  # Check dependency advisories, licenses and sources (deny.toml), plus unused dependencies.
   supply-chain:
     name: cargo-deny + machete
     runs-on: ubuntu-latest

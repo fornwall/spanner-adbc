@@ -1174,11 +1174,9 @@ impl Statement for SpannerStatement {
     }
 
     fn set_substrait_plan(&mut self, _plan: impl AsRef<[u8]>) -> Result<()> {
-        // Spanner has no Substrait support (it executes GoogleSQL / PostgreSQL text), so there is
-        // nothing to execute a Substrait plan against.
+        // The driver submits SQL text through Spanner's query API.
         Err(unsupported(
-            "setting a Substrait plan: Spanner executes GoogleSQL or PostgreSQL text, not \
-             Substrait plans; use set_sql_query instead",
+            "setting a Substrait plan: use set_sql_query with GoogleSQL text instead",
         ))
     }
 
@@ -1229,13 +1227,10 @@ fn check_query_only(sql: &str, entry_point: &str, dml_rationale: &str) -> Result
     Ok(())
 }
 
-/// Guard for `;`-separated **multi-statement** batches on the DML paths: `ExecuteBatchDml`
-/// executes DML only, so a batch mixing DML with queries or DDL can neither run atomically nor be
-/// split across Spanner's execution surfaces. Reject it up front, naming the offending statement —
-/// crucially *before* anything is buffered in a manual transaction, where a poisoned buffer would
-/// otherwise fail the eventual commit of the whole batch (recoverable only by `rollback`). A
-/// single statement (or empty text) always passes. All-DDL batches never reach this — the leading
-/// keyword routes them to `run_ddl` first.
+/// Validate `;`-separated batches for `ExecuteBatchDml`, which accepts only DML. Reject mixed
+/// batches before buffering any statements in a manual transaction; otherwise an invalid
+/// statement would prevent the entire buffer from committing until rollback.
+/// Single statements and empty input pass. All-DDL batches are routed to `run_ddl` earlier.
 fn check_all_dml_batch(statements: &[String]) -> Result<()> {
     if statements.len() > 1
         && let Some(other) = statements.iter().find(|s| !crate::sql::is_dml(s))

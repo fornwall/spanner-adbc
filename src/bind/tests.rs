@@ -554,8 +554,8 @@ fn resolves_parameters_positionally_by_default() {
 
 #[test]
 fn by_name_mode_binds_by_name_and_leaves_extra_params_unbound() {
-    // Strict by-name: order-independent, and a query parameter no column names (@c) is simply
-    // left unbound (Spanner rejects that at execution time, not here).
+    // By-name binding ignores column order. A parameter with no matching column (@c) stays
+    // unbound; Spanner rejects it at execution time.
     let b = int_batch(&["b", "a"]);
     assert_eq!(
         resolve_parameter_names("SELECT @a, @b, @c", &b, true).unwrap(),

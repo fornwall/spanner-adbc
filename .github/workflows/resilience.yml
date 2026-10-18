@@ -13,8 +13,7 @@ on:
     # Nightly at 04:30 UTC; scheduled failures also create a tracking issue.
     - cron: "30 4 * * *"
 
-# Cancel superseded PR runs (a rapid re-push cancels the in-flight run for the same
-# ref); pushes to main are never cancelled.
+# Cancel superseded PR runs; let main-branch runs complete.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -55,7 +54,6 @@ jobs:
     needs: resilience
     if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    # Least privilege: only this job needs to write issues.
     permissions:
       issues: write
     steps:

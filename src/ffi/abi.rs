@@ -493,9 +493,8 @@ mod tests {
 
     use super::*;
 
-    /// The canonical `adbc_core` constants are what every exported function now returns. Pin
-    /// them independently to the C header so an incompatible dependency change cannot silently
-    /// alter this driver's ABI.
+    /// Check the exported `adbc_core` status constants against the C header so an incompatible
+    /// dependency change cannot silently alter this driver's ABI.
     #[test]
     fn status_codes_match_the_c_header() {
         assert_eq!(size_of::<AdbcStatusCode>(), 1);

@@ -80,7 +80,8 @@ immediately and cannot be rolled back. See [transactions](transactions.md).
 ## Parameters and ingest
 
 `bind` supplies an Arrow batch; `bind_stream` accepts a reader but collects its batches
-in memory before execution.
+in memory before execution. For large ingests, use separate autocommit calls in append mode
+with bounded batches.
 
 - For SQL parameters, columns bind positionally to distinct `@name` parameters in SQL order.
   A parameter may be written `@name`, ``@`name` `` or with whitespace or a comment after the `@`,
@@ -91,9 +92,8 @@ in memory before execution.
   creation or replacement. Table, schema and column names are validated before any RPC: a name
   containing a backtick, a backslash or a control character is rejected rather than escaped,
   because Spanner's DDL parser does not honour escapes inside backticks. Rows become insert
-  mutations. Autocommit ingest commits chunks, so a
-  whole ingest is not atomic; manual mode buffers all mutations for one commit. Any table DDL
-  still executes immediately.
+  mutations. Autocommit ingest commits chunks, so a whole ingest is not atomic; manual mode
+  buffers all mutations for one commit. Any table DDL executes immediately.
 
 Setting SQL clears an ingest target, and setting an ingest target clears SQL. `prepare()` checks
 that a destination is configured; Spanner plans SQL during execution.

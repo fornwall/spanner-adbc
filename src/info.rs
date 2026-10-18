@@ -67,7 +67,7 @@ enum InfoValue {
 fn value_for(code: InfoCode) -> InfoValue {
     match code {
         InfoCode::VendorName => InfoValue::Str(VENDOR_NAME),
-        // Spanner speaks SQL (GoogleSQL / PostgreSQL) but not Substrait.
+        // Spanner accepts SQL text, not Substrait plans.
         InfoCode::VendorSql => InfoValue::Bool(true),
         InfoCode::VendorSubstrait => InfoValue::Bool(false),
         InfoCode::DriverName => InfoValue::Str(DRIVER_NAME),

@@ -244,9 +244,8 @@ fn partition_descriptor_preserves_fallback_types_and_reader_precision() {
     assert_eq!(error.status, Status::InvalidArguments);
 }
 
-/// A pre-envelope bare descriptor (no `"v"` key) is now rejected — the driver has never had
-/// users, so there are no legacy descriptors to accept, and a descriptor carries a live
-/// session/transaction identity that could not outlive a driver upgrade anyway.
+/// Every partition descriptor must carry a versioned envelope; a bare payload is rejected
+/// before it can be interpreted as an executable partition.
 #[test]
 fn bare_partition_descriptor_is_rejected() {
     let bare: &[u8] = br#"{"inner":{"Query":{"sql":"SELECT 1"}}}"#;

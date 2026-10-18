@@ -64,9 +64,8 @@ impl SpannerStatement {
             return self.build_bound_statements(sql);
         }
         let statements = crate::sql::split_statements(sql);
-        // The batch is applied via `ExecuteBatchDml`, which executes DML only — reject a batch
-        // mixing in a query or DDL up front (see `check_all_dml_batch`), crucially *before* any
-        // statement is buffered in a manual transaction.
+        // `ExecuteBatchDml` accepts only DML. Validate the entire batch before buffering any
+        // statements in a manual transaction.
         check_all_dml_batch(&statements)?;
         Ok(statements
             .into_iter()

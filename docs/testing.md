@@ -54,8 +54,8 @@ containers they created. A container-name collision fails without disturbing the
 container; choose another `SPANNER_EMULATOR_CONTAINER` (and `TOXIPROXY_CONTAINER` for fault tests)
 if needed. Published ports bind to localhost. Tests use `test-project/test-instance/adbc-test`.
 
-The emulator wrapper uses **9010/9020** because test provisioning still uses the pinned SDK's
-REST admin endpoint. The driver itself uses gRPC for DDL. Parallel emulators can use distinct
+The emulator wrapper uses **9010** for gRPC and **9020** for REST. Test provisioning uses the
+REST admin endpoint; the driver uses gRPC for DDL. Parallel emulators can use distinct
 Docker-network IPs with their internal ports and unique container names.
 
 [`scripts/with-omni.sh`](../scripts/with-omni.sh) pins Omni to `2026.r4-lts`;

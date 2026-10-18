@@ -193,11 +193,8 @@ impl Drop for Watchdog {
 
 /// Arm a [`Watchdog`] for the enclosing test, naming it after that test's own function.
 ///
-/// Every test in this file needs one, and spelling the function name out again in the call was
-/// both noise and a thing that could go stale (a renamed test kept aborting under the old name).
-/// The name is recovered from a nested marker function's `type_name`, which is a `&'static str`,
-/// so the [`Watchdog`] API is unchanged. The default limit is two minutes; pass a `Duration` for
-/// a test that legitimately needs longer.
+/// Derive the name from a nested marker function's `type_name` so renaming a test also updates
+/// its watchdog diagnostic. The default limit is two minutes; pass a `Duration` to override it.
 macro_rules! watchdog {
     () => {
         watchdog!(Duration::from_secs(120))
@@ -2226,13 +2223,11 @@ fn query_timeout_fires_on_a_stream_that_is_silent_from_the_start() {
     );
 }
 
-/// A new operation on the statement must not **un-cancel** a live streamed reader from an earlier
-/// `execute`. With the old shared resettable signal, the new operation's `reset()` cleared the
-/// latch a `cancel()` had set between two chunk fetches, so the old reader either resumed
-/// streaming or — if the prefetch task had already exited with a chunk still buffered — yielded
-/// that chunk and then a clean end-of-stream: a silently **truncated** result. With per-operation
-/// signals the old reader keeps its own latched signal forever, so its next fetch must fail with
-/// `Status::Cancelled`, while the new operation (on a fresh signal) runs to completion.
+/// A new operation must not clear cancellation on an earlier streamed reader. Reusing a signal
+/// could let that reader resume, or yield a buffered chunk followed by a clean end-of-stream
+/// after its prefetch task exits, silently truncating the result. The earlier reader must retain
+/// its latched signal and fail with `Status::Cancelled`; the new operation gets a fresh signal
+/// and runs to completion.
 #[test]
 fn new_operation_does_not_uncancel_an_earlier_streamed_reader() {
     let _watchdog = watchdog!();
@@ -3366,12 +3361,10 @@ fn mutations_only_manual_commit_uses_the_write_only_path() {
 /// paths: DML buffered *before* the flag is set must not reach the wire through `commit()` — nor
 /// through re-enabling `adbc.connection.autocommit`, which commits pending work as a side effect.
 ///
-/// This is a wire assertion by necessity: the driver-side rejection is unit-tested in
-/// `src/connection.rs` (`read_only_rejects_a_commit_that_would_write`), but only the mock proves
-/// that *no* `ExecuteBatchDml`/`Commit` leaves the driver — the whole point of the guard. It also
-/// pins the surrounding contract the fix must not break: the buffer stays replayable (clearing the
-/// flag and committing again applies exactly it), `rollback` is never gated, and a read-only
-/// connection still commits a query transaction (which writes nothing) and still runs queries.
+/// In addition to the unit-tested rejection, verify that no `ExecuteBatchDml` or `Commit`
+/// reaches the server. The buffer must remain replayable after clearing the flag, `rollback`
+/// must remain available, and read-only connections must still run queries and commit their
+/// read-only transactions.
 #[test]
 fn read_only_connection_rejects_the_commit_of_buffered_dml() {
     let _watchdog = watchdog!();

@@ -385,16 +385,14 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
 
 /// `WHERE` predicate keeping only the columns a `SELECT *` would return.
 ///
-/// Spanner marks a column `HIDDEN` when it is excluded from `SELECT *` — most importantly the
-/// implicit `rowid` key it adds to a table created without a `PRIMARY KEY` clause, which is what
-/// bulk ingest now creates (see [`bind::create_table_sql`](crate::bind::create_table_sql)). Such a
-/// column is invisible to every other schema surface the driver exposes — query results and
-/// `get_table_schema`, which reads `SELECT * LIMIT 0` — so listing it here would make `get_objects`
-/// alone describe columns no query ever returns.
+/// Spanner excludes `HIDDEN` columns from `SELECT *`, including the implicit `rowid` key on
+/// tables created without a `PRIMARY KEY` clause by bulk ingest (see
+/// [`bind::create_table_sql`](crate::bind::create_table_sql)). Excluding them here keeps
+/// `get_objects` consistent with `get_table_schema`, which reads `SELECT * LIMIT 0`.
 ///
 /// `IS_HIDDEN` is documented as the `STRING` `"TRUE"`/`"FALSE"` (like `IS_NULLABLE`'s `"YES"`/
 /// `"NO"`), but the emulator types it as a `BOOL`; the `CAST` accepts both (GoogleSQL parses
-/// `"TRUE"` case-insensitively into `TRUE`) rather than betting on one.
+/// `"TRUE"` case-insensitively into `TRUE`).
 const HIDE_HIDDEN_COLUMNS: &str = "NOT CAST(IS_HIDDEN AS BOOL)";
 
 /// `WHERE` predicate dropping the constraints that exist only to describe a hidden column — the

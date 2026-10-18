@@ -1,20 +1,17 @@
 name: ADBC validation
 
-# Runs the canonical Apache Arrow ADBC C++ validation suite against the driver's
-# C ABI (see adbc-validation/). Kept separate from the main CI job because it
-# builds arrow-adbc + GoogleTest from source, which is slower than the Rust tests.
+# Build the Apache Arrow ADBC C++ validation suite against the driver's C ABI.
+# See adbc-validation/README.md for coverage and sanitizer settings.
 on:
   push:
     branches: [main]
   pull_request:
 
-# Cancel superseded PR runs (a rapid re-push cancels the in-flight run for the same
-# ref); pushes to main are never cancelled.
+# Cancel superseded PR runs; let main-branch runs complete.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Least privilege: nothing in this workflow needs to write to the repository.
 permissions:
   contents: read
 
@@ -50,11 +47,9 @@ jobs:
             toolchain: nightly
 
     env:
-      # Forwarded to scripts/run-adbc-validation.sh → -DSPANNER_VALIDATION_SANITIZE (C++ side).
-      # Empty for the plain leg. Distinct build dir per leg so the flag sets never share a cache/tree.
+      # Instrument the C++ harness and its dependencies.
       ADBC_VALIDATION_SANITIZE: ${{ matrix.sanitize }}
-      # Non-empty (address) only on the rust-asan leg: instruments the cdylib itself via nightly
-      # -Zsanitizer=address, and makes the script build the C++ side with clang for runtime matching.
+      # Instrument the Rust cdylib and std; the runner selects clang for a shared ASan runtime.
       ADBC_VALIDATION_RUST_SANITIZE: ${{ matrix.rust-sanitize }}
       ADBC_VALIDATION_BUILD_DIR: ${{ github.workspace }}/.adbc-validation-build-${{ matrix.name }}
 
@@ -66,17 +61,14 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Install Rust toolchain (nightly, for the -Zsanitizer=address cdylib)
-        # The rust-asan leg needs nightly for -Zsanitizer=address / -Zbuild-std, plus the rust-src
-        # component so build-std can recompile+instrument the standard library.
+        # rust-src lets -Zbuild-std instrument the standard library.
         if: matrix.toolchain == 'nightly'
         uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly branch, 2026-10-16
         with:
           toolchain: nightly
           components: rust-src
 
-      # Rust's -Zsanitizer=address links LLVM compiler-rt ASan; the C++ side must therefore be
-      # built with clang so both share ONE runtime (gcc's libasan would abort at startup when
-      # mixed). The run script defaults CC/CXX to clang when ADBC_VALIDATION_RUST_SANITIZE is set.
+      # Mixing GCC's libasan with Rust's compiler-rt ASan aborts at startup.
       - name: Install clang (compiler-rt ASan, to match the instrumented cdylib)
         if: matrix.rust-sanitize != ''
         uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9

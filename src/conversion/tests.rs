@@ -1006,9 +1006,8 @@ fn conversion_errors_name_the_column() {
 }
 
 /// `INT64` arrives as a JSON string, so every `i64` — including magnitudes above 2^53 that an
-/// `f64` cannot represent — round-trips exactly. A JSON *number* encoding (which the old f64
-/// fallback would have cast to `i64`, silently rounding) is now a loud decode error rather than
-/// a truncated result.
+/// `f64` cannot represent — round-trips exactly. A JSON number encoding must fail decoding,
+/// because converting it through `f64` could lose integer precision.
 #[test]
 fn int64_string_round_trips_exactly_and_number_encoding_is_a_decode_error() {
     use arrow_array::Int64Array;
@@ -1024,7 +1023,7 @@ fn int64_string_round_trips_exactly_and_number_encoding_is_a_decode_error() {
     assert_eq!(ints.value(1), above_2_53);
 
     // A JSON-number encoding of the same magnitude would lose precision if cast through f64,
-    // so it must now error rather than decode to a rounded value.
+    // so it must fail decoding rather than return a rounded value.
     let as_number = (above_2_53 as f64).to_value();
     let err = build_array(&DataType::Int64, &[Some(&as_number)]).unwrap_err();
     assert_eq!(err.status, Status::InvalidData);

@@ -6,6 +6,7 @@
 /fuzz/artifacts
 /.adbc-validation-build/
 /.adbc-validation-build-*/
+.venv/
 
 # perf / flamegraph profiling artifacts
 perf.data

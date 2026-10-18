@@ -9,6 +9,7 @@
 [![Build](https://github.com/fornwall/spanner-adbc/actions/workflows/libraries.yml/badge.svg)](https://github.com/fornwall/spanner-adbc/actions/workflows/libraries.yml)
 
 A Python [ADBC](https://arrow.apache.org/adbc/) driver for **Google Cloud Spanner**.
+Supports GoogleSQL databases; PostgreSQL-dialect databases are not supported.
 
 Query Spanner through [DBAPI 2.0](https://peps.python.org/pep-0249/) and fetch
 [Apache Arrow](https://arrow.apache.org/) results for pandas, Polars, DuckDB, or PyArrow.
