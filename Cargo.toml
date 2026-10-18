@@ -2,7 +2,7 @@
 [workspace]
 members = ["fuzz"]
 default-members = ["."]
-# Keep nested agent worktrees outside this workspace.
+# Local worktrees are separate workspaces.
 exclude = [".claude"]
 
 [package]
@@ -17,8 +17,8 @@ homepage = "https://github.com/fornwall/spanner-adbc"
 readme = "README.md"
 keywords = ["adbc", "arrow", "spanner", "database", "gcp"]
 categories = ["database", "api-bindings"]
-# Ship only files needed by downstream builds.
-exclude = [".github/", "scripts/", "/fuzz", "/adbc-validation", "/Cargo.lock"]
+# Exclude CI, external validation harnesses and the separate Python package.
+exclude = [".github/", "scripts/", "/fuzz", "/adbc-validation", "/foundry-validation", "/python"]
 
 [package.metadata.docs.rs]
 # Include the FFI entrypoints in docs.

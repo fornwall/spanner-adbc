@@ -5,9 +5,8 @@ use spanner_adbc::fuzzing::{
     named_parameters, quote_ident, resolve_parameter_names, split_statements,
 };
 
-// Fuzz the bind-side SQL surfaces with an arbitrary (query, bound column names) pair: `@name`
-// parameter extraction, the column→parameter pairing, and identifier quoting. Each is checked
-// against an independent restatement of its contract, not just "doesn't panic".
+// Check parameter extraction, column-to-parameter mapping and identifier quoting against
+// independent invariants for arbitrary queries and bound column names.
 fuzz_target!(|input: (String, Vec<String>, bool)| {
     let (sql, column_names, bind_by_name) = input;
 
@@ -80,12 +79,9 @@ fuzz_target!(|input: (String, Vec<String>, bool)| {
     // quote_ident: either the identifier is rejected, or the result is backtick-delimited and its
     // body carries no backtick and no backslash at all.
     //
-    // That second property is deliberately stated without reference to this crate's lexer. Spanner
-    // has two parsers that disagree about escaping — the query parser honours `` \` `` inside
-    // backticks, the DDL parser does not and ends the identifier at the first backtick — so an
-    // oracle built on the driver's own model of GoogleSQL can only confirm the driver is
-    // self-consistent, which is exactly how an escaping bug on the DDL path stayed invisible here.
-    // "No delimiter and no escape in the body" is grammar-independent: it holds under both.
+    // Keep this check independent of the driver's lexer: Spanner's query parser honours
+    // `` \` `` inside backticks, while its DDL parser ends the identifier at the first backtick.
+    // A body without delimiters or escapes is safe under both grammars.
     for ident in column_names
         .iter()
         .map(String::as_str)

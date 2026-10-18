@@ -1,18 +1,14 @@
 name: Foundry validation
 
-# The ADBC Driver Foundry validation suite (adbc-drivers/validation) as a type/feature coverage
-# harness. Gating: the Spanner-dialect overrides under foundry-validation/queries/spanner/ cover
-# the whole corpus (every case passes or skips with a reason — no expected failures; see
-# foundry-validation/README.md). The canonical Apache C++ conformance suite runs in
-# adbc-validation.yml.
+# Run Foundry type/feature validation with GoogleSQL overrides and a fixed skip baseline.
+# See foundry-validation/README.md; C ABI conformance runs in adbc-validation.yml.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
 
-# Cancel superseded PR runs (a rapid re-push cancels the in-flight run for the same
-# ref); pushes to main are never cancelled.
+# Cancel superseded PR runs; let main-branch runs complete.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

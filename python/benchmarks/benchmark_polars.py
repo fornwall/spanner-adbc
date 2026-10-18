@@ -1,32 +1,22 @@
 #!/usr/bin/env python3
-"""Benchmark: official google-cloud-spanner client vs. this ADBC driver.
+"""Compare ADBC and google-cloud-spanner reads into Polars on the emulator.
 
-Both engines do the *same* job against the *same* emulator table: download the
-whole table, hand it to Polars, and compute a column mean. The only thing that
-differs is how the rows get from Spanner into a ``polars.DataFrame``:
+Both clients read the same mixed-type table and compute a column mean. ADBC
+passes an Arrow table to ``pl.from_arrow``; google-cloud-spanner materializes
+Python rows for ``pl.DataFrame``. Timings include connection setup, reading,
+DataFrame construction and aggregation, but exclude table population.
 
-* **ADBC** streams the result as Apache Arrow record batches and Polars ingests
-  the ``pyarrow.Table`` zero-copy (``pl.from_arrow``). No per-row Python objects
-  are ever created.
-* **Official client** yields each row as a Python ``list`` from a
-  ``StreamedResultSet``; we collect them and build the ``DataFrame`` row-wise
-  (``pl.DataFrame(rows, orient="row")``) — the idiomatic way to get columnar
-  data out of the client. Every cell becomes a Python object on the way.
+Run from the repository root after following the benchmark README's setup:
 
-That difference is the whole point of an Arrow-native driver, and this
-benchmark measures it end to end (download + convert + one Polars aggregation).
-
-Run it against a throwaway emulator:
-
-    scripts/with-emulator.sh <venv>/bin/python python/benchmarks/benchmark_polars.py
+    PYTHONPATH=python scripts/with-emulator.sh <venv>/bin/python python/benchmarks/benchmark_polars.py
 
 Options: ``--rows N`` (default 100000), ``--repeat K`` (default 5),
 ``--batch B`` (ingest batch size for setup, default 20000).
 
 Requires ``SPANNER_EMULATOR_HOST`` (set by ``with-emulator.sh``) and the
 bundled driver library next to ``spanner_adbc`` (see the benchmark
-README). The instance/database are created here over the emulator's REST admin
-API, exactly like the Python test suite's conftest.
+README). The script creates the instance and database through the emulator's
+REST admin API.
 """
 
 from __future__ import annotations
@@ -40,16 +30,13 @@ import time
 import urllib.error
 import urllib.request
 
-# Fixed emulator ids, matching the Rust integration test and the Python conftest
-# so the benchmark reuses whatever those already created.
+# Reuse the integration tests' emulator instance and database.
 PROJECT = "test-project"
 INSTANCE = "test-instance"
 DATABASE = "adbc-test"
 TABLE = "BenchPolars"
 
-# Columns of the benchmark table. A deliberately mixed set of types so the
-# row->columnar conversion the official client forces is representative, not a
-# single-column best case. `value` is the FLOAT64 we take the mean of.
+# Include numeric, string and boolean columns; aggregate the FLOAT64 value column.
 COLUMNS = "id, value, quantity, category, active"
 DDL = (
     f"CREATE TABLE {TABLE} ("
@@ -62,9 +49,6 @@ DDL = (
 )
 
 
-# --------------------------------------------------------------------------- #
-# Emulator admin bootstrap (REST, stdlib only) — same approach as conftest.py.
-# --------------------------------------------------------------------------- #
 def _rest_base() -> str:
     grpc = os.environ["SPANNER_EMULATOR_HOST"]
     host = grpc.rsplit(":", 1)[0] or "localhost"
@@ -128,17 +112,11 @@ def ensure_database() -> str:
     return f"projects/{PROJECT}/instances/{INSTANCE}/databases/{DATABASE}"
 
 
-# --------------------------------------------------------------------------- #
-# Setup: (re)create and populate the benchmark table via the ADBC driver's
-# bulk-ingest path. Population is NOT part of the measured workload — it just
-# needs to be fast, and native insert mutations are the quickest way in.
-# --------------------------------------------------------------------------- #
 def build_data(n: int):
     import pyarrow as pa
 
     ids = list(range(n))
-    # Deterministic, mildly varied values so the mean is a real (non-trivial)
-    # number and both engines must agree on it exactly.
+    # Deterministic values let both clients read identical data.
     value = [((i * 7) % 10_000) / 100.0 for i in ids]
     quantity = [i % 500 for i in ids]
     category = [f"cat-{i % 20}" for i in ids]
@@ -184,12 +162,8 @@ def setup_table(database: str, n: int, batch: int) -> None:
         conn.close()
 
 
-# --------------------------------------------------------------------------- #
-# The two engines under test. Each returns (mean, n_rows) and is timed as a
-# whole: SQL execute + full download + Polars ingest + one aggregation.
-# --------------------------------------------------------------------------- #
 def run_adbc(database: str):
-    """ADBC: Arrow record batches -> zero-copy Polars -> mean."""
+    """Read an Arrow table through ADBC and return the Polars mean and row count."""
     import polars as pl
 
     import spanner_adbc.dbapi as spanner_adbc
@@ -205,8 +179,8 @@ def run_adbc(database: str):
     try:
         with conn.cursor() as cur:
             cur.execute(f"SELECT {COLUMNS} FROM {TABLE}")
-            table = cur.fetch_arrow_table()  # pyarrow.Table, columnar
-        df = pl.from_arrow(table)  # zero-copy: shares Arrow buffers
+            table = cur.fetch_arrow_table()
+        df = pl.from_arrow(table)
         return df["value"].mean(), df.height
     finally:
         conn.close()
@@ -237,11 +211,8 @@ def run_official(database: str):
     return df["value"].mean(), df.height
 
 
-# --------------------------------------------------------------------------- #
-# Timing harness + report.
-# --------------------------------------------------------------------------- #
 def timeit(fn, repeat: int):
-    # One warm-up run (not counted) to fault in gRPC channels, sessions, imports.
+    # Exclude the first run, which also loads imports and initializes client state.
     result = fn()
     times = []
     for _ in range(repeat):
@@ -286,7 +257,6 @@ def main() -> int:
     setup_table(database, args.rows, args.batch)
 
     print(f">> benchmarking (repeat={args.repeat}) — download whole table, Polars mean(value)")
-    adbc_mean, adbc_rows = None, None
     results = []
     for name, fn in (("adbc", run_adbc), ("official", run_official)):
         print(f"    running: {name} ...", flush=True)
@@ -313,7 +283,7 @@ def main() -> int:
     by_name = {s["name"]: s for s in summaries}
     speedup = by_name["official"]["min"] / by_name["adbc"]["min"]
     print()
-    print(f"  => ADBC is {speedup:.1f}x faster than the official client on this workload")
+    print(f"  official / ADBC minimum elapsed time: {speedup:.2f}x")
     return 0
 
 

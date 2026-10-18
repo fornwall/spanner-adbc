@@ -257,8 +257,6 @@ fn cancel_does_not_wait_for_a_held_dispatch_turn() {
 }
 
 /// A call arriving while another holds the dispatch turn waits for it and then succeeds.
-/// Before the state moved behind a lock, the second call either raced (undefined behavior) or
-/// was refused with "unusable after an earlier panic".
 #[test]
 fn a_call_blocked_behind_a_dispatch_turn_completes_instead_of_failing() {
     let slot = Exported::into_private_data(7_u32);

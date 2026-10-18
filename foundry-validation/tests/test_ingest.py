@@ -3,12 +3,7 @@ import pytest
 
 from . import spanner
 
-# Which ingest cases `test_create_long_values` runs on — it ingests 1 KiB…128 KiB
-# values, so it only makes sense for the variable-length string/binary types. The
-# suite's default is just {string, binary}; Spanner's STRING(MAX)/BYTES(MAX) columns
-# take the large- and view-layout variants through the same driver code path
-# (`bind::cell_value`), so exercise all six. Sizes top out at 128 KiB, well under
-# Spanner's 10 MiB per-cell limit.
+# Exercise 1–128 KiB values in all supported variable-length string/binary layouts.
 LONG_VALUE_QUERIES = {
     "ingest/string",
     "ingest/large_string",

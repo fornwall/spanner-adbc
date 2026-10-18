@@ -1,27 +1,13 @@
-// Cross-boundary AddressSanitizer canary for the ADBC validation `rust-asan` leg.
+// AddressSanitizer positive control for the ADBC validation `rust-asan` run.
 //
-// This tiny program is the positive control that proves the Rust cdylib is *actually*
-// ASan-instrumented — not merely that a passing leg happens to be green. It is compiled by
-// scripts/run-adbc-validation.sh with clang `-fsanitize=address` and run against the
-// nightly-instrumented cdylib right after that cdylib is built (before any database work).
+// scripts/run-adbc-validation.sh compiles this with clang `-fsanitize=address` and runs it
+// against the instrumented Rust cdylib before database setup. It loads the test-only
+// spanner_adbc_asan_canary symbol, allocates a C++ heap buffer, and asks Rust to write one
+// byte past its end.
 //
-// The shape it exercises is the one the whole rust-asan leg is about: instrumented Rust writing
-// out of bounds on **C++-allocated** memory. This program:
-//   1. `dlopen`s the cdylib (exactly how the ADBC driver manager loads the driver),
-//   2. `dlsym`s `spanner_adbc_asan_canary` (present only in an `--cfg asan_canary` build),
-//   3. `new[]`-allocates a small heap buffer here on the C++ side (so the ASan redzone/poison
-//      lives on the C++ allocation), and
-//   4. calls into the instrumented Rust function, which writes one byte past the end.
-//
-// Because both sides share one compiler-rt ASan runtime and shadow memory, ASan reports a
-// `heap-buffer-overflow` attributed to the Rust frame. If the cdylib were NOT instrumented the
-// out-of-bounds store would go unnoticed and this program would exit 0 — which the run script
-// treats as a disarmed leg and fails loudly.
-//
-// The script asserts on the outcome (non-zero exit + an `AddressSanitizer` / `heap-buffer-overflow`
-// report), so this program does not need to self-diagnose; it just performs the overflow. With
-// `ASAN_OPTIONS=...abort_on_error=1` ASan aborts the process on the finding, which the script
-// captures and inspects.
+// Both sides must share the compiler-rt ASan runtime and shadow memory so the Rust store sees
+// the C++ allocation's poisoned redzone. The script requires a non-zero exit and an ASan
+// heap-buffer-overflow report; returning normally means the instrumentation check failed.
 
 #include <dlfcn.h>
 #include <cstdio>
@@ -54,7 +40,7 @@ int main(int argc, char** argv) {
   }
   canary_fn canary = reinterpret_cast<canary_fn>(sym);
 
-  // Allocate the buffer HERE, on the C++ side, so the ASan redzone is placed by the C++ allocator.
+  // Allocate in C++ so the Rust access must observe the C++ allocator's ASan redzone.
   const size_t len = 16;
   unsigned char* buf = new unsigned char[len];
 
@@ -68,7 +54,7 @@ int main(int argc, char** argv) {
   // Instrumented Rust writes buf[len] — one past the end. ASan should abort here.
   canary(buf, len);
 
-  // If we reach this line, the out-of-bounds write went undetected: the cdylib is NOT ASan-armed.
+  // Returning normally means the out-of-bounds write went undetected.
   std::fprintf(
       stderr, "canary: RETURNED without an ASan report — the cdylib is not ASan-armed\n");
   delete[] buf;

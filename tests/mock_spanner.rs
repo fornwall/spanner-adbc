@@ -1218,16 +1218,11 @@ fn manual_transaction_queries_share_one_read_only_transaction() {
     connection.rollback().expect("discard the buffered insert");
 }
 
-/// Regression, autocommit half: `execute_update` on SQL that is neither DDL nor DML (a
-/// SELECT) must execute it through the **read-only query** machinery — `ExecuteStreamingSql`, not
-/// `ExecuteBatchDml` — drain and discard the rows, and report no count (`None`). `adbc.h`
-/// sanctions running any statement without expecting a result set (`ExecuteQuery` with a NULL
-/// out-stream), which is exactly the call that lands here.
+/// In autocommit mode, `execute_update` on a SELECT must use `ExecuteStreamingSql`, drain the
+/// rows and return no count (`None`). This supports the ADBC call with a NULL output stream.
 ///
-/// The mock scripts only `ExecuteStreamingSql`; the old mis-routing to the DML pipeline would hit
-/// the unscripted `ExecuteBatchDml` catch-all (`UNIMPLEMENTED`) and fail loudly. Bound parameters
-/// must ride the same path: a bound SELECT runs the bound-query machinery (with the parameter
-/// attached), drained and discarded the same way.
+/// The mock scripts only `ExecuteStreamingSql`; sending DML RPCs fails with `UNIMPLEMENTED`.
+/// Bound SELECTs must use the same path and include their parameters.
 #[test]
 fn execute_update_routes_a_query_to_the_read_only_path() {
     let _watchdog = watchdog!();
@@ -1300,11 +1295,9 @@ fn execute_update_routes_a_query_to_the_read_only_path() {
     );
 }
 
-/// Regression: `execute_partitions` must reject more than one bound parameter row with
-/// `InvalidArguments` **before any RPC** — partitioned execution has no per-row fan-out, and the
-/// old behaviour silently truncated the bound data to row 0 — and it must consume the bound rows
-/// however the call ends (the DML-path convention), so a reused statement handle never silently
-/// re-applies stale rows to a later, unrelated execution.
+/// Partitioned execution has no per-row fan-out, so `execute_partitions` rejects multiple bound
+/// rows with `InvalidArguments` before any RPC. It must consume the rows even on failure so a
+/// reused statement cannot apply them to a later execution.
 #[test]
 fn execute_partitions_rejects_multiple_bound_rows_and_consumes_them() {
     let _watchdog = watchdog!();
@@ -1518,16 +1511,11 @@ fn bind_stream_rejects_schema_changes_without_replacing_previous_bindings() {
     }
 }
 
-/// Regression: a **failed** parameterized (bound) query must still consume its bound rows,
-/// exactly like the DML/ingest/partition paths — otherwise a reused statement handle would silently
-/// re-apply the stale bound rows to a later, unrelated execution. The old bound-query path cleared
-/// `self.bound` only on success (the error propagated out via `?` before the clear), so a query that
-/// failed at the RPC left the rows behind.
+/// A failed bound query must consume its parameter rows so a reused statement cannot apply
+/// them to a later execution.
 ///
-/// The server returns `FAILED_PRECONDITION` for the streaming query, so `execute` fails. The proof
-/// the bound rows were consumed: `get_parameter_schema` then falls back to the SQL's `@name`
-/// references (a single field named `p`) instead of reflecting the stale bound batch's schema (whose
-/// column is named `c`).
+/// After the server returns `FAILED_PRECONDITION`, `get_parameter_schema` must report the SQL
+/// parameter `p`, rather than the discarded bound batch's column `c`.
 #[test]
 fn failed_bound_query_still_consumes_bound_rows() {
     let _watchdog = watchdog!();
@@ -1576,22 +1564,16 @@ fn failed_bound_query_still_consumes_bound_rows() {
     );
 }
 
-/// Regression, manual-mode half: in a manual transaction `execute_update` on a SELECT must
-/// run it immediately as a read-only query (on the transaction's shared multi-use read-only
-/// transaction, which it begins) and buffer **nothing** to commit — the old mis-routing buffered
-/// the SELECT as pending "DML", which poisoned the eventual `ExecuteBatchDml` commit (only
-/// `rollback` recovered). Also covered here:
+/// In manual mode, `execute_update` on a SELECT must run immediately on the shared read-only
+/// transaction without buffering DML. Also covered here:
 ///
 /// - a mixed `;`-batch (`DELETE …; SELECT 1`) is rejected up front with `InvalidArguments`,
 ///   before anything is buffered;
 /// - with real DML buffered, `execute_update` on a SELECT hits the kind guard (`InvalidState`,
 ///   read-your-writes rationale) exactly like `execute`.
 ///
-/// The proof nothing was buffered: `commit()` succeeds without any transaction RPC — the mock
-/// scripts only `ExecuteStreamingSql`, so a commit that tried to apply a buffered statement would
-/// hit the unscripted `BeginTransaction`/`ExecuteBatchDml`/`Commit` catch-alls and fail. (A
-/// query-kind transaction's commit is a pure no-op on the wire: a Spanner read-only transaction
-/// needs no commit RPC.)
+/// The mock scripts only `ExecuteStreamingSql`, so any commit RPC fails with `UNIMPLEMENTED`.
+/// A read-only transaction needs no commit RPC.
 #[test]
 fn execute_update_query_in_manual_mode_buffers_nothing() {
     let _watchdog = watchdog!();
@@ -5061,10 +5043,8 @@ fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_pat
 /// this by running them all on a single multi-use read-only transaction (as `get_objects` does),
 /// rather than a fresh single-use transaction per query.
 ///
-/// This captures every `ExecuteStreamingSql` transaction selector and asserts the first query
-/// begins ONE read-only transaction inline and every later query — the rest of discovery and all
-/// aggregate scans — reuses it by id. The previous per-query single-use implementation would show a
-/// fresh `single_use` selector on every request instead.
+/// Captured `ExecuteStreamingSql` selectors must begin a read-only transaction on the first
+/// query and reuse its id for all later discovery and aggregate queries.
 #[test]
 fn get_statistics_shares_one_read_only_transaction() {
     let _watchdog = watchdog!();
@@ -5288,8 +5268,8 @@ fn ingest_operational_errors_keep_status_and_details_without_metadata_probes() {
                 tx.try_send(Ok(response)).unwrap();
                 Ok(tonic::Response::new(rx))
             });
-            // A successful existence probe used to replace the operational error with
-            // AlreadyExists and discard its vendor code and structured details.
+            // An existence probe must not replace an operational error with AlreadyExists
+            // or discard its vendor code and structured details.
             mock.expect_execute_streaming_sql().returning(move |_| {
                 record_probes.fetch_add(1, Ordering::SeqCst);
                 Ok(stream_of(vec![Ok(partial_result_set(

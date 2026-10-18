@@ -1,22 +1,16 @@
 #!/usr/bin/env bash
 #
 # Run the ADBC Driver Foundry validation suite (https://github.com/adbc-drivers/validation)
-# against the spanner-adbc driver. This is a *type/feature coverage* harness — complementary to
-# scripts/run-adbc-validation.sh, which runs Apache arrow-adbc's C++ C-ABI conformance suite.
+# against the spanner-adbc driver. See foundry-validation/README.md for coverage and skips.
 #
-# With no Spanner target configured it starts a throwaway emulator (via scripts/with-emulator.sh),
-# creates the test instance/database itself, then runs the suite:
+# With no target configured, start an emulator and create a test instance/database.
 #
 #   scripts/run-foundry-validation.sh                      # emulator
 #   SPANNER_EMULATOR_HOST=localhost:9010 scripts/run-foundry-validation.sh
 #   scripts/run-foundry-validation.sh -k connection        # pass extra pytest args
 #   scripts/run-foundry-validation.sh --prepare           # build/install without a server
 #
-# The suite's base query corpus assumes a portable SQL dialect (no mandatory PRIMARY KEY,
-# INTEGER/BIGINT type names, positional $1 parameters); the Spanner-dialect overrides under
-# foundry-validation/queries/spanner/ cover the corpus, so this run GATES CI
-# (foundry-validation.yml). Every case passes or skips with a reason — no expected failures;
-# see foundry-validation/README.md.
+# GoogleSQL overrides live in foundry-validation/queries/spanner/.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

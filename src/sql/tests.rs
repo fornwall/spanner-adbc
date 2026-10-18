@@ -705,17 +705,12 @@ fn quote_ident_accepts_every_name_spanner_can_represent() {
 
 #[test]
 fn quote_ident_rejects_names_backticks_cannot_contain() {
-    // The identifier-injection boundary. Spanner's two parsers disagree about escaping — the
-    // query parser honours `` \` ``, the DDL parser ends the identifier at the first backtick and
-    // treats `\` as an ordinary character — so no escaping scheme is safe on both paths.
-    // Rejecting is: what survives contains neither a delimiter nor an escape, making it one
-    // opaque token under either grammar.
+    // Spanner's query parser honours `` \` ``, but its DDL parser ends the identifier at the
+    // first backtick and treats `\` as an ordinary character. Reject both characters so an
+    // accepted identifier remains one opaque token under either grammar.
     //
-    // The payload below is the real one: as an ingest column name it previously produced
-    // `CREATE TABLE `t` (`k\` INT64, Id INT64 NOT NULL) PRIMARY KEY (Id), INTERLEAVE IN PARENT
-    // parent ON DELETE CASCADE -- ` INT64)`, which the emulator executed — creating a table
-    // interleaved into an unrelated parent with cascading delete. DDL is not transactional, so
-    // the injected schema change could not be rolled back.
+    // Accepting the payload below as an ingest column name could inject an INTERLEAVE clause
+    // with cascading delete. DDL is not transactional, so rollback cannot undo that schema change.
     let payload = "k` INT64, Id INT64 NOT NULL) PRIMARY KEY (Id), \
                    INTERLEAVE IN PARENT parent ON DELETE CASCADE -- ";
     for ident in [

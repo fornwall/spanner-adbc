@@ -10,7 +10,7 @@ fn main() {
     let lockfile = Path::new(&manifest_dir).join("Cargo.lock");
     println!("cargo:rerun-if-changed={}", lockfile.display());
 
-    // Packaged sources exclude Cargo.lock. Always set the variable consumed by src/info.rs.
+    // Always set the variable consumed by src/info.rs, even without a lockfile.
     let version = match fs::read_to_string(&lockfile) {
         // Reject an ambiguous or empty version when a lockfile is available.
         Ok(lock) => arrow_array_version(&lock).unwrap_or_else(|| {
@@ -23,8 +23,7 @@ fn main() {
         Err(e) => {
             println!(
                 "cargo:warning=could not read {} ({e}); reporting arrow-array version as \
-                 \"unknown\" (expected for a source build from the published package, which \
-                 excludes Cargo.lock)",
+                 \"unknown\"",
                 lockfile.display()
             );
             "unknown".to_string()

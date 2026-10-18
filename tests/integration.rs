@@ -1004,14 +1004,11 @@ fn manual_transaction_buffers_commits_and_rolls_back() {
     drop_tables(connection, &["AdbcTxn"]);
 }
 
-/// A **failed** commit must keep the buffered DML: the transaction stays open so the caller can
-/// retry (a genuine replay) or roll back.
+/// A failed commit must keep buffered DML so the caller can retry or roll back.
 ///
-/// Regression test — taking the buffer *before* the apply lost the DML on error, so a retried
-/// commit saw an empty batch and reported success having written nothing. The failure is forced
-/// with DML that buffers fine (buffering never talks to Spanner) but cannot execute: an unknown
-/// table. Enabling autocommit is an implicit commit, so it must fail too and leave the connection
-/// in manual mode with the buffer intact; only `rollback` discards it.
+/// DML against an unknown table buffers locally but fails at commit. Enabling autocommit is an
+/// implicit commit, so it must also fail and leave manual mode and the buffer intact; only
+/// `rollback` discards the pending work.
 #[test]
 fn failed_commit_keeps_the_transaction_replayable() {
     let Some(mut fx) = fixture() else {
@@ -1034,11 +1031,7 @@ fn failed_commit_keeps_the_transaction_replayable() {
         Some(5)
     );
 
-    // A FAILED commit must keep the buffered DML: the transaction stays open so the caller can
-    // retry (a genuine replay) or roll back. Regression: taking the buffer *before* the apply lost
-    // the DML on error, so a retried commit saw an empty batch and reported success having written
-    // nothing. Force the failure with DML that buffers fine (buffering never talks to Spanner) but
-    // cannot execute — an unknown table.
+    // Force a commit failure with DML against an unknown table; buffering itself makes no RPC.
     connection
         .set_option(
             OptionConnection::AutoCommit,
@@ -1486,8 +1479,7 @@ fn bulk_ingest_append_failures_remap_to_the_adbc_contract() {
 /// produces, since the C ABI exposes only `ExecuteQuery`:
 ///
 /// - **DML through `execute()`** (not the Rust-only `execute_update`) must run on the read/write
-///   path and yield an empty result set. Regression test for routing it to a read-only single-use
-///   transaction, which Spanner rejects.
+///   path and yield an empty result set; Spanner rejects DML in a read-only transaction.
 /// - **Bound data is consumed** by the execute that uses it: a handle reused for a follow-up query
 ///   (the Python DBAPI's `adbc_ingest` then `cursor.execute`) must not replay the stale rows and
 ///   run the query once per bound row.
@@ -1519,11 +1511,7 @@ fn execute_entry_point_and_statement_handle_reuse() {
         Some(2)
     );
 
-    // DML issued through the query entry point (`execute`, not the Rust-only `execute_update`) must
-    // run on the read/write path and succeed. Every ADBC client — the Python DBAPI, R, etc. — issues
-    // DML this way, since the C ABI exposes only `ExecuteQuery`. Regression test for routing it to a
-    // read-only single-use transaction, which Spanner rejects ("DML statements may not be performed
-    // in single-use transactions").
+    // The C ABI routes DML through ExecuteQuery, so execute() must use a read/write transaction.
     let mut dml_via_execute = connection.new_statement().expect("new statement");
     dml_via_execute
         .set_sql_query("INSERT INTO AdbcBind (Id, Name) VALUES (3, 'Carol')")
@@ -1655,8 +1643,7 @@ fn execute_entry_point_and_statement_handle_reuse() {
 /// `rowid`. That key must be invisible on every surface: `SELECT *` returns exactly the ingested
 /// columns, and so do `get_table_schema` and `get_objects` — which must also hide the
 /// `PK_`/`CK_IS_NOT_NULL_` constraints Spanner attaches to it
-/// (`objects::HIDE_HIDDEN_COLUMN_CONSTRAINTS`). Earlier driver versions exposed a synthetic
-/// `adbc_ingest_key` column here instead.
+/// (`objects::HIDE_HIDDEN_COLUMN_CONSTRAINTS`).
 ///
 /// `create` onto an already-existing table is the ADBC-contractual error path: the driver's
 /// `CREATE TABLE` (no `IF NOT EXISTS`) is rejected and remapped onto `AlreadyExists` naming the
@@ -1668,8 +1655,7 @@ fn ingest_create_modes_and_the_implicit_hidden_key() {
     };
     let connection = &mut fx.connection;
 
-    // Create-mode bulk ingest: the driver builds the table from the bound Arrow schema (with a
-    // synthetic UUID primary key), so no CREATE TABLE is needed first. Exercises create/append/replace.
+    // Create the table from the Arrow schema, then exercise append and replace on that table.
     let mut drop_create = connection.new_statement().expect("new statement");
     drop_create
         .set_sql_query("DROP TABLE IF EXISTS AdbcCreate")
@@ -1690,9 +1676,7 @@ fn ingest_create_modes_and_the_implicit_hidden_key() {
         Some(2)
     ); // drops + recreates
     assert_eq!(count_rows(connection, "AdbcCreate"), 2);
-    // A `SELECT *` reads back exactly the ingested columns: the created table has no `PRIMARY KEY`
-    // clause, so Spanner keys it on an implicit `rowid` that no `SELECT *` returns (earlier driver
-    // versions appended a visible synthetic `adbc_ingest_key` column here instead).
+    // SELECT * exposes the ingested columns and omits Spanner's implicit rowid.
     let mut read_create = connection.new_statement().expect("new statement");
     read_create
         .set_sql_query("SELECT * FROM AdbcCreate ORDER BY Id")
@@ -1849,11 +1833,8 @@ fn ingest_create_append_mode_creates_then_appends() {
     drop_tables(connection, &["AdbcCreateAppend"]);
 }
 
-/// A user-keyed table is the `append` story: create it with your own DDL — a primary key fixes
-/// Spanner's physical row layout, so it is the user's choice, not the driver's, and there is
-/// deliberately no ingest option for it — then append into it. The declared key really is enforced:
-/// re-appending a duplicate is an insert-mutation conflict, surfaced as `AlreadyExists`. The
-/// removed `spanner.ingest.primary_key` option is now just an unknown statement option.
+/// Append ingest respects a table's user-defined primary key: duplicate keys fail with
+/// `AlreadyExists`. Keys are declared in DDL; `spanner.ingest.primary_key` is unsupported.
 #[test]
 fn ingest_appends_into_a_user_keyed_table() {
     let Some(mut fx) = fixture() else {
@@ -1861,10 +1842,6 @@ fn ingest_appends_into_a_user_keyed_table() {
     };
     let connection = &mut fx.connection;
 
-    // A user-keyed table is the `append` story: create it with your own DDL (the primary key fixes
-    // Spanner's physical row layout, so it is the user's choice, not the driver's — there is
-    // deliberately no ingest option for it), then append into it. Its declared key really is
-    // enforced: re-appending a duplicate is an insert-mutation conflict → `AlreadyExists`.
     let mut keyed_ddl = connection.new_statement().expect("new statement");
     keyed_ddl
         .set_sql_query(
@@ -1889,18 +1866,18 @@ fn ingest_appends_into_a_user_keyed_table() {
         "duplicate primary key must be AlreadyExists, got: {dup_err:?}"
     );
     drop_tables(connection, &["AdbcIngestPk"]);
-    // The removed `spanner.ingest.primary_key` option is now just an unknown statement option.
+    // Primary keys must be declared in DDL; there is no corresponding ingest option.
     let mut gone = connection.new_statement().expect("new statement");
     let gone_err = gone
         .set_option(
             OptionStatement::Other("spanner.ingest.primary_key".into()),
             OptionValue::String("Id".into()),
         )
-        .expect_err("the removed ingest primary-key option must no longer be accepted");
+        .expect_err("an unsupported ingest primary-key option must be rejected");
     assert_eq!(
         gone_err.status,
         adbc_core::error::Status::NotImplemented,
-        "a removed option must report NotImplemented like any unknown one, got: {gone_err:?}"
+        "an unsupported option must report NotImplemented, got: {gone_err:?}"
     );
 }
 
@@ -3538,11 +3515,8 @@ fn bulk_ingest_edge_cases() {
     drop_tables(connection, &["AdbcEdge"]);
 }
 
-/// An empty (zero-batch) `bind_stream` declares a schema but binds no parameter rows. It must feed
-/// **only** the bulk-ingest path (which can build a table from the schema and commit zero rows) and
-/// must NOT hijack the non-ingest DML/query paths: those key off the bound *parameter* buffer, which
-/// an empty stream must leave empty. Regression test for the four defects found when an empty stream
-/// was synthesised into the shared `bound` buffer as a zero-row batch.
+/// A zero-batch `bind_stream` supplies a schema for bulk ingest but no parameter rows. It must
+/// leave the parameter buffer empty so subsequent DML and queries execute without bound rows.
 #[test]
 fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
     let Some(mut fx) = fixture() else {

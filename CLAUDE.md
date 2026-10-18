@@ -56,12 +56,12 @@ Targets: `sql`, `values`, `like`, `options`, `keyword`, `params`, `partition`, `
 and in `docs/testing.md`; a test checks this, and CI derives its matrix from the manifest.
 `fuzz/` shares the root workspace and lockfile but is excluded from default build/test commands.
 
-## Temporary git pins
+## Dependency pins
 
 - Read exact revisions from `Cargo.toml`/`Cargo.lock`. Locate matching dependency source with
   `cargo metadata --format-version 1 --locked`; do not guess Cargo checkout hashes or revisions.
-- Consult the pinned source for API details. The client is the googleapis preview client;
-  older yoshidan-style examples use a different API, and docs.rs may describe another revision.
+- Consult the pinned Google Cloud source for API details; examples for other Spanner clients
+  and docs.rs for a different revision may use incompatible APIs.
 - Keep `adbc_core`, `adbc_ffi`, `adbc_driver_manager` and CMake's `ARROW_ADBC_TAG` on one revision;
   `src/ffi/abi.rs` transcribes that revision's `c/include/arrow-adbc/adbc.h`.
 - Keep all dependencies from `google-cloud-rust`, including `spanner-grpc-mock`, on one revision.
@@ -71,7 +71,7 @@ and in `docs/testing.md`; a test checks this, and CI derives its matrix from the
   The Google Cloud pin keeps the client and unpublished `spanner-grpc-mock` on one revision.
 - Each git dependency family independently blocks crates.io publishing.
 
-### Revert checklist
+### Registry migration checklist
 
 When intentionally moving a family to crates.io, update every affected location together:
 

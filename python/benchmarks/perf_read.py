@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Minimal ADBC read loop for `perf record` — isolates the driver+client read path.
+"""Repeat ADBC reads for CPU profiling with ``perf record``.
 
-Populates a table once, then reads the whole thing back as Arrow N times so the
-profile is dominated by the streaming read (client `rs.next()` + our Arrow
-build), with no Polars / official-client / timing code to muddy the samples.
+Populate a table once, then read it as Arrow repeatedly. The recording includes
+setup and fetching; use the printed read-loop marker to identify the latter.
 
-    scripts/with-emulator.sh bash -c \
-      'perf record -g --call-graph dwarf -o perf.data -- \
-       <venv>/bin/python python/benchmarks/perf_read.py'
+    PYTHONPATH=python scripts/with-emulator.sh \
+      perf record --call-graph dwarf -o perf.data -- \
+      <venv>/bin/python python/benchmarks/perf_read.py
 """
 
 from __future__ import annotations

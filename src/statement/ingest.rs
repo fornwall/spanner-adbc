@@ -395,10 +395,8 @@ impl SpannerStatement {
             return Ok(0);
         }
         if self.ingest_batch_write {
-            // BatchWrite ships one MutationGroup per row and applies groups independently, so the
-            // per-commit mutation cap does not bind it the way a write-only `Commit` is bound — it
-            // is deliberately left out of the mutation-limit bisect. (Its own per-request size limit
-            // could warrant a follow-up, but is not this backstop's concern.)
+            // BatchWrite applies one MutationGroup per row independently, so it does not use
+            // the whole-chunk mutation-limit bisect. Its per-request size limit is separate.
             let mutations = self
                 .build_range_mutations(target, start, end)
                 .map_err(|e| note_rows_already_committed(e, prior_total))?;

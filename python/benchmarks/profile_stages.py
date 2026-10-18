@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Localize where the ADBC read path spends its time vs. the official client.
+"""Time query execution, fetching, Polars construction and aggregation.
 
-Breaks each engine into stages so we can see whether the cost is the network
-download, the Spanner->Arrow conversion, or the Polars ingest — and sweeps
-`spanner.rows_per_batch` to separate per-chunk round-trip overhead from
-per-row conversion cost.
+Compare ADBC with google-cloud-spanner and vary ``spanner.rows_per_batch`` to
+measure the effect of Arrow batch size. Fetch timings include network reads
+and conversion; these stages do not isolate the two costs.
 """
 
 from __future__ import annotations

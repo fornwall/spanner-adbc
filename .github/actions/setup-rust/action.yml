@@ -1,8 +1,6 @@
 name: Setup Rust
 description: >
-  Install the Rust toolchain pinned in rust-toolchain.toml — the single source of truth for the
-  driver's Rust version — through a SHA-pinned dtolnay/rust-toolchain. Callers may add extra
-  rustup components/targets. (fuzz.yml deliberately does not use this; it runs on nightly.)
+  Install the version in rust-toolchain.toml with optional rustup components and targets.
 
 inputs:
   components:
@@ -21,10 +19,7 @@ runs:
       id: version
       shell: bash
       run: |
-        # rust-toolchain.toml is the single source of truth for the version, but
-        # dtolnay/rust-toolchain can't read that file, so extract the channel and pass it
-        # explicitly below. Use sed (not `grep -P`) so this also works on the BSD userland of the
-        # macOS runners.
+        # Pass the pinned version explicitly; sed also works on macOS runners.
         channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)
         if [ -z "$channel" ]; then
           echo "::error::could not read 'channel' from rust-toolchain.toml" >&2
@@ -33,10 +28,7 @@ runs:
         echo "channel=$channel" >> "$GITHUB_OUTPUT"
 
     - name: Install Rust toolchain
-      # Third-party actions are pinned to a commit SHA (first-party actions/* stay on their major
-      # tag) — a hijacked mutable tag would otherwise run in CI with repo read access. dtolnay/
-      # rust-toolchain reads the toolchain from its ref name, so pinning the SHA requires selecting
-      # the toolchain explicitly (done here from rust-toolchain.toml). Trailing comment names the ref.
+      # A SHA-pinned rust-toolchain action requires an explicit toolchain input.
       uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
       with:
         toolchain: ${{ steps.version.outputs.channel }}

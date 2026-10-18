@@ -396,8 +396,7 @@ pub mod fuzzing {
                  (cargo-fuzz only runs declared targets, and fuzz.yml's matrix derives from them)"
             );
 
-            // The matrix must stay derived. A literal list here is exactly the regression that
-            // left three targets unfuzzed.
+            // Derive the CI matrix from the manifest so new fuzz targets run automatically.
             let workflow =
                 std::fs::read_to_string(root.join(".github/workflows/fuzz.yml")).unwrap();
             assert!(

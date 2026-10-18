@@ -554,25 +554,15 @@ fn reset_peer_surfaces_error_then_recovers() {
     eprintln!("reset_peer surfaced a clean error and the driver recovered afterwards");
 }
 
-/// A manual-transaction `commit()` under a transient transport fault must never lose the buffered
-/// write: once the fault clears, the update has to land — through whichever path the client
-/// surfaces the fault.
+/// A manual-transaction commit must preserve buffered writes across a transient transport fault.
 ///
-/// Empirically (verified against the pinned client) a *persistent* transport fault cannot make
-/// `commit()` return an error at all: `apply_request_defaults` marks every Spanner data-plane RPC
-/// idempotent (safe for DML because `seqno` gives replay protection) and `SpannerRetryPolicy` has
-/// no attempt cap, so the client retries the faulted RPC internally until the network heals and
-/// the same `commit()` call then succeeds. That is the branch this test pins down today. If a
-/// future client version starts surfacing transport errors instead, the `Err` branch takes over
-/// and exercises the driver's failed-commit contract directly: the buffer must survive the error
-/// (the take-before-apply regression consumed it, so a retried commit "succeeded" on an empty
-/// batch — a silent lost write) and a retried `commit()` must replay it. The SQL-level version of
-/// that regression is covered deterministically in `tests/integration.rs`.
+/// The pinned client marks data-plane RPCs idempotent (DML has `seqno` replay protection) and
+/// retries without an attempt cap, so the same commit call succeeds once the network recovers.
+/// If the client instead returns a transport error, a retried commit must replay the buffered
+/// work. `tests/integration.rs` also checks buffer preservation after a deterministic SQL error.
 ///
-/// The buffered DML is an idempotent UPDATE (`SET Val = 1`), so the final assertion is immune to
-/// the inherent ambiguity of a faulted commit (the RPC may or may not have reached the emulator
-/// before the reset): however many times the update is applied, `Val` must end up 1. Under the
-/// regression a retried commit succeeds instantly on an empty buffer and `Val` stays 0.
+/// `SET Val = 1` is idempotent, so the result remains testable even if the commit reached the
+/// emulator before the fault. A lost write leaves the seeded value at 0.
 #[test]
 fn commit_under_transport_fault_never_loses_the_write() {
     let Some(toxi) = toxi() else {
@@ -616,10 +606,8 @@ fn commit_under_transport_fault_never_loses_the_write() {
         );
     }
 
-    // Break the transport before the commit starts, run the commit on a worker thread, and give
-    // it a few seconds under the fault. Expected today: the commit neither succeeds nor fails —
-    // the client is retrying inside the call (see the doc comment). Clear the toxic afterwards
-    // regardless, so a test failure doesn't leave the proxy poisoned for the other tests.
+    // Give the commit five seconds under the fault, then clear it before asserting so a test
+    // failure cannot leave the proxy broken for other tests.
     toxi.add_reset_peer("resil_commit_reset", 0);
     let (tx, rx) = mpsc::channel();
     let commit_conn = connection.clone();
@@ -631,9 +619,8 @@ fn commit_under_transport_fault_never_loses_the_write() {
     toxi.remove_toxic("resil_commit_reset");
 
     match during_fault {
-        // Today's client: the commit is blocked in the client's internal retry loop. With the
-        // fault gone it must complete successfully on its own (allow generously for the retry
-        // backoff plus channel re-establishment).
+        // The pinned client retries inside commit. Allow for backoff and reconnection after
+        // the fault clears.
         Err(_) => {
             eprintln!("commit is blocked retrying under the fault (expected); removing the fault");
             let healed = rx
@@ -670,9 +657,7 @@ fn commit_under_transport_fault_never_loses_the_write() {
         ),
     }
 
-    // The buffered update must persist, whichever path delivered it. Under the
-    // take-before-apply regression a failed attempt emptied the buffer, so the follow-up commit
-    // reported success with nothing written and Val stayed 0.
+    // The buffered update must persist whether the first commit or a retried commit applied it.
     assert_eq!(
         query_int(
             &connection,

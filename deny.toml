@@ -5,14 +5,12 @@
 all-features = true
 
 [advisories]
-# Fail on security vulnerabilities; only warn on yanked crates (the transitive tree occasionally
-# pins a yanked patch release we don't control).
+# Fail on security vulnerabilities; warn on yanked dependencies.
 yanked = "warn"
 ignore = []
 
 [licenses]
-# Permissive licenses present in the dependency tree. The AND-heavy expression from `aws-lc-sys`
-# requires ISC + Apache-2.0 + MIT + BSD-3-Clause to all be allowed.
+# aws-lc-sys requires ISC, Apache-2.0, MIT and BSD-3-Clause together.
 allow = [
     "Apache-2.0",
     "MIT",
@@ -29,7 +27,7 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
 ]
 confidence-threshold = 0.9
-# The allow list is intentionally forward-compatible; don't warn about entries not currently hit.
+# Retain license entries across dependency updates.
 unused-allowed-license = "allow"
 
 [bans]
@@ -41,8 +39,8 @@ wildcards = "allow"
 unknown-registry = "deny"
 unknown-git = "deny"
 # The google-cloud-* crates share a revision with the unpublished spanner-grpc-mock;
-# the adbc_* crates deliberately track upstream main with the validation suite; the arrow-*
-# crates until a release has the FFI_ArrowArrayStream constructor and accessors (see Cargo.toml).
+# adbc_* tracks upstream main with the validation suite; arrow-* needs unreleased
+# FFI_ArrowArrayStream APIs (see Cargo.toml).
 allow-git = [
     "https://github.com/googleapis/google-cloud-rust",
     "https://github.com/apache/arrow-adbc",

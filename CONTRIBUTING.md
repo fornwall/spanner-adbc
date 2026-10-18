@@ -68,6 +68,6 @@ Without the overrides, registry Arrow 60 lacks the stream constructor and callba
 used by the FFI implementation.
 
 Read revisions from `Cargo.toml`/`Cargo.lock` and follow the
-[revert checklist](CLAUDE.md#revert-checklist) when switching to registry releases. Keep each
-family on one revision, including the ADBC C++ validation header. Check published API availability
-before removing a pin.
+[migration checklist](CLAUDE.md#registry-migration-checklist) when switching to registry releases.
+Keep each family on one revision, including the ADBC C++ validation header. Check published API
+availability before removing a pin.

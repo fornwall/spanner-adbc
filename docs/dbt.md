@@ -1,29 +1,28 @@
-# Spanner adapter plan for dbt 2
+# Spanner adapter proposal for dbt 2
 
-This repository provides the Spanner ADBC driver, but no dbt adapter yet. This document proposes
-an integration with the Rust implementation at [dbt-labs/dbt][dbt], using this driver's shared
-library. Installing the Python package or a shared library alone does not add `type: spanner`
-to dbt. The profile, SQL and materialization designs below are not implemented adapter features.
+This repository provides the Spanner ADBC driver, but no dbt adapter. The proposed integration
+with the Rust implementation at [dbt-labs/dbt][dbt] would use this driver's shared library.
+Installing the Python package or shared library does not add `type: spanner` to dbt; the profile,
+SQL and materialization designs below are not implemented.
 
 Reviewed on **2026-10-18**, against:
 
 - **spanner-adbc 0.9.0**, repository commit
   [`90bd3c5`](https://github.com/fornwall/spanner-adbc/commit/90bd3c5).
-- **dbt v2.0.8**, the latest published stable v2 release on that date, released October 14
+- **dbt v2.0.8**, released October 14
   ([release][dbt-release], commit `43918198c2f02366ceb33f60006812872b0bab40`).
 - **dbt upstream `main`**, commit
-  [`00e5d9ef340bd07476f8f02e4e6d048fa8749993`][dbt-main], for contribution planning.
-  Source links below pin this snapshot; `main` and the release differ. Recheck both before
-  implementing or filing issues. dbt v1 lives on `1.latest` and is outside this plan.
+  [`00e5d9ef340bd07476f8f02e4e6d048fa8749993`][dbt-main].
+  Source links pin this snapshot; `main` and the release differ. These observations need
+  revalidation before implementation or issue reports. dbt v1 is outside this proposal.
 
-## Upstream work to pursue first
+## Potential upstream changes
 
-Start with small changes that benefit existing adapters, each with a focused reproducer and
-regression test, before submitting Spanner registration or materializations to
-[dbt-labs/dbt][dbt]. These source-review findings need reproducers before they can be reported as
-bugs. Check upstream issues and PRs before submitting a fix to avoid duplicating existing work.
+The following source-review findings could benefit existing adapters as well as Spanner. They
+need reproducers, regression tests and a check for existing upstream fixes before being reported
+as bugs. They are independent of a local Spanner prototype.
 
-### Small correctness fixes
+### Correctness candidates
 
 1. **Include the selected driver library in the loaded-driver cache key.**
    [`AdbcDriverKey`][driver-cache] stores the discriminant of `LoadStrategy`, discarding the
@@ -85,7 +84,7 @@ The cache, statement ownership, private-option, builder-formatting and update-re
 above were also checked in the v2.0.8 source. The relation/formatter findings are pinned to
 reviewed `main`; their release impact still needs a reproducer.
 
-### Shared improvements to agree on before adapter submission
+### Shared adapter features
 
 8. **Make execution completion and affected-row reporting explicit at the adapter layer.**
    The [engine][engine-execute] uses `execute_update()` for selected backends, but usually calls
@@ -125,14 +124,11 @@ reviewed `main`; their release impact still needs a reproducer.
     that arbitrary drivers can already be selected in a released profile. Include a small
     fake-driver conformance suite for options, schema discovery, errors and cancellation.
 
-Items 1–7 are independent preparation PRs, not prerequisites that must all merge before a local
-prototype. Agree on items 8–11 while prototyping, then land the pieces the integration needs
-before submitting Spanner support. Follow dbt's [adapter architecture rules][architecture]:
-keep backend behavior above `dbt-adbc`, use its existing primitives/options, and discuss any
-proposed low-level API expansion with maintainers. Avoid making Spanner depend on a general
-plugin-system redesign.
+The adapter should follow dbt's [architecture rules][architecture]: keep backend behavior above
+`dbt-adbc` and use its existing primitives/options. Items 8–11 identify shared features to agree
+with maintainers while prototyping; a general plugin-system redesign is outside this proposal.
 
-## Integration boundary and current driver behavior
+## Integration boundary and driver behavior
 
 Use the **ADBC C ABI**, loading `libspanner_adbc.so`, `libspanner_adbc.dylib` or `spanner_adbc.dll`
 with `AdbcSpannerInit` (fallback `AdbcDriverInit`). The driver supports ADBC 1.0 and 1.1.
@@ -169,7 +165,7 @@ not imply they can be ingested: structs, nested lists and `UInt64` are unsupport
 Preserve NUMERIC decimals and JSON metadata rather than silently converting them to floats/text.
 See [type mapping](../README.md#type-mapping).
 
-## Implementation plan
+## Proposed implementation
 
 ### 1. Prove connectivity and settle the adapter contract
 
@@ -196,7 +192,7 @@ cross-database models and unsupported materializations/configuration with useful
 
 ### 2. Add experimental dbt registration, metadata and SQL behavior
 
-The current source requires changes across these integration points:
+The reviewed dbt snapshot requires changes across these integration points:
 
 | Area | Upstream starting point |
 | --- | --- |
@@ -210,7 +206,7 @@ The current source requires changes across these integration points:
 | Macro packages and materializations | [`dbt-loader/src/load_packages.rs`][macro-loader], `dbt-loader/src/dbt_macro_assets/` |
 | Macro dispatch inheritance | [`dbt-jinja/minijinja/src/dispatch_object.rs`][macro-dispatch] (`get_adapter_prefixes`) |
 
-Choose local and production loading explicitly: the current [adapter engine][engine-loading]
+Choose local and production loading explicitly: the reviewed [adapter engine][engine-loading]
 selects `CdnCache` for ordinary non-DuckDB adapters, and generic-backend authentication is
 unimplemented in `dbt-auth`. Successful generic/system loading in the harness does not supply
 these adapter-level decisions. Macro-package loading and dispatch inheritance also need separate
@@ -318,7 +314,7 @@ driver already has emulator/Omni CI, while cloud/auth validation is opt-in. Reus
 
 Submit registration/auth/metadata and a minimal macro set in reviewable stages after the shared
 preparation work. Agree with maintainers on supported OS/architectures, library naming, release
-artifacts, checksums and installation; dbt's current [driver distribution manifest][drivers]
+artifacts, checksums and installation; the reviewed [driver distribution manifest][drivers]
 does not automatically consume this repository's releases. Keep advanced loading, snapshots,
 grants/dependency migration, PostgreSQL dialect and full static analysis as explicit later scope
 unless their implementation and tests are included.

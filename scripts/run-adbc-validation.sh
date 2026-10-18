@@ -59,10 +59,8 @@ build_suffix=""
 [ -n "$RUST_SANITIZE" ] && build_suffix="-rustsan"
 BUILD_DIR="${ADBC_VALIDATION_BUILD_DIR:-$REPO_ROOT/.adbc-validation-build$build_suffix}"
 
-# Disable LeakSanitizer: the driver's shared Tokio runtime, gRPC connection pools and lazy
-# globals are intentionally process-lifetime and would swamp the run with non-actionable
-# "leaks". ASan memory errors and UBSan reports stay fatal. Exported for both the build (gtest
-# discovery runs the binary) and the run.
+# Disable leak checks for the driver's process-lifetime runtime and connection pools.
+# Keep ASan memory errors and UBSan reports fatal, including during gtest discovery.
 if [ -n "$SANITIZE" ] || [ -n "$RUST_SANITIZE" ]; then
   export ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:${ASAN_OPTIONS:-}"
   export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:${UBSAN_OPTIONS:-}"
@@ -126,14 +124,13 @@ run_rust_asan_canary() {
   if [ "$rc" -ne 0 ] \
       && printf '%s' "$out" | grep -q 'AddressSanitizer' \
       && printf '%s' "$out" | grep -q 'heap-buffer-overflow'; then
-    echo ">> ASan canary OK: cross-boundary heap-buffer-overflow reported (exit $rc) — the cdylib IS ASan-armed"
+    echo ">> ASan canary OK: instrumented cdylib reported heap-buffer-overflow (exit $rc)"
     printf '%s\n' "$out" | grep -E 'heap-buffer-overflow|spanner_adbc_asan_canary' | head -n 4 \
       | sed 's/^/     /'
     return 0
   fi
 
-  echo "!! ASan canary did NOT trip — the Rust cdylib is not ASan-armed; the rust-asan leg is a no-op" >&2
-  echo "!! (a -Zsanitizer=address / -Zbuild-std regression would let real in-Rust memory bugs pass silently)" >&2
+  echo "!! ASan canary failed: expected a heap-buffer-overflow report from the Rust cdylib" >&2
   echo "!! canary exit=$rc; full output follows:" >&2
   printf '%s\n' "$out" | sed 's/^/     /' >&2
   return 1
@@ -171,9 +168,7 @@ list_available_cases() {
   '
 }
 
-# Stale guard: every EXCLUDED entry must still be a case the harness exposes, so a
-# rename/removal upstream (e.g. after bumping ARROW_ADBC_TAG) is caught instead of
-# silently rotting. Needs no database (`--gtest_list_tests` only enumerates).
+# Detect excluded tests renamed or removed upstream. Test enumeration needs no database.
 run_stale_guard() {
   echo ">> stale guard: every EXCLUDED entry must still exist upstream"
   local bin="$BUILD_DIR/spanner_validation"
@@ -210,8 +205,7 @@ run_stale_guard() {
   return 0
 }
 
-# Gate: run every case EXCEPT the excluded ones; it must pass. This is where a
-# newly-added upstream case auto-enrolls (it isn't excluded, so it runs here).
+# Run all non-excluded tests, including new upstream cases.
 run_gate() {
   echo ">> gate: running every non-EXCLUDED case (must all pass or self-skip)"
   "$BUILD_DIR/spanner_validation" --gtest_filter="-$EXCLUDED_FILTER"

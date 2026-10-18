@@ -47,7 +47,7 @@ jobs:
             runner: windows-latest
             lib: spanner_adbc.dll
           - target: aarch64-pc-windows-msvc
-            runner: windows-11-arm # native ARM64 Windows; aws-lc-rs cross-compiles poorly, native is clean.
+            runner: windows-11-arm # Build aws-lc-rs natively on ARM64.
             lib: spanner_adbc.dll
 
     steps:
@@ -318,8 +318,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF#refs/tags/v}"
-          # Insert `version = '...'` right after the `name = ...` key, matching the
-          # key order of the specification's example manifest.
+          # Add the release version to the source manifest.
           awk -v ver="$version" '
             { print }
             !done && /^name = / { printf "version = '\''%s'\''\n", ver; done = 1 }
@@ -339,11 +338,9 @@ jobs:
           cat SHA256SUMS
 
       - name: Publish release assets
-        # Pinned to a commit: this step runs with contents: write and publishes the release
-        # assets users download — a hijacked v3 tag must not be able to replace them.
+        # SHA-pinned because this action publishes release assets with contents: write.
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          # dist/* now also includes the driver manifest and the generated SHA256SUMS file.
           files: dist/*
           generate_release_notes: true
 
@@ -388,12 +385,7 @@ jobs:
           set -euo pipefail
           mkdir -p wheelhouse
           # target | lib filename | wheel platform tag.
-          # NOTE: the manylinux tag matches the pinned ubuntu-22.04 build
-          # runners (glibc 2.35), and the build job's "Verify glibc requirement"
-          # step enforces it. Likewise the macosx tags match the build job's
-          # macos_deployment_target values, enforced by its "Verify the minimum
-          # macOS" step. If you change any of these tags, change the build job
-          # (and its check) to match.
+          # Keep these tags aligned with the build job's glibc and macOS checks.
           rows=(
             "x86_64-unknown-linux-gnu|libspanner_adbc.so|manylinux_2_35_x86_64"
             "aarch64-unknown-linux-gnu|libspanner_adbc.so|manylinux_2_35_aarch64"
@@ -529,8 +521,7 @@ jobs:
           path: dist
 
       - name: Publish to PyPI
-        # Pinned to a commit: this step holds the OIDC id-token for PyPI trusted publishing
-        # and sees the wheels in plaintext — release/v1 is a mutable *branch*.
+        # SHA-pinned because this action holds the PyPI publishing identity token.
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           # No username/password: presence of the OIDC token triggers the

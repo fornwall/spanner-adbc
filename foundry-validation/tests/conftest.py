@@ -18,9 +18,7 @@ from . import spanner
 def pytest_collection_modifyitems(
     session: pytest.Session, config: pytest.Config, items: list[pytest.Item]
 ) -> None:
-    # Delegate to the suite's own hook (it filters out the interactive test_repl
-    # unless --repl is passed, adds JUnit metadata, etc.). It is imported as a
-    # module here rather than registered as a plugin, so it only runs if we call it.
+    # The upstream module is not registered as a plugin, so call its hook explicitly.
     adbc_drivers_validation.tests.conftest.pytest_collection_modifyitems(
         session, config, items
     )
@@ -145,9 +143,7 @@ def _skip_baseline_guard(session: pytest.Session) -> None:
 
     if not os.environ.get("FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE"):
         return
-    # A `-k`/`-m`-filtered run collects only part of the suite, so its skipped set is
-    # not the full inventory — never enforce against a subset even if the env var
-    # leaked in. (CI runs unfiltered; this is belt-and-suspenders for local runs.)
+    # Filtered runs cannot be compared with the full skip inventory.
     if getattr(session.config.option, "keyword", "") or getattr(
         session.config.option, "markexpr", ""
     ):
@@ -200,9 +196,11 @@ def driver(request, pytestconfig) -> adbc_drivers_validation.model.DriverQuirks:
 def driver_path(driver) -> str:
     if library := os.environ.get("ADBC_SPANNER_LIBRARY"):
         return str(Path(library).resolve())
-    ext = {"win32": "dll", "darwin": "dylib"}.get(sys.platform, "so")
-    # Built cdylib at the repo root: foundry-validation/tests -> repo root.
-    return str(Path(__file__).resolve().parents[2] / f"target/debug/libspanner_adbc.{ext}")
+    library = {
+        "win32": "spanner_adbc.dll",
+        "darwin": "libspanner_adbc.dylib",
+    }.get(sys.platform, "libspanner_adbc.so")
+    return str(Path(__file__).resolve().parents[2] / "target" / "debug" / library)
 
 
 @pytest.fixture(scope="module")
