@@ -1,20 +1,12 @@
-//! Deterministic fault injection against an **in-process mock Spanner gRPC server**.
+//! Deterministic fault injection against an in-process mock Spanner gRPC server.
 //!
-//! These tests run fully **offline** in a plain `cargo test` — no Docker, no emulator, no
-//! network beyond a loopback TCP port. They complement the two other suites:
+//! These tests run with `cargo test` and use only a loopback TCP port. They complement:
 //!
-//! - `tests/integration.rs` — correctness against the real emulator / a real database
-//!   (self-skips when no target is configured).
-//! - `tests/resilience.rs` + `tests/RESILIENCE.md` — **transport**-level faults through
-//!   Toxiproxy (an L4 proxy). Its "Honest limitations" section notes it cannot produce
-//!   *logical* gRPC statuses (no `ABORTED`, no mid-stream status, no scripted hang).
+//! - `tests/integration.rs` — correctness against the emulator, Spanner Omni or Cloud Spanner.
+//! - `tests/resilience.rs` — transport faults through Toxiproxy; see `tests/RESILIENCE.md`.
 //!
-//! This file is that missing complement: a scriptable `google.spanner.v1.Spanner` server that
-//! returns exactly the gRPC status/stream shape a test asks for, so the driver's error mapping,
-//! stream-failure and cancellation paths get deterministic regression coverage. The division of
-//! labor is: **Toxiproxy = transport faults, this harness = logical gRPC faults.** The same
-//! approach carries most of the historical-regression coverage in the ADBC Flight SQL driver
-//! (its in-process mock-server suite).
+//! A scriptable `google.spanner.v1.Spanner` server returns chosen gRPC statuses and stream
+//! responses to exercise error mapping, stream failures, retries and cancellation.
 //!
 //! The server reuses `spanner-grpc-mock`, the mockall/tonic-based mock the pinned
 //! `google-cloud-spanner` client uses for its own end-to-end tests (see `src/spanner/grpc-mock`
@@ -1676,7 +1668,7 @@ fn execute_update_query_in_manual_mode_buffers_nothing() {
     connection.rollback().expect("discard the buffered insert");
 }
 
-/// (a) `ABORTED` (with a `google.rpc.RetryInfo` detail) on `ExecuteStreamingSql` surfaces as a
+/// `ABORTED` (with a `google.rpc.RetryInfo` detail) on `ExecuteStreamingSql` surfaces as a
 /// clean ADBC error: the numeric gRPC code preserved in `vendor_code` (ABORTED = 10), the server's
 /// message kept, and the `RetryInfo` detail forwarded into `Error::details`.
 ///
@@ -1693,15 +1685,13 @@ fn execute_update_query_in_manual_mode_buffers_nothing() {
 /// fully-qualified proto type name (`google.rpc.retryinfo`), value = the detail's ProtoJSON, whose
 /// `retryDelay` round-trips the 50 ms the mock sent (`0.05s`).
 ///
-/// **Fidelity note.** This drives the driver's public `adbc_core` traits (`Connection` /
-/// `Statement`), *not* the C-ABI FFI — that is simply as far as this harness reaches. The detail is
-/// retrievable across the C boundary too: the ADBC C detail transport re-reads
+/// This test uses the public `adbc_core` traits (`Connection` / `Statement`). The C ABI detail
+/// mapping is tested in `src/ffi/error/tests.rs`: the ADBC C detail transport re-reads
 /// `ErrorGetDetail`/`ErrorGetDetailCount` only when `vendor_code ==
 /// ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA` (`i32::MIN`), and the driver's own export layer
 /// (`src/ffi/error.rs`) always stamps that sentinel on the 1.1.0 layout. What it costs there is the
 /// numeric gRPC code the sentinel displaces (`ABORTED` = 10), which that layer hands back as one
-/// further detail keyed `adbc.spanner.vendor_code` — covered by the unit tests in
-/// `src/ffi/error/tests.rs`.
+/// further detail keyed `adbc.spanner.vendor_code`.
 #[test]
 fn aborted_surfaces_vendor_code_and_retry_info_detail() {
     let _watchdog = watchdog!();
@@ -1762,7 +1752,7 @@ fn aborted_surfaces_vendor_code_and_retry_info_detail() {
     );
 }
 
-/// (a″) `PERMISSION_DENIED` on `ExecuteStreamingSql` (as a caller lacking a Spanner IAM read
+/// `PERMISSION_DENIED` on `ExecuteStreamingSql` (as a caller lacking a Spanner IAM read
 /// permission gets from real Spanner — the emulator never enforces IAM, so this is the only way to
 /// exercise the path). The driver must surface a clean ADBC error whose message keeps the server's
 /// text (which already names the missing `spanner.databases.select` permission) *and* gains the
@@ -1826,7 +1816,7 @@ fn permission_denied_surfaces_iam_guidance() {
     );
 }
 
-/// (b) `UNAVAILABLE` mid-stream: the server sends one `PartialResultSet` (with a resume token),
+/// `UNAVAILABLE` mid-stream: the server sends one `PartialResultSet` (with a resume token),
 /// then fails the stream. The client resumes once — from exactly the token it saw — and when the
 /// resume attempt is refused permanently, the driver surfaces a clean ADBC error: no panic, no
 /// hang (watchdog-enforced), message and code intact.
@@ -1900,10 +1890,9 @@ fn unavailable_mid_stream_surfaces_a_clean_error() {
     );
 }
 
-/// (c) A server that accepts the RPC, sends one row, then goes silent (stream held open,
+/// A server that accepts the RPC, sends one row, then goes silent (stream held open,
 /// nothing more ever arrives): `Statement::cancel` from another thread unblocks the reader
-/// promptly with `Status::Cancelled`. This is the foundation for future timeout tests — the
-/// blocked position is a genuine in-flight `block_on` on a live gRPC stream, produced without
+/// promptly with `Status::Cancelled`. The reader blocks in `block_on` on a live gRPC stream without
 /// Toxiproxy's bandwidth throttling (compare `cancel_interrupts_in_flight_query` in
 /// tests/resilience.rs).
 #[test]
@@ -1982,17 +1971,13 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
     );
 }
 
-/// (c′) The timeout twin of the silent-stream cancel test above, on the **DDL** path:
+/// The timeout twin of the silent-stream cancel test above, on the **DDL** path:
 /// `spanner.rpc.timeout_seconds.update` bounds `run_ddl` — the admin `UpdateDatabaseDdl` call and
-/// its long-running-operation poll loop, which sit inside the same `with_timeout`, so bounding the
-/// wrapper bounds the poll loop that used to run unbounded.
+/// its long-running-operation poll loop, which sit inside the same `with_timeout`.
 ///
-/// Do not "simplify" this back to racing a tiny deadline against a real emulator DDL:
-/// tokio's timer wheel has ~1ms granularity, so a sub-millisecond deadline fires up to ~1ms late,
-/// while the emulator answers DDL over a warm local connection in well under that — whichever won
-/// decided the result. Here there is nothing to race. The admin endpoint is a black hole ([`GatedEndpoint`]), so the
-/// DDL can never complete and the driver's deadline is the *only* way the call can return quickly
-/// — the deadline's value affects how long the test takes, not whether it passes. Unwiring the
+/// The admin endpoint is silent ([`GatedEndpoint`]), so the driver's deadline is the only way
+/// the call can return quickly. Racing a tiny deadline against emulator DDL would be unreliable:
+/// Tokio's timer wheel has ~1ms granularity, while local DDL can complete in less time. Unwiring the
 /// update timeout from `run_ddl` fails this test on the status assertion: the request then falls
 /// through to the admin client's *own* ~60s default request deadline and surfaces as `Internal`,
 /// not `Timeout` (the `Watchdog` is only a backstop for a genuine hang).
@@ -2092,7 +2077,7 @@ fn silent_stream_reader(
     statement.execute().expect("execute settles the schema")
 }
 
-/// (c″) The **fetch** twin of the silent-stream tests above —
+/// The **fetch** twin of the silent-stream tests above —
 /// `spanner.rpc.timeout_seconds.fetch` bounds each *subsequent* chunk fetch of a live streamed
 /// result, set through the ordinary statement option surface and observed firing on a real gRPC
 /// stream (`src/timeout.rs`'s own `fetch_timeout_fires_inside_the_prefetch_task` exercises
@@ -2340,7 +2325,7 @@ fn new_operation_does_not_uncancel_an_earlier_streamed_reader() {
     );
 }
 
-/// (d) **Self-healing bulk ingest.** An autocommit ingest chunk the driver sized as "safe"
+/// **Self-healing bulk ingest.** An autocommit ingest chunk the driver sized as "safe"
 /// (rows × columns under its 20k budget) can still overshoot Spanner's *true* per-commit mutation
 /// cap once invisible secondary-index entries are counted. The mock rejects any `Commit` carrying
 /// more than 40 mutations with the real "too many mutations" `INVALID_ARGUMENT`, and accepts the
@@ -2401,7 +2386,7 @@ fn ingest_bisects_a_chunk_that_overshoots_the_mutation_limit() {
     );
 }
 
-/// (d′) The negative companion: a `Commit` failure that is **not** the mutation-limit rejection
+/// The negative companion: a `Commit` failure that is **not** the mutation-limit rejection
 /// must propagate unchanged — no bisecting. The mock fails every commit with `ALREADY_EXISTS` (a
 /// duplicate primary key), and the driver must surface that status after exactly **one** commit,
 /// with the append remap naming the target table. Proves the bisect predicate is narrow: only the
@@ -2449,7 +2434,7 @@ fn ingest_does_not_bisect_a_non_mutation_limit_error() {
     );
 }
 
-/// (d‴) **A mutation-build failure on a later chunk still reports the earlier chunks' committed
+/// **A mutation-build failure on a later chunk still reports the earlier chunks' committed
 /// rows**. An autocommit multi-chunk ingest commits chunk by chunk, so a failure *after* an
 /// earlier chunk has landed must carry the exact already-committed count — the `run_ingest` contract
 /// — whether the failure is a rejected commit *or* a conversion error raised while building a later
@@ -2511,7 +2496,7 @@ fn mutation_build_failure_on_a_later_chunk_notes_committed_rows() {
     );
 }
 
-/// (d⁗) **A cancelled/timed-out chunk commit is ambiguous.** Cancel/timeout *drops* the
+/// **A cancelled/timed-out chunk commit is ambiguous.** Cancel/timeout *drops* the
 /// in-flight `Commit` future, which may still land server-side, so the failing chunk's own outcome
 /// is unknown — the "rows already committed" annotation must flag that ambiguity (and the
 /// duplicate-row risk on a caller-driven retry) instead of implying exact accounting. The mock fails
@@ -2558,7 +2543,7 @@ fn cancelled_ingest_commit_reports_ambiguous_outcome() {
     );
 }
 
-/// (d″) **A failed exists-probe must not mask the ingest error.** When an `append` commit
+/// **A failed exists-probe must not mask the ingest error.** When an `append` commit
 /// fails with anything other than `AlreadyExists`, the driver probes `INFORMATION_SCHEMA.TABLES` to
 /// choose between the contract's `NotFound` (table absent) and `AlreadyExists` (schema mismatch).
 /// Here the probe *itself* fails — as it would for a principal that may write but not read
@@ -2628,7 +2613,7 @@ fn ingest_append_keeps_the_original_error_when_the_exists_probe_fails() {
     );
 }
 
-/// (d‴) **BatchWrite per-group failure.** The `spanner.ingest.batch_write` transport reports a
+/// **BatchWrite per-group failure.** The `spanner.ingest.batch_write` transport reports a
 /// failed mutation group *in band* — a `google.rpc.Status` embedded in a streamed
 /// `BatchWriteResponse`, not a gRPC trailer — so it never passes through `from_spanner`. This is the
 /// only wire coverage of that second error path (`error::from_status_parts`), and it must be
@@ -2639,9 +2624,8 @@ fn ingest_append_keeps_the_original_error_when_the_exists_probe_fails() {
 /// - and the status' **structured details** reach [`adbc_core::error::Error::details`] under the
 ///   contract `from_spanner` documents — key = lowercased proto type name, value = ProtoJSON.
 ///
-/// The details assertion is the point: before the fix only `code` + `message` were forwarded
-/// on this path, so an `ErrorInfo` a caller needs to distinguish *why* a group failed was silently
-/// dropped. Driving it through the wire also exercises the client's own
+/// `ErrorInfo` details explain why a group failed and must survive alongside its code and message.
+/// Driving the response through the wire also exercises the client's
 /// `prost Any → wkt::Any` decode of the embedded status, which the `src/error.rs` unit tests
 /// (which build the details directly) cannot.
 #[test]
@@ -2730,11 +2714,11 @@ fn batch_write_group_failure_forwards_status_details() {
     );
 }
 
-/// (d⁗) **BatchWrite same-chunk applied rows.** BatchWrite applies mutation groups
+/// **BatchWrite same-chunk applied rows.** BatchWrite applies mutation groups
 /// non-atomically, so groups *before* a failing one within the same chunk stay committed. The error
 /// annotation must therefore report those same-chunk applied rows — not just whole earlier chunks —
 /// so the caller learns the true table state. The mock streams two OK groups then a failing one in a
-/// single chunk; before the fix `applied` was discarded and the count would be zero (no annotation).
+/// single chunk and checks that the error reports both committed rows.
 #[test]
 fn batch_write_folds_same_chunk_applied_rows_into_committed_count() {
     let _watchdog = watchdog!();
@@ -2787,7 +2771,7 @@ fn batch_write_folds_same_chunk_applied_rows_into_committed_count() {
     );
 }
 
-/// (d″) **Manual-mode ingest atomicity.** A manual-transaction ingest whose *later* row fails
+/// **Manual-mode ingest atomicity.** A manual-transaction ingest whose *later* row fails
 /// Arrow→Spanner conversion (row 1 here: a Date32 far outside Spanner's
 /// 0001-01-01..9999-12-31 range) must leave the transaction buffer completely untouched — not
 /// buffer rows `0..k` and then error, which a later `commit` would silently apply as a partial
@@ -2897,15 +2881,12 @@ fn manual_ingest_conversion_failure_leaves_txn_buffer_untouched() {
     );
 }
 
-/// (d) Commit-statistics capture: with `spanner.commit_stats=true` the driver must set
+/// Commit-statistics capture: with `spanner.commit_stats=true` the driver must set
 /// `return_commit_stats` on the `CommitRequest` and thread the server's `mutation_count` out of the
 /// `CommitResponse` into `spanner.commit_stats.mutation_count`.
 ///
-/// This is the only **gating** coverage that asserts a *positive* mutation count: the emulator
-/// returns `commit_stats = None`, so its integration test (`commit_stats_reports_mutation_count` in
-/// tests/integration.rs) can only assert a positive count against real Spanner — a non-gating,
-/// nightly path. A regression that stopped threading the count would pass every gating check but
-/// this one.
+/// The emulator returns `commit_stats = None`. This mock supplies a positive count, so the
+/// response mapping is also checked without a Cloud Spanner target.
 ///
 /// An `append` bulk ingest is the cleanest committing operation to script here: its autocommit
 /// write-only transaction is a plain `BeginTransaction` + `Commit` (no `ExecuteBatchDml` result-set
@@ -3399,7 +3380,7 @@ fn mutations_only_manual_commit_uses_the_write_only_path() {
     }
 }
 
-/// (f) `adbc.connection.readonly` must gate the **commit** paths, not just the statement write
+/// `adbc.connection.readonly` must gate the **commit** paths, not just the statement write
 /// paths: DML buffered *before* the flag is set must not reach the wire through `commit()` — nor
 /// through re-enabling `adbc.connection.autocommit`, which commits pending work as a side effect.
 ///
@@ -3706,8 +3687,8 @@ fn read_staleness_reaches_the_wire_on_single_use_queries() {
 ///    `multi_use_timestamp_bound`) that the client begins *inline*, so the bound rides the first
 ///    request's `transaction.begin` selector instead.
 ///
-/// Neither is vacuous: before the fix both ran a strong read, i.e. read-only options with **no**
-/// timestamp bound at all, which is what `single_use_read_only_bound` / `read_only_bound` panic on.
+/// Both bound helpers reject a missing timestamp bound, so falling back to a strong read fails
+/// the assertions.
 #[test]
 fn read_staleness_reaches_the_wire_on_metadata_reads() {
     use adbc_core::options::ObjectDepth;
@@ -4275,13 +4256,8 @@ fn autocommit_batch_dml_is_flagged_last_statements_but_manual_commit_is_not() {
     );
 }
 
-/// (wire): `spanner.request.priority` must reach the `ExecuteBatchDml` RPC itself — the
-/// path *all* plain autocommit DML takes — and not only the transaction's commit. The client's
-/// `BatchDmlBuilder` gained the priority setter upstream (UP-4,
-/// googleapis/google-cloud-rust#6047); before it, the batch went out with
-/// `PRIORITY_UNSPECIFIED` while the caller had asked for `low`, so Spanner scheduled the actual
-/// DML work at the default priority. The request tag rides the same `RequestOptions`, so it is
-/// asserted here too.
+/// `spanner.request.priority` and `spanner.request.tag` must reach the `ExecuteBatchDml` RPC
+/// itself, which executes plain autocommit DML. Commit priority alone does not cover this work.
 #[test]
 fn batch_dml_carries_the_request_priority_and_tag() {
     let _watchdog = watchdog!();
@@ -4328,13 +4304,11 @@ fn batch_dml_carries_the_request_priority_and_tag() {
     assert_eq!(options.request_tag, "etl-batch");
 }
 
-/// UP-5 (wire): what a `spanner.ingest.batch_write` firehose ingest must put on its `BatchWrite`
+/// The options a `spanner.ingest.batch_write` ingest must put on its `BatchWrite`
 /// request — asserted over two ingests on one connection, each a single one-row chunk, so both the
 /// unset and the set state of the change-stream flag are observed against the same mock script.
 ///
-/// 1. `spanner.request.priority` and `spanner.transaction.tag` must be carried (the client's
-///    `BatchWriteTransactionBuilder` gained those setters upstream,
-///    googleapis/google-cloud-rust#6073, before which a BatchWrite ingest silently ignored both),
+/// 1. `spanner.request.priority` and `spanner.transaction.tag` must be carried,
 ///    while `spanner.request.tag` must **not** appear: Spanner ignores per-request tags on
 ///    BatchWrite — the reason the client exposes no setter for it — so the driver drops it rather
 ///    than sending a tag that does nothing. With
@@ -4347,9 +4321,6 @@ fn batch_dml_carries_the_request_priority_and_tag() {
 ///    (`apply_to_runner`, autocommit DML) are covered by
 ///    [`exclude_from_change_streams_reaches_the_wire_on_runner_commits`], which reads the
 ///    inline-begin `TransactionOptions` off the `ExecuteBatchDml` request instead.
-///
-/// Step 1 being the negative half is what makes step 2 meaningful: a driver that hard-coded the
-/// flag either way would fail one of them.
 #[test]
 fn batch_write_carries_the_request_options_and_change_stream_exclusion() {
     let _watchdog = watchdog!();
@@ -4881,15 +4852,12 @@ fn exec_incremental_spec_default_is_a_no_op() {
 }
 
 // ---------------------------------------------------------------------------
-// Retry-limit accounting per RPC path (UP-14)
+// Retry-limit accounting per RPC path
 // ---------------------------------------------------------------------------
 
-// The pinned client runs two *different* retry loops, and they no longer agree on what
-// `spanner.retry.max_elapsed_seconds` means. These tests pin the exact, observed numbers on one
-// path of each kind, so the asymmetry is a checked fact rather than a claim in a comment, and so a
-// `google-cloud-rust` rev bump that changes it (UP-14) fails here loudly instead of silently
-// changing what a caller's option means. See `src/retry.rs`'s module doc for the user-facing
-// statement of this.
+// The pinned client's unary and streaming retry loops account for elapsed time differently.
+// These tests check both paths so dependency updates cannot silently change the documented
+// `spanner.retry.max_elapsed_seconds` behavior. See `src/retry.rs`.
 //
 // - **Unary** RPCs (`ExecuteBatchDml`, `ExecuteSql`, `BeginTransaction`, `Commit`) go through gax's
 //   `retry_loop`, which increments `RetryState::attempt_count` *before* each attempt and pins
@@ -4923,11 +4891,11 @@ fn set_constant_backoff(statement: &mut impl Statement) {
 /// Count the `ExecuteStreamingSql` attempts a query makes when every attempt fails, under the
 /// retry option `key` = `value`.
 ///
-/// The fault is delivered **inside** the result stream, and that is load-bearing: the pinned client
+/// The fault is delivered inside the result stream: the pinned client
 /// dispatches server-streaming RPCs outside gax's retry loop (`server_streaming/builder.rs`'s
 /// `send()` issues the RPC with no retry loop of its own), so an `UNAVAILABLE` returned as the
 /// *initial* RPC status is never retried no matter what the policy says — scripting it that way
-/// would make this probe vacuous. Only a status arriving mid-stream reaches `ResultSet::check_retry`
+/// would bypass the retry policy. Only a status arriving mid-stream reaches `ResultSet::check_retry`
 /// and therefore the configured policy.
 fn streaming_attempts(key: &str, value: OptionValue) -> usize {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -5014,12 +4982,8 @@ fn retry_max_attempts_is_exact_on_unary_rpcs() {
     }
 }
 
-/// On the **streaming** query path the same option is now exact too: the client seeds its
-/// hand-rolled resume policy with `1 + retry_count`, the same 1-based attempt count gax's own loop
-/// passes, so `N` permits `N` attempts and `1` disables retrying. (It used to seed the bare
-/// `retry_count` — retries so far, `0` on the first failure — and permit `N + 1`: the attempt half
-/// of UP-14, fixed upstream.) Varying `N` rather than asserting a constant is what proves the
-/// option reaches the streaming retry loop at all rather than being ignored.
+/// The streaming resume policy uses the same 1-based attempt count as the unary loop:
+/// `N` permits `N` attempts and `1` disables retrying.
 #[test]
 fn retry_max_attempts_is_exact_on_the_streaming_path() {
     let _watchdog = watchdog!();
@@ -5033,7 +4997,7 @@ fn retry_max_attempts_is_exact_on_the_streaming_path() {
             attempts, max_attempts as usize,
             "max_attempts={max_attempts} must permit exactly {max_attempts} ExecuteStreamingSql \
              attempts; a change here means the pinned client's stream-resume accounting moved — \
-             update src/retry.rs, docs/options.md and REVIEW.md's UP-14 to match"
+             update src/retry.rs and docs/options.md to match"
         );
     }
 }
@@ -5041,8 +5005,7 @@ fn retry_max_attempts_is_exact_on_the_streaming_path() {
 /// `spanner.retry.max_elapsed_seconds` bounds the unary paths, but is **inert** on the streaming
 /// query path: the client builds a fresh `RetryState` (hence `start = Instant::now()`) for every
 /// resume decision, so the gax elapsed-time decorator always compares now against a deadline one
-/// budget in the future and never exhausts. This is the half of UP-14 that is still open upstream
-/// (the attempt off-by-one, same root cause, has been fixed). A streaming caller who wants a
+/// budget in the future and never exhausts. A streaming caller who wants a
 /// wall-clock bound has a working one in the separate `spanner.rpc.timeout_seconds.{query,fetch}`
 /// family.
 #[test]
@@ -5064,9 +5027,8 @@ fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_pat
     );
 
     // A 150ms budget against the constant 10ms backoff (gax applies *full* jitter, so each delay
-    // is drawn from 0..=10ms) plus a loopback RPC: this machine lands in the high single digits.
-    // The assertion is a band rather than a count because the loop is wall-clock driven, so the
-    // exact number is machine speed — but both ends carry weight. `< unbounded` proves the budget
+    // is drawn from 0..=10ms) plus a loopback RPC. The assertion allows a range because the
+    // exact count depends on RPC latency. `< unbounded` proves the budget
     // fired at all; `>= 2` proves it did not simply abandon the very first failure, which is how a
     // too-small budget would make this test pass for the wrong reason.
     let unary = unary_attempts(
@@ -5087,9 +5049,9 @@ fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_pat
     assert_eq!(
         streaming,
         RETRY_PROBE_CAP + 1,
-        "a 50ms elapsed budget currently never exhausts the streaming retry loop (UP-14), so the \
+        "a 50ms elapsed budget currently never exhausts the streaming retry loop, so the \
          mock's own cap is what stops it; a change here means the pinned client's stream-resume \
-         accounting moved — update src/retry.rs, docs/options.md and REVIEW.md's UP-14 to match"
+         accounting moved — update src/retry.rs and docs/options.md to match"
     );
 }
 
@@ -5224,11 +5186,9 @@ fn get_statistics_shares_one_read_only_transaction() {
 /// The ADBC catalog level carries the **database id**, and every catalog argument round-trips
 /// against it.
 ///
-/// `""` used to be both the reported value and the only accepted filter, which made the level
-/// carry no information — adbc.h defines `""` in a *filter* as "only objects **without** a
-/// catalog", so reporting it as a *value* said nothing. `get_objects` at `Catalogs` depth issues
-/// no RPC at all (it short-circuits before `INFORMATION_SCHEMA`), so the whole round trip is
-/// checkable against the mock server without scripting a single query.
+/// An empty catalog filter selects only objects without a catalog, so it excludes this database.
+/// `get_objects` at `Catalogs` depth issues no RPC (it short-circuits before `INFORMATION_SCHEMA`),
+/// so the round trip needs no scripted queries.
 #[test]
 fn the_catalog_level_reports_the_database_id_and_filters_round_trip() {
     use adbc_core::options::ObjectDepth;

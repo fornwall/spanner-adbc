@@ -6306,9 +6306,8 @@ fn hinted_dml_routes_to_the_read_write_path() {
     );
 }
 
-/// DML with a `THEN RETURN` clause returns its rows through `execute()` (previously they were
-/// silently discarded as an empty result), reports the stats-based affected count through
-/// `execute_update()`, fans out over bound parameters, and is rejected up front in manual
+/// DML with a `THEN RETURN` clause returns its rows through `execute()`, reports the affected count
+/// through `execute_update()`, fans out over bound parameters, and is rejected up front in manual
 /// transaction mode, where its rows would be unobtainable (commit goes through `ExecuteBatchDml`,
 /// which does not support `THEN RETURN`).
 #[test]
@@ -6633,7 +6632,7 @@ fn query_with_trailing_semicolons_returns_rows() {
     assert_eq!(planned.field(0).data_type(), &DataType::Int64);
 }
 
-/// The spec `adbc.connection.readonly` option. Covers the four dimensions the review asks for:
+/// The spec `adbc.connection.readonly` option covers:
 /// **round-trip** (defaults to `false`, and set values read back through `get_option`), **allow**
 /// (a SELECT still runs), **deny** (DML, DDL and bulk ingest each fail with `InvalidState`), and
 /// **toggle/live** (the flag is shared live with every statement — not snapshotted at creation —

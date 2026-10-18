@@ -24,8 +24,8 @@ database. A real target uses ADC and must already exist; use a dedicated test da
 dependencies. Keep that revision aligned with the Rust arrow-adbc dependencies in `Cargo.toml`.
 `ADBC_VALIDATION_BUILD_DIR` overrides the build directory.
 
-`--full` uses CTest to run cases in separate processes. It prints failures but deliberately does
-not propagate CTest's failure exit status; use the default mode for CI.
+`--full` uses CTest to run cases in separate processes. It prints failures but does not propagate
+CTest's failure exit status; use the default mode for CI.
 
 ## Coverage and exclusions
 

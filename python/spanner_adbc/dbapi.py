@@ -74,8 +74,6 @@ def connect(
         ``False`` (the default) buffers writes until ``commit()``. Queries and
         writes cannot share a manual transaction. DDL always applies immediately.
     """
-    # The driver manager builds and owns the database/connection handles here and
-    # tears them down if the connection fails, so no manual cleanup is needed.
     return adbc_driver_manager.dbapi.connect(
         driver=_driver_path(),
         entrypoint=ENTRYPOINT,

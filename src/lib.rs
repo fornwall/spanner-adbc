@@ -78,15 +78,12 @@
 // are configured in `[lints.rust]` in Cargo.toml (they apply uniformly to all targets). The two
 // `unsafe_code` lints below stay here because they are feature-conditional.
 //
-// All of this crate's `unsafe` lives in the `ffi` module — the hand-written ADBC C ABI export
-// layer, which is nothing but pointer handling across that boundary — under a single audited
-// `#[allow(unsafe_code)]`. Deny elsewhere so new unsafe can't creep in, and hard-`forbid` it
-// entirely in the pure-Rust build (no `ffi` feature), where no unsafe exists at all.
+// Unsafe code is confined to the C ABI export layer and the test-only ASan canary.
+// Builds without the `ffi` feature forbid unsafe code throughout the crate.
 #![deny(unsafe_code)]
 #![cfg_attr(not(feature = "ffi"), forbid(unsafe_code))]
 
-// Test-only ASan tripwire, compiled ONLY under `--cfg asan_canary` (the validation suite's
-// `rust-asan` leg). Absent from every normal build — see the module docs.
+// The validation suite enables this ASan check with `--cfg asan_canary`.
 #[cfg(asan_canary)]
 mod asan_canary;
 

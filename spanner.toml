@@ -1,20 +1,14 @@
 # ADBC driver manifest for the Google Cloud Spanner driver.
 #
-# A driver manifest lets an ADBC driver manager find this driver *by name*
-# instead of by an explicit path to the shared library:
+# Load by name with an ADBC driver manager that supports manifests:
 #
-#     driver = "spanner"                                  # resolves spanner.toml
+#     driver = "spanner"
 #     uri    = "spanner:///projects/p/instances/i/databases/d"
 #
-# The second form works because a driver manager with no `driver` option takes
-# the URI *scheme* as the driver name, and this driver's own connection URIs
-# already use the `spanner://` scheme. See the ADBC specification,
-# docs/source/format/driver_manifests.rst ("Driver Manifests" and
-# "Resolving a Driver from a Connection URI").
+# Without `driver`, the URI scheme selects the driver name.
+# Specification: https://arrow.apache.org/adbc/current/format/driver_manifests.html
 #
-# WHERE TO PUT THIS FILE
-#
-# The driver manager searches, in order (per the spec's discovery rules):
+# Install as `spanner.toml` in a driver discovery directory. Search order:
 #
 #   1. every directory in the `ADBC_DRIVER_PATH` environment variable
 #      (`:`-separated on Unix, `;`-separated on Windows)
@@ -30,25 +24,13 @@
 #        macOS:   `/Library/Application Support/ADBC/Drivers`
 #        Windows: `HKEY_LOCAL_MACHINE\SOFTWARE\ADBC\Drivers\spanner`
 #
-# Install it as `spanner.toml` in one of those directories, keeping the file
-# name — the base name is what the driver manager matches against the driver
-# name / URI scheme.
+# Edit `Driver.shared` below to match the installed library. Paths must be absolute
+# or resolvable by the platform's dynamic loader; they are not relative to this file.
+# The defaults assume a system-wide installation of a GitHub release library.
 #
-# EDIT THE PATHS BELOW
-#
-# `Driver.shared` paths are used **verbatim**: neither the C nor the Rust driver
-# manager resolves them relative to this manifest, so they must be absolute (or
-# resolvable by the platform's dynamic loader). The defaults below assume the
-# library from the GitHub release archive was installed into the conventional
-# system location; change them to wherever you actually put it.
-#
-# Python users do not need to edit anything: `pip install spanner-adbc`
-# bundles the library, and
+# For the Python package, generate a manifest pointing at its bundled library:
 #
 #     python -m spanner_adbc.manifest install
-#
-# writes a manifest pointing at the bundled library into a directory the driver
-# manager searches.
 
 manifest_version = 1
 
@@ -59,19 +41,14 @@ url = 'https://github.com/fornwall/spanner-adbc'
 source = 'https://github.com/fornwall/spanner-adbc'
 
 [ADBC]
-# Maximum ADBC specification revision this driver implements. The export layer
-# in src/ffi/ serves both 1.0.0 and 1.1.0 callers.
+# Supports ADBC 1.0.0 and 1.1.0 callers.
 version = '1.1.0'
 
 [Driver]
-# The driver's own entrypoint. It also exports the driver manager's default
-# `AdbcDriverInit`, so this key is strictly optional — it is spelled out here
-# because it is the documented, stable symbol name for this driver.
+# AdbcDriverInit is also exported as a fallback.
 entrypoint = 'AdbcSpannerInit'
 
-# Platform tuples are `<os>_<arch>[_<env>]` exactly as the spec's authoritative
-# table defines them (x86-64 -> `amd64`, aarch64 -> `arm64`, musl -> `_musl`).
-# These eight are the targets .github/workflows/libraries.yml builds.
+# Platform tuples for the eight targets built by .github/workflows/libraries.yml.
 [Driver.shared]
 linux_amd64 = '/usr/local/lib/libspanner_adbc.so'
 linux_arm64 = '/usr/local/lib/libspanner_adbc.so'

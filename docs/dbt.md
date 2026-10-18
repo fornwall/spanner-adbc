@@ -1,4 +1,4 @@
-# Spanner support in dbt 2: upstream preparation and implementation plan
+# Spanner adapter plan for dbt 2
 
 This repository provides the Spanner ADBC driver, but no dbt adapter yet. This document proposes
 an integration with the Rust implementation at [dbt-labs/dbt][dbt], using this driver's shared
@@ -20,9 +20,8 @@ Reviewed on **2026-10-18**, against:
 
 Start with small changes that benefit existing adapters, each with a focused reproducer and
 regression test, before submitting Spanner registration or materializations to
-[dbt-labs/dbt][dbt]. These are findings from source review, not reports of reproduced production
-failures. No issues or PRs have been filed as part of this document. Search current issues/PRs
-again before opening one; upstream may already have fixed a candidate.
+[dbt-labs/dbt][dbt]. These source-review findings need reproducers before they can be reported as
+bugs. Check upstream issues and PRs before submitting a fix to avoid duplicating existing work.
 
 ### Small correctness fixes
 
@@ -128,7 +127,7 @@ reviewed `main`; their release impact still needs a reproducer.
 
 Items 1–7 are independent preparation PRs, not prerequisites that must all merge before a local
 prototype. Agree on items 8–11 while prototyping, then land the pieces the integration needs
-before asking maintainers to accept Spanner support. Follow dbt's [adapter architecture rules][architecture]:
+before submitting Spanner support. Follow dbt's [adapter architecture rules][architecture]:
 keep backend behavior above `dbt-adbc`, use its existing primitives/options, and discuss any
 proposed low-level API expansion with maintainers. Avoid making Spanner depend on a general
 plugin-system redesign.
@@ -149,7 +148,7 @@ to obtain a connection. A Python DBAPI adapter belongs to a separate dbt v1 effo
 | Current driver capability | Consequence for dbt 2 |
 | --- | --- |
 | GoogleSQL parsing/quoting and `@name` parameters | Start with GoogleSQL databases. PostgreSQL-dialect support is outside this plan. |
-| ADBC autocommit defaults to `true` | Set/verify it deliberately; Python DBAPI defaults do not apply. Do not issue generic SQL `BEGIN`/`COMMIT` hooks. |
+| ADBC autocommit defaults to `true` | Set and verify it explicitly; Python DBAPI defaults do not apply. Do not issue generic SQL `BEGIN`/`COMMIT` hooks. |
 | Ordinary autocommit DML statements and homogeneous DML batches commit atomically | Keep a multi-statement atomic DML operation in one driver call; verify dbt does not split it into separately committed calls. Opt-in partitioned DML commits partitions independently. |
 | Manual mode allows snapshot queries or buffered writes, with no mixing/read-your-writes | Do not reuse a warehouse transaction wrapper that introspects after buffering writes. Buffered mutations run after all buffered DML. |
 | DDL runs immediately through the admin API and waits for completion | DDL is outside manual transactions; rollback cannot undo it and a DDL batch can partially apply. |
@@ -170,7 +169,7 @@ not imply they can be ingested: structs, nested lists and `UInt64` are unsupport
 Preserve NUMERIC decimals and JSON metadata rather than silently converting them to floats/text.
 See [type mapping](../README.md#type-mapping).
 
-## Rough implementation plan
+## Implementation plan
 
 ### 1. Prove connectivity and settle the adapter contract
 
@@ -188,7 +187,7 @@ Agree on a proposed `type: spanner` profile contract; these fields are not accep
 | Credentials | ADC by default; map explicit sources to documented `spanner.auth.*` database options with dbt redaction. Let the driver refresh supported credential sources; fixed `spanner.auth.access_token` values require caller-managed validity. |
 | Emulator / Omni | Map endpoint and mode explicitly. Emulator uses `spanner.emulator`; Omni uses `spanner.instance_type=omni` plus an endpoint. |
 | Threads and execution settings | dbt worker count plus correctly scoped driver priority, timeout, retry and request/transaction tag options. |
-| Timestamp precision | Expose `spanner.max_timestamp_precision`; choose/test a default deliberately. Microseconds cover years 1–9999 but truncate finer precision; nanoseconds have a narrower range. |
+| Timestamp precision | Expose `spanner.max_timestamp_precision`; document and test the default. Microseconds cover years 1–9999 but truncate finer precision; nanoseconds have a narrower range. |
 
 Set connection defaults before creating statements; shared options are copied at statement
 creation. Keep access tokens and inline credential JSON out of URI query parameters. Validate

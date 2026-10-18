@@ -164,10 +164,8 @@ fn vendor_version_is_null_not_the_driver_version() {
 fn unrecognized_codes_are_omitted_rather_than_rejected() {
     // `adbc.h`: "Drivers/vendors will ignore requests for unrecognized codes (the row will be
     // omitted from the result)" — so an XDBC-range ([500, 1000)) or vendor-specific (>= 10000)
-    // code is silently dropped, never an error, and never a row with a fabricated value. These
-    // reach the driver as `InfoCode::Other` (apache/arrow-adbc#4510); before it the C FFI
-    // exporter rejected the whole call with "Unknown info code" before this function ran, so
-    // this contract was only observable at the Rust-trait level.
+    // code is silently dropped, never an error or a row with a fabricated value. These codes
+    // reach the driver as `InfoCode::Other`.
     let batch = build(Some(
         [InfoCode::Other(500), InfoCode::Other(10_042)]
             .into_iter()

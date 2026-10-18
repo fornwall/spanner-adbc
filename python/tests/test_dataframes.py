@@ -172,9 +172,7 @@ def test_pandas_read_dtypes_and_values(spanner_database):
 
 
 def test_bulk_ingest_from_dataframe(spanner_database):
-    # Build a Polars frame, hand it to the ADBC bulk-ingest path via Arrow, and
-    # read it back. ARRAY is now part of the bind/ingest surface, so the frame
-    # carries the full column spread including an ARRAY<INT64> (Tags).
+    # Round-trip a Polars frame through bulk ingest, including ARRAY<INT64>.
     conn = _connect(spanner_database)
     try:
         with conn.cursor() as cur:
@@ -228,10 +226,8 @@ def test_bulk_ingest_from_dataframe(spanner_database):
 
 
 def test_bulk_ingest_array_element_types(spanner_database):
-    # Exercise every now-supported ARRAY element type through the bind/ingest path,
-    # including per-element nulls and a fully-null array. The DATE / TIMESTAMP /
-    # NUMERIC elements bind as strings that Spanner coerces to ARRAY<DATE|TIMESTAMP|
-    # NUMERIC> from column context; assert they round-trip exactly.
+    # Exercise all supported ARRAY element types, including null elements and arrays.
+    # DATE, TIMESTAMP and NUMERIC strings are coerced from the column context.
     conn = _connect(spanner_database)
     try:
         with conn.cursor() as cur:

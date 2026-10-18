@@ -36,26 +36,12 @@ def pytest_addoption(parser):
 SKIP_BASELINE_PATH = Path(__file__).resolve().parents[1] / "skip_baseline.txt"
 
 _SKIP_BASELINE_HEADER = """\
-# Foundry validation skip-inventory baseline.
+# Foundry validation skip baseline: sorted pytest nodeids expected to skip.
+# Optional trailing "  # <reason>" annotations are ignored when comparing nodeids.
+# Reasons are maintained in the .txtcase files.
 #
-# The sorted set of pytest nodeids expected to SKIP on a full suite run. One nodeid
-# per line, optionally followed by "  # <reason>" for reviewer readability. The
-# comparison key is the NODEID ALONE — the trailing reason is not compared (reasons
-# live in the .txtcase files and are maintained there; comparing them here would
-# couple this guard to unrelated reason edits).
-#
-# Why it exists: the suite reports Spanner's SQL-dialect divergences as per-case
-# skips. Without a pinned inventory, bumping ADBC_VALIDATION_REF can silently slip a
-# new upstream case into skip with no coverage, and a case that starts passing can
-# stay silently skipped (its skip never removed to enable it). This baseline pins
-# exactly which cases skip so either drift fails CI.
-#
-# Guard: foundry-validation/tests/conftest.py, enforced only when
-# FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE is set (the CI workflow sets it). It fails a
-# full run on either an *unlisted skip* (skipping now, not in this file) or a *stale
-# entry* (in this file, not skipping now — it passes/fails/was renamed).
-#
-# Regenerate after a legitimate skip-set change (rewrites this file from the run):
+# CI sets FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE to reject new or stale skips.
+# Regenerate after an intentional change to the skip set:
 #   FOUNDRY_UPDATE_SKIP_BASELINE=1 scripts/run-foundry-validation.sh
 """
 
@@ -66,20 +52,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 
 
 def _require_passes_guard(session: pytest.Session, exitstatus: int) -> None:
-    # Fail loudly on a "green" run that exercised no real coverage.
-    #
-    # The suite reports Spanner's expected SQL-dialect divergences as per-case
-    # *skips* (each with a reason), and pytest exits 0 when every collected case is
-    # skipped. So an all-skip run is indistinguishable, by exit code alone, from a
-    # broken harness that silently skipped everything (e.g. the driver failing to
-    # load, or a fixture misconfiguration) — the exact "harness breakage looks like
-    # an expected dialect skip" hole that the gating workflow otherwise leaves open.
-    #
-    # When FOUNDRY_VALIDATION_REQUIRE_PASSES is set — the CI workflow sets it, so
-    # ad-hoc local `-k` runs (which may legitimately select only skipped cases) are
-    # unaffected — require that at least one collected case actually passed. This
-    # mirrors the env-gated fail-loud convention of the ADBC_TEST_REQUIRE_TARGET
-    # skip guard used by the Rust/Python integration suites.
+    # Pytest succeeds when every case skips. CI requires at least one passing case;
+    # local filtered runs leave this guard disabled.
     if exitstatus != int(pytest.ExitCode.OK):
         return
     if not os.environ.get("FOUNDRY_VALIDATION_REQUIRE_PASSES"):
@@ -149,15 +123,7 @@ def _write_baseline(path: Path, skipped: dict[str, str]) -> None:
 
 
 def _skip_baseline_guard(session: pytest.Session) -> None:
-    # Pin *which* cases skip, so a suite-ref bump can't silently slip a new case into
-    # skip (no coverage) or leave a now-passing case silently skipped (its .txtcase
-    # skip never removed). This is the Foundry analog of the closed-set/xfail-strict
-    # guard in scripts/run-adbc-validation.sh for the C++ suite, adapted to the
-    # skip-based pytest model.
-    #
-    # Regenerate mode (FOUNDRY_UPDATE_SKIP_BASELINE) takes precedence: it rewrites the
-    # baseline from this run instead of comparing — how a maintainer updates the file
-    # after a legitimate skip-set change.
+    # Fail when the skip set changes, unless explicitly regenerating the baseline.
     reporter = session.config.pluginmanager.get_plugin("terminalreporter")
 
     def emit(message: str) -> None:

@@ -158,8 +158,9 @@ The geo-partitioning quota is unrelated to query partitions.
 so even a single ingest chunk can partially succeed. This path has no replay protection. Manual
 mode ignores the option and buffers mutations for an atomic commit.
 
-BatchWrite receives request priority, transaction tag and change-stream exclusion. Request tags,
-commit delay/stats and `spanner.retry.*` tuning do not apply; the update timeout does.
+BatchWrite receives request priority, transaction tag, change-stream exclusion, retry tuning
+and the update timeout. Request tags and commit delay/stats do not apply. Streaming retries
+honor the attempt cap but not the retry elapsed-time limit; use the update timeout for a deadline.
 
 `spanner.dml.partitioned=true` opts into non-atomic, idempotent `UPDATE`/`DELETE`. It returns a
 lower bound on affected rows and rejects manual mode, multiple statements/parameter rows and

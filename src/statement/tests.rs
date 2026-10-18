@@ -18,8 +18,7 @@ fn ingest_temporary_accepts_false_and_rejects_true() {
     // Spanner has no temporary tables: a truthy value is rejected as unimplemented.
     let error = check_ingest_temporary(OptionValue::String("true".into())).unwrap_err();
     assert_eq!(error.status, Status::NotImplemented);
-    // Malformed values fail boolean coercion, not the temporary-table check — the
-    // formerly-accepted lenient spellings and int-typed sets alike.
+    // Invalid spellings and non-string values fail boolean coercion before the feature check.
     for bad in ["maybe", "FALSE", "0", "no", "TRUE", "1", "yes"] {
         let error = check_ingest_temporary(OptionValue::String(bad.into())).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "{bad}");
@@ -45,8 +44,7 @@ fn exec_incremental_accepts_false_and_rejects_true() {
     // Incremental execution is not implemented: a truthy value is rejected as such.
     let error = check_exec_incremental(OptionValue::String("true".into())).unwrap_err();
     assert_eq!(error.status, Status::NotImplemented);
-    // Malformed values fail boolean coercion, not the incremental check — the
-    // formerly-accepted lenient spellings and int-typed sets alike.
+    // Invalid spellings and non-string values fail boolean coercion before the feature check.
     for bad in ["maybe", "FALSE", "0", "no", "TRUE", "1", "yes"] {
         let error = check_exec_incremental(OptionValue::String(bad.into())).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "{bad}");
@@ -281,8 +279,7 @@ fn bool_option_parses_exact_true_false() {
 
 #[test]
 fn bool_option_rejects_non_bool_values() {
-    // A string that is not exactly "true"/"false" — including the formerly-accepted lenient
-    // spellings (case variants, 1/0, yes/no), dropped for ADBC-ecosystem parity.
+    // Only the exact strings "true" and "false" are accepted.
     for bad in [
         "maybe", "", "2", "t", "on", "TRUE", "True", "FALSE", "False", "1", "0", "yes", "no",
         "YES", "NO",

@@ -1,20 +1,16 @@
-//! FFI / stream-lifecycle battery for the ADBC driver's C ABI export.
+//! Stream lifetime and handle lifecycle tests for the ADBC driver's C ABI export.
 //!
-//! Driver-manager-level regression tests for the crash class that dominated other ADBC drivers'
-//! bug reports (DuckDB's 2026 stream-lifetime fixes, e.g. the release race fixed in DuckDB PR
-//! #21800; the C++ `adbc_validation` suite's TestResultIndependence / TestResultInvalidation
-//! checks): a result stream handed across the C ABI is a standalone object, so consuming or
-//! releasing it must never crash regardless of what has happened to the statement / connection /
-//! database that produced it. Erroring is acceptable per the ADBC spec; crashing is not.
+//! A result stream is an independent C ABI object. Consuming or releasing it must remain safe
+//! after the statement, connection or database that produced it has been released or reused.
+//! These tests include the C++ `adbc_validation` suite's TestResultIndependence and
+//! TestResultInvalidation scenarios.
 //!
-//! These live in their own binary rather than in `tests/integration.rs` because they are
-//! *structurally* independent of everything there: every query generates its rows server-side with
-//! `GENERATE_ARRAY`, so the battery touches no table, writes nothing, and needs none of that
-//! suite's schema serialization (`serial_guard`). All it needs is a reachable database and a built
-//! cdylib.
+//! Every query generates rows with `GENERATE_ARRAY`, so these tests need no tables or schema
+//! serialization (`serial_guard`). They require a reachable database; raw C ABI tests also
+//! require a built cdylib.
 //!
-//! Like `tests/integration.rs` the file **skips itself** unless `SPANNER_OMNI_ENDPOINT`, `SPANNER_EMULATOR_HOST` or
-//! `SPANNER_GCP_DATABASE` is set, so a plain `cargo test` stays green:
+//! Tests skip unless `SPANNER_OMNI_ENDPOINT`, `SPANNER_EMULATOR_HOST` or
+//! `SPANNER_GCP_DATABASE` is set:
 //!
 //! ```sh
 //! scripts/with-emulator.sh cargo test --test ffi_lifecycle -- --nocapture
@@ -234,7 +230,7 @@ fn drain_rows(reader: Box<dyn RecordBatchReader + Send>) -> usize {
         .sum()
 }
 
-/// (a) TestResultIndependence, through the C ABI: a live result stream must keep working — or at
+/// TestResultIndependence, through the C ABI: a live result stream must keep working — or at
 /// worst error, never crash — after the statement, connection and database that produced it have
 /// all been released. In particular, releasing the hierarchy must not tear down the shared Tokio
 /// runtime while the stream's reader still blocks on it (the exported reader owns `Arc` handles
@@ -316,7 +312,7 @@ fn stream_survives_statement_connection_database_release() {
     assert_eq!(first.num_rows() + rest, 1000);
 }
 
-/// (b) TestResultInvalidation, through the C ABI: executing again on a statement whose previous
+/// TestResultInvalidation, through the C ABI: executing again on a statement whose previous
 /// result stream is still open must not crash. The second result must be complete and correct;
 /// the first stream may be invalidated (erroring on its next pull) or keep working — this driver
 /// hands out independent streams — but either way draining it afterwards must be safe.
@@ -354,7 +350,7 @@ fn ffi_execute_twice_with_first_stream_still_open() {
     }
 }
 
-/// (c) Cross-thread release race (the DuckDB PR #21800 bug class): a second thread releases a
+/// Cross-thread release race: a second thread releases a
 /// live result stream while the main thread starts and consumes a new query on the same
 /// connection. ~50 iterations to give the race room to bite.
 #[test]
@@ -386,7 +382,7 @@ fn ffi_stream_release_races_new_query() {
     }
 }
 
-/// (e) Unhappy paths must surface specific errors — not crashes — through the C ABI: executing
+/// Unhappy paths must surface specific errors — not crashes — through the C ABI: executing
 /// with no SQL set (query and update paths), deriving a parameter schema with nothing to derive
 /// it from, and preparing an empty statement. The statement must stay usable afterwards.
 /// (Cancel-after-release, the remaining InvalidState-class path, needs raw FFI calls and lives in
@@ -440,7 +436,7 @@ fn ffi_unhappy_paths_error_instead_of_crash() {
     );
 }
 
-/// (f) Abandoning a half-consumed stream, through the C ABI: read one batch of a large result,
+/// Abandoning a half-consumed stream, through the C ABI: read one batch of a large result,
 /// release the stream mid-flight (which must also clean up the driver's background prefetch task
 /// — `spawn_prefetch` in `src/runtime.rs`; its `JoinHandle` is aborted on reader drop), and
 /// verify the statement and connection keep working. Repeated a few times so leaked tasks or a
@@ -515,14 +511,12 @@ fn drop_half_consumed_reader_then_connection_still_works() {
     assert_eq!(drain_rows(probe.execute().expect("fresh query")), 1000);
 }
 
-/// (d) Double-release and error-struct reuse at the raw C ABI — paths the managed Rust wrappers
+/// Double-release and error-struct reuse at the raw C ABI — paths the managed Rust wrappers
 /// never exercise, because their `Drop` impls release exactly once. Releasing a statement /
 /// connection / database / driver twice must yield a clean `INVALID_STATE` error, not a crash or
 /// double-free; one `FFI_AdbcError` struct is reused across every call with its embedded
 /// `release` callback invoked (deliberately twice — it must be idempotent) between uses, the
-/// standard C consumer idiom. This is the regression test for the fork's idempotent
-/// `release_ffi_error` fix (see the `adbc_ffi` pin note in Cargo.toml) ahead of the eventual
-/// unpin to a crates.io arrow-adbc release, and it also covers cancel-after-release from (e).
+/// standard C consumer idiom. Also covers cancellation after releasing the handle.
 #[cfg(feature = "ffi")]
 #[test]
 fn ffi_double_release_and_error_struct_reuse() {
@@ -546,7 +540,7 @@ fn ffi_double_release_and_error_struct_reuse() {
     ensure_database_once(&target);
 
     /// Release `error`'s contents through its embedded callback, twice: the second call is the
-    /// idempotency check (pre-fix, it double-freed the message `CString`).
+    /// idempotency check for the message and private data cleanup.
     fn release_error_twice(error: &mut FFI_AdbcError) {
         assert!(
             error.release.is_some(),
@@ -641,7 +635,7 @@ fn ffi_double_release_and_error_struct_reuse() {
         error_message(&error)
     );
     release_error_twice(&mut error);
-    // (e) Cancel on a released statement: a specific InvalidState-class error, not a crash.
+    // Cancel on a released statement returns InvalidState.
     let status = unsafe { driver.StatementCancel.unwrap()(&mut statement, &mut error) };
     assert_eq!(
         status, ADBC_STATUS_INVALID_STATE,

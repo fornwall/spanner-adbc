@@ -9,9 +9,7 @@ on:
     tags: ["v*"]
   pull_request:
 
-# Cancel superseded PR runs (a rapid re-push cancels the in-flight run for the same
-# ref). Pushes to main and v* tag pushes are NEVER cancelled — a release build/publish
-# must always run to completion.
+# Cancel superseded PR runs; let branch and release builds complete.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -27,27 +25,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The Linux runners are pinned to 22.04 (glibc 2.35) because the wheels
-          # built from these libraries are tagged manylinux_2_35 (see the
-          # python-wheels job); a "Verify glibc requirement" step below fails the
-          # build if the library ever needs newer glibc symbols than the tag
-          # promises. To support older distros, switch to building inside a
-          # manylinux container and lower the tags together.
+          # Keep the runner glibc version and manylinux wheel tags in sync.
+          # The glibc-symbol check below verifies compatibility.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
             lib: libspanner_adbc.so
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
             lib: libspanner_adbc.so
-          # NOTE: the linux x86-64 *musl* (Alpine) library is built by the separate
-          # `build-musl` job below, not this matrix — it must be compiled inside Alpine
-          # (its gcc/libgcc are musl-native), see that job's comment for why.
-          # macos_deployment_target must match the macosx_* wheel tags in the
-          # python-wheels job; a "Verify the minimum macOS" step below fails the
-          # build if the library ever requires a newer macOS than the tag
-          # promises. Change the two together. The floors mirror the
-          # adbc-driver-manager wheels (10.15 x86-64 / 11.0 arm64) — the Python
-          # package is unusable without it, so older would gain nothing.
+          # Musl libraries use the Alpine job below. Keep macOS deployment targets
+          # in sync with wheel tags; they match the driver-manager wheel minimums.
           - target: aarch64-apple-darwin
             runner: macos-26
             lib: libspanner_adbc.dylib
@@ -66,10 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Third-party actions in this workflow are pinned to commit SHAs: this job builds the
-      # binaries that tagged releases attach and PyPI wheels bundle, so a hijacked mutable
-      # tag/branch in any of them could tamper with what users download. The trailing comment
-      # names the ref each SHA was resolved from.
+      # Third-party actions are SHA-pinned; trailing comments identify their releases.
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
         with:
@@ -88,17 +72,11 @@ jobs:
 
       - name: Build shared library
         env:
-          # On macOS, pin the minimum OS the library supports instead of inheriting it
-          # from the host SDK — rustc, cc and aws-lc's cmake all honor this variable.
-          # Empty (and read by nothing) on the other platforms.
+          # rustc, cc and aws-lc CMake use this minimum macOS version.
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
         run: cargo build --release --target ${{ matrix.target }}
 
-      # The Linux wheels are tagged manylinux_2_35, which promises pip that the
-      # bundled library loads on any glibc >= 2.35 system. Enforce that promise:
-      # fail if the built .so requires a newer glibc symbol version (e.g. after
-      # a runner image bump), instead of shipping a wheel that installs fine on
-      # Ubuntu 22.04 / Debian 12 and then fails at dlopen time.
+      # Reject libraries requiring a newer glibc than the manylinux wheel tag allows.
       - name: Verify glibc requirement matches the manylinux_2_35 wheel tag
         if: contains(matrix.target, 'linux-gnu')
         run: |
@@ -112,10 +90,7 @@ jobs:
             exit 1
           fi
 
-      # Same promise-enforcement as the glibc check above, for the macosx_* wheel tags:
-      # fail if the built dylib's minimum OS is newer than the deployment target (e.g. a
-      # dependency's build system ignoring MACOSX_DEPLOYMENT_TARGET), instead of shipping
-      # a wheel that installs fine and then fails at dlopen time on the OS the tag allows.
+      # Reject libraries requiring a newer macOS than the wheel tag allows.
       - name: Verify the minimum macOS matches the wheel tag
         if: contains(matrix.target, 'apple-darwin')
         run: |
@@ -144,8 +119,6 @@ jobs:
           cp README.md LICENSE "$staging/"
           if [ "${{ runner.os }}" = "Windows" ]; then
             # Include the MSVC import library for consumers that link at build time.
-            # It is a required part of the Windows artifact, so a missing one is a
-            # build regression that must fail the job loudly, not be swallowed.
             implib="target/${{ matrix.target }}/release/spanner_adbc.dll.lib"
             if [ ! -f "$implib" ]; then
               echo "::error::expected Windows import library $implib is missing" >&2
@@ -165,19 +138,9 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Linux *musl* (Alpine) libraries, for the musllinux_1_2 wheels. Kept out of the
-  # matrix above because they cannot be produced on the glibc runners: aws-lc-rs (the
-  # hardwired TLS backend) has no pure-Rust option, so its C code must be compiled by a
-  # musl toolchain, and — critically — a musl *cdylib* has to link *dynamically* (rustc
-  # drops the cdylib crate-type entirely under the musl target's default crt-static),
-  # which needs a musl-native libgcc that Ubuntu's `musl-tools` does not ship (a
-  # cross-linked .so ends up pulling glibc's libc/libgcc instead). Building inside
-  # Alpine, whose native gcc/libgcc are musl, is the clean path: `cargo build` there
-  # targets <arch>-unknown-linux-musl natively, and RUSTFLAGS=-Ctarget-feature=-crt-static
-  # keeps the cdylib dynamic so it dlopen()s on Alpine. Only the compile runs in the
-  # container; checkout/package/upload run on the host so the JS actions work normally.
-  # Each arch builds natively on its own runner (x86-64 on ubuntu-24.04, aarch64 on
-  # ubuntu-24.04-arm) so the aws-lc C compiles native — no musl cross-toolchain needed.
+  # Build musl libraries natively in Alpine so aws-lc and libgcc link against musl.
+  # Disable crt-static: Rust otherwise omits the cdylib for musl targets.
+  # Only compilation runs in the container; JavaScript actions run on the host.
   build-musl:
     name: ${{ matrix.target }}
     strategy:
@@ -194,15 +157,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The rust:alpine image is digest-pinned for the same reason the actions above are
-      # SHA-pinned: this job compiles a binary that tagged releases attach and the PyPI
-      # wheel bundles, so a hijacked mutable tag must not be able to tamper with it. The
-      # digest points at the multi-arch image index, so `docker run` pulls the matching
-      # amd64/arm64 variant for whichever runner this matrix leg lands on; the trailing
-      # comment names the tag the digest was resolved from. The image only supplies the
-      # musl base toolchain (gcc/libgcc + apk packages) — the *Rust* version is still
-      # rust-toolchain.toml's single pin, which rustup honours inside the container (it
-      # auto-installs that toolchain over the image's default when `cargo build` runs).
+      # The image digest covers both architectures; Rust still follows rust-toolchain.toml.
       # Image: rust:1.99.1-alpine3.24.
       - name: Build shared library (Alpine/musl)
         run: |
@@ -217,9 +172,7 @@ jobs:
               cargo build --release
             '
 
-      # Confirm the promise the musllinux_1_2 wheel makes: a real musl object (no
-      # *required* glibc-versioned symbols) that exports the driver entrypoint. Docker
-      # wrote the target dir as root; read-only inspection on the host is unaffected.
+      # Verify musllinux compatibility and the exported driver entrypoint.
       - name: Verify the library is a musl (not glibc) shared object
         run: |
           set -euo pipefail
@@ -228,14 +181,8 @@ jobs:
             echo "::error::musl build produced no cdylib at $lib (crt-static dropping it?)" >&2
             exit 1
           fi
-          # A musl build must not *require* any glibc-versioned symbol. But GCC's
-          # crtbeginS.o emits *weak, undefined* references to the legacy libgcc frame
-          # hooks (__register_frame_info / __deregister_frame_info), and on aarch64 those
-          # carry a GLIBC_2.0 version tag (they don't appear on x86-64). Being weak and
-          # undefined, musl's loader leaves them NULL and the crt code is NULL-guarded, so
-          # they are not a real glibc dependency and must not fail this check. Only a
-          # *non-weak* (GLOBAL) undefined GLIBC symbol is a genuine glibc link — parse the
-          # dynamic symbol table (Bind=$5, Ndx=$7, Name+version=$8) and fail on those.
+          # GCC's aarch64 crtbeginS.o has weak GLIBC-tagged frame hooks that musl
+          # leaves NULL. Only required (non-weak) symbols indicate a glibc dependency.
           strong="$(readelf -W --dyn-syms "$lib" \
             | awk '$8 ~ /@GLIBC_/ && $7 == "UND" && $5 != "WEAK" { print $8 }' || true)"
           if [ -n "$strong" ]; then
@@ -272,19 +219,8 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Gate every tag-triggered publish step on the commit's required workflows being green.
-  # This workflow (and only this one) triggers on tags, and it runs no tests itself — so
-  # without this job a `cargo release --execute` (which pushes the "Release X.Y.Z"
-  # commit and the vX.Y.Z tag together) would attach GitHub Release assets and publish
-  # to PyPI (irreversible) even if that exact commit is red, or before the checks have
-  # finished. The branch push that accompanies the tag triggers each of these workflows
-  # on the same SHA (they all run on push to `main` + pull_request); here we poll every
-  # one of them for github.sha and only succeed once ALL have concluded `success`,
-  # failing (and thus blocking `release` / `python-publish`) otherwise. The gate covers
-  # the Rust CI (ci.yml) AND the two ADBC conformance suites that run on the same commit:
-  # the canonical Apache C++ validation (adbc-validation.yml) and the Driver Foundry
-  # coverage harness (foundry-validation.yml) — a tag must not publish while either
-  # conformance suite is red on that exact SHA.
+  # Wait for required workflows on the tagged commit before publishing.
+  # The branch push accompanying cargo release supplies runs for the same SHA.
   ci-gate:
     name: Require CI + conformance green on this commit
     needs: build
@@ -301,14 +237,9 @@ jobs:
           set -euo pipefail
           sha="${{ github.sha }}"
           repo="${{ github.repository }}"
-          # Every workflow file that must be green on this commit before the release may
-          # attach assets / publish to PyPI. Each triggers on the push to `main` that
-          # accompanies the tag, so each produces a run for this SHA.
+          # Each required workflow must run on the main-branch push accompanying the tag.
           required=(ci.yml adbc-validation.yml foundry-validation.yml)
-          # 30-minute budget: a run may not be registered yet when the tag arrives, and
-          # the emulator/C++ suites take a few minutes; poll until all complete either way.
-          # A required workflow that never registers a run keeps `pending` and thus times
-          # out below — i.e. the fail-safe blocks the publish rather than releasing blind.
+          # Allow 30 minutes for runs to register and complete; missing runs block publishing.
           deadline=$(( SECONDS + 1800 ))
           while true; do
             pending=()
@@ -339,15 +270,7 @@ jobs:
             sleep 20
           done
 
-  # Single source of truth for the release version is Cargo.toml; on a vX.Y.Z tag the
-  # pushed tag must equal it. This standalone gate runs that check once, and both the
-  # GitHub-Release (`release`) and PyPI (`python-publish`) jobs depend on it, so a tag
-  # that disagrees with the crate version publishes nothing anywhere. Previously the
-  # check lived only inside `python-wheels`, leaving `release` free to attach assets for
-  # a mismatched tag; and `release`/`python-publish` were unordered siblings, so a
-  # partial failure could leave a PyPI version with no GitHub assets or vice versa (see
-  # the `needs:` on `python-publish`, which runs the irreversible PyPI step last).
-  # Tag-only: on branch/PR pushes there is no tag to check.
+  # Require the tag to match Cargo.toml before publishing libraries or wheels.
   version-gate:
     name: Tag matches crate version
     if: startsWith(github.ref, 'refs/tags/')
@@ -360,9 +283,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # `cargo metadata` (--no-deps: read only this manifest and resolve nothing, so
-          # the git-pinned dependencies are never fetched) is more robust than a
-          # positional grep of Cargo.toml — it parses the manifest the way cargo does.
+          # Read the package version without resolving or fetching dependencies.
           crate_version="$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "spanner-adbc") | .version')"
           tag_version="${GITHUB_REF#refs/tags/v}"
@@ -385,26 +306,13 @@ jobs:
       - name: Download the platform library artifacts
         uses: actions/download-artifact@v8
         with:
-          # Only the per-platform library archives the `build` job uploaded. Without this
-          # pattern the step downloads *every* artifact of the run — and since `python-wheels`
-          # runs concurrently (both jobs only need `build`), its `python-wheels` artifact could
-          # land in dist/ depending on timing and be attached to the GitHub Release without
-          # matching the `spanner-adbc-*` checksum glob below. Wheels are published to PyPI by
-          # `python-publish`, not attached to the release.
+          # Download library archives only; the wheel artifact may be uploaded concurrently.
           pattern: spanner-adbc-*
           path: dist
           merge-multiple: true
 
-      # Attach the ADBC driver manifest next to the archives. It is what makes
-      # `driver="spanner"` (and `uri="spanner:///..."`, which resolves the driver from
-      # the URI scheme) work without naming a library path: drop it into one of the
-      # driver manager's search directories — `$ADBC_DRIVER_PATH`,
-      # `~/.config/adbc/drivers`, `/etc/adbc/drivers`, ... — after pointing its
-      # `Driver.shared` entry at wherever the extracted library actually lives. The
-      # checked-in manifest carries no `version` (nothing would keep a hardcoded one in
-      # step with Cargo.toml); stamp the released version in here instead. The tag is
-      # the crate version verbatim — `version-gate`, which this job needs, fails the
-      # release otherwise.
+      # Stamp the release version into the driver-discovery manifest.
+      # Users set Driver.shared to the extracted library path before installing it.
       - name: Stamp the release version into the driver manifest
         shell: bash
         run: |
@@ -425,10 +333,7 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          # One checksums file over every published asset, so downstream consumers can
-          # pin the driver by hash instead of trusting a mutable release tag (verify
-          # with `sha256sum -c SHA256SUMS`). The globs match the platform archives and
-          # the driver manifest, never the SHA256SUMS file itself.
+          # Include every published archive and the manifest in SHA256SUMS.
           sha256sum spanner-adbc-* spanner.toml > SHA256SUMS
           echo "Published checksums:"
           cat SHA256SUMS
@@ -442,10 +347,7 @@ jobs:
           files: dist/*
           generate_release_notes: true
 
-  # Repackage the per-platform shared libraries built above into Python wheels.
-  # No compilation happens here — a Spanner ADBC wheel is "data-only" (it ships
-  # the prebuilt cdylib and links nothing against Python), so a single Linux
-  # runner can stamp out every platform's wheel by forcing the platform tag.
+  # Package prebuilt libraries as py3-none platform wheels on one runner.
   python-wheels:
     name: Python wheels
     needs: [build, build-musl]
@@ -455,15 +357,11 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          # Only drives `setup.py bdist_wheel` to repackage the prebuilt libraries;
-          # the wheel tag is forced to py3-none-<platform>, so this version does not
-          # affect the artifact. Pinned (not "3.x") for a reproducible release host.
+          # This Python version only packages binaries; wheels use the py3-none ABI tag.
           python-version: "3.15.0"
 
       - name: Install build tooling
-        # setuptools only: it has vendored the `bdist_wheel` command since v70.1, and
-        # `python/setup.py` imports it from there, so the standalone `wheel` package is
-        # no longer part of this build.
+        # The build uses the bdist_wheel command bundled with setuptools.
         run: python -m pip install --upgrade pip setuptools
 
       - name: Download platform libraries
@@ -477,14 +375,7 @@ jobs:
         working-directory: python
         run: |
           set -euo pipefail
-          # Single source of truth for the version is Cargo.toml. The tag-vs-crate
-          # consistency check that guards a vX.Y.Z release lives in the standalone
-          # `version-gate` job (which the tag-only `python-publish` job depends on), so
-          # a mismatched tag never reaches PyPI; here we only stamp the wheel version.
-          # Derive the version with `cargo metadata` (--no-deps: read only this manifest
-          # and resolve nothing, so the git-pinned dependencies are never fetched), the
-          # same robust parse the `version-gate` job uses — more reliable than a
-          # positional grep of Cargo.toml, since it parses the manifest the way cargo does.
+          # Stamp wheels with the Cargo.toml version; version-gate checks release tags.
           crate_version="$(cargo metadata --no-deps --format-version 1 --manifest-path ../Cargo.toml \
             | jq -r '.packages[] | select(.name == "spanner-adbc") | .version')"
           echo "__version__ = \"${crate_version}\"" > spanner_adbc/_version.py
@@ -531,9 +422,7 @@ jobs:
           mv dist/*.whl wheelhouse/
           ls -l wheelhouse
 
-      # Inspect the freshly built wheels before the irreversible python-publish
-      # step (which needs: python-wheels) can ship them. All cheap and on the same
-      # runner; catches a wheel that packages fine but is broken or empty.
+      # Check wheel metadata, bundled libraries and loading before publishing.
       - name: Check wheel metadata and that each bundles its platform library
         shell: bash
         working-directory: python
@@ -565,11 +454,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Only the native glibc (manylinux x86_64) wheel is installable on this
-          # glibc runner, so smoke-test that one; the musllinux wheels are only
-          # inspected above (pip on glibc rejects them, and they need an Alpine host).
-          # Install the actual built wheel — not the source tree the unit-test job
-          # uses — to confirm the bundled library resolves.
+          # Smoke-test the installed manylinux x86_64 wheel on this glibc runner.
+          # The other platform wheels are inspected above.
           whl="$(ls python/wheelhouse/*manylinux_2_35_x86_64.whl)"
           python -m pip install "$whl"
           # Import from a directory without the source tree so the *installed*
@@ -577,11 +463,8 @@ jobs:
           cd "$RUNNER_TEMP"
           python -c "import spanner_adbc; print(spanner_adbc._driver_path()); import spanner_adbc.dbapi"
 
-      # Prove that the manifest the wheel installs actually makes the driver
-      # *discoverable*: a manifest that ships but is never found is worse than none,
-      # because it looks like the feature works. Entirely offline — AdbcDatabaseInit
-      # opens no connection, so a resolution failure (NOT_FOUND from the driver
-      # manager) is the only way this can fail, and no Spanner target is needed.
+      # Verify driver-name and URI-scheme discovery through the installed manifest.
+      # Database initialization needs no Spanner connection.
       - name: Check the installed wheel's driver manifest resolves by name and URI scheme
         shell: bash
         run: |
@@ -625,18 +508,11 @@ jobs:
           path: python/wheelhouse/*.whl
           if-no-files-found: error
 
-  # Publish the wheels to PyPI on a vX.Y.Z tag via PyPI Trusted Publishing
-  # (OIDC) — no API token or long-lived secret. Authentication is proven by the
-  # short-lived `id-token` GitHub mints for this job, which must match the
-  # trusted publisher configured on PyPI (owner + repo + this workflow filename
-  # `libraries.yml` + the `pypi` environment below). See README/setup notes.
+  # Publish with PyPI Trusted Publishing. The PyPI publisher must match this
+  # repository, libraries.yml and the pypi environment; see python/README.md.
   python-publish:
     name: Publish wheels to PyPI
-    # `version-gate`: refuse to publish a wheel whose tag disagrees with the crate
-    # version. `release`: PyPI is irreversible (a version can't be re-uploaded), so run
-    # it strictly *after* the GitHub-Release assets are attached — a failure there must
-    # not leave a PyPI version with no matching GitHub assets. (`release` transitively
-    # depends on `version-gate` too; it is also listed explicitly for clarity.)
+    # Publish to PyPI after matching-version GitHub Release assets are attached.
     needs: [python-wheels, ci-gate, version-gate, release]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest

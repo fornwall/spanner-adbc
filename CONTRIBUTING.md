@@ -60,7 +60,14 @@ ADBC deliberately tracks upstream `main`, including the C++ validation suite; Ar
 the `FFI_ArrowArrayStream` constructor and accessors that arrow-rs 60 lacks.
 Each family independently prevents crates.io publishing.
 
+Downstream Rust projects must match the `adbc_core` source and revision. With the default `ffi`
+feature enabled, they must also copy all four Arrow overrides from this repository's
+`[patch.crates-io]` section into their workspace root `Cargo.toml`. Cargo only applies patches
+from the top-level workspace; adding this crate as a git dependency does not inherit them.
+Without the overrides, registry Arrow 60 lacks the stream constructor and callback accessors
+used by the FFI implementation.
+
 Read revisions from `Cargo.toml`/`Cargo.lock` and follow the
 [revert checklist](CLAUDE.md#revert-checklist) when switching to registry releases. Keep each
-family on one revision, including the ADBC C++ validation header; downstream Rust users must
-use the same `adbc_core` source. Check published API availability before removing a pin.
+family on one revision, including the ADBC C++ validation header. Check published API availability
+before removing a pin.

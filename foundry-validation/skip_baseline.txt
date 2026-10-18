@@ -1,23 +1,9 @@
-# Foundry validation skip-inventory baseline.
+# Foundry validation skip baseline: sorted pytest nodeids expected to skip.
+# Optional trailing "  # <reason>" annotations are ignored when comparing nodeids.
+# Reasons are maintained in the .txtcase files.
 #
-# The sorted set of pytest nodeids expected to SKIP on a full suite run. One nodeid
-# per line, optionally followed by "  # <reason>" for reviewer readability. The
-# comparison key is the NODEID ALONE — the trailing reason is not compared (reasons
-# live in the .txtcase files and are maintained there; comparing them here would
-# couple this guard to unrelated reason edits).
-#
-# Why it exists: the suite reports Spanner's SQL-dialect divergences as per-case
-# skips. Without a pinned inventory, bumping ADBC_VALIDATION_REF can silently slip a
-# new upstream case into skip with no coverage, and a case that starts passing can
-# stay silently skipped (its skip never removed to enable it). This baseline pins
-# exactly which cases skip so either drift fails CI.
-#
-# Guard: foundry-validation/tests/conftest.py, enforced only when
-# FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE is set (the CI workflow sets it). It fails a
-# full run on either an *unlisted skip* (skipping now, not in this file) or a *stale
-# entry* (in this file, not skipping now — it passes/fails/was renamed).
-#
-# Regenerate after a legitimate skip-set change (rewrites this file from the run):
+# CI sets FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE to reject new or stale skips.
+# Regenerate after an intentional change to the skip set:
 #   FOUNDRY_UPDATE_SKIP_BASELINE=1 scripts/run-foundry-validation.sh
 
 tests/test_connection.py::TestConnection::test_get_objects_constraints_unique[spanner:emulator]  # not implemented

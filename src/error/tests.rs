@@ -87,9 +87,7 @@ fn unmapped_codes_fall_back_to_internal() {
     for code in [Code::ResourceExhausted, Code::Internal, Code::Ok] {
         assert_eq!(status_for_grpc_code(code), Status::Internal);
     }
-    // An out-of-range numeric decodes to `Unknown`, which now has its own arm — the catch-all is
-    // still mandatory (the `Code` enum is `#[non_exhaustive]`), it is just no longer what an
-    // unrecognised wire code reaches.
+    // An unrecognised numeric wire code decodes to `Unknown`, which maps to Status::Unknown.
     assert_eq!(status_for_grpc_code(Code::from(9999)), Status::Unknown);
 }
 
@@ -260,7 +258,7 @@ fn permission_denied_preserves_the_message_and_appends_iam_guidance() {
             .contains("Caller is missing IAM permission spanner.databases.select")
     );
     // ...and the fixed guidance is appended: a generic "grant a role that includes it" hint
-    // plus the IAM doc link — no specific role is named (BigQuery-driver parity).
+    // plus the IAM doc link, without prescribing a specific role.
     assert!(
         adbc.message.contains("grant an IAM role that includes it"),
         "expected the appended IAM guidance, got: {}",
@@ -270,7 +268,7 @@ fn permission_denied_preserves_the_message_and_appends_iam_guidance() {
         adbc.message
             .contains("https://cloud.google.com/spanner/docs/iam")
     );
-    // The role enumeration was intentionally dropped: no predefined role names leak through.
+    // The required role depends on the caller's permissions and access policy.
     assert!(
         !adbc.message.contains("roles/spanner."),
         "guidance must name no specific IAM role, got: {}",

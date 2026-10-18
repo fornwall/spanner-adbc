@@ -644,7 +644,7 @@ fn an_integer_impersonation_lifetime_is_accepted() {
 // Building impersonated credentials on top of a valid base credential succeeds without any
 // network I/O: the `impersonated` builder clones the source credential and constructs a lazy
 // token provider — the IAM `generateAccessToken` call only happens on first token use. We use an
-// `authorized_user` base (which itself builds offline, like #23's test) and must run inside a
+// `authorized_user` base (which also builds offline) and must run inside a
 // Tokio runtime because the builders spawn token-cache tasks, exactly as `connect()` does.
 #[test]
 fn impersonated_credentials_build_without_network() {

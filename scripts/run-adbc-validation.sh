@@ -34,29 +34,18 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Sanitizers for the C++ side (harness + arrow-adbc + driver manager), e.g.
-# ADBC_VALIDATION_SANITIZE=address,undefined. The Rust cdylib stays uninstrumented (see
-# adbc-validation/CMakeLists.txt), but ASan's process-wide malloc/free/memcpy interceptors
-# still catch double-free / overflow / use-after-free on the C-ABI structs crossing the
-# boundary.
+# Instrument the C++ harness, driver manager and validation libraries.
 SANITIZE="${ADBC_VALIDATION_SANITIZE:-}"
 
-# ADBC_VALIDATION_RUST_SANITIZE=address instruments the cdylib ITSELF via nightly
-# `-Zsanitizer=address` + `-Zbuild-std` (std must be instrumented too, else ASan misreports
-# std allocations), catching memory bugs *inside* Rust that the C-side-only ASan cannot see.
-# Only `address` is supported (no `-Zsanitizer=undefined` cdylib story). REQUIRES
-# ADBC_VALIDATION_SANITIZE to include `address`: the C++ executable owns the runtime and both
-# sides must share it — Rust uses compiler-rt ASan, so the C++ side needs clang (gcc's libasan
-# is incompatible and aborts at startup when mixed), hence the CC/CXX clang default below.
+# Instrument Rust and std with nightly ASan. Requires address sanitization on
+# the C++ side and clang so both sides share the compiler-rt runtime.
 RUST_SANITIZE="${ADBC_VALIDATION_RUST_SANITIZE:-}"
 
 # Host target triple. `-Zbuild-std` needs an explicit --target, which relocates the cdylib to
 # target/<triple>/debug/; resolved once here and reused for both the build and the library path.
 RUST_TARGET="$(rustc -vV | sed -n 's/host: //p')"
 
-# When instrumenting the Rust side, compile the C++ side with clang so both link the SAME
-# compiler-rt ASan runtime (mixing gcc's libasan with compiler-rt ASan in one process is unsound
-# and aborts at startup). Only default these — respect a caller-provided CC/CXX.
+# Default to clang for runtime compatibility; respect explicit compiler choices.
 if [ -n "$RUST_SANITIZE" ]; then
   export CC="${CC:-clang}"
   export CXX="${CXX:-clang++}"
@@ -94,37 +83,16 @@ for arg in "$@"; do
 done
 
 # ---------------------------------------------------------------------------
-# EXCLUDED: the single source of truth for cases that are known-not-passing or
-# not-applicable to Spanner. Everything NOT listed must pass (or self-skip) and is
-# gate-enforced, so new upstream cases run automatically. Each entry is enforced to
-# still exist upstream (stale guard) and to still fail-or-skip (expected-failure
-# guard). Cases needing only SQL adaptation are handled by SpannerQuirks::RewriteSql
-# in adbc-validation/spanner_validation.cc, not by exclusion; cases a quirk makes
-# self-skip need no entry here either (the gate tolerates skips).
-# ---------------------------------------------------------------------------
+# Excluded cases must still exist and fail or skip. All other cases run in the gate.
+# Adapt dialect-specific SQL in SpannerQuirks::RewriteSql when possible.
 EXCLUDED=(
-  # --- Arrow types the driver cannot map to a Spanner column ------------------
-  # Duration / Interval: unmapped, so ingest fails with "cannot create a Spanner
-  #   column for Arrow type ...". The natural target, Spanner's INTERVAL column, is
-  #   unsupported by the emulator (CREATE TABLE fails with a GOOGLESQL_RET_CHECK on
-  #   IsSupportedColumnType), so neither could pass in CI even with driver support.
-  #   Interval(MonthDayNano) is a clean 1:1 with Spanner INTERVAL on real Spanner and
-  #   is a candidate for a future PR; Duration has no fixed-unit Spanner counterpart
-  #   (one INTERVAL column reads back as only one Arrow type) and the suite's
-  #   ValidateIngestedTemporalData FAILs any non-TIMESTAMP temporal readback.
-  # UInt64: u64::MAX exceeds i64::MAX, so it cannot widen to INT64 losslessly. It
-  #   would fit NUMERIC, but that reads back as Decimal128, not the INT64 the shared
-  #   IngestSelectRoundTripType quirk expects — and the suite's SchemaField cannot
-  #   express Decimal128(precision, scale) to assert such a round-trip.
+  # Duration and Interval have no supported column mapping; the emulator also
+  # rejects INTERVAL columns. UInt64 cannot fit losslessly in INT64, and the
+  # suite cannot express a NUMERIC/Decimal128 round-trip for this case.
   'SpannerStatementTest.SqlIngestDuration'
   'SpannerStatementTest.SqlIngestInterval'
   'SpannerStatementTest.SqlIngestUInt64'
 
-  # (SqlQueryCancel used to sit here: it wants get_next to return exactly ECANCELED,
-  #  which arrow-rs's FFI_ArrowArrayStream exporter cannot emit -- it maps every error
-  #  to ENOSYS/ENOMEM/EIO/EINVAL. The driver now exports its own Arrow C stream
-  #  (src/ffi/stream.rs), which recovers the ADBC status from the error the reader
-  #  boxed and maps Cancelled -> ECANCELED, so the case is gate-enforced.)
 )
 
 # The colon-joined --gtest_filter value for the EXCLUDED set. Prefixed with `-`
@@ -134,12 +102,8 @@ EXCLUDED_FILTER="$(IFS=:; printf '%s' "${EXCLUDED[*]}")"
 
 # ---------------------------------------------------------------------------
 
-# Cross-boundary ASan canary (rust-asan leg only). A green rust-asan leg is no proof the Rust
-# instrumentation is armed — a -Zsanitizer/-Zbuild-std regression disarms it silently. So call an
-# intentionally-out-of-bounds Rust symbol (spanner_adbc_asan_canary, compiled only under
-# --cfg asan_canary) from a clang -fsanitize=address program against a C++-allocated buffer: the
-# exact cross-boundary shape this leg exists to cover. ASan MUST report a heap-buffer-overflow;
-# if it does not, the leg is a no-op and we fail loudly.
+# Verify Rust instrumentation by writing past a C++-allocated buffer.
+# The test-only canary must trigger an ASan heap-buffer-overflow report.
 run_rust_asan_canary() {
   local lib="$REPO_ROOT/target/$RUST_TARGET/debug/libspanner_adbc.so"
   local src="$REPO_ROOT/adbc-validation/asan_canary.cc"
@@ -177,15 +141,12 @@ run_rust_asan_canary() {
 
 build_harness() {
   if [ -n "$RUST_SANITIZE" ]; then
-    # Nightly + build-std so the cdylib AND std are instrumented; -Zbuild-std forces an explicit
-    # --target, so the artifact lands under target/<triple>/debug/. `--cfg asan_canary` compiles
-    # the test-only tripwire (src/asan_canary.rs) into THIS build only — nothing else sets that
-    # cfg, so the out-of-bounds symbol never leaks into a shipped cdylib.
+    # Instrument Rust and std, and include the test-only overflow canary.
+    # The explicit target places the library in target/<triple>/debug/.
     echo ">> building the spanner-adbc cdylib with -Zsanitizer=$RUST_SANITIZE (nightly, -Zbuild-std, --target $RUST_TARGET, --cfg asan_canary)"
     RUSTFLAGS="-Zsanitizer=$RUST_SANITIZE --cfg asan_canary ${RUSTFLAGS:-}" \
       cargo +nightly build -Zbuild-std --target "$RUST_TARGET"
-    # Positive control: prove the freshly-built cdylib is ACTUALLY ASan-armed before running the
-    # (slow) suite, so a silently-disarmed leg fails fast here instead of going green as a no-op.
+    # Verify instrumentation before running the full suite.
     run_rust_asan_canary
   else
     echo ">> building the spanner-adbc cdylib"

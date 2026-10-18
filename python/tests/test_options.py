@@ -24,13 +24,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LIB_RS = _REPO_ROOT / "src" / "lib.rs"
 _OPTIONS_MD = _REPO_ROOT / "docs" / "options.md"
 
-# Driver option keys that intentionally have NO typed enum member. Every entry
-# needs a reason — this allowlist is what keeps the guard honest.
+# Read-only options have no enum member because the enums configure handles.
 _EXPECTED_MISSING = {
-    # Read-only introspection key, not a setting: it is *read back* after a commit
-    # via `get_option_int`, and setting it returns NotImplemented. The enums exist to
-    # populate db_kwargs / conn_kwargs / adbc_stmt_kwargs, so a member would only
-    # invite a call that the driver rejects.
+    # Available through get_option_int after a commit; setting it is unsupported.
     "spanner.commit_stats.mutation_count",
 }
 
@@ -47,11 +43,7 @@ _LEVELS = [
     ("Statement options", StatementOptions),
 ]
 
-# Each option *level* draws its documented keys from one or more `docs/options.md`
-# sections. The docs split the shared options — the ones available on BOTH the
-# connection and the statement — into their own `## Shared options …` section
-# rather than repeating them under each level, so that one section feeds both the
-# connection and the statement levels.
+# Shared option sections contribute keys to both connection and statement enums.
 _SHARED_SECTION = "Shared options (connection and statement)"
 _LEVEL_SECTIONS = {
     "Database options": ["Database options"],

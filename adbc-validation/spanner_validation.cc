@@ -98,14 +98,8 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
     return "CREATE TABLE `" + std::string(name) + "` (id INT64) PRIMARY KEY (id)";
   }
 
-  // Deliberately unsupported: the SqlIngestPrimaryKey case append-ingests rows
-  // *omitting* the primary-key column and expects the database to auto-assign
-  // ascending key values ("databases start numbering at 0 or 1"). Spanner has
-  // no ordered auto-increment: a keyless insert mutation writes NULL (a second
-  // NULL key row is a duplicate-PK error), and Spanner SEQUENCEs are
-  // bit-reversed, so even a DEFAULT sequence key cannot satisfy the case's
-  // `ORDER BY id` readback that expects insertion order. Returning nullopt is
-  // the quirk's sanctioned way to say so; the case self-skips.
+  // The suite expects ordered auto-increment keys. Spanner's bit-reversed
+  // sequence keys do not preserve insertion order, so this case is unsupported.
   std::optional<std::string> PrimaryKeyIngestTableDdl(std::string_view) const override {
     return std::nullopt;
   }
@@ -140,35 +134,14 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
     return "@p" + std::to_string(index);
   }
 
-  // GoogleSQL quotes identifiers with backticks, not ANSI double quotes (which
-  // GoogleSQL reserves for string literals). The hook (apache/arrow-adbc#4504)
-  // feeds the suite's ingest/prepare readback and DDL statements, so they are
-  // valid GoogleSQL instead of failing on the quoting itself.
+  // GoogleSQL uses backticks for identifiers and double quotes for strings.
   std::string QuoteIdentifier(std::string_view name) const override {
     return "`" + std::string(name) + "`";
   }
 
-  // Substitute GoogleSQL for the suite's dialect-sensitive default SQL (the
-  // generic per-query override hook from apache/arrow-adbc#4496; the routing of
-  // all the statement-test SQL below it is apache/arrow-adbc#4514 — see
-  // ARROW_ADBC_TAG in CMakeLists.txt). Three Spanner-isms drive the rewrites:
-  //   - DDL: Spanner has INT64/STRING(MAX), not INT/INTEGER/TEXT; DML INSERT
-  //     requires an explicit column list.
-  //   - `NULLS FIRST`/`NULLS LAST` are rejected (by the emulator's GoogleSQL);
-  //     dropping them is semantics-preserving — GoogleSQL's defaults are
-  //     exactly NULLS FIRST for ASC and NULLS LAST for DESC.
-  //   - An ingest-created table has no declared key (see CreateSampleTable), so
-  //     Spanner orders its rows by the implicit `rowid` it assigns — a
-  //     bit-reversed identity, i.e. not insertion order. A readback whose
-  //     expected values are order-sensitive therefore needs an explicit
-  //     ORDER BY even where upstream relies on the natural order.
-  // `SELECT *` itself needs no rewriting: the implicit key is HIDDEN, so an
-  // ingest-created table reads back as exactly the ingested columns (driver
-  // versions up to 0.7 appended a visible `adbc_ingest_key` column here and had
-  // to project past it in every readback).
-  // Every entry pins the upstream default so a future ARROW_ADBC_TAG bump that
-  // changes a query out from under us fails the test loudly, rather than
-  // silently rewriting a query the substitution no longer matches.
+  // Adapt native type names, INSERT column lists and NULL ordering to GoogleSQL.
+  // Readbacks with order-sensitive expectations need explicit ORDER BY clauses.
+  // Pin each upstream query so a changed suite query requires reviewing its rewrite.
   std::string RewriteSql(std::string_view query_id,
                          std::string default_sql) const override {
     struct Rewrite {
@@ -196,20 +169,12 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
         {"StatementTest::TestSqlIngestSample::select-bulk-ingest",
          {"SELECT * FROM `bulk_ingest` ORDER BY int64s ASC NULLS FIRST",
           "SELECT * FROM `bulk_ingest` ORDER BY `int64s` ASC"}},
-        // Append is the one ORDER BY-less readback whose expected values are
-        // order-sensitive: it wants {42, -42, NULL}, its insertion order, which
-        // Spanner's implicit-key order does not reproduce. `ORDER BY int64s
-        // DESC` does, exactly (GoogleSQL DESC puts NULLs last by default).
-        // Replace ({42}, then {-42, -42}), CreateAppend ({42, 42, 42}) and
-        // StreamZeroArrays (no rows) compare order-insensitively, so their
-        // upstream `SELECT *` runs unrewritten.
+        // Append expects {42, -42, NULL}; explicit descending order reproduces this.
+        // Other unordered readbacks compare rows without relying on insertion order.
         {"StatementTest::TestSqlIngestAppend::select-bulk-ingest",
          {"SELECT * FROM `bulk_ingest`",
           "SELECT * FROM `bulk_ingest` ORDER BY `int64s` DESC"}},
-        // Now passing (apache/arrow-adbc#4534 gave the readback a deterministic
-        // `ORDER BY <col> ASC NULLS FIRST` and sorted the expected vectors — see
-        // ARROW_ADBC_TAG in CMakeLists.txt). Only the INSERT column list and the
-        // NULLS FIRST (implicit for GoogleSQL ASC) need rewriting.
+        // Add the INSERT column list and omit the implicit NULLS FIRST.
         {"StatementTest::TestSqlPrepareUpdate::insert-bulk-ingest",
          {"INSERT INTO `bulk_ingest` VALUES (@p0)",
           "INSERT INTO `bulk_ingest` (`int64s`) VALUES (@p0)"}},
@@ -319,40 +284,25 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   bool supports_statistics() const override { return true; }
   bool supports_cancel() const override { return true; }
   bool supports_dynamic_parameter_binding() const override { return true; }
-  // The driver's bulk-ingest append path probes INFORMATION_SCHEMA on failure and remaps to the
-  // spec statuses (missing table -> NotFound, incompatible schema -> AlreadyExists), so the
-  // `SqlIngestErrors` case's incompatible-append assertion now holds.
+  // Append probes INFORMATION_SCHEMA on failure to distinguish missing tables
+  // (NotFound) from incompatible schemas (AlreadyExists).
   bool supports_error_on_incompatible_schema() const override { return true; }
   bool supports_concurrent_statements() const override { return true; }
   bool supports_transactions() const override { return true; }
-  // The `Transactions` case cannot apply to this driver's manual-transaction
-  // model: it bulk-ingests a table inside an uncommitted transaction and then
-  // expects to read it back on the same connection (read-your-writes). The
-  // driver buffers a manual transaction's writes until commit — a manual
-  // transaction is one kind of work (queries or DML), fixed by its first
-  // statement — so that read-back is rejected with InvalidState rather than
-  // served. Declaring DDL as implicitly committing makes the case self-skip
-  // (its own guard honours this quirk) rather than fail — and it is literally
-  // true: Spanner DDL goes through the admin UpdateDatabaseDdl API, applies
-  // immediately whatever the transaction state, and cannot be rolled back.
+  // DDL applies immediately through the admin API and cannot be rolled back.
+  // This also skips the suite transaction case, which expects reads to see
+  // uncommitted writes; this driver buffers writes until commit.
   bool ddl_implicit_commit_txn() const override { return true; }
   // Spanner's catalog level is the database itself, and its default schema is the
   // unnamed "" of INFORMATION_SCHEMA, so the connection reports both rather than
   // NOT_FOUND.
   bool supports_metadata_current_catalog() const override { return true; }
   bool supports_metadata_current_db_schema() const override { return true; }
-  // View-typed columns, a target catalog, and a target db-schema are all real
-  // driver capabilities (the driver binds Arrow view layouts, accepts its own
-  // database as the target catalog, and has named-schema support), so declare them
-  // rather than hiding the cases behind a false quirk. All five cases are gate-enforced.
   bool supports_ingest_view_types() const override { return true; }
   bool supports_bulk_ingest_catalog() const override { return true; }
   bool supports_bulk_ingest_db_schema() const override { return true; }
 
-  // The driver reports the database id as the ADBC catalog, so every case that
-  // filters by, sets, or asserts the current catalog must use the same name.
-  // Ignore connection options following the database path.
-  // with no query parameters, so the last path segment is the database id.
+  // The ADBC catalog is the database id, excluding URI query parameters.
   std::string catalog() const override {
     const std::string uri = EnvOr("ADBC_SPANNER_URI", "");
     const std::string path = uri.substr(0, uri.find_first_of("?#"));

@@ -13,7 +13,7 @@ on:
         description: "Seconds to fuzz each target"
         default: "1200"
 
-# Least privilege: nothing in this workflow needs to write to the repository.
+# The failure-reporting job grants its own issue-write permission.
 permissions:
   contents: read
 
@@ -21,13 +21,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The matrix is DERIVED from the `[[bin]]` targets in fuzz/Cargo.toml, never hardcoded.
-  # A hardcoded list is what let `staleness`, `directed_read` and `uri` (added in #354) sit
-  # declared, seeded and documented while CI never fuzzed them — the list is the one place a
-  # new target has to be remembered, so it is the one place that silently rots. Deriving it
-  # means adding a `[[bin]]` is all it takes to get fuzzed the next night.
-  # `every_fuzz_target_is_wired_and_documented` (src/lib.rs) fails the PR-time `test` job if
-  # this job ever goes back to a literal list.
+  # Derive the target matrix from fuzz/Cargo.toml so new targets run automatically.
+  # The unit test every_fuzz_target_is_wired_and_documented checks this wiring.
   discover:
     name: discover fuzz targets
     runs-on: ubuntu-latest
@@ -127,10 +122,7 @@ jobs:
           path: fuzz/artifacts/
           if-no-files-found: ignore
 
-  # A scheduled fuzz failure otherwise surfaces only as an email, and a scheduled workflow that
-  # keeps failing (or that nobody watches) auto-disables after 60 days of inactivity. Open — or
-  # comment on an already-open — tracking issue so a nightly regression stays visible in the repo.
-  # Only fires on the nightly `schedule` trigger, never on manual `workflow_dispatch` runs.
+  # Keep scheduled failures visible in one tracking issue.
   report-failure:
     # Both jobs, so a `discover` failure (which skips `fuzz` entirely, fuzzing nothing) is
     # reported rather than passing as a quiet no-op.

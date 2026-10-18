@@ -1,6 +1,5 @@
-//! Resolves the version of the `arrow-array` crate this build links against, so `get_info` can
-//! report the ADBC `DriverArrowVersion` info code. The arrow crates export no version constant,
-//! so the version is read out of `Cargo.lock` and embedded via `SPANNER_ADBC_ARROW_VERSION`.
+//! Reads the `arrow-array` version from `Cargo.lock` for ADBC `DriverArrowVersion`.
+//! Arrow does not export a version constant.
 
 use std::env;
 use std::fs;
@@ -11,21 +10,16 @@ fn main() {
     let lockfile = Path::new(&manifest_dir).join("Cargo.lock");
     println!("cargo:rerun-if-changed={}", lockfile.display());
 
-    // `Cargo.lock` is `exclude`d from the published package (see Cargo.toml), so a build from the
-    // crates.io/sdist tarball has no lockfile at all. Fall back gracefully instead of panicking:
-    // `src/info.rs` reads this value via `env!`, so it must always be set for the crate to compile.
+    // Packaged sources exclude Cargo.lock. Always set the variable consumed by src/info.rs.
     let version = match fs::read_to_string(&lockfile) {
-        // A present-but-surprising lockfile (missing, duplicate or empty `arrow-array` version) is
-        // still a hard error — better to fail the build than embed a wrong or empty string.
+        // Reject an ambiguous or empty version when a lockfile is available.
         Ok(lock) => arrow_array_version(&lock).unwrap_or_else(|| {
             panic!(
                 "could not resolve a unique `arrow-array` version from {}",
                 lockfile.display()
             )
         }),
-        // No lockfile (e.g. a source build from the published package): warn and carry on with a
-        // placeholder, so `get_info`'s `DriverArrowVersion` reports "vunknown" rather than the
-        // build failing outright.
+        // Without a readable lockfile, DriverArrowVersion reports "vunknown".
         Err(e) => {
             println!(
                 "cargo:warning=could not read {} ({e}); reporting arrow-array version as \
@@ -39,9 +33,7 @@ fn main() {
     println!("cargo:rustc-env=SPANNER_ADBC_ARROW_VERSION={version}");
 }
 
-/// The `version` of the `arrow-array` package in the lockfile — `None` unless exactly one
-/// (non-empty) version is present, so a surprising lockfile fails the build instead of silently
-/// embedding a wrong or empty string.
+/// Returns the `arrow-array` version if exactly one non-empty entry is present.
 fn arrow_array_version(lock: &str) -> Option<String> {
     let mut versions: Vec<&str> = Vec::new();
     let mut in_arrow_array = false;

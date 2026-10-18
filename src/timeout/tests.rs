@@ -175,7 +175,7 @@ fn with_timeout_passes_a_completing_future_through() {
     }
 }
 
-/// The core bug being fixed: an operation that never resolves (a hung RPC) must fail with
+/// An operation that never resolves (a hung RPC) must fail with
 /// `Status::Timeout` — naming the responsible option — instead of blocking `block_on` forever.
 #[test]
 fn with_timeout_fails_a_hung_operation_with_timeout_status() {

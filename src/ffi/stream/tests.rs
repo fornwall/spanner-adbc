@@ -106,18 +106,14 @@ fn exports_adbc_statuses_as_errno() {
     assert!(message.contains("not supported"), "{message}");
 }
 
-/// The reason this whole export layer exists, pinned end to end at the Rust level: the C++
-/// `adbc_validation` case `SpannerStatementTest.SqlQueryCancel` requires the result stream's
+/// The C++ `adbc_validation` case `SpannerStatementTest.SqlQueryCancel` requires the result stream's
 /// `get_next` to return exactly `ECANCELED` (or 0) once the statement has been cancelled.
 ///
 /// The error built here is byte for byte what a cancelled read hands this layer in production:
 /// `runtime.rs` raises `("operation cancelled", Status::Cancelled)`, `SpannerBatchReader` wraps it
 /// with `conversion.rs`'s `to_arrow_error` -- i.e. `ArrowError::ExternalError(Box::new(error))` --
-/// and only this module's downcast back through the error chain recovers the ADBC status behind
-/// it. Exporting the same reader through arrow-rs's own `FFI_ArrowArrayStream` exporter, which the
-/// driver used before this layer, could not: it maps every `ArrowError` onto
-/// `ENOSYS`/`ENOMEM`/`EIO`/`EINVAL`, so a cancel surfaced as `EINVAL` (22) and the case had to be
-/// excluded from the validation gate.
+/// and this module downcasts through the error chain to recover the ADBC status and map it to
+/// the required errno.
 #[test]
 fn a_cancelled_read_reports_ecanceled_for_sql_query_cancel() {
     use super::super::abi::ADBC_STATUS_CANCELLED;
@@ -147,8 +143,7 @@ fn a_cancelled_read_reports_ecanceled_for_sql_query_cancel() {
 
 /// The timeout twin of `a_cancelled_read_reports_ecanceled_for_sql_query_cancel`: an RPC deadline
 /// from `spanner.rpc.timeout_seconds.{query,fetch}` reaches the reader as the same boxed driver
-/// error, only with `Status::Timeout`, and must come out as `ETIMEDOUT` rather than the `EINVAL`
-/// arrow-rs's exporter gave every such failure.
+/// error, only with `Status::Timeout`, and must come out as `ETIMEDOUT`.
 #[test]
 fn a_timed_out_read_reports_etimedout() {
     use super::super::abi::ADBC_STATUS_TIMEOUT;

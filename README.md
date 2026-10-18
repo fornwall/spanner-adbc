@@ -1,5 +1,5 @@
 > [!WARNING]
-> **Experimental.** Project is AI-generated and has not seen real world usage.
+> **Experimental.** This project is AI-generated and has not yet seen real-world use.
 
 # spanner-adbc
 
@@ -62,8 +62,10 @@ returned nested records map to Arrow lists and structs.
   The current schema is fixed at `""`; qualify named schemas in SQL or use `adbc.ingest.target_db_schema`.
 
 See [transactions](docs/transactions.md) for transaction boundaries and RPC behavior, and
-[ADBC concepts](docs/adbc.md) for handle ownership and errors. Spanner errors retain their gRPC
-code and structured details; C ABI 1.1 callers retrieve the code through error details.
+[ADBC concepts](docs/adbc.md) for handle ownership and errors. [Known limitations](docs/limitations.md)
+cover dependency constraints, streaming retry deadlines and calling the driver from Tokio.
+Spanner errors retain their gRPC code and structured details; C ABI 1.1 callers retrieve the
+code through error details.
 
 ## Shared library (loadable driver)
 
@@ -157,8 +159,10 @@ year 1–9999 range, truncating sub-microsecond digits toward negative infinity.
 [timestamp precision](docs/options.md#timestamp-precision).
 
 The crate uses git-pinned Google Cloud, ADBC and Arrow dependencies and is not published to crates.io.
-Downstream Rust users must use the same `adbc_core` revision as `Cargo.toml`. See
-[dependency pins](CONTRIBUTING.md#dependency-pins) before changing them.
+Downstream Rust users must use the same `adbc_core` revision as [Cargo.toml](Cargo.toml). For the
+default `ffi` feature, also copy its four Arrow `[patch.crates-io]` entries into your own workspace's
+root `Cargo.toml`: Cargo does not inherit dependency patches, and the FFI code needs the pinned
+Arrow stream APIs. See [dependency pins](CONTRIBUTING.md#dependency-pins).
 
 ## Contributing
 

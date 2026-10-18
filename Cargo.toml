@@ -14,7 +14,6 @@ license = "Apache-2.0"
 description = "ADBC (Arrow Database Connectivity) driver for Google Cloud Spanner"
 repository = "https://github.com/fornwall/spanner-adbc"
 homepage = "https://github.com/fornwall/spanner-adbc"
-documentation = "https://docs.rs/spanner-adbc"
 readme = "README.md"
 keywords = ["adbc", "arrow", "spanner", "database", "gcp"]
 categories = ["database", "api-bindings"]
@@ -73,7 +72,7 @@ arrow-data = ">=58, <61"
 # Platform-specific errno values for the Arrow C Stream Interface.
 libc = "0.2"
 # Keep Google Cloud crates aligned with the unpublished spanner-grpc-mock.
-# Disable unused builtin-metrics (Cloud Monitoring), saving about 1.25 MB (6.9%).
+# Disable unused builtin-metrics (Cloud Monitoring) to reduce library size.
 # Retain the default rustls crypto provider for TLS.
 google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "415dbbb8ec607f4ba927ed0e38366194cb09530d", default-features = false, features = ["default-rustls-provider"] }
 # Anonymous, ADC and explicit credentials.
@@ -126,8 +125,7 @@ broken_intra_doc_links = "deny"
 private_intra_doc_links = "warn"
 
 [profile.release]
-# One codegen unit reduced the cdylib from 25.2 to 18.2 MB; fat LTO added no benefit.
-# Size optimization levels slowed conversion benchmarks by 12–280%.
+# Thin LTO and one codegen unit reduce library size; default optimization favors throughput.
 # Keep unwinding: FFI guards catch panics instead of terminating the host process.
 strip = true
 lto = "thin"

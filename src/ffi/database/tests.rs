@@ -457,16 +457,11 @@ fn a_pre_init_set_accepts_every_key_the_live_database_classifies() {
     assert_eq!(release(&mut live), ADBC_STATUS_OK);
 }
 
-/// The exporter this layer replaced built a fresh [`SpannerDriver`] — and therefore a fresh
-/// multi-threaded Tokio runtime — on *every* `AdbcDatabaseInit`, and panicked outright when the
-/// runtime could not be built. [`shared_driver`] builds one behind a `OnceLock` instead, so every
-/// database a host opens in this process is created by the same driver and runs on its one
-/// runtime.
+/// Every `AdbcDatabaseInit` must use the process-wide [`shared_driver`], so databases share
+/// one Tokio runtime rather than allocating a thread pool each.
 ///
-/// Every `Init` test here executes that path, but none of them observes it, so the very bug this
-/// layer exists to fix would pass the whole suite. This is the assertion that would not.
-/// (`every_database_a_driver_creates_shares_the_drivers_runtime` in `src/driver/tests.rs` covers
-/// the other half: that one driver means one runtime for all of its databases.)
+/// `every_database_a_driver_creates_shares_the_drivers_runtime` in `src/driver/tests.rs`
+/// checks that the shared driver gives every database the same runtime.
 #[test]
 fn every_database_is_initialized_through_one_shared_driver() {
     let before = shared_driver().unwrap();

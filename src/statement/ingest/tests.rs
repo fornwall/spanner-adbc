@@ -237,8 +237,7 @@ fn ingest_batch_write_option_coerces_and_unsets_on_empty() {
     for empty in ["", "   "] {
         assert!(!ingest_batch_write_option(OptionValue::String(empty.into())).unwrap());
     }
-    // A non-bool string — including the formerly-accepted lenient spellings — and an
-    // int-typed set are rejected with InvalidArguments (the shared boolean coercion).
+    // Invalid boolean strings and non-string values are rejected with InvalidArguments.
     for bad in ["maybe", "TRUE", "1", "yes", "FALSE", "0", "no"] {
         let error = ingest_batch_write_option(OptionValue::String(bad.into())).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "{bad}");

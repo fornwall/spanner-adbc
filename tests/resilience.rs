@@ -80,7 +80,7 @@ fn database_path() -> String {
 /// Whether `ADBC_TEST_REQUIRE_TARGET` demands a configured target (CI sets it).
 ///
 /// When truthy, [`toxi`] panics instead of returning `None` when the Toxiproxy / emulator env
-/// wiring is missing, so a broken workflow refactor fails loudly rather than passing vacuously.
+/// wiring is missing, so CI cannot silently skip the suite.
 fn require_target() -> bool {
     matches!(
         std::env::var("ADBC_TEST_REQUIRE_TARGET").ok().as_deref(),
@@ -99,9 +99,8 @@ fn toxi() -> Option<Toxiproxy> {
     let resolved = resolve_toxi();
     if resolved.is_none() && require_target() {
         panic!(
-            "ADBC_TEST_REQUIRE_TARGET is set but TOXIPROXY_URL / SPANNER_EMULATOR_HOST are not both \
-             configured — the resilience harness env wiring is missing, so this suite would skip \
-             all fault-injection coverage. Refusing to pass vacuously."
+            "ADBC_TEST_REQUIRE_TARGET is set; configure both TOXIPROXY_URL and \
+             SPANNER_EMULATOR_HOST to run the resilience suite"
         );
     }
     resolved
@@ -671,7 +670,7 @@ fn commit_under_transport_fault_never_loses_the_write() {
         ),
     }
 
-    // THE assertion: the buffered update landed, whichever path delivered it. Under the
+    // The buffered update must persist, whichever path delivered it. Under the
     // take-before-apply regression a failed attempt emptied the buffer, so the follow-up commit
     // reported success with nothing written and Val stayed 0.
     assert_eq!(
@@ -708,8 +707,7 @@ fn commit_under_transport_fault_never_loses_the_write() {
 /// surfaces the transport error, it just retries until the network recovers. Without a deadline
 /// that is an unbounded hang; `spanner.rpc.timeout_seconds.update` wraps the whole driver-side
 /// operation (including the client's internal retries) in a `tokio::time::timeout` and turns the
-/// hang into a prompt `Timeout`. This closes the gap `tests/RESILIENCE.md` previously flagged: the
-/// option was documented to bound a commit under a fault, but nothing drove it under a toxic.
+/// hang into a prompt `Timeout`.
 ///
 /// The write runs on a worker thread bounded by a generous watchdog: if the deadline fails to fire
 /// the test fails loudly rather than hanging the suite. The seeded row plus the idempotent

@@ -3,7 +3,7 @@
 //!
 //! Uses synthetic wire values without a network or emulator.
 //!
-//! Run with `cargo bench` (or `cargo bench -- --test` for a fast single-pass sanity run). Each
+//! Run with `cargo bench` (or `cargo bench -- --test` for a single-pass check). Each
 //! benchmark converts one default-size streaming chunk (`spanner.rows_per_batch` = 8192 rows), so
 //! results read as "time to convert one chunk"; throughput is reported in rows/second.
 
@@ -42,7 +42,7 @@ fn bench_conversion(c: &mut Criterion) {
 
     // Scalar-heavy chunk: INT64 + FLOAT64 + STRING + BOOL, the common flat result shape. INT64
     // arrives as a decimal string (parsed), FLOAT64/BOOL natively, STRING copied verbatim. A
-    // sprinkle of SQL NULLs keeps the null path honest.
+    // null INT64 every 16 rows exercises null handling.
     {
         let ints = column(|i| {
             if i % 16 == 0 {

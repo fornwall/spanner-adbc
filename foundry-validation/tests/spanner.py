@@ -1,9 +1,4 @@
-# Driver quirks describing the spanner-adbc driver to the ADBC Driver Foundry
-# validation suite (https://github.com/adbc-drivers/validation).
-#
-# The suite is driver-agnostic: it drives our cdylib through the ADBC driver
-# manager and runs a corpus of declarative type/feature cases, so nothing here
-# depends on how the driver is implemented (it is not related to driverbase-rs).
+# Spanner dialect and capability overrides for https://github.com/adbc-drivers/validation.
 import os
 from pathlib import Path
 
@@ -65,8 +60,7 @@ class SpannerQuirks(model.DriverQuirks):
             return default.replace(
                 "(spam INT, eggs VARCHAR)", "(spam INT64, eggs STRING(MAX))"
             )
-        # The suite's sample table uses portable DDL (INT/VARCHAR, no key); Spanner needs a
-        # primary key and native type names.
+        # Adapt the sample table to GoogleSQL type names and an explicit primary key.
         if context == "TestStatement.sample_table":
             return "CREATE TABLE `sample_table` (id INT64, value STRING(MAX)) PRIMARY KEY (id)"
         if context == "TestStatement.test_rows_affected.create_table":

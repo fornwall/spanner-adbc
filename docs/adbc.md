@@ -16,6 +16,11 @@ using Google Cloud Spanner and Arrow record batches. See the [README](../README.
 Rust callers construct `SpannerDriver::try_new()`. The synchronous ADBC methods drive the async
 Spanner client on the driver's runtime. The C ABI uses one process-wide driver/runtime.
 
+Calling these methods directly from a Tokio async task can panic when they block on the driver's
+runtime. Use `tokio::task::spawn_blocking` or a dedicated blocking thread for driver creation,
+calls, result consumption and handle cleanup. Keeping cleanup there also avoids shutting down
+the native Rust driver's runtime in an async context. See [known limitations](limitations.md).
+
 Other languages load the shared library, built with `cargo build --release`, through an ADBC
 driver manager. It exports `AdbcSpannerInit` and the fallback `AdbcDriverInit`; both populate
 an ADBC 1.0.0 or 1.1.0 function table. [src/ffi/](../src/ffi) implements the C ABI and exchanges
@@ -74,7 +79,7 @@ immediately and cannot be rolled back. See [transactions](transactions.md).
 
 ## Parameters and ingest
 
-`bind` supplies an Arrow batch; `bind_stream` accepts a reader but currently collects its batches
+`bind` supplies an Arrow batch; `bind_stream` accepts a reader but collects its batches
 in memory before execution.
 
 - For SQL parameters, columns bind positionally to distinct `@name` parameters in SQL order.

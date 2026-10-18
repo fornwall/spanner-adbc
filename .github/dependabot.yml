@@ -1,10 +1,5 @@
-# Dependabot keeps our SHA-pinned GitHub Actions and Cargo dependencies monitored.
-#
-# Note: the two git-pinned dependency families — the `google-cloud-*` crates
-# (pinned to a `google-cloud-rust` revision) and `adbc_core`/`adbc_ffi`/
-# `adbc_driver_manager` (pinned to an `apache/arrow-adbc` `main` revision) — are
-# intentionally out of Dependabot's scope: it does not bump git-revision deps,
-# and those are reverted manually per the CLAUDE.md checklist.
+# Monitor GitHub Actions and registry Cargo dependencies. Coordinate git-pinned
+# dependency updates across Cargo and validation harnesses; see CLAUDE.md.
 version: 2
 updates:
   - package-ecosystem: github-actions

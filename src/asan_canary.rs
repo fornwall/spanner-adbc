@@ -1,34 +1,17 @@
-//! Test-only AddressSanitizer **tripwire**, compiled ONLY under `--cfg asan_canary`.
+//! Test-only AddressSanitizer check, compiled only under `--cfg asan_canary`.
 //!
-//! This module does not exist in any normal build — not `cargo build`, not
-//! `cargo build --release`, not `cargo clippy --all-targets --all-features` (a bare `--cfg` is
-//! deliberately NOT set by `--all-features`, which is exactly why this is a `--cfg` gate and not a
-//! Cargo feature), and not `cargo test`. It is switched on solely by the ADBC validation suite's
-//! `rust-asan` leg (`scripts/run-adbc-validation.sh` appends `--cfg asan_canary` to the sanitizer
-//! `RUSTFLAGS`), so the intentionally-out-of-bounds symbol below can NEVER leak into a shipped
-//! cdylib.
+//! `scripts/run-adbc-validation.sh` sets this cfg in the `rust-asan` run. A cfg gate keeps the
+//! exported function out of normal builds, including `--all-features` builds.
 //!
-//! ## Why it exists
+//! A passing validation suite alone cannot prove that Rust's sanitizer instrumentation is
+//! enabled. This positive control writes out of bounds from the Rust cdylib into a buffer
+//! allocated by a clang `-fsanitize=address` C++ program. The validation script requires ASan
+//! to report a `heap-buffer-overflow` at the Rust store.
 //!
-//! A *passing* `rust-asan` leg on its own is no proof the Rust instrumentation is actually armed:
-//! if the `-Zsanitizer=address` / `-Zbuild-std` wiring silently regressed (a flag typo, a toolchain
-//! skew, an ABI mismatch that disarms rather than aborts), the suite would still go green and give
-//! false confidence. This canary is the positive control: the validation script calls it from a
-//! clang `-fsanitize=address` C++ program against C++-allocated heap memory and asserts ASan fires.
-//! If ASan does NOT report the overflow, the leg fails loudly — a disarmed leg goes red instead of
-//! silently passing.
-//!
-//! ## What it proves (the cross-boundary shape)
-//!
-//! [`spanner_adbc_asan_canary`] takes a pointer + length to a buffer the **C++ side allocated**
-//! (with `new`/`malloc`, so the ASan redzone/poison lives on the C++ allocation) and writes one
-//! byte past the end from *inside the instrumented Rust cdylib*. Because both sides share one
-//! compiler-rt ASan runtime and shadow memory, the instrumented Rust store is checked against the
-//! poison the C++ allocator placed, and ASan reports a `heap-buffer-overflow` attributed to the
-//! Rust frame. That is precisely the cross-boundary composition — instrumented Rust writing out of
-//! bounds on C++-allocated memory — a pure-Rust tripwire could not demonstrate.
+//! Using C++-allocated memory checks that both sides share the compiler-rt ASan runtime and
+//! shadow memory: the instrumented Rust access must see the C++ allocator's poisoned redzone.
 
-/// Test-only ASan tripwire — **intentionally writes one byte out of bounds** and must NEVER be
+/// Test-only ASan check — **intentionally writes one byte out of bounds** and must not be
 /// enabled in a shipped build.
 ///
 /// Compiled only under `--cfg asan_canary` (the validation suite's `rust-asan` leg). Given a
@@ -40,8 +23,8 @@
 /// # Safety
 ///
 /// `ptr` must point to an allocation of at least `len` bytes. The function then deliberately
-/// performs an out-of-bounds write at offset `len`, which is undefined behaviour by construction —
-/// that is the whole point of the tripwire, and why it is quarantined behind `--cfg asan_canary`.
+/// performs an out-of-bounds write at offset `len`, which is undefined behaviour by construction.
+/// Run it only in the sanitizer validation subprocess, which expects ASan to terminate it.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
 // Deliberate out-of-bounds write; the crate-wide deny is overridden here only.

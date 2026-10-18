@@ -26,8 +26,6 @@ fn like_matching() {
     assert!(!like_match("", "x"));
     // A pattern `%` must stay a wildcard even when the value has a literal `%` where the
     // wildcard begins matching — the value starts with `%`, or a `%` follows matched literals.
-    // The literal branch used to mis-consume it there, so these all failed. Found by the `like`
-    // fuzz target's differential regex oracle.
     assert!(like_match("%", "%foo"));
     assert!(like_match("%", "%^%?"));
     assert!(like_match("a%", "a%b"));

@@ -58,9 +58,8 @@ The emulator wrapper uses **9010/9020** because test provisioning still uses the
 REST admin endpoint. The driver itself uses gRPC for DDL. Parallel emulators can use distinct
 Docker-network IPs with their internal ports and unique container names.
 
-[`scripts/with-omni.sh`](../scripts/with-omni.sh) starts Omni `2026.r4-lts`, the latest published
-[release](https://docs.cloud.google.com/spanner-omni/download) checked on 2026-10-18.
-The version is pinned in that script; set `SPANNER_OMNI_IMAGE` to test another release.
+[`scripts/with-omni.sh`](../scripts/with-omni.sh) pins Omni to `2026.r4-lts`;
+set `SPANNER_OMNI_IMAGE` to test another [release](https://docs.cloud.google.com/spanner-omni/download).
 It requires Docker and GNU `timeout`, publishes ports 15000–15025 on localhost, waits for gRPC
 admin readiness, creates `default/default/adbc-test`, and removes its container and storage on exit.
 
