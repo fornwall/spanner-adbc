@@ -146,7 +146,7 @@ def test_execute_partitions_round_trip(spanner_database):
             with conn.cursor() as cur:
                 cur.adbc_read_partition(token)
                 table = cur.fetch_arrow_table()
-            assert table.schema.names == ["Id"]
+            assert table.schema == schema
             ids = table.column("Id").to_pylist()
             # No id may appear in more than one partition.
             assert seen.isdisjoint(ids)
