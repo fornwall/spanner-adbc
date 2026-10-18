@@ -1,3 +1,18 @@
-// part: metadata
+// Use native GoogleSQL types; preserve the upstream values and assert the canonical Arrow schema.
 
-skip = "Spanner has one 64-bit integer type; a SMALLINT literal reads back as INT64, not the case's Int16"
+// part: query
+
+SELECT CAST(16384 AS INT64) AS res
+
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "res",
+            "format": "l",
+            "flags": ["nullable"]
+        }
+    ]
+}

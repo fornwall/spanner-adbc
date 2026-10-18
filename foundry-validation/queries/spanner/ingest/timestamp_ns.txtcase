@@ -1,3 +1,19 @@
-// part: metadata
+// Preserve the upstream timestamp input and instants; read back in UTC with an exact supported unit.
 
-skip = "Spanner TIMESTAMP is timezone-aware (UTC); the driver returns Timestamp(_, UTC), not the case's tz-naive timestamp"
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "idx",
+            "format": "l",
+            "flags": ["nullable"]
+        },
+        {
+            "name": "value",
+            "format": "tsn:UTC",
+            "flags": ["nullable"]
+        }
+    ]
+}

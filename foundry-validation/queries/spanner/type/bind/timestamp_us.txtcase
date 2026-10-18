@@ -1,3 +1,33 @@
+// Preserve the upstream timestamp input and instants; read back in UTC with an exact supported unit.
+
 // part: metadata
 
-skip = "case binds timestamps outside Arrow's nanosecond range (~1677-2262), which the driver's nanosecond TIMESTAMP read path cannot represent"
+[setup]
+drop = "test_timestamp"
+
+[setup.connection.options]
+"spanner.max_timestamp_precision" = { apply = "microseconds", revert = "nanoseconds_error_on_overflow" }
+
+// part: setup_query
+
+CREATE TABLE test_timestamp (
+    idx INT64,
+    res TIMESTAMP
+) PRIMARY KEY (idx)
+
+// part: bind_query
+
+INSERT INTO test_timestamp (idx, res) VALUES ($1, $2)
+
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "res",
+            "format": "tsu:UTC",
+            "flags": ["nullable"]
+        }
+    ]
+}

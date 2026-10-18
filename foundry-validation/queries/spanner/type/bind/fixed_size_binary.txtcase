@@ -1,3 +1,11 @@
-// part: metadata
+// Keep the upstream bound Arrow data and assert Spanner's canonical readback.
 
-skip = "Spanner has no fixed-size binary type (only BYTES(MAX))"
+// part: setup_query
+
+CREATE TABLE test_fixed_size_binary (
+    res BYTES(MAX)
+)
+
+// part: bind_query
+
+INSERT INTO test_fixed_size_binary (res) VALUES ($1)

@@ -6,7 +6,6 @@ import adbc_drivers_validation.model
 import adbc_drivers_validation.tests.conftest
 import pytest
 from adbc_drivers_validation.tests.conftest import (  # noqa: F401
-    conn,
     conn_factory,
     db_kwargs,
     manual_test,
@@ -238,3 +237,14 @@ def driver_path(driver) -> str:
     ext = {"win32": "dll", "darwin": "dylib"}.get(sys.platform, "so")
     # Built cdylib at the repo root: foundry-validation/tests -> repo root.
     return str(Path(__file__).resolve().parents[2] / f"target/debug/libspanner_adbc.{ext}")
+
+
+@pytest.fixture(scope="module")
+def conn(conn_factory, driver):
+    # Foundry expects secondary_schema to exist before schema-scoped tests run.
+    # Keep connection setup lazy so query linting can still run without a database.
+    with conn_factory() as connection:
+        with connection.cursor() as cursor:
+            schema = driver.quote_identifier(driver.features.secondary_schema)
+            cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+        yield connection

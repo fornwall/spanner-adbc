@@ -1,3 +1,38 @@
+// Preserve the upstream timestamp input and instants; read back in UTC with an exact supported unit.
+
 // part: metadata
 
-skip = "Spanner returns TIMESTAMP as Arrow Timestamp(Nanosecond); does not match the case's unit"
+[setup.connection.options]
+"spanner.max_timestamp_precision" = { apply = "microseconds", revert = "nanoseconds_error_on_overflow" }
+
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "idx",
+            "format": "l",
+            "flags": ["nullable"]
+        },
+        {
+            "name": "value",
+            "format": "tsu:UTC",
+            "flags": ["nullable"]
+        },
+        {
+            "name": "value2",
+            "format": "tsu:UTC",
+            "flags": ["nullable"]
+        }
+    ]
+}
+
+// part: expected
+
+{"idx": 0, "value": null, "value2": null}
+{"idx": 1, "value": 0, "value2": 0}
+{"idx": 2, "value": 946684800000000, "value2": 946684800000000}
+{"idx": 3, "value": 1684158330000000, "value2": 1684158330000000}
+{"idx": 4, "value": -62135596800000000, "value2": -62135596800000000}
+{"idx": 5, "value": 253402300799000000, "value2": 253402300799000000}

@@ -294,13 +294,13 @@ fn scalar_binder(name: &str, data_type: &DataType) -> Result<ScalarBinder> {
         },
         DataType::Decimal128(_, scale) => {
             // Validate once per array cell, including null and empty arrays.
-            numeric_scale(name, *scale)?;
+            validate_numeric_scale(name, *scale)?;
             |_, dt, a, i| {
                 let DataType::Decimal128(_, scale) = dt else {
                     unreachable!("scalar_binder dispatched a Decimal128 arm on {dt:?}")
                 };
                 Ok(scalar_value(a.is_null(i), || {
-                    numeric_string(a.as_primitive::<Decimal128Type>().value(i), *scale as u32)
+                    numeric_string(a.as_primitive::<Decimal128Type>().value(i), *scale)
                 }))
             }
         }
@@ -432,16 +432,15 @@ fn timestamp_value(column: &dyn Array, unit: &TimeUnit, row: usize) -> i64 {
     }
 }
 
-/// Validate a `Decimal128` scale for Spanner `NUMERIC` (must be a non-negative `u32` `<= 38`).
-fn numeric_scale(name: &str, scale: i8) -> Result<u32> {
-    u32::try_from(scale)
-        .ok()
-        .filter(|s| *s <= 38)
-        .ok_or_else(|| {
-            invalid_argument(format!(
-                "cannot bind NUMERIC parameter {name:?}: unsupported scale {scale}"
-            ))
-        })
+/// Validate the Arrow Decimal128 scale. Negative scales represent integer multiples of ten;
+/// Spanner checks whether the formatted value fits NUMERIC's precision and range.
+fn validate_numeric_scale(name: &str, scale: i8) -> Result<()> {
+    if scale > 38 {
+        return Err(invalid_argument(format!(
+            "cannot bind NUMERIC parameter {name:?}: unsupported scale {scale}"
+        )));
+    }
+    Ok(())
 }
 
 /// Format a UTC timestamp at its source precision, rejecting years outside Spanner's range.
@@ -476,13 +475,19 @@ fn timestamp_string(name: &str, unit: &TimeUnit, value: i64) -> Result<String> {
 
 /// Format an unscaled `Decimal128` value at the given scale as a plain decimal string, exact across
 /// the whole `i128` range (which covers Spanner's `NUMERIC`). `scale` must be `<= 38`.
-fn numeric_string(unscaled: i128, scale: u32) -> String {
-    if scale == 0 {
-        return unscaled.to_string();
+fn numeric_string(unscaled: i128, scale: i8) -> String {
+    if scale <= 0 {
+        let mut value = unscaled.to_string();
+        if unscaled != 0 && scale < 0 {
+            // Append zeros instead of multiplying: the decimal value may exceed i128,
+            // and even i8::MIN is a valid negative Arrow scale.
+            value.extend(std::iter::repeat_n('0', usize::from(scale.unsigned_abs())));
+        }
+        return value;
     }
     let negative = unscaled < 0;
     let magnitude = unscaled.unsigned_abs();
-    let divisor = 10u128.pow(scale); // scale <= 38, so this fits in u128
+    let divisor = 10u128.pow(scale as u32); // 0 < scale <= 38, so this fits in u128
     format!(
         "{}{}.{:0width$}",
         if negative { "-" } else { "" },
@@ -511,7 +516,7 @@ fn spanner_column_type(mut data_type: &DataType) -> Result<String> {
         DataType::Date32 | DataType::Date64 => "DATE".to_string(),
         DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
         DataType::Decimal128(_, scale) => {
-            numeric_scale("ingest column", *scale)?;
+            validate_numeric_scale("ingest column", *scale)?;
             "NUMERIC".to_string()
         }
         DataType::List(field) | DataType::LargeList(field) => {

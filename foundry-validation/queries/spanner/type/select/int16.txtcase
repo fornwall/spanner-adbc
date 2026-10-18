@@ -1,3 +1,27 @@
-// part: metadata
+// Use native GoogleSQL types; preserve the upstream values and assert the canonical Arrow schema.
 
-skip = "Spanner has one 64-bit integer type; a SMALLINT value reads back as INT64, not the case's Int16"
+// part: setup_query
+
+CREATE TABLE test_int16 (
+    idx INT64,
+    res INT64
+);
+
+INSERT INTO test_int16 (idx, res) VALUES (1, 16384);
+INSERT INTO test_int16 (idx, res) VALUES (2, 32767);
+INSERT INTO test_int16 (idx, res) VALUES (3, -32768);
+INSERT INTO test_int16 (idx, res) VALUES (4, 0);
+INSERT INTO test_int16 (idx, res) VALUES (5, NULL);
+
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "res",
+            "format": "l",
+            "flags": ["nullable"]
+        }
+    ]
+}

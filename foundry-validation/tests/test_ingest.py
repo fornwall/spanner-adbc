@@ -1,4 +1,5 @@
 import adbc_drivers_validation.tests.ingest
+import pytest
 
 from . import spanner
 
@@ -26,4 +27,20 @@ def pytest_generate_tests(metafunc) -> None:
 
 
 class TestIngest(adbc_drivers_validation.tests.ingest.TestIngest):
-    pass
+    @pytest.fixture(autouse=True)
+    def connection_options(self, request, conn):
+        # The upstream ingest tests only apply statement options. Apply query-specific
+        # connection options before they create cursors, including for the readback.
+        query = request.node.callspec.params.get("query")
+        setup = query.metadata().setup.connection if query is not None else None
+        if setup is None:
+            yield
+            return
+        previous = {key: conn.adbc_connection.get_option(key) for key in setup.options}
+        try:
+            conn.adbc_connection.set_options(
+                **{key: value.apply for key, value in setup.options.items()}
+            )
+            yield
+        finally:
+            conn.adbc_connection.set_options(**previous)

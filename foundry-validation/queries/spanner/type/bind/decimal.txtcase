@@ -1,3 +1,24 @@
-// part: metadata
+// Keep the upstream bound Arrow data and assert Spanner's canonical readback.
 
-skip = "Spanner NUMERIC is fixed precision/scale (38,9); it does not round-trip the case's DECIMAL(10,2)"
+// part: setup_query
+
+CREATE TABLE test_decimal (
+    res NUMERIC
+)
+
+// part: bind_query
+
+INSERT INTO test_decimal (res) VALUES ($1)
+
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "res",
+            "format": "d:38,9",
+            "flags": ["nullable"]
+        }
+    ]
+}

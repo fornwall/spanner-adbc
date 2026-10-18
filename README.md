@@ -146,6 +146,8 @@ tables use the Arrow storage types for these columns.
 
 Binding and ingest widen `UInt8`/`UInt16`/`UInt32` to `INT64` and `Float16` to `FLOAT32`;
 `UInt64` is unsupported. `FixedSizeBinary` maps to `BYTES`.
+`Decimal128` binding and ingest preserve values with negative scales (for example, `99` at
+scale `-2` is `9900`); Spanner validates the `NUMERIC` range, and readback uses scale 9.
 
 Nanosecond timestamps cover roughly 1677–2262; values outside that range fail with
 `InvalidArguments`. Set `spanner.max_timestamp_precision=microseconds` to cover Spanner's full

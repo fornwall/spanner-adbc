@@ -419,9 +419,9 @@ fn ingest_ddl_rejects_types_the_value_encoder_cannot_bind() {
     let dictionary =
         |data_type| DataType::Dictionary(Box::new(DataType::Int32), Box::new(data_type));
     for data_type in [
-        DataType::Decimal128(10, -2),
-        dictionary(DataType::Decimal128(10, -2)),
-        list(DataType::Decimal128(10, -2)),
+        DataType::Decimal128(38, 39),
+        dictionary(DataType::Decimal128(38, 39)),
+        list(DataType::Decimal128(38, 39)),
         list(list(DataType::Int64)),
         dictionary(list(list(DataType::Int64))),
         list(dictionary(DataType::Utf8)),
@@ -884,6 +884,18 @@ fn numeric_string_formats_full_i128_range() {
     assert_eq!(
         numeric_string(10i128.pow(30), 9),
         "1000000000000000000000.000000000"
+    );
+}
+
+#[test]
+fn numeric_string_preserves_negative_scale_without_integer_overflow() {
+    assert_eq!(numeric_string(99, -2), "9900");
+    assert_eq!(numeric_string(-99, -2), "-9900");
+    assert_eq!(numeric_string(0, i8::MIN), "0");
+    assert_eq!(numeric_string(1, i8::MIN), format!("1{}", "0".repeat(128)));
+    assert_eq!(
+        numeric_string(i128::MIN, -1),
+        "-1701411834604692317316873037158841057280"
     );
 }
 
@@ -1653,22 +1665,23 @@ fn nested_dictionary_json_preserves_type_for_values_and_both_null_kinds() {
 }
 
 #[test]
-fn invalid_decimal_scale_is_rejected_including_null_and_empty_containers() {
+fn negative_decimal_scale_binds_including_null_and_empty_containers() {
     use arrow_array::builder::{Decimal128Builder, ListBuilder};
 
-    let decimal = Decimal128Array::from(vec![Some(1), None])
-        .with_precision_and_scale(38, -1)
+    let decimal = Decimal128Array::from(vec![Some(-99), None])
+        .with_precision_and_scale(38, -2)
         .unwrap();
     let dictionary = arrow_array::DictionaryArray::new(
-        arrow_array::Int8Array::from(vec![Some(0), None]),
+        arrow_array::Int8Array::from(vec![Some(0), Some(1), None]),
         Arc::new(decimal.clone()),
     );
     let mut lists = ListBuilder::new(
         Decimal128Builder::new()
-            .with_precision_and_scale(38, -1)
+            .with_precision_and_scale(38, -2)
             .unwrap(),
     );
-    lists.values().append_value(1);
+    lists.values().append_value(-99);
+    lists.values().append_null();
     lists.append(true);
     lists.append(true);
     lists.append(false);
@@ -1679,11 +1692,42 @@ fn invalid_decimal_scale_is_rejected_including_null_and_empty_containers() {
     ];
     for array in arrays {
         let field = Field::new("amount", array.data_type().clone(), true);
+        let is_list = matches!(array.data_type(), DataType::List(_));
+        assert_eq!(
+            spanner_field_type(&field).unwrap(),
+            if is_list { "ARRAY<NUMERIC>" } else { "NUMERIC" }
+        );
         for row in 0..array.len() {
-            let error = cell_value("amount", &field, array.as_ref(), row).unwrap_err();
-            assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
-            assert!(error.message.contains("amount"), "{error}");
-            assert!(error.message.contains("unsupported scale -1"), "{error}");
+            let (value, _) = cell_value("amount", &field, array.as_ref(), row).unwrap();
+            if is_list && row < 2 {
+                let values = value.as_list().unwrap();
+                if row == 0 {
+                    assert_eq!(values.len(), 2);
+                    assert_eq!(values.get(0).unwrap().as_str(), Some("-9900"));
+                    assert_eq!(
+                        values.get(1).unwrap().kind(),
+                        google_cloud_spanner::value::Kind::Null
+                    );
+                } else {
+                    assert!(values.is_empty());
+                }
+            } else if row == 0 {
+                assert_eq!(value.as_str(), Some("-9900"));
+            } else {
+                assert_eq!(value.kind(), google_cloud_spanner::value::Kind::Null);
+            }
         }
+    }
+}
+
+#[test]
+fn decimal_scale_above_arrow_limit_is_rejected() {
+    let data_type = DataType::Decimal128(38, 39);
+    for error in [
+        scalar_binder("amount", &data_type).unwrap_err(),
+        spanner_column_type(&data_type).unwrap_err(),
+    ] {
+        assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+        assert!(error.message.contains("unsupported scale 39"), "{error}");
     }
 }

@@ -1,3 +1,28 @@
-// part: metadata
+// Use native GoogleSQL types; preserve the upstream values and assert the canonical Arrow schema.
 
-skip = "Spanner TIMESTAMP is timezone-aware (UTC); the driver returns Timestamp(_, UTC), so a tz-naive read-back never matches"
+// part: setup_query
+
+CREATE TABLE test_timestamp (
+    idx INT64,
+    res TIMESTAMP
+);
+
+INSERT INTO test_timestamp (idx, res) VALUES (1, TIMESTAMP '2023-05-15 13:45:30.12345678+00');
+INSERT INTO test_timestamp (idx, res) VALUES (2, TIMESTAMP '2000-01-01 00:00:00.23456789+00');
+INSERT INTO test_timestamp (idx, res) VALUES (3, TIMESTAMP '1969-07-20 20:17:40.34567890+00');
+INSERT INTO test_timestamp (idx, res) VALUES (4, TIMESTAMP '1677-09-21 00:12:43.15+00');
+INSERT INTO test_timestamp (idx, res) VALUES (5, TIMESTAMP '2262-04-11 23:47:16.85+00');
+INSERT INTO test_timestamp (idx, res) VALUES (6, NULL);
+
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "res",
+            "format": "tsn:UTC",
+            "flags": ["nullable"]
+        }
+    ]
+}

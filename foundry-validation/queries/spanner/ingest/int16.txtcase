@@ -1,3 +1,19 @@
-// part: metadata
+// Keep the upstream input; validate Spanner's canonical readback type.
 
-skip = "Spanner returns all integers as INT64, not the case's int16"
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "idx",
+            "format": "l",
+            "flags": ["nullable"]
+        },
+        {
+            "name": "value",
+            "format": "l",
+            "flags": ["nullable"]
+        }
+    ]
+}

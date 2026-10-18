@@ -1,3 +1,47 @@
+// Preserve the upstream timestamp input and instants; read back in UTC with an exact supported unit.
+
 // part: metadata
 
-skip = "Spanner has one TIMESTAMP type; the driver reads it as Arrow Timestamp(Nanosecond) (default) or Timestamp(Microsecond) via spanner.max_timestamp_precision, never the case's Second unit, so the read-back array unit never matches"
+[setup]
+drop = "test_timestamptz"
+
+[setup.connection.options]
+"spanner.max_timestamp_precision" = { apply = "microseconds", revert = "nanoseconds_error_on_overflow" }
+
+// part: setup_query
+
+CREATE TABLE test_timestamptz (
+    idx INT64,
+    res TIMESTAMP,
+    res2 TIMESTAMP
+) PRIMARY KEY (idx)
+
+// part: bind_query
+
+INSERT INTO test_timestamptz (idx, res, res2) VALUES ($1, $2, $3)
+
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "res",
+            "format": "tsu:UTC",
+            "flags": ["nullable"]
+        },
+        {
+            "name": "res2",
+            "format": "tsu:UTC",
+            "flags": ["nullable"]
+        }
+    ]
+}
+
+// part: expected
+
+{"res": null, "res2": null}
+{"res": -14182940000000, "res2": -14182940000000}
+{"res": 946684800000000, "res2": 946684800000000}
+{"res": 1684158330000000, "res2": 1684158330000000}
+{"res": 253402300799000000, "res2": 253402300799000000}

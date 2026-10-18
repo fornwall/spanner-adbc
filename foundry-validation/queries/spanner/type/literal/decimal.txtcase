@@ -1,3 +1,18 @@
-// part: metadata
+// Use native GoogleSQL types; preserve the upstream values and assert the canonical Arrow schema.
 
-skip = "Spanner NUMERIC is fixed precision/scale (38,9); it does not round-trip the case's NUMERIC(10,2)"
+// part: query
+
+SELECT CAST(123.45 AS NUMERIC) AS res
+
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "res",
+            "format": "d:38,9",
+            "flags": ["nullable"]
+        }
+    ]
+}

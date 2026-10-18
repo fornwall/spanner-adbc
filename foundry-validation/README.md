@@ -35,24 +35,31 @@ and manual dispatch. Cases must pass or skip with a reason; there are no expecte
 
 - [`tests/spanner.py`](tests/spanner.py) defines capabilities, connection options, identifier
   quoting, `@pN` parameters and DDL overrides. Metadata expects catalog `adbc-test` and default
-  schema `""`. Primary/foreign-key constraints and exact aggregate statistics are enabled;
-  unique/check constraint cases are disabled in this harness.
+  schema `""`. Primary/foreign-key and CHECK constraints, XDBC type names/nullability, named-schema
+  metadata and ingest, and exact aggregate statistics are enabled. The connection fixture creates
+  `validation_schema` for the schema-scoped tests.
 - [`queries/spanner/`](queries/spanner/) overlays the upstream bind, select, literal and ingest
   cases with native type names, typed parameters, explicit INSERT column lists and deterministic
   readback ordering. The `.txtcase` files contain the exact expected schemas and skip reasons.
 - [`tests/test_ingest.py`](tests/test_ingest.py) enables long-value tests for string, large string,
-  string view, binary, large binary and binary view. Other test modules reuse upstream classes
-  and fixtures through [`tests/conftest.py`](tests/conftest.py).
+  string view, binary, large binary and binary view. Its fixture applies each case's connection
+  options to ingest and readback, restoring the previous values even when a test fails. Other test
+  modules reuse upstream classes and fixtures through [`tests/conftest.py`](tests/conftest.py).
 
-Timestamp cases use UTC-aware Arrow timestamps. Select cases `timestamp7tz` through `timestamp9tz`
-use nanoseconds; `timestamp4tz` through `timestamp6tz` use the microsecond option for values outside
-Arrow's nanosecond range. Bind cases similarly cover nanosecond and microsecond UTC timestamps.
-Naive timestamps and second/millisecond readback units are skipped where schemas cannot match.
+Timestamp cases retain the upstream naive/timezone-aware inputs and expected instants, with
+UTC readback. Nanosecond cases preserve nanosecond precision; lower-precision cases use the
+microsecond option to cover years 1–9999. Expected integer timestamps are rescaled exactly, and
+SQL timestamp literals specify UTC explicitly.
 
-Some skipped cases reflect roundtrip schema differences rather than unsupported input: narrower
-integers read back as `INT64`, fixed-size binary as variable-width binary, and `float16` as
-`FLOAT32`. Decimal cases expect schemas other than Spanner's fixed `NUMERIC(38,9)` mapping. The
-[skip inventory](skip_baseline.txt) records the current full set, including harness feature skips.
+Type adaptations preserve the original input schemas and values while asserting Spanner's output:
+narrow integers widen to `INT64`, fixed-size binary returns variable-width binary, `float16`
+returns `FLOAT32`, and decimals (including negative scales) return `Decimal128(38,9)`.
+No schema or value comparisons are disabled.
+
+The [skip inventory](skip_baseline.txt) contains only TIME-of-day cases and unavailable harness
+features: temporary tables, cross-catalog operations, changing the current catalog/schema,
+UNIQUE table constraints, and ingest nullability (the driver does not report `xdbc_nullable`
+or create NOT NULL columns from Arrow field nullability).
 
 ## Skip baseline
 

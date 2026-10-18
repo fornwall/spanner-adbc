@@ -1,3 +1,19 @@
-// part: metadata
+// Keep the upstream negative-scale input; validate Spanner's canonical readback type.
 
-skip = "Spanner NUMERIC is fixed precision/scale (38,9); it does not round-trip the case's decimal"
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "idx",
+            "format": "l",
+            "flags": ["nullable"]
+        },
+        {
+            "name": "value",
+            "format": "d:38,9",
+            "flags": ["nullable"]
+        }
+    ]
+}

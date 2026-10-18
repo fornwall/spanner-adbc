@@ -2143,6 +2143,45 @@ fn standalone_parameters_preserve_arrow_types_and_values() {
     }
 }
 
+#[test]
+fn negative_scale_numeric_parameters_round_trip() {
+    let Some(mut fx) = fixture_unguarded() else {
+        return;
+    };
+    for (scale, unscaled, expected) in [
+        (-2, Some(99), Some(9_900_000_000_000)),
+        (-2, Some(-99), Some(-9_900_000_000_000)),
+        (-2, None, None),
+        (i8::MIN, Some(0), Some(0)),
+    ] {
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                DataType::Decimal128(38, scale),
+                true,
+            )])),
+            vec![Arc::new(
+                Decimal128Array::from(vec![unscaled])
+                    .with_precision_and_scale(38, scale)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let mut statement = fx.connection.new_statement().unwrap();
+        statement.set_sql_query("SELECT @amount AS amount").unwrap();
+        statement.bind(input).unwrap();
+        let batches = statement
+            .execute()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let result = col::<Decimal128Array>(batches[0].column(0));
+        assert_eq!(result.data_type(), &DataType::Decimal128(38, 9));
+        assert_eq!(result.iter().collect::<Vec<_>>(), vec![expected]);
+    }
+}
+
 /// `prepare()` preconditions: preparing a statement before its query is set is an `InvalidState`
 /// error (the ADBC precondition), while a bulk-ingest statement needs no SQL query at all, so
 /// preparing one with only a target set is fine — even when that target table does not exist.
@@ -2231,7 +2270,7 @@ fn bulk_ingest_replace_rejects_unbindable_schema_before_dropping_table() {
     assert_eq!(insert.execute_update().unwrap(), Some(1));
 
     for data_type in [
-        DataType::Decimal128(10, -2),
+        DataType::UInt64,
         DataType::List(Arc::new(Field::new(
             "item",
             DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),

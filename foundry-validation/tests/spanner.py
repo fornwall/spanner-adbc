@@ -24,30 +24,25 @@ class SpannerQuirks(model.DriverQuirks):
         connection_get_statistics=True,
         connection_transactions=True,
         get_objects=True,
-        # The constraint-setup DDL hook (sample_ddl_constraints below) is implemented
-        # and the driver reports the constraints faithfully, so both enabled cases
-        # pass: _primary because the driver reports constraint_column_usage as NULL
-        # for non-FK constraints, and _foreign because the FK tables are created with
-        # no PRIMARY KEY clause (Spanner keys them on a hidden `rowid`, whose implicit
-        # PK/NOT NULL constraints get_objects omits along with the column itself), so
-        # each reports exactly the one FK constraint the suite asserts.
-        # Everything else the tests assert matches what the driver reports: the FK
-        # shapes are exact, and declared key order is preserved (PRIMARY KEY (b, a)
-        # reports ["b", "a"], FOREIGN KEY (c, b) reports ["c", "b"]), so the
-        # quirk_get_objects_constraints_*_normalized defaults (False) are correct.
+        get_objects_constraints_check=True,
+        # The DDL hook below creates only the declared constraints each test expects.
+        # Hidden rowid constraints are omitted from metadata; declared key order is
+        # preserved, and non-FK constraint_column_usage is NULL.
         get_objects_constraints_foreign=True,
         get_objects_constraints_primary=True,
         statement_bind=True,
         statement_bulk_ingest=True,
+        statement_bulk_ingest_schema=True,
         statement_execute_schema=True,
         statement_get_parameter_schema=True,
         statement_prepare=True,
         statement_rows_affected=True,
-        supported_xdbc_fields=[],
+        supported_xdbc_fields=["xdbc_type_name", "xdbc_is_nullable"],
         # The driver reports the database id as the ADBC catalog; the default schema is
         # the unnamed "" of GoogleSQL INFORMATION_SCHEMA.
         current_catalog="adbc-test",
         current_schema="",
+        secondary_schema="validation_schema",
     )
 
     # Database options are filled in by get_quirks() for the selected backend.
@@ -66,6 +61,10 @@ class SpannerQuirks(model.DriverQuirks):
         return f"@p{index}"
 
     def query_override(self, context: str, default: str) -> str:
+        if context == "TestConnection.test_get_table_schema_schema":
+            return default.replace(
+                "(spam INT, eggs VARCHAR)", "(spam INT64, eggs STRING(MAX))"
+            )
         # The suite's sample table uses portable DDL (INT/VARCHAR, no key); Spanner needs a
         # primary key and native type names.
         if context == "TestStatement.sample_table":
@@ -85,15 +84,17 @@ class SpannerQuirks(model.DriverQuirks):
     def sample_ddl_constraints(self) -> list[str]:
         # Spanner DDL: INT64, PRIMARY KEY clause after the column list, table-level
         # FOREIGN KEY constraints. Parents are created before children. Only the
-        # tables needed by the enabled tests (primary/foreign) are created; Spanner
-        # has no UNIQUE table constraint (only unique indexes), and the check
-        # feature is off.
+        # tables needed by the enabled tests are created; Spanner has no UNIQUE
+        # table constraint (only unique indexes).
         #
         # The two FK children declare no primary key of their own — the suite asserts
         # each reports exactly one constraint, and a declared key would be a second.
         # Spanner keys them on a hidden `rowid`, which get_objects omits (along with
         # its implicit PK and NOT NULL check constraints).
         return [
+            "CREATE TABLE constraint_check (a INT64, b INT64,"
+            " CONSTRAINT check_positive CHECK (a > 0),"
+            " CONSTRAINT check_order CHECK (a < b))",
             "CREATE TABLE constraint_primary (a INT64, b INT64) PRIMARY KEY (a)",
             "CREATE TABLE constraint_primary_multi (a INT64, b INT64) PRIMARY KEY (b, a)",
             "CREATE TABLE constraint_primary_multi2 (a INT64, b INT64) PRIMARY KEY (a, b)",

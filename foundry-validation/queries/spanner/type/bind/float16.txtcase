@@ -1,3 +1,12 @@
-// part: metadata
+// Keep the upstream bound Arrow data and assert Spanner's canonical readback.
 
-skip = "Spanner has no 16-bit float type"
+// part: setup_query
+
+CREATE TABLE test_float16 (
+    idx INT64,
+    res FLOAT32
+)
+
+// part: bind_query
+
+INSERT INTO test_float16 (idx, res) VALUES ($1, $2)

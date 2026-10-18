@@ -1,3 +1,24 @@
-// part: metadata
+// Keep the upstream bound Arrow data and assert Spanner's canonical readback.
 
-skip = "Spanner has one 64-bit integer type; a bound INT16 reads back as INT64, not the case's narrower type"
+// part: setup_query
+
+CREATE TABLE test_int16 (
+    res INT64
+)
+
+// part: bind_query
+
+INSERT INTO test_int16 (res) VALUES ($1)
+
+// part: expected_schema
+
+{
+    "format": "+s",
+    "children": [
+        {
+            "name": "res",
+            "format": "l",
+            "flags": ["nullable"]
+        }
+    ]
+}

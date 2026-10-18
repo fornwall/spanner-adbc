@@ -1,3 +1,0 @@
-// part: metadata
-
-skip = "Spanner has no fixed-size binary type (only BYTES(MAX))"
