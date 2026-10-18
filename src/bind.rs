@@ -8,8 +8,9 @@
 //! losslessly. Strings, bytes, booleans, dates, timestamps and Decimal128 retain their values and
 //! nulls. Timestamps preserve the source unit's precision; decimal formatting uses the full i128.
 //!
-//! Spanner infers parameter types except for `arrow.json`-tagged strings and list elements, which
-//! explicitly bind as `JSON` and `ARRAY<JSON>`. Mutations use the target column's type instead.
+//! Parameters carry their Arrow logical type, including nulls and empty lists. `arrow.json`-tagged
+//! strings bind as `JSON`; Arrow `Null` leaves inference to SQL. Mutations use the target column's
+//! type instead.
 
 use std::ops::Range;
 
@@ -109,7 +110,7 @@ pub(crate) fn resolve_parameter_names(
     Ok(params)
 }
 
-/// Bind one cell, adding an explicit type when its field carries JSON metadata.
+/// Bind one cell with its Arrow logical type, preserving JSON extension metadata.
 fn bind_one(
     builder: StatementBuilder,
     name: &str,
@@ -118,9 +119,42 @@ fn bind_one(
     row: usize,
 ) -> Result<StatementBuilder> {
     let (value, param_type) = cell_value(name, field, column, row)?;
+    let param_type = param_type.or_else(|| parameter_type(column.data_type()));
     Ok(match param_type {
         Some(t) => builder.add_typed_param(name, value, t),
         None => builder.add_param(name, value),
+    })
+}
+
+/// Type an already-validated binding. Arrow `Null` (including list elements) needs SQL context.
+/// Keep this separate from value encoding: mutation values take their type from the target table.
+fn parameter_type(mut data_type: &DataType) -> Option<Type> {
+    while let DataType::Dictionary(_, value) = data_type {
+        data_type = value;
+    }
+    Some(match data_type {
+        DataType::Boolean => types::bool(),
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => types::int64(),
+        DataType::Float16 | DataType::Float32 => types::float32(),
+        DataType::Float64 => types::float64(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => types::string(),
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => types::bytes(),
+        DataType::Date32 | DataType::Date64 => types::date(),
+        DataType::Timestamp(_, _) => types::timestamp(),
+        DataType::Decimal128(_, _) => types::numeric(),
+        DataType::List(item) | DataType::LargeList(item) => {
+            types::array(parameter_type(item.data_type())?)
+        }
+        _ => return None,
     })
 }
 
@@ -458,8 +492,11 @@ fn numeric_string(unscaled: i128, scale: u32) -> String {
     )
 }
 
-/// Map an Arrow ingest type to its Spanner column type, rejecting unsupported types.
-pub(crate) fn spanner_column_type(data_type: &DataType) -> Result<String> {
+/// Map an ingest type to DDL, rejecting types the value encoder cannot bind before any DDL runs.
+fn spanner_column_type(mut data_type: &DataType) -> Result<String> {
+    while let DataType::Dictionary(_, value) = data_type {
+        data_type = value;
+    }
     Ok(match data_type {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "INT64".to_string(),
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => "INT64".to_string(),
@@ -473,11 +510,15 @@ pub(crate) fn spanner_column_type(data_type: &DataType) -> Result<String> {
         | DataType::FixedSizeBinary(_) => "BYTES(MAX)".to_string(),
         DataType::Date32 | DataType::Date64 => "DATE".to_string(),
         DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
-        DataType::Decimal128(_, _) => "NUMERIC".to_string(),
-        DataType::List(field) | DataType::LargeList(field) => {
-            format!("ARRAY<{}>", spanner_column_type(field.data_type())?)
+        DataType::Decimal128(_, scale) => {
+            numeric_scale("ingest column", *scale)?;
+            "NUMERIC".to_string()
         }
-        DataType::Dictionary(_, value) => spanner_column_type(value)?,
+        DataType::List(field) | DataType::LargeList(field) => {
+            // List binding accepts scalar children only, including for null or empty lists.
+            scalar_binder(field.name(), field.data_type())?;
+            format!("ARRAY<{}>", spanner_field_type(field)?)
+        }
         other => {
             return Err(invalid_argument(format!(
                 "cannot create a Spanner column for Arrow type {other:?}; cast it to a type with \
@@ -492,17 +533,7 @@ fn spanner_field_type(field: &Field) -> Result<String> {
     if is_json_field(field) {
         return Ok("JSON".to_string());
     }
-    // Keep list element metadata when looking through dictionary encoding.
-    let mut data_type = field.data_type();
-    while let DataType::Dictionary(_, value) = data_type {
-        data_type = value;
-    }
-    match data_type {
-        DataType::List(item) | DataType::LargeList(item) => {
-            Ok(format!("ARRAY<{}>", spanner_field_type(item)?))
-        }
-        other => spanner_column_type(other),
-    }
+    spanner_column_type(field.data_type())
 }
 
 /// Build ingest DDL, optionally qualified by schema and guarded by `IF NOT EXISTS`.

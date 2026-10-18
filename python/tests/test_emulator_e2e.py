@@ -99,7 +99,7 @@ def test_bulk_ingest_append(emulator_database):
                     "Name": pa.array(["x", "y", "z"], type=pa.string()),
                 }
             )
-            # Only append mode is supported by the driver; the table exists already.
+            # Preserve the table's explicitly declared primary key.
             count = cur.adbc_ingest("AdbcPyIngest", data, mode="append")
             assert count == 3
 

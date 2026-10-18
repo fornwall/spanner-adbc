@@ -1,26 +1,8 @@
-//! GoogleSQL text helpers: lexing, statement classification/splitting, identifier quoting, and
-//! bind-parameter extraction.
+//! GoogleSQL lexing, statement classification/splitting, identifier quoting and parameter names.
 //!
-//! This is the single home for the driver's SQL-text concerns — everything that inspects or
-//! rewrites raw SQL strings under GoogleSQL's lexical rules lives here, so the lexer
-//! ([`lex`]/[`Lexer`]/[`Lexeme`]) and its consumers ([`split_statements`], [`is_dml_returning`],
-//! [`named_parameters`], …) plus identifier quoting ([`quote_ident`]/[`qualified_table`]) sit next
-//! to each other rather than being duplicated across modules.
-//!
-//! **DDL routing.** Spanner does not accept DDL (`CREATE`/`ALTER`/`DROP`/…) over the data-plane SQL
-//! API — DDL is applied through the Database Admin `UpdateDatabaseDdl` long-running operation, which
-//! takes a *list* of statements and applies them as one schema change. The driver therefore detects
-//! DDL ([`is_ddl`]) and routes it there (see [`SpannerStatement`](crate::SpannerStatement)).
-//!
-//! Because `UpdateDatabaseDdl` accepts multiple statements at once, a single `execute` of a
-//! `;`-separated batch is submitted as one call. That is how dbt's "build an intermediate table,
-//! then rename it over the target" swap can be made near-atomic:
-//!
-//! ```sql
-//! CREATE TABLE my_model__tmp (id INT64, ...) PRIMARY KEY (id);
-//! DROP TABLE my_model;
-//! RENAME TABLE my_model__tmp TO my_model
-//! ```
+//! All SQL inspection shares one lexer so quoted literals and comments have consistent boundaries.
+//! Classification routes DDL to the admin API and DML to read/write transactions; splitting lets
+//! each API accept a batch. DDL batches are not transactional.
 
 use crate::error::invalid_argument;
 use adbc_core::error::Result;
@@ -33,16 +15,12 @@ const DDL_KEYWORDS: &[&str] = &[
 /// Leading keywords that identify a Spanner DML statement (data modification).
 const DML_KEYWORDS: &[&str] = &["INSERT", "UPDATE", "DELETE"];
 
-/// Return `true` if `sql` begins with a DDL statement (ignoring leading whitespace and comments).
+/// Whether the first nonempty statement is DDL, ignoring comments and statement hints.
 pub(crate) fn is_ddl(sql: &str) -> bool {
     first_keyword(sql).is_some_and(|kw| DDL_KEYWORDS.iter().any(|k| kw.eq_ignore_ascii_case(k)))
 }
 
-/// Return `true` if `sql` begins with a DML statement (`INSERT`/`UPDATE`/`DELETE`).
-///
-/// Used to route DML that arrives through the query entry point (`execute`) — as every ADBC client
-/// does, since the C ABI exposes only `ExecuteQuery` — onto the read/write transaction path instead
-/// of a read-only single-use one, which Spanner rejects for DML.
+/// Whether the first nonempty statement is DML (`INSERT`/`UPDATE`/`DELETE`).
 pub(crate) fn is_dml(sql: &str) -> bool {
     first_keyword(sql).is_some_and(|kw| DML_KEYWORDS.iter().any(|k| kw.eq_ignore_ascii_case(k)))
 }
@@ -325,29 +303,15 @@ pub(crate) fn strip_trailing_terminators(sql: &str) -> String {
     }
 }
 
-/// The first SQL keyword — the leading ASCII-alphabetic run of the first word, borrowed from
-/// `sql` in its original case (callers compare case-insensitively, so classification allocates
-/// nothing) — skipping leading whitespace, `--`/`#`/`/* */` comments, and
-/// [statement hints](https://cloud.google.com/spanner/docs/reference/standard-sql/query-syntax#statement_hints)
-/// (`@{HINT=value, …}`), which GoogleSQL allows before the statement proper — so hinted DML/DDL is
-/// classified by its real leading keyword, not misread as "no keyword" and routed to the wrong
-/// execution path.
-///
-/// The scan is delegated to the shared [`lex`] tokenizer: a hint body is lexed normally, so a `}`
-/// inside a string literal in the hint does not close it, and an unterminated hint or comment
-/// consumes the rest of the input — no keyword. Anything else before the first word — a quoted
-/// identifier/literal, punctuation, a bare `@param`/`@@var` — means the input does not start with a
-/// keyword, as does a first word that does not start with an ASCII letter.
-///
-/// Only the leading ASCII-alphabetic run of the first word is returned, so an identifier-shaped
-/// word is classified by its prefix (`CREATE2` routes as `CREATE`). No valid Spanner statement
-/// begins with such a word, so this only decides which error the user sees.
+/// Borrow the first keyword, skipping empty statements, comments, whitespace and `@{…}` hints.
+/// A quoted `}` does not close a hint; an unterminated hint consumes the remaining input.
+/// Other leading punctuation or quoted text yields no keyword. The keyword is the first word's
+/// ASCII-alphabetic prefix, in its original case; invalid words such as `CREATE2` route as `CREATE`.
 pub(crate) fn first_keyword(sql: &str) -> Option<&str> {
     let mut lexemes = significant_lexemes(sql);
     while let Some(lexeme) = lexemes.next() {
         match lexeme {
-            // Already filtered out, but skipping keeps this correct on its own terms.
-            Lexeme::Comment(_) => {}
+            Lexeme::Comment(_) | Lexeme::Other(';') => {}
             // A statement hint `@{…}`: skip through its closing `}`. GoogleSQL lexes `@` and `{`
             // as separate tokens, so `@ {…}` and `@/*c*/{…}` are hints too (Spanner accepts both)
             // — `significant_lexemes` has already dropped whatever sat between them.

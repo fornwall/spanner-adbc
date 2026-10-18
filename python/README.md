@@ -1,5 +1,7 @@
 # spanner-adbc
 
+> **Experimental.** AI-generated and not yet validated in production use.
+
 [![PyPI version](https://img.shields.io/pypi/v/spanner-adbc.svg)](https://pypi.org/project/spanner-adbc/)
 [![Python versions](https://img.shields.io/pypi/pyversions/spanner-adbc.svg)](https://pypi.org/project/spanner-adbc/)
 [![Wheel](https://img.shields.io/pypi/wheel/spanner-adbc.svg)](https://pypi.org/project/spanner-adbc/#files)
@@ -40,6 +42,20 @@ with spanner.connect(
 ```
 
 Use GoogleSQL `@name` parameters with `cur.execute(...)`; `?` placeholders are unsupported.
+Pass a tuple in first-occurrence order instead of formatting values into SQL:
+
+```python
+import spanner_adbc.dbapi as spanner
+from spanner_adbc import DatabaseOptions
+
+with spanner.connect(
+    db_kwargs={DatabaseOptions.URI: "spanner:///projects/p/instances/i/databases/d"},
+) as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT @name AS name, @id AS id", ("Alice", 42))
+        assert cur.fetchone() == ("Alice", 42)
+```
+
 `fetchone()` and `fetchall()` return Python rows; Arrow and DataFrame helpers are shown below.
 
 ## Driver manifest (`driver="spanner"`)
@@ -159,6 +175,9 @@ chosen by its first query or write; mixing them raises `spanner.ProgrammingError
 commit or rollback. Queries share a snapshot. DML is buffered until `conn.commit()`, so queries
 cannot read buffered writes.
 
+Exiting `with spanner.connect(...)` closes the connection without committing. Call
+`conn.commit()` explicitly before leaving the block to keep buffered writes.
+
 DDL always executes immediately: rollback cannot undo it, and it runs before buffered DML.
 Use `autocommit=True` for immediately committed DML, including `THEN RETURN` statements.
 See [transactions](https://github.com/fornwall/spanner-adbc/blob/main/docs/transactions.md) for
@@ -202,6 +221,23 @@ with spanner.connect(
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers ORDER BY SingerId")
         table = cur.fetch_arrow_table()      # -> pyarrow.Table
+```
+
+`fetch_arrow_table()` and DataFrame helpers collect the complete result in memory. For large
+queries, consume record batches while the cursor and connection remain open:
+
+```python
+import spanner_adbc.dbapi as spanner
+from spanner_adbc import DatabaseOptions
+
+with spanner.connect(
+    db_kwargs={DatabaseOptions.URI: "spanner:///projects/p/instances/i/databases/d"},
+) as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT SingerId, FirstName FROM Singers")
+        with cur.fetch_record_batch() as batches:
+            for batch in batches:
+                print(batch.num_rows)  # process or write each batch here
 ```
 
 **polars — read straight from the connection:**
@@ -328,4 +364,13 @@ from trusted sources: they execute using the receiving connection's credentials.
 | Windows arm64  | `win_arm64`              | ARM64 Windows                                |
 
 Building for an older OS requires a compatible native driver and Python dependencies.
+Source wheel builds require exactly one native driver library staged in `python/spanner_adbc/`;
+the Python build does not compile Rust. For example, on Linux:
+
+```sh
+cargo build --release
+cp target/release/libspanner_adbc.so python/spanner_adbc/
+pip install './python[dbapi]'
+```
+
 For local builds and releases, see [CONTRIBUTING.md](https://github.com/fornwall/spanner-adbc/blob/main/CONTRIBUTING.md).

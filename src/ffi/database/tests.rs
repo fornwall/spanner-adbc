@@ -171,6 +171,48 @@ fn setting_the_same_option_twice_keeps_the_later_value() {
     assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
 
+#[test]
+fn repeated_options_keep_their_order_relative_to_uri_expansion() {
+    let uri = adbc_core::constants::ADBC_OPTION_URI;
+    let endpoint = crate::OPTION_ENDPOINT;
+    for (options, expected) in [
+        (
+            [
+                (endpoint, "http://first:9010"),
+                (uri, "spanner://uri:9010/projects/p/instances/i/databases/d"),
+                (endpoint, "http://last:9010"),
+            ],
+            "http://last:9010",
+        ),
+        (
+            [
+                (
+                    uri,
+                    "spanner://first:9010/projects/p/instances/i/databases/d",
+                ),
+                (endpoint, "http://explicit:9010"),
+                (
+                    uri,
+                    "spanner://last:9010/projects/p/instances/i/databases/d",
+                ),
+            ],
+            "last:9010",
+        ),
+    ] {
+        let mut database = pending();
+        for (key, value) in options {
+            assert_eq!(set(&mut database, key, value), ADBC_STATUS_OK);
+        }
+        assert_eq!(
+            unsafe { database_init(&raw mut database, null()) },
+            ADBC_STATUS_OK
+        );
+        let found = get(&mut database, endpoint).unwrap();
+        assert_eq!(release(&mut database), ADBC_STATUS_OK);
+        assert_eq!(found, expected);
+    }
+}
+
 /// A failed `Init` must keep the buffered options so the offending one can be corrected and
 /// `Init` retried, rather than silently reinitializing from an empty buffer.
 #[test]

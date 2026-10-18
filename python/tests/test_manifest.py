@@ -103,6 +103,14 @@ def test_manifest_escapes_backslashes(tmp_path):
     assert "\\\\" not in shared
 
 
+def test_manifest_does_not_require_a_known_platform(tmp_path, monkeypatch):
+    # A source-built library can work on architectures without published wheels.
+    monkeypatch.setattr(manifest_mod.platform, "machine", lambda: "riscv64")
+    library = tmp_path / "libspanner_adbc.so"
+    written = manifest_mod.install(tmp_path, library=library)
+    assert tomllib.loads(written.read_text())["Driver"]["shared"] == str(library.resolve())
+
+
 @pytest.mark.parametrize("name", ['quote"', "tab\t", "line\n", "control\x01", "del\x7f", "snow☃𐐀"])
 def test_manifest_paths_round_trip_through_toml(tmp_path, name):
     library = tmp_path / name / "libspanner_adbc.so"

@@ -1,7 +1,7 @@
 # Open project review findings
 
-Four upstream items remain. Verified against the pinned `google-cloud-rust` `ec54ef0a` and
-`arrow-adbc` `32c67b09` sources on 2026-09-16. Keep IDs stable; remove resolved items.
+Three upstream items remain. Verified against the pinned `google-cloud-rust` `415dbbb8` and
+`arrow-adbc` `0a40cf30` sources on 2026-10-18. Keep IDs stable; remove resolved items.
 
 ## google-cloud-rust
 
@@ -10,9 +10,6 @@ Four upstream items remain. Verified against the pinned `google-cloud-rust` `ec5
   `ReadWriteTransaction` has no public constructor, commit or rollback. A public handle would
   let the driver replace buffered manual transactions and support reads after writes.
   Sources: `src/spanner/src/{transaction_runner,read_write_transaction}.rs`.
-- [ ] **UP-7 — Channel count configuration.** `SPANNER_NUM_CHANNELS` controls the channel count
-  (default 4), with no public client-builder setter. Expose a setter so drivers can offer a
-  per-database option. Source: `src/spanner/src/client.rs`.
 - [ ] **UP-14 — Streaming retry elapsed-time limit.** `ResultSet::check_retry` constructs a fresh
   `RetryState` on each retry decision, resetting its start time. Thus
   `spanner.retry.max_elapsed_seconds` does not bound streaming retries. Attempt counting is now

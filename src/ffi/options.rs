@@ -62,13 +62,8 @@ where
     /// A pre-`Init` set is buffered verbatim and validated when `Init` replays it through the
     /// driver's own constructor.
     ///
-    /// adbc.h would rather have the key rejected here, but the driver's `set_option` is its own
-    /// validator: a database option can rewrite several fields at once (`adbc.uri` expands into
-    /// the individual keys), so there is no pure classifier to consult that would not be a second
-    /// copy of the setter, free to drift from it. Buffering keeps one validator. The buffer is
-    /// ordered and last-write-wins per key, which is what makes the replay mean the same thing as
-    /// setting the options one by one on a live object: the driver's precedence rule -- a later
-    /// option overrides what an earlier `adbc.uri` expanded to -- survives the `Init` boundary.
+    /// Validation uses the driver's setter at `Init`. Each key retains its last value and
+    /// position, allowing corrections after a failed init while preserving URI precedence.
     fn set(&mut self, key: K, value: OptionValue) -> Result<()> {
         match self {
             Self::Pending(options) => {

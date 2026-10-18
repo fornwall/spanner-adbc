@@ -1,26 +1,15 @@
 //! How an exported object is represented behind `private_data`, and how entry points reach it.
 //!
-//! Every exported handle stores a reference-counted [`Exported<S>`], which centralizes what no
-//! individual entry point should then have to remember: panic containment is per object rather
-//! than per process, uninitialized and released handles are rejected uniformly, calls on one
-//! object serialize behind a mutex, and [`cancel`] neither takes that mutex nor borrows the
-//! handle's reference.
+//! Each handle owns an [`Arc<Exported<S>>`]. Calls serialize through its state mutex, and a panic
+//! poisons every state locked by that call. [`cancel`] uses a separate lock so it can interrupt a
+//! blocked operation.
 //!
-//! What the reference count does *not* cover, and cannot: `private_data` is a field of the
-//! caller's own `AdbcDatabase`/`AdbcConnection`/`AdbcStatement` struct. `Release` writes it while
-//! `Cancel` reads it, so a host that lets the two overlap is racing on its own memory before the
-//! driver is reached at all. What the count buys is narrower than "`Cancel` is safe against a
-//! concurrent `Release`": from the moment [`cancel`] holds a reference of its own, a `Release` on
-//! another thread can no longer free the object under it, and the last of the two frees it
-//! instead. Reading the slot and taking that reference are two steps, though, and a `Release`
-//! that lands between them drops the last reference to memory [`cancel`] is about to touch. No
-//! driver reached through a raw `private_data` field can close that window — the upstream C++
-//! framework has the same exposure — so the host owes `Release` the exclusion every other C API
-//! demands of a destructor, against `Cancel` as much as against anything else.
+//! Callers must exclude `Release` from all other calls, including `Cancel`: reading the caller's
+//! `private_data` and acquiring an owned reference are not atomic. Once acquired, the cancel
+//! reference keeps the state alive until cancellation completes.
 
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use adbc_core::CancelHandle;
@@ -31,11 +20,10 @@ use super::abi::{ADBC_STATUS_OK, AdbcError, AdbcStatusCode};
 use super::error::export_error;
 use super::guard::catch;
 
-/// Options accumulated before init, preserving insertion order with last-write-wins per key.
+/// Options accumulated before init, retaining each key's last value and position.
 ///
-/// Order matters: the driver applies `adbc.uri` before other database options so that explicit
-/// options win over URI-derived ones, and it rejects a *duplicated* URI. Collapsing repeats here
-/// keeps a caller that simply sets the same option twice from tripping that check.
+/// Position matters because a URI can also set individual options: an explicit endpoint set
+/// after a URI must be applied after it, even if that endpoint was set earlier too.
 pub(crate) struct OptionBuffer<K> {
     /// Cloned rather than taken by the fallible constructors, so a failed `Init` keeps the
     /// options and the handle can be initialized again.
@@ -44,15 +32,14 @@ pub(crate) struct OptionBuffer<K> {
 
 impl<K: PartialEq> OptionBuffer<K> {
     pub(crate) fn set(&mut self, key: K, value: OptionValue) {
-        if let Some(entry) = self
+        if let Some(index) = self
             .entries
-            .iter_mut()
-            .find(|(existing, _)| *existing == key)
+            .iter()
+            .position(|(existing, _)| *existing == key)
         {
-            entry.1 = value;
-        } else {
-            self.entries.push((key, value));
+            self.entries.remove(index);
         }
+        self.entries.push((key, value));
     }
 }
 
@@ -102,10 +89,6 @@ impl<K: PartialEq, S> Staged<K, S> {
 /// would alias when two calls overlap, which adbc.h explicitly permits for `Cancel` and the
 /// option getters.
 pub(crate) struct Exported<S> {
-    /// Set when a call on this object panicked. The panic is stopped inside [`dispatch`], but the
-    /// state it was mutating may hold torn invariants, so a poisoned object refuses all further
-    /// dispatches. Atomic because entry points on other threads read it concurrently.
-    poisoned: AtomicBool,
     /// The object's cancel handle, populated once the state is initialized. Kept beside — not
     /// inside — the state so [`cancel`] can reach the driver's thread-safe cancellation machinery
     /// while another call holds the state lock.
@@ -115,11 +98,8 @@ pub(crate) struct Exported<S> {
     state: Mutex<S>,
 }
 
-// Every entry point reaches this struct through a raw `private_data` field, so no call site
-// checks that sharing it between the caller's threads is sound -- the field types have to carry
-// that, and the compiler is never asked. Ask it here, where the unsizing coercion is the proof
-// and the function exists only to be type-checked: a field added later that is not `Sync` -- a
-// `Cell`, an `Rc` -- would otherwise compile and race.
+// Raw FFI pointers bypass these trait checks at call sites. Keep a compile-time assertion that
+// adding a field cannot make sharing a handle between caller threads unsound.
 fn _exported_is_shareable<S: Send>(exported: &Exported<S>) -> &(dyn Send + Sync) {
     exported
 }
@@ -139,7 +119,6 @@ impl<S: Send> Exported<S> {
         cancel: Option<Box<dyn CancelHandle>>,
     ) -> *mut c_void {
         Arc::into_raw(Arc::new(Self {
-            poisoned: AtomicBool::new(false),
             cancel: Mutex::new(cancel),
             state: Mutex::new(state),
         }))
@@ -151,26 +130,13 @@ impl<S: Send> Exported<S> {
 impl<S> Exported<S> {
     /// Take the state lock, refusing a poisoned object.
     ///
-    /// The poison flag is checked *after* acquiring the lock: the flag is set while the panicking
-    /// call still holds the lock, so acquiring it is what guarantees the flag is visible here.
-    /// The std mutex's own poisoning is deliberately ignored — a panic is stopped inside
-    /// [`dispatch`] before it can unwind past the guard, so the std flag never carries
-    /// information `poisoned` does not.
+    /// This also rejects a state borrowed by another handle's call when that call panicked.
     fn lock_state(&self, kind: &str) -> Result<MutexGuard<'_, S>> {
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if self.poisoned.load(Ordering::Acquire) {
-            return Err(poisoned(kind));
-        }
-        Ok(state)
+        self.state.lock().map_err(|_| poisoned(kind))
     }
 }
 
-/// The one refusal for a handle that carries no usable driver object.
-///
-/// A null `private_data`, a pre-`Init` state and a missing cancel handle are the same thing to
-/// the caller — a handle it may not use yet, or may not use any more — and the caller cannot
-/// tell which side it is on from where the call landed. Naming the released case matters most:
-/// it is the one that looks like a working handle from the outside.
+/// A null slot, pending state or missing cancel handle is not usable yet, or has been released.
 #[cold]
 #[inline(never)]
 fn uninitialized(kind: &str) -> Error {
@@ -205,9 +171,7 @@ unsafe fn borrowed<'a, S>(slot: *mut c_void, kind: &str) -> Result<&'a Exported<
 /// Take a reference of one's own to the object behind `slot`, keeping it alive independently of
 /// the handle.
 ///
-/// [`cancel`] is the one entry point adbc.h says must always be thread-safe, so it is the one that
-/// may legitimately still be running when [`release`] drops the handle's reference; cloning the
-/// count here keeps that a completed cancel rather than a use-after-free.
+/// Used by [`cancel`] to retain the state for the duration of cancellation.
 ///
 /// # Safety
 /// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
@@ -241,25 +205,16 @@ where
     let outcome = catch(|| {
         let exported = unsafe { borrowed::<S>(slot, kind) }?;
         let mut state = exported.lock_state(kind)?;
-        // The driver call is contained on its own so a panic can mark this object. The store
-        // happens while the state lock is still held, which is what makes it visible to every
-        // later `lock_state`.
-        catch(|| f(&mut state)).unwrap_or_else(|panicked| {
-            exported.poisoned.store(true, Ordering::Release);
-            Err(panicked)
-        })
+        // The guard must unwind before `catch` handles a panic so the mutex records poisoning.
+        f(&mut state)
     });
     finish(outcome.unwrap_or_else(Err), error)
 }
 
 /// Cancel the object's in-flight operation without taking its dispatch turn.
 ///
-/// adbc.h requires `Cancel` to stay callable while another thread is blocked inside an operation
-/// on the same object — interrupting that operation is its main purpose — so this path must not
-/// wait on the state lock that the blocked call holds. The handle stored beside the state reaches
-/// the driver's own cancellation machinery, which is thread-safe throughout. The poison flag is
-/// deliberately not consulted: cancelling whatever a panicked call left running is strictly more
-/// useful than refusing.
+/// Uses the separate cancel lock, including after the state has been poisoned, so a blocked or
+/// panicked operation can still be cancelled.
 ///
 /// # Safety
 /// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
@@ -284,12 +239,8 @@ pub(crate) unsafe fn cancel<S>(
     finish(outcome.unwrap_or_else(Err), error)
 }
 
-/// Store the cancel handle for [`cancel`] to find. Called by an object whose state is only built
-/// later, just *before* that state is published: [`cancel`] never takes the state lock, so the
-/// instant the object becomes usable is the instant a caller may start an operation and cancel
-/// it. Until the handle is installed [`cancel`] refuses the object as [`uninitialized`]. An
-/// object that has its state at construction passes the handle to
-/// [`Exported::into_private_data_with_handles`] instead and needs none of this.
+/// Install cancellation before publishing an initialized state. Statements supply the cancel
+/// handle at construction through [`Exported::into_private_data_with_cancel`] instead.
 ///
 /// # Safety
 /// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
@@ -320,13 +271,11 @@ pub(crate) unsafe fn lock_state<'a, S>(slot: *mut c_void, kind: &str) -> Result<
 /// Drop the handle's reference to the object and null the slot out, so a second release is an
 /// error rather than a double free.
 ///
-/// The object itself is freed here only if nothing else holds a reference — a [`cancel`] running
-/// on another thread does, and then the last of the two frees it. Every other entry point merely
-/// borrows, so adbc.h's rule still stands for them: no call on the object may be in flight.
+/// An already acquired cancel reference can defer destruction until cancellation finishes.
 ///
 /// # Safety
 /// `slot` must point to a handle field holding null or a pointer produced by
-/// [`Exported::<S>::into_private_data`], and no call other than [`cancel`] may be in flight.
+/// [`Exported::<S>::into_private_data`]. No borrowed state or new acquisition may be in flight.
 pub(crate) unsafe fn release<S>(
     slot: &mut *mut c_void,
     kind: &'static str,

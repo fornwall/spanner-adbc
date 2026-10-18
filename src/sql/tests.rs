@@ -45,6 +45,7 @@ fn detects_ddl() {
         "RENAME TABLE a TO b",
         "-- a comment\nCREATE INDEX idx ON t(c)",
         "/* header */ create table t (id int64) primary key (id)",
+        "; /* empty */ ; CREATE TABLE t (id INT64) PRIMARY KEY (id)",
     ] {
         assert!(is_ddl(sql), "should be DDL: {sql}");
     }
@@ -71,6 +72,7 @@ fn detects_dml() {
         "  update t SET c = 1 WHERE id = 1",
         "DELETE FROM t WHERE true",
         "/* c */ insert into t (id) values (1)",
+        "; -- empty\n; UPDATE t SET c = 1 WHERE true",
     ] {
         assert!(is_dml(sql), "should be DML: {sql}");
     }
@@ -118,7 +120,12 @@ fn first_keyword_edge_cases() {
         Some("DELETE")
     );
     // Empty / whitespace / comment-only / unterminated-comment input has no keyword.
-    for sql in ["", "  \n\t", "-- only\n /* comments */", "/* unterminated"] {
+    for sql in [
+        "",
+        "  \n\t",
+        "; -- only\n ; /* comments */ ;",
+        "/* unterminated",
+    ] {
         assert_eq!(first_keyword(sql), None, "no keyword in {sql:?}");
     }
     // A leading quoted identifier or literal is not a keyword.

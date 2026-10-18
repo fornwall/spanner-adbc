@@ -89,26 +89,19 @@ fn value_for(code: InfoCode) -> InfoValue {
 /// Build the `get_info` record batch for the requested `codes` (or the full [`REPORTED`] set when
 /// `None`).
 pub(crate) fn build(codes: Option<HashSet<InfoCode>>) -> Result<RecordBatch> {
-    // One row per recognised code, in code order. An explicit request yields a row for each
-    // requested code in [`REPORTED`] (even the null-valued ones) and — per the `adbc.h` contract —
-    // silently omits unrecognized codes, keeping explicit requests and `get_info(None)` symmetric.
-    let codes: Vec<InfoCode> = match codes {
-        Some(set) => {
-            let mut v: Vec<InfoCode> = set.into_iter().filter(|c| REPORTED.contains(c)).collect();
-            v.sort_by_key(|c| u32::from(c));
-            v
-        }
-        None => REPORTED.to_vec(),
-    };
-
-    let mut names: Vec<u32> = Vec::with_capacity(codes.len());
-    let mut type_ids: Vec<i8> = Vec::with_capacity(codes.len());
-    let mut offsets: Vec<i32> = Vec::with_capacity(codes.len());
+    let mut names: Vec<u32> = Vec::with_capacity(REPORTED.len());
+    let mut type_ids: Vec<i8> = Vec::with_capacity(REPORTED.len());
+    let mut offsets: Vec<i32> = Vec::with_capacity(REPORTED.len());
     let mut strings: Vec<Option<&'static str>> = Vec::new();
     let mut bools: Vec<Option<bool>> = Vec::new();
     let mut ints: Vec<Option<i64>> = Vec::new();
 
-    for code in codes {
+    // REPORTED is already sorted; unknown requested codes need no allocation or sorting.
+    for code in REPORTED.iter().copied().filter(|code| {
+        codes
+            .as_ref()
+            .is_none_or(|requested| requested.contains(code))
+    }) {
         names.push(u32::from(&code));
         let (type_id, offset) = match value_for(code) {
             InfoValue::Str(s) => {

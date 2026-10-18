@@ -21,23 +21,8 @@ from spanner_adbc import (
     StatementOptions,
 )
 
-# --------------------------------------------------------------------------- #
-# Typed-option parity guard
-# --------------------------------------------------------------------------- #
-# The enums in ``_options.py`` are hand-written, so a driver option added on the
-# Rust side silently never gets a typed member (this is exactly how
-# ``spanner.ingest.batch_write`` went missing). These tests close that gap class by
-# DERIVING both sides mechanically instead of restating a list by hand:
-#
-#   * the set of driver-specific option keys comes from the ``pub const OPTION_*``
-#     declarations in ``src/lib.rs`` — the driver's own source of truth;
-#   * each key's *level* (database / connection / statement) comes from the
-#     per-level tables in ``docs/options.md``, which already document every key.
-#
-# Nothing here builds Rust or talks to an emulator; it is pure text parsing. The
-# repo root is only present in a source checkout (which is how CI runs it — the
-# published wheel is data-only and ships no tests), so the tests skip cleanly when
-# the sources are absent rather than failing in an installed-wheel context.
+# Derive option keys from Rust constants and levels from the reference tables,
+# so additions need corresponding documentation and Python enum members.
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LIB_RS = _REPO_ROOT / "src" / "lib.rs"
@@ -160,12 +145,10 @@ def test_typed_enum_members_are_real_keys_at_their_level(heading, enum_cls):
 
 
 def test_connect_functions_take_db_kwargs():
-    """Both connect entry points expose the raw-option escape hatch and nothing
-    else credential-shaped — all options travel through db_kwargs now."""
+    """Both connect entry points take credentials through db_kwargs."""
     for fn in (spanner_adbc.connect, spanner_adbc.dbapi.connect):
         params = inspect.signature(fn).parameters
         assert "db_kwargs" in params
-        # The friendly per-credential kwargs were removed in favour of db_kwargs.
         assert "access_token" not in params
         assert "keyfile" not in params
         assert "uri" not in params

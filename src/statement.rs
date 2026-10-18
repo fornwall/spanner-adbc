@@ -470,8 +470,7 @@ impl SpannerStatement {
         Ok(Box::new(reader))
     }
 
-    /// Apply one or more DDL statements as a single Spanner `UpdateDatabaseDdl` schema change,
-    /// which makes a multi-step change (dbt's intermediate-table build plus rename swap) near-atomic.
+    /// Submit DDL through `UpdateDatabaseDdl`. Statements in a batch are not transactional.
     ///
     /// DDL always runs **immediately, regardless of the connection's transaction mode** — Spanner
     /// DDL goes through the admin API and is never transactional, so it neither fixes a manual

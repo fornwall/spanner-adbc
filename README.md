@@ -24,7 +24,8 @@ For Python installation and examples, see [python/README.md](python/README.md).
   A transaction supports either snapshot queries or buffered writes; it cannot mix the two.
 - **Binding:** Arrow batches or streams supply one execution per row. Binding is positional by
   default; `adbc.statement.bind_by_name=true` matches column names to `@name` parameters.
-  Multi-row bound queries share one read-only snapshot.
+  Parameters retain their Arrow types, including typed nulls and empty arrays. Multi-row bound
+  queries share one read-only snapshot.
 - **Bulk ingest:** all four `adbc.ingest.mode` values, using insert mutations. Table creation
   leaves primary-key generation to Spanner's
   [hidden `rowid`](https://docs.cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys).

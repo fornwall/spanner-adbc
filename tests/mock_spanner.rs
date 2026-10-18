@@ -640,7 +640,7 @@ fn serve_begin_transaction(mock: &mut MockSpanner) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn bound_dml_strips_trailing_terminators() {
+fn bound_dml_strips_leading_and_trailing_terminators() {
     let _watchdog = watchdog!();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded = requests.clone();
@@ -649,17 +649,27 @@ fn bound_dml_strips_trailing_terminators() {
         mock.expect_commit().returning(|_| commit_ok());
     });
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().unwrap();
-    statement
-        .set_sql_query("INSERT INTO MockTable (c) VALUES (@p);; -- trailing comment")
-        .unwrap();
-    statement.bind(ingest_batch(2)).unwrap();
-    assert_eq!(statement.execute_update().unwrap(), Some(2));
+    for update in [false, true] {
+        let mut statement = connection.new_statement().unwrap();
+        statement
+            .set_sql_query(
+                "; -- empty\n; INSERT INTO MockTable (c) VALUES (@p);; -- trailing comment",
+            )
+            .unwrap();
+        statement.bind(ingest_batch(2)).unwrap();
+        if update {
+            assert_eq!(statement.execute_update().unwrap(), Some(2));
+        } else {
+            assert_eq!(statement.execute().unwrap().count(), 0);
+        }
+    }
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].statements.len(), 2);
-    for statement in &requests[0].statements {
-        assert_eq!(statement.sql, "INSERT INTO MockTable (c) VALUES (@p)");
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert_eq!(request.statements.len(), 2);
+        for statement in &request.statements {
+            assert_eq!(statement.sql, "INSERT INTO MockTable (c) VALUES (@p)");
+        }
     }
 }
 

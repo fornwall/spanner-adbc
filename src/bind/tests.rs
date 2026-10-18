@@ -155,9 +155,7 @@ fn binds_json_tagged_strings_as_json_params() {
             Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#), None])),
         ],
     );
-    // Value row: the tagged column binds with an explicit JSON param type, the untagged one
-    // stays untyped (Spanner infers STRING). Asserted via the built Statement's Debug
-    // rendering, since its params are not otherwise readable from outside the client crate.
+    // Identical storage values have distinct logical types: JSON versus STRING.
     let stmt = bind_row(Statement::builder("SELECT @p0, @p1"), &b, 0)
         .unwrap()
         .build();
@@ -167,8 +165,8 @@ fn binds_json_tagged_strings_as_json_params() {
         "no JSON param type for p0 in: {dbg}"
     );
     assert!(
-        !dbg.contains(r#""p1": Type"#),
-        "untagged p1 must stay untyped: {dbg}"
+        dbg.contains(r#""p1": Type(Type { code: String"#),
+        "untagged p1 must bind as STRING: {dbg}"
     );
     // Null row: the JSON type annotation must survive a typed null.
     let stmt = bind_row(Statement::builder("SELECT @p0, @p1"), &b, 1)
@@ -179,6 +177,63 @@ fn binds_json_tagged_strings_as_json_params() {
         dbg.contains(r#""p0": Type(Type { code: Json"#),
         "typed null lost JSON type: {dbg}"
     );
+}
+
+#[test]
+fn null_parameters_keep_their_arrow_logical_types() {
+    for (data_type, expected) in [
+        (DataType::Boolean, types::bool()),
+        (DataType::Int8, types::int64()),
+        (DataType::Int16, types::int64()),
+        (DataType::Int32, types::int64()),
+        (DataType::Int64, types::int64()),
+        (DataType::UInt8, types::int64()),
+        (DataType::UInt16, types::int64()),
+        (DataType::UInt32, types::int64()),
+        (DataType::Float16, types::float32()),
+        (DataType::Float32, types::float32()),
+        (DataType::Float64, types::float64()),
+        (DataType::Utf8, types::string()),
+        (DataType::LargeUtf8, types::string()),
+        (DataType::Utf8View, types::string()),
+        (DataType::Binary, types::bytes()),
+        (DataType::LargeBinary, types::bytes()),
+        (DataType::BinaryView, types::bytes()),
+        (DataType::FixedSizeBinary(4), types::bytes()),
+        (DataType::Date32, types::date()),
+        (DataType::Date64, types::date()),
+        (
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            types::timestamp(),
+        ),
+        (DataType::Decimal128(38, 9), types::numeric()),
+        (
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            types::string(),
+        ),
+        (
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            types::array(types::string()),
+        ),
+        (
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Int64, true))),
+            types::array(types::int64()),
+        ),
+    ] {
+        let null = arrow_array::new_null_array(&data_type, 1);
+        let b = batch(vec![Field::new("p", data_type.clone(), true)], vec![null]);
+        let actual = bound(Statement::builder("SELECT @p0"), &b, 0);
+        assert!(
+            actual.contains(&format!("\"p0\": {expected:?}")),
+            "{data_type}: {actual}"
+        );
+    }
+    let b = batch(
+        vec![Field::new("p", DataType::Null, true)],
+        vec![Arc::new(arrow_array::NullArray::new(1))],
+    );
+    let actual = bound(Statement::builder("SELECT CAST(@p0 AS STRING)"), &b, 0);
+    assert!(!actual.contains("\"p0\": Type"), "{actual}");
 }
 
 #[test]
@@ -356,6 +411,29 @@ fn create_table_sql_names_the_column_it_cannot_map() {
         err.message
     );
     assert!(err.message.contains("UInt64"), "{}", err.message);
+}
+
+#[test]
+fn ingest_ddl_rejects_types_the_value_encoder_cannot_bind() {
+    let list = |data_type| DataType::List(Arc::new(Field::new("item", data_type, true)));
+    let dictionary =
+        |data_type| DataType::Dictionary(Box::new(DataType::Int32), Box::new(data_type));
+    for data_type in [
+        DataType::Decimal128(10, -2),
+        dictionary(DataType::Decimal128(10, -2)),
+        list(DataType::Decimal128(10, -2)),
+        list(list(DataType::Int64)),
+        dictionary(list(list(DataType::Int64))),
+        list(dictionary(DataType::Utf8)),
+    ] {
+        let schema = Schema::new(vec![Field::new("bad", data_type.clone(), true)]);
+        let error = create_table_sql("t", None, &schema, false).unwrap_err();
+        assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+        assert!(
+            error.message.starts_with("ingest column \"bad\": "),
+            "{data_type}: {error}"
+        );
+    }
 }
 
 #[test]

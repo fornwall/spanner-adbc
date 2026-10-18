@@ -206,11 +206,6 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
         {"StatementTest::TestSqlIngestAppend::select-bulk-ingest",
          {"SELECT * FROM `bulk_ingest`",
           "SELECT * FROM `bulk_ingest` ORDER BY `int64s` DESC"}},
-        // Spanner cannot infer the types of undeclared parameters selected
-        // bare; the CASTs give the inference the context it needs (the driver
-        // then binds the Arrow int64/string columns to matching param types).
-        {"StatementTest::TestSqlPrepareSelectParams::select-params",
-         {"SELECT @p0, @p1", "SELECT CAST(@p0 AS INT64), CAST(@p1 AS STRING)"}},
         // Now passing (apache/arrow-adbc#4534 gave the readback a deterministic
         // `ORDER BY <col> ASC NULLS FIRST` and sorted the expected vectors — see
         // ARROW_ADBC_TAG in CMakeLists.txt). Only the INSERT column list and the

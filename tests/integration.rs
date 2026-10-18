@@ -2147,6 +2147,75 @@ fn parameter_binding_round_trip() {
     drop_tables(connection, &["AdbcBind"]);
 }
 
+#[test]
+fn standalone_parameters_preserve_arrow_types_and_values() {
+    let Some(mut fx) = fixture_unguarded() else {
+        return;
+    };
+    let mut lists =
+        arrow_array::builder::ListBuilder::new(arrow_array::builder::StringBuilder::new());
+    lists.values().append_value("one");
+    lists.values().append_null();
+    lists.append(true);
+    lists.append(true);
+    let dictionary: arrow_array::DictionaryArray<arrow_array::types::Int32Type> =
+        [Some("decoded"), None].into_iter().collect();
+    let columns: Vec<arrow_array::ArrayRef> = vec![
+        Arc::new(StringArray::from(vec![Some("Alice"), None])),
+        Arc::new(BinaryArray::from(vec![Some(b"\0\xff".as_slice()), None])),
+        Arc::new(Date32Array::from(vec![Some(0), None])),
+        Arc::new(
+            TimestampNanosecondArray::from(vec![Some(1_234_567_890), None]).with_timezone("UTC"),
+        ),
+        Arc::new(
+            Decimal128Array::from(vec![Some(1_250_000_000), None])
+                .with_precision_and_scale(38, 9)
+                .unwrap(),
+        ),
+        Arc::new(BooleanArray::from(vec![Some(true), None])),
+        Arc::new(Float32Array::from(vec![Some(1.5), None])),
+        Arc::new(Float64Array::from(vec![Some(f64::INFINITY), None])),
+        Arc::new(Int64Array::from(vec![Some(42), None])),
+        Arc::new(lists.finish()),
+        Arc::new(dictionary),
+        Arc::new(arrow_array::NullArray::new(2)),
+    ];
+    let fields = columns
+        .iter()
+        .enumerate()
+        .map(|(i, column)| Field::new(format!("p{i}"), column.data_type().clone(), true))
+        .collect::<Vec<_>>();
+    let input = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    let mut statement = fx.connection.new_statement().unwrap();
+    let mut projections = (0..11)
+        .map(|i| format!("@p{i} AS p{i}"))
+        .collect::<Vec<_>>();
+    projections.push("CAST(@p11 AS STRING) AS p11".to_string());
+    statement
+        .set_sql_query(format!("SELECT {}", projections.join(", ")))
+        .unwrap();
+    statement.bind(input.clone()).unwrap();
+    let planned = statement.execute_schema().unwrap();
+    let reader = statement.execute().unwrap();
+    assert_eq!(*reader.schema(), planned);
+    let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(batches.len(), 2);
+    let decoded = StringArray::from(vec![Some("decoded"), None]);
+    for (row, batch) in batches.iter().enumerate() {
+        assert_eq!(batch.num_rows(), 1);
+        for column in 0..10 {
+            assert_eq!(
+                batch.column(column).to_data(),
+                input.column(column).slice(row, 1).to_data(),
+                "row {row}, column {column}"
+            );
+        }
+        assert_eq!(batch.column(10).to_data(), decoded.slice(row, 1).to_data());
+        assert_eq!(batch.column(11).data_type(), &DataType::Utf8);
+        assert!(batch.column(11).is_null(0));
+    }
+}
+
 /// `prepare()` preconditions: preparing a statement before its query is set is an `InvalidState`
 /// error (the ADBC precondition), while a bulk-ingest statement needs no SQL query at all, so
 /// preparing one with only a target set is fine — even when that target table does not exist.
@@ -2213,6 +2282,47 @@ fn bulk_ingest_quotes_reserved_word_identifiers() {
     );
     assert_eq!(count_rows(connection, "`create`"), 2);
     drop_tables(connection, &["`create`"]);
+}
+
+#[test]
+fn bulk_ingest_replace_rejects_unbindable_schema_before_dropping_table() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
+    let table = "AdbcInvalidReplace";
+    let mut ddl = connection.new_statement().unwrap();
+    ddl.set_sql_query(format!(
+        "DROP TABLE IF EXISTS {table}; CREATE TABLE {table} (Id INT64) PRIMARY KEY (Id)"
+    ))
+    .unwrap();
+    ddl.execute_update().unwrap();
+    let mut insert = connection.new_statement().unwrap();
+    insert
+        .set_sql_query(format!("INSERT INTO {table} (Id) VALUES (42)"))
+        .unwrap();
+    assert_eq!(insert.execute_update().unwrap(), Some(1));
+
+    for data_type in [
+        DataType::Decimal128(10, -2),
+        DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            true,
+        ))),
+    ] {
+        let schema = Arc::new(Schema::new(vec![Field::new("bad", data_type, true)]));
+        let mut replace = ingest_stmt(connection, table, "replace");
+        replace.bind(RecordBatch::new_empty(schema)).unwrap();
+        let error = replace.execute_update().unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(
+            error.message.starts_with("ingest column \"bad\": "),
+            "{error}"
+        );
+        assert_eq!(count_rows(connection, table), 1);
+    }
+    drop_tables(connection, &[table]);
 }
 
 /// `ARRAY<scalar>` columns map to a native Arrow `List` of the element type, and their values

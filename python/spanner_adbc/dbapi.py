@@ -1,8 +1,4 @@
-"""DBAPI 2.0 (PEP 249) interface for the Spanner ADBC driver.
-
-This is the layer most users want: it returns a standard DBAPI connection with
-cursors, plus the ADBC Arrow extensions (``fetch_arrow_table``, ``fetch_df``,
-``adbc_ingest``) that pandas / polars / DuckDB consume directly.
+"""DBAPI cursors and Arrow/DataFrame helpers for the Spanner ADBC driver.
 
     import spanner_adbc.dbapi as spanner
     with spanner.connect(
@@ -10,12 +6,12 @@ cursors, plus the ADBC Arrow extensions (``fetch_arrow_table``, ``fetch_df``,
     ) as conn:
         df = conn.cursor().execute("SELECT * FROM Singers").fetch_df()
 
-Note: DBAPI is autocommit-off by default, which puts this driver into its
-buffer-and-commit manual-transaction mode — call ``conn.commit()`` to apply DML.
-Pass ``autocommit=True`` to keep the driver's default single-statement mode.
+Autocommit is off by default: call ``conn.commit()`` to apply buffered writes.
+Closing a connection discards uncommitted writes. Use ``autocommit=True`` to
+commit each DML statement immediately.
 """
 
-import typing
+from collections.abc import Mapping
 
 import adbc_driver_manager.dbapi
 from adbc_driver_manager import (
@@ -58,8 +54,8 @@ __all__ = [
 
 
 def connect(
-    db_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
-    conn_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
+    db_kwargs: Mapping[str, str] | None = None,
+    conn_kwargs: Mapping[str, str] | None = None,
     autocommit: bool = False,
 ) -> adbc_driver_manager.dbapi.Connection:
     """Open a DBAPI 2.0 connection to a Spanner database.
@@ -67,20 +63,16 @@ def connect(
     Parameters
     ----------
     db_kwargs:
-        Database-level driver options, keyed by their raw option strings — best
-        written with the :class:`DatabaseOptions` constants, e.g.
-        ``{DatabaseOptions.URI.value: "spanner:///projects/<p>/instances/<i>/databases/<d>"}``
-        (see src/lib.rs / docs/options.md). The ``uri`` option requires the
-        ``spanner://`` scheme; a bare database path is rejected. Credentials, the
-        emulator, endpoint overrides, and every other setting are passed here as
-        their raw keys — and the secret-holding ``KEYFILE_JSON`` / ``ACCESS_TOKEN``
-        options must be, since a ``uri`` may not carry them as query parameters.
+        Database options keyed by :class:`DatabaseOptions` members or raw strings.
+        Include ``DatabaseOptions.URI``, for example
+        ``spanner:///projects/p/instances/i/databases/d``. Pass credentials here;
+        inline credential JSON and access tokens are forbidden in URI parameters.
     conn_kwargs:
         Connection-level options, keyed with the :class:`ConnectionOptions`
         constants (``adbc.connection.*`` / ``spanner.*``).
     autocommit:
-        Toggles PEP 249 autocommit; ``False`` (the default) puts the driver into
-        its buffer-and-commit manual-transaction mode.
+        ``False`` (the default) buffers writes until ``commit()``. Queries and
+        writes cannot share a manual transaction. DDL always applies immediately.
     """
     # The driver manager builds and owns the database/connection handles here and
     # tears them down if the connection fails, so no manual cleanup is needed.

@@ -1,29 +1,8 @@
 """Typed option-key constants for the Spanner ADBC driver.
 
-These ``StrEnum`` members are the raw option-key strings the driver understands.
-They can be used directly as dictionary keys, and ``str()`` and formatting return
-the option key on every supported Python version. ``.value`` also remains usable.
-Every driver setting is passed as one of these keys — through
-``db_kwargs=`` / ``conn_kwargs=`` on :func:`spanner_adbc.dbapi.connect`, or
-``adbc_stmt_kwargs=`` on ``conn.cursor(...)`` — and these enums make that
-discoverable and typo-safe.
-
-Example::
-
-    import spanner_adbc.dbapi as spanner
-    from spanner_adbc import ConnectionOptions, DatabaseOptions, StatementOptions
-
-    with spanner.connect(
-        db_kwargs={DatabaseOptions.URI: "spanner:///projects/p/instances/i/databases/d"},
-        conn_kwargs={ConnectionOptions.READ_STALENESS: "max:10s"},
-    ) as conn:
-        cur = conn.cursor(
-            adbc_stmt_kwargs={StatementOptions.ROWS_PER_BATCH: "1024"}
-        )
-
-Standard ADBC option keys (``adbc.*``) live in ``adbc_driver_manager``; a few that
-the driver honours are included here for convenience. The authoritative reference
-for every option, its type, default and behaviour is ``docs/options.md``.
+Use members directly as dictionary keys in ``db_kwargs`` / ``conn_kwargs`` on
+``connect()``, or ``adbc_stmt_kwargs`` on ``cursor()``. Their string representation
+is the wire key. See ``docs/options.md`` for types, defaults and accepted values.
 """
 
 import enum
@@ -169,9 +148,6 @@ class StatementOptions(enum.StrEnum):
     #: non-atomic **BatchWrite** RPC instead of a write-only transaction.
     #: Ignored in manual-transaction mode.
     INGEST_BATCH_WRITE = "spanner.ingest.batch_write"
-    #: ``"true"`` runs the statement's DML as Partitioned DML: Spanner splits it
-    #: across partitions and applies each independently, so a large ``UPDATE`` or
-    #: ``DELETE`` never hits the per-commit mutation limit. Not atomic — a partition
-    #: may be applied more than once, so the statement must be idempotent — and
-    #: ``rowcount`` is a lower bound, not an exact count.
+    #: ``"true"`` partitions an idempotent ``UPDATE`` or ``DELETE`` across
+    #: independent commits. Non-atomic; ``rowcount`` is a lower bound.
     DML_PARTITIONED = "spanner.dml.partitioned"

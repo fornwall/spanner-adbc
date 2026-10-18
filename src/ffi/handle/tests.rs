@@ -29,12 +29,12 @@ fn option_buffer_keeps_order_and_collapses_repeats() {
 
     let entries = buffer.entries.clone();
     assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].0, OptionDatabase::Uri);
+    assert_eq!(entries[0].0, OptionDatabase::Other("x".into()));
+    assert_eq!(entries[1].0, OptionDatabase::Uri);
     assert!(
-        matches!(&entries[0].1, OptionValue::String(value) if value == "second"),
+        matches!(&entries[1].1, OptionValue::String(value) if value == "second"),
         "the later write must win"
     );
-    assert_eq!(entries[1].0, OptionDatabase::Other("x".into()));
 }
 
 #[test]
@@ -79,6 +79,46 @@ fn a_panicking_call_poisons_only_that_object() {
     let mut second_slot = second;
     unsafe { release::<u32>(&mut first_slot, "statement", null()) };
     unsafe { release::<u32>(&mut second_slot, "statement", null()) };
+}
+
+#[test]
+fn a_panicking_call_also_poisons_borrowed_handles() {
+    let mut connection = Exported::into_private_data(0_u32);
+    let mut database = Exported::into_private_data(0_u32);
+
+    let status = unsafe {
+        dispatch::<u32, _>(connection, "connection", null(), |state| {
+            let mut borrowed = lock_state::<u32>(database, "database")?;
+            *state = 1;
+            *borrowed = 1;
+            panic!("panic while initializing from a borrowed database");
+        })
+    };
+    assert_eq!(status, AdbcStatusCode::from(Status::Internal));
+
+    for (slot, kind) in [(connection, "connection"), (database, "database")] {
+        let mut called = false;
+        let status = unsafe {
+            dispatch::<u32, _>(slot, kind, null(), |_| {
+                called = true;
+                Ok(())
+            })
+        };
+        assert_eq!(status, AdbcStatusCode::from(Status::Internal), "{kind}");
+        assert!(!called, "must not reuse the poisoned {kind}");
+        assert_eq!(
+            unsafe { lock_state::<u32>(slot, kind) }.unwrap_err().status,
+            Status::Internal,
+        );
+    }
+
+    for (slot, kind) in [(&mut connection, "connection"), (&mut database, "database")] {
+        assert_eq!(
+            unsafe { release::<u32>(slot, kind, null()) },
+            ADBC_STATUS_OK
+        );
+        assert!(slot.is_null());
+    }
 }
 
 /// A cancel handle that parks inside `try_cancel` until the test releases it, so a `Release` can
@@ -251,8 +291,7 @@ fn a_call_blocked_behind_a_dispatch_turn_completes_instead_of_failing() {
     unsafe { release::<u32>(&mut slot, "statement", null()) };
 }
 
-/// With the poison flag now atomic and the state behind a lock, overlapping ordinary calls
-/// serialize; under the previous `&mut` scheme this loop was a data race.
+/// Ordinary calls on one handle must serialize access to its state.
 #[test]
 fn concurrent_dispatches_serialize_instead_of_racing() {
     const THREADS: usize = 8;

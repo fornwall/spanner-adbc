@@ -8,7 +8,7 @@ the library with ``python -m spanner_adbc.manifest install``.
 
 import functools
 import pathlib
-import typing
+from collections.abc import Mapping
 
 import adbc_driver_manager
 
@@ -29,30 +29,22 @@ ENTRYPOINT = "AdbcSpannerInit"
 
 
 def connect(
-    db_kwargs: typing.Optional[typing.Mapping[str, str]] = None,
+    db_kwargs: Mapping[str, str] | None = None,
 ) -> adbc_driver_manager.AdbcDatabase:
     """Create a low-level ADBC database handle for Spanner.
 
     Parameters
     ----------
     db_kwargs:
-        Database-level driver options, keyed by their raw option strings — best
-        written with the :class:`DatabaseOptions` constants, e.g.
-        ``{DatabaseOptions.URI.value: "spanner:///projects/<p>/instances/<i>/databases/<d>"}``
-        (see src/lib.rs / docs/options.md). The ``uri`` option requires the
-        ``spanner://`` scheme; a bare database path is rejected. Credentials, the
-        emulator, endpoint overrides, and every other setting are all passed here
-        as their raw keys — for example
-        ``{DatabaseOptions.URI.value: "...", DatabaseOptions.KEYFILE.value: "/path/key.json"}``
-        or ``{DatabaseOptions.URI.value: "...", DatabaseOptions.EMULATOR.value: "true"}``.
+        Database options keyed by :class:`DatabaseOptions` members or raw strings.
+        ``DatabaseOptions.URI`` requires a URI such as
+        ``spanner:///projects/p/instances/i/databases/d``. Pass credentials and
+        emulator settings here too; see ``docs/options.md``.
 
     For a DBAPI 2.0 connection, prefer :func:`spanner_adbc.dbapi.connect`.
     """
-    # ** unpacking accepts the dotted, non-identifier option keys; they land in
-    # AdbcDatabase's **kwargs and are forwarded as ADBC options.
-    options = dict(db_kwargs) if db_kwargs else {}
     return adbc_driver_manager.AdbcDatabase(
-        driver=_driver_path(), entrypoint=ENTRYPOINT, **options
+        driver=_driver_path(), entrypoint=ENTRYPOINT, **(db_kwargs or {})
     )
 
 
