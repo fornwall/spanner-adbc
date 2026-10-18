@@ -127,7 +127,7 @@ cargo +nightly fuzz run sql
 test and Clippy commands. The [workflow](../.github/workflows/fuzz.yml) derives its matrix from
 `fuzz/Cargo.toml`, seeds runs from `fuzz/seeds/`, and caches the generated corpus. The unit test
 `every_fuzz_target_is_wired_and_documented` checks harnesses, manifest entries, CI discovery and
-target names in this page and `CLAUDE.md`.
+target names in this page and [AGENTS.md](../AGENTS.md#fuzzing).
 
 ## Benchmarks
 

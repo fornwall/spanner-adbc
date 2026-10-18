@@ -1,6 +1,5 @@
 """Option-key parity and option round trips through the Python wrappers."""
 
-import inspect
 import re
 from pathlib import Path
 
@@ -9,16 +8,12 @@ import pytest
 from conftest import database_options
 
 import spanner_adbc
-import spanner_adbc.dbapi
 import spanner_adbc.dbapi as spanner
 from spanner_adbc import (
     ConnectionOptions,
     DatabaseOptions,
     StatementOptions,
 )
-
-# Derive option keys from Rust constants and levels from the reference tables,
-# so additions need corresponding documentation and Python enum members.
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LIB_RS = _REPO_ROOT / "src" / "lib.rs"
@@ -30,11 +25,8 @@ _EXPECTED_MISSING = {
     "spanner.commit_stats.mutation_count",
 }
 
-# `pub const OPTION_FOO: &str = "spanner.foo";` — the value may wrap onto its own
-# line (rustfmt does this for the longer keys), hence the newline-tolerant `\s*`.
+# Allow rustfmt to wrap a constant's value onto the next line.
 _OPTION_CONST_RE = re.compile(r'pub const OPTION_[A-Z0-9_]+: &str =\s*"([^"]+)"\s*;')
-
-# A row of a `docs/options.md` level table: `| `spanner.foo` | ... |`.
 _DOC_TABLE_KEY_RE = re.compile(r"^\| `([^`]+)` \|", re.M)
 
 _LEVELS = [
@@ -60,17 +52,12 @@ def _require_sources():
 def _driver_option_keys():
     """Every option key the driver declares, parsed out of `src/lib.rs`."""
     keys = set(_OPTION_CONST_RE.findall(_LIB_RS.read_text()))
-    assert keys, f"parsed no OPTION_* constants out of {_LIB_RS} — the guard would be vacuous"
+    assert keys, f"parsed no OPTION_* constants out of {_LIB_RS}"
     return keys
 
 
 def _documented_keys_by_level():
-    """`{level name: {key, ...}}` — the option keys documented at each level.
-
-    A level aggregates the tables of one or more `docs/options.md` sections (see
-    `_LEVEL_SECTIONS`); the shared section, documenting options available on both
-    the connection and the statement, feeds both of those levels.
-    """
+    """Collect documented keys, including shared keys at both applicable levels."""
     keys_by_section = {}
     for section in re.split(r"^## ", _OPTIONS_MD.read_text(), flags=re.M):
         heading = section.split("\n", 1)[0].strip()
@@ -84,14 +71,7 @@ def _documented_keys_by_level():
 
 
 def test_every_driver_option_key_is_documented_at_some_level():
-    """Precondition for the parity check below: `docs/options.md` must place every
-    `OPTION_*` key in a level table, otherwise a key could dodge the parity test by
-    being undocumented rather than by being present at the wrong level.
-
-    (The Rust test `every_handled_option_key_is_documented` in `src/lib.rs` checks
-    documentation too, but against a hand-written key list; this one derives the
-    key set, so it also covers keys that list forgets.)
-    """
+    """An undocumented key must not escape the enum parity checks below."""
     _require_sources()
     documented = set().union(*_documented_keys_by_level().values())
     undocumented = _driver_option_keys() - documented
@@ -132,44 +112,15 @@ def test_typed_enum_members_are_real_keys_at_their_level(heading, enum_cls):
     )
 
 
-def test_connect_functions_take_db_kwargs():
-    """Both connect entry points take credentials through db_kwargs."""
-    for fn in (spanner_adbc.connect, spanner_adbc.dbapi.connect):
-        params = inspect.signature(fn).parameters
-        assert "db_kwargs" in params
-        assert "access_token" not in params
-        assert "keyfile" not in params
-        assert "uri" not in params
-
-
-def test_option_enums_are_exported_and_well_formed():
+def test_option_enums_are_exported_without_aliases():
     for enum_cls in (DatabaseOptions, ConnectionOptions, StatementOptions):
-        values = [member.value for member in enum_cls]
-        # No duplicate keys within a level.
+        assert getattr(spanner, enum_cls.__name__) is enum_cls
+        assert enum_cls.__name__ in spanner_adbc.__all__
+        assert enum_cls.__name__ in spanner.__all__
+        # Enum iteration skips aliases, so check all declared members.
+        values = [member.value for member in enum_cls.__members__.values()]
         assert len(values) == len(set(values))
-        # Every key uses a known ADBC prefix.
-        assert all(v.startswith(("spanner.", "adbc.", "uri")) for v in values)
-
-
-def test_option_enum_values_are_usable_as_kwargs_keys():
-    # The whole point of the enums: .value is the raw string db_kwargs expects.
-    assert DatabaseOptions.ACCESS_TOKEN.value == "spanner.auth.access_token"
-    assert ConnectionOptions.READ_STALENESS.value == "spanner.read.staleness"
-    assert StatementOptions.ROWS_PER_BATCH.value == "spanner.rows_per_batch"
-
-
-@pytest.mark.parametrize("enum_cls", [DatabaseOptions, ConnectionOptions, StatementOptions])
-def test_option_members_behave_as_wire_strings(enum_cls):
-    for member in enum_cls:
-        assert isinstance(member, str)
-        assert member == member.value
-        assert hash(member) == hash(member.value)
-        assert str(member) == member.value
-        assert "%s" % member == member.value
-        assert f"{member}" == member.value
-        assert "{}".format(member) == member.value
-        assert f"{member:>80}" == f"{member.value:>80}"
-        assert dict(**{member: "configured"}) == {member.value: "configured"}
+        assert all(str(member) == member.value for member in enum_cls)
 
 
 def test_low_level_connect_accepts_option_members_directly(monkeypatch):
@@ -195,6 +146,24 @@ def test_low_level_connect_accepts_option_members_directly(monkeypatch):
             "spanner.emulator": "true",
         }
     ]
+
+
+@pytest.mark.parametrize("autocommit", [False, True])
+def test_dbapi_connect_forwards_options(monkeypatch, autocommit):
+    monkeypatch.setattr(spanner, "_driver_path", lambda: "/driver.so")
+    monkeypatch.setattr(spanner.adbc_driver_manager.dbapi, "connect", lambda **kwargs: kwargs)
+    options = {DatabaseOptions.ACCESS_TOKEN: "token"}
+    connection_options = {ConnectionOptions.REQUEST_TAG: "python-test"}
+
+    assert spanner.connect(options, connection_options, autocommit=autocommit) == {
+        "driver": "/driver.so",
+        "entrypoint": spanner_adbc.ENTRYPOINT,
+        "db_kwargs": {"spanner.auth.access_token": "token"},
+        "conn_kwargs": {"spanner.request.tag": "python-test"},
+        "autocommit": autocommit,
+    }
+    assert options == {DatabaseOptions.ACCESS_TOKEN: "token"}
+    assert connection_options == {ConnectionOptions.REQUEST_TAG: "python-test"}
 
 
 def test_connection_option_round_trips_through_kwargs(spanner_database):

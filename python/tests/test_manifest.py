@@ -2,6 +2,7 @@
 
 import os
 import tomllib
+from pathlib import Path
 
 import pytest
 
@@ -9,28 +10,6 @@ from conftest import database_options
 
 import spanner_adbc
 from spanner_adbc import manifest as manifest_mod
-
-# Architecture / OS names from the spec's authoritative platform-tuple table.
-_SPEC_OSES = {"linux", "macos", "windows", "freebsd", "openbsd"}
-_SPEC_ARCHES = {
-    "x86",
-    "amd64",
-    "arm",
-    "armbe",
-    "arm64",
-    "arm64be",
-    "s390x",
-    "powerpc",
-    "powerpc64",
-    "powerpc64le",
-    "riscv",
-    "riscv64",
-    "sparc",
-    "sparc64",
-    "wasm32",
-    "wasm64",
-}
-_SPEC_ENVS = {"musl", "mingw"}
 
 
 def _has_library() -> bool:
@@ -45,16 +24,6 @@ needs_library = pytest.mark.skipif(
     not _has_library(),
     reason="no bundled driver library in this checkout/install",
 )
-
-
-def test_platform_tuple_matches_the_spec_vocabulary():
-    tuple_ = manifest_mod.platform_tuple()
-    os_name, _, rest = tuple_.partition("_")
-    arch, _, env = rest.partition("_")
-    assert os_name in _SPEC_OSES, tuple_
-    assert arch in _SPEC_ARCHES, tuple_
-    if env:
-        assert env in _SPEC_ENVS, tuple_
 
 
 @needs_library
@@ -98,8 +67,8 @@ def test_manifest_escapes_backslashes(tmp_path):
 
 
 def test_manifest_does_not_require_a_known_platform(tmp_path, monkeypatch):
-    # A source-built library can work on architectures without published wheels.
-    monkeypatch.setattr(manifest_mod.platform, "machine", lambda: "riscv64")
+    # Source-built libraries can work on platforms without published wheels.
+    monkeypatch.setattr(manifest_mod.sys, "platform", "unknown")
     library = tmp_path / "libspanner_adbc.so"
     written = manifest_mod.install(tmp_path, library=library)
     assert tomllib.loads(written.read_text())["Driver"]["shared"] == str(library.resolve())
@@ -113,8 +82,6 @@ def test_manifest_paths_round_trip_through_toml(tmp_path, name):
 
 
 def test_failed_install_preserves_existing_manifest(tmp_path, monkeypatch):
-    from pathlib import Path
-
     target = tmp_path / manifest_mod.MANIFEST_NAME
     target.write_text("original manifest", encoding="utf-8")
 
@@ -176,20 +143,32 @@ def test_cli_path_and_print(capsys):
         assert tomllib.loads(capsys.readouterr().out)["Driver"]["shared"]
 
 
-def test_default_install_dir_is_a_searched_directory():
-    """The default target must be a directory a driver manager actually searches.
+@pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
+def test_virtualenv_manifest_stays_in_the_environment(tmp_path, monkeypatch, platform):
+    monkeypatch.setattr(manifest_mod.sys, "prefix", str(tmp_path / "venv"))
+    monkeypatch.setattr(manifest_mod.sys, "base_prefix", str(tmp_path / "base"))
+    monkeypatch.setattr(manifest_mod.sys, "platform", platform)
+    assert manifest_mod.default_install_dir() == tmp_path / "venv/etc/adbc/drivers"
 
-    In a venv the Python driver manager adds ``<sys.prefix>/etc/adbc/drivers``;
-    outside one, the user config directory is searched under the default load
-    flags.
-    """
-    import sys
 
-    directory = manifest_mod.default_install_dir()
-    if sys.prefix != sys.base_prefix:
-        assert directory == __import__("pathlib").Path(sys.prefix) / "etc/adbc/drivers"
-    else:
-        assert "adbc" in str(directory).lower()
+@pytest.mark.parametrize(
+    "platform,env,expected",
+    [
+        ("linux", {}, "home/.config/adbc/drivers"),
+        ("linux", {"XDG_CONFIG_HOME": "config"}, "config/adbc/drivers"),
+        ("darwin", {}, "home/Library/Application Support/ADBC/Drivers"),
+        ("win32", {"LOCALAPPDATA": "local"}, "local/ADBC/Drivers"),
+    ],
+)
+def test_user_manifest_uses_platform_config_directory(tmp_path, monkeypatch, platform, env, expected):
+    monkeypatch.setattr(manifest_mod.sys, "prefix", manifest_mod.sys.base_prefix)
+    monkeypatch.setattr(manifest_mod.sys, "platform", platform)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    for key in ("XDG_CONFIG_HOME", "LOCALAPPDATA"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, str(tmp_path / value))
+    assert manifest_mod.default_install_dir() == tmp_path / expected
 
 
 @needs_library

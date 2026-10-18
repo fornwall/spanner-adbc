@@ -1,6 +1,4 @@
-//! The option surface shared by more than one ADBC object: coercions from an [`OptionValue`] into
-//! concrete Rust types, the [`SharedConfig`] bundle a connection and its statements both carry, and
-//! the [`impl_shared_option_dispatch`] macro that routes option keys to that bundle for both.
+//! Option parsing and configuration shared by connections and statements.
 //!
 //! The driver, connection and statement all accept the same handful of option shapes — booleans
 //! (as exactly the string `true`/`false`), plain strings, positive integers (as an integer or a
@@ -243,7 +241,7 @@ pub(crate) fn double_from_stored_string(stored: Result<String>, what: &str) -> R
 /// parsed by [`int_from_stored_string`] / [`double_from_stored_string`]. Only `get_option_string`
 /// differs per level; the key type is `Self::Option`, whose `AsRef<str>` names the key for the
 /// error message. Read-only keys like `spanner.commit_stats.mutation_count` live in
-/// `get_option_string` (via [`impl_shared_option_dispatch`]) and need no special-casing here.
+/// `get_option_string` and need no special-casing here.
 macro_rules! impl_typed_option_getters {
     () => {
         fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
@@ -267,11 +265,8 @@ pub(crate) use impl_typed_option_getters;
 /// [`SpannerStatement`](crate::statement::SpannerStatement) it creates both carry: everything
 /// option-settable that is *not* a client handle.
 ///
-/// A connection starts from [`Default`] and applies its own options on top; each new statement
-/// takes an [`inherit`](Self::inherit)ed copy, and may then override the fields it also exposes
-/// (the "staleness pattern"). [`impl_shared_option_dispatch`] emits the key→setter / key→getter
-/// dispatch for these fields once, for both objects — which is why both must name their field
-/// `config`. Bundled, adding an option touches this struct and the macro, and no signature.
+/// A connection starts from [`Default`]; new statements [`inherit`](Self::inherit) its values
+/// and can override shared options through [`set_option`](Self::set_option).
 #[derive(Debug, Clone)]
 pub(crate) struct SharedConfig {
     /// The standard `adbc.connection.readonly` flag: a connection that has it set rejects all
@@ -353,266 +348,106 @@ impl SharedConfig {
     pub(crate) fn is_read_only(&self) -> bool {
         self.read_only.load(Ordering::Acquire)
     }
-}
 
-/// Generate the two shared option-dispatch helpers that `SpannerConnection` and `SpannerStatement`
-/// share verbatim.
-///
-/// Both objects carry a [`SharedConfig`] — as a field named `config` — whose fields have identical
-/// setters/getters on either object, so this macro emits the key→setter / key→getter dispatch once
-/// (rather than ~20 near-identical match arms in each of `connection.rs` and `statement.rs`) as two
-/// inherent methods:
-///
-/// - `set_shared_option(key, value)` applies a shared option, returning `Ok(Some(()))` when the key
-///   was handled and `Ok(None)` when it is not a shared key (so the caller can fall through to its
-///   own options / error). The value's own parse errors propagate unchanged.
-/// - `shared_option_string(key)` reports a shared option's canonical string, returning the
-///   `NotFound` error for an unset (or non-shared) key exactly as the hand-written arms did.
-///
-/// An arm that is pure plumbing — "parse this value into that field" — names the option key once,
-/// as the arm's own pattern, and passes that same `key` to the parser as the label for its error;
-/// only the parsers whose shape is more than a coercion stay behind a named function.
-///
-/// Object-specific options (ingest/bind/batch on the statement, `transaction.tag` on the
-/// connection, catalog/schema, autocommit, …) stay as explicit arms in each caller; only the
-/// mechanical glue lives here. The referenced names (`TimestampPrecision`, `err`, `Status`,
-/// `OptionValue`, `Result`) resolve at the expansion site, where both callers already import them.
-macro_rules! impl_shared_option_dispatch {
-    () => {
-        /// Apply one of the shared "staleness-pattern" options. `Ok(Some(()))` = handled;
-        /// `Ok(None)` = `key` is not a shared option. See [`impl_shared_option_dispatch`].
-        fn set_shared_option(&mut self, key: &str, value: OptionValue) -> Result<Option<()>> {
-            use crate::options::{F64Range, f64_option, non_empty_string_option};
-            match key {
-                crate::OPTION_READ_STALENESS => self.config.read_staleness.set_staleness(value)?,
-                crate::OPTION_REQUEST_PRIORITY => self.config.request.set_priority(value)?,
-                crate::OPTION_REQUEST_TAG => self.config.request.set_request_tag(value)?,
-                crate::OPTION_DIRECTED_READ => self.config.directed_read.set(value)?,
-                crate::OPTION_MAX_COMMIT_DELAY => {
-                    self.config.request.set_max_commit_delay(value)?
-                }
-                crate::OPTION_COMMIT_STATS => self.config.request.set_commit_stats(value)?,
-                crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS => self
-                    .config
-                    .request
-                    .set_exclude_txn_from_change_streams(value)?,
-                crate::OPTION_QUERY_OPTIMIZER_VERSION => {
-                    self.config.query_options.optimizer_version =
-                        non_empty_string_option(value, key)?
-                }
-                crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
-                    self.config.query_options.optimizer_statistics_package =
-                        non_empty_string_option(value, key)?
-                }
-                crate::OPTION_MAX_TIMESTAMP_PRECISION => {
-                    self.config.timestamp_precision = TimestampPrecision::parse_option(value)?
-                }
-                crate::OPTION_RPC_TIMEOUT_QUERY => {
-                    self.config.timeouts.query =
-                        f64_option(value, key, F64Range::NonNegativeSeconds)?
-                }
-                crate::OPTION_RPC_TIMEOUT_UPDATE => {
-                    self.config.timeouts.update =
-                        f64_option(value, key, F64Range::NonNegativeSeconds)?
-                }
-                crate::OPTION_RPC_TIMEOUT_FETCH => {
-                    self.config.timeouts.fetch =
-                        f64_option(value, key, F64Range::NonNegativeSeconds)?
-                }
-                crate::OPTION_RETRY_MAX_ATTEMPTS => self.config.retry.set_max_attempts(value)?,
-                crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
-                    self.config.retry.max_elapsed_seconds =
-                        f64_option(value, key, F64Range::PositiveSeconds)?
-                }
-                crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
-                    self.config.retry.backoff_initial_seconds =
-                        f64_option(value, key, F64Range::PositiveSeconds)?
-                }
-                crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
-                    self.config.retry.backoff_max_seconds =
-                        f64_option(value, key, F64Range::PositiveSeconds)?
-                }
-                crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
-                    self.config.retry.backoff_multiplier =
-                        f64_option(value, key, F64Range::PositiveFactor)?
-                }
-                _ => return Ok(None),
+    /// Apply a shared option. Returns `false` for keys this configuration does not handle.
+    pub(crate) fn set_option(&mut self, key: &str, value: OptionValue) -> Result<bool> {
+        match key {
+            crate::OPTION_READ_STALENESS => self.read_staleness.set_staleness(value)?,
+            crate::OPTION_REQUEST_PRIORITY => self.request.set_priority(value)?,
+            crate::OPTION_REQUEST_TAG => self.request.set_request_tag(value)?,
+            crate::OPTION_DIRECTED_READ => self.directed_read.set(value)?,
+            crate::OPTION_MAX_COMMIT_DELAY => self.request.set_max_commit_delay(value)?,
+            crate::OPTION_COMMIT_STATS => self.request.set_commit_stats(value)?,
+            crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS => {
+                self.request.set_exclude_txn_from_change_streams(value)?
             }
-            Ok(Some(()))
+            crate::OPTION_QUERY_OPTIMIZER_VERSION => {
+                self.query_options.optimizer_version = non_empty_string_option(value, key)?
+            }
+            crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
+                self.query_options.optimizer_statistics_package =
+                    non_empty_string_option(value, key)?
+            }
+            crate::OPTION_MAX_TIMESTAMP_PRECISION => {
+                self.timestamp_precision = TimestampPrecision::parse_option(value)?
+            }
+            crate::OPTION_RPC_TIMEOUT_QUERY => {
+                self.timeouts.query = f64_option(value, key, F64Range::NonNegativeSeconds)?
+            }
+            crate::OPTION_RPC_TIMEOUT_UPDATE => {
+                self.timeouts.update = f64_option(value, key, F64Range::NonNegativeSeconds)?
+            }
+            crate::OPTION_RPC_TIMEOUT_FETCH => {
+                self.timeouts.fetch = f64_option(value, key, F64Range::NonNegativeSeconds)?
+            }
+            crate::OPTION_RETRY_MAX_ATTEMPTS => self.retry.set_max_attempts(value)?,
+            crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
+                self.retry.max_elapsed_seconds = f64_option(value, key, F64Range::PositiveSeconds)?
+            }
+            crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
+                self.retry.backoff_initial_seconds =
+                    f64_option(value, key, F64Range::PositiveSeconds)?
+            }
+            crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
+                self.retry.backoff_max_seconds = f64_option(value, key, F64Range::PositiveSeconds)?
+            }
+            crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
+                self.retry.backoff_multiplier = f64_option(value, key, F64Range::PositiveFactor)?
+            }
+            _ => return Ok(false),
         }
+        Ok(true)
+    }
 
-        /// Report a shared option's canonical string, or a `NotFound` error when it is unset or not
-        /// a shared option. See [`impl_shared_option_dispatch`].
-        fn shared_option_string(&self, key: &str) -> Result<String> {
-            let value: Option<String> = match key {
-                crate::OPTION_READ_STALENESS => self
-                    .config
-                    .read_staleness
-                    .staleness_string()
-                    .map(str::to_string),
-                crate::OPTION_REQUEST_PRIORITY => {
-                    self.config.request.priority_string().map(str::to_string)
-                }
-                crate::OPTION_REQUEST_TAG => {
-                    self.config.request.request_tag_string().map(str::to_string)
-                }
-                crate::OPTION_DIRECTED_READ => self
-                    .config
-                    .directed_read
-                    .option_string()
-                    .map(str::to_string),
-                crate::OPTION_MAX_COMMIT_DELAY => self
-                    .config
-                    .request
-                    .max_commit_delay_string()
-                    .map(str::to_string),
-                // A plain boolean; always reports the effective value ("true"/"false", default
-                // "false").
-                crate::OPTION_COMMIT_STATS => {
-                    Some(self.config.request.commit_stats_string().to_string())
-                }
-                // A plain boolean; always reports the effective value ("true"/"false", default
-                // "false").
-                crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS => Some(
-                    self.config
-                        .request
-                        .exclude_txn_from_change_streams_string()
-                        .to_string(),
-                ),
-                // The captured mutation count from the most recent commit that requested commit
-                // stats; None → NotFound below.
-                crate::OPTION_COMMIT_STATS_MUTATION_COUNT => self
-                    .config
-                    .commit_stats
-                    .mutation_count()
-                    .map(|n| n.to_string()),
-                crate::OPTION_QUERY_OPTIMIZER_VERSION => {
-                    self.config.query_options.optimizer_version.clone()
-                }
-                crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => self
-                    .config
-                    .query_options
-                    .optimizer_statistics_package
-                    .clone(),
-                // Always set (there is a default mode), so the effective value is always reported.
-                crate::OPTION_MAX_TIMESTAMP_PRECISION => {
-                    Some(self.config.timestamp_precision.as_str().to_string())
-                }
-                crate::OPTION_RPC_TIMEOUT_QUERY => {
-                    self.config.timeouts.query.map(|s| s.to_string())
-                }
-                crate::OPTION_RPC_TIMEOUT_UPDATE => {
-                    self.config.timeouts.update.map(|s| s.to_string())
-                }
-                crate::OPTION_RPC_TIMEOUT_FETCH => {
-                    self.config.timeouts.fetch.map(|s| s.to_string())
-                }
-                crate::OPTION_RETRY_MAX_ATTEMPTS => {
-                    self.config.retry.max_attempts.map(|n| n.to_string())
-                }
-                crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
-                    self.config.retry.max_elapsed_seconds.map(|s| s.to_string())
-                }
-                crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => self
-                    .config
-                    .retry
-                    .backoff_initial_seconds
-                    .map(|s| s.to_string()),
-                crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
-                    self.config.retry.backoff_max_seconds.map(|s| s.to_string())
-                }
-                crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
-                    self.config.retry.backoff_multiplier.map(|m| m.to_string())
-                }
-                _ => None,
-            };
-            value.ok_or_else(|| crate::error::option_not_set(key))
-        }
-    };
+    /// Return a shared option, or `NotFound` when it is unset or unknown.
+    pub(crate) fn option_string(&self, key: &str) -> Result<String> {
+        let value: Option<String> = match key {
+            crate::OPTION_READ_STALENESS => {
+                self.read_staleness.staleness_string().map(str::to_string)
+            }
+            crate::OPTION_REQUEST_PRIORITY => self.request.priority_string().map(str::to_string),
+            crate::OPTION_REQUEST_TAG => self.request.request_tag_string().map(str::to_string),
+            crate::OPTION_DIRECTED_READ => self.directed_read.option_string().map(str::to_string),
+            crate::OPTION_MAX_COMMIT_DELAY => {
+                self.request.max_commit_delay_string().map(str::to_string)
+            }
+            crate::OPTION_COMMIT_STATS => Some(self.request.commit_stats_string().to_string()),
+            crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS => Some(
+                self.request
+                    .exclude_txn_from_change_streams_string()
+                    .to_string(),
+            ),
+            crate::OPTION_COMMIT_STATS_MUTATION_COUNT => {
+                self.commit_stats.mutation_count().map(|n| n.to_string())
+            }
+            crate::OPTION_QUERY_OPTIMIZER_VERSION => self.query_options.optimizer_version.clone(),
+            crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
+                self.query_options.optimizer_statistics_package.clone()
+            }
+            crate::OPTION_MAX_TIMESTAMP_PRECISION => {
+                Some(self.timestamp_precision.as_str().to_string())
+            }
+            crate::OPTION_RPC_TIMEOUT_QUERY => self.timeouts.query.map(|s| s.to_string()),
+            crate::OPTION_RPC_TIMEOUT_UPDATE => self.timeouts.update.map(|s| s.to_string()),
+            crate::OPTION_RPC_TIMEOUT_FETCH => self.timeouts.fetch.map(|s| s.to_string()),
+            crate::OPTION_RETRY_MAX_ATTEMPTS => self.retry.max_attempts.map(|n| n.to_string()),
+            crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
+                self.retry.max_elapsed_seconds.map(|s| s.to_string())
+            }
+            crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
+                self.retry.backoff_initial_seconds.map(|s| s.to_string())
+            }
+            crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
+                self.retry.backoff_max_seconds.map(|s| s.to_string())
+            }
+            crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
+                self.retry.backoff_multiplier.map(|m| m.to_string())
+            }
+            _ => None,
+        };
+        value.ok_or_else(|| crate::error::option_not_set(key))
+    }
 }
-pub(crate) use impl_shared_option_dispatch;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use adbc_core::error::Status;
-
-    #[test]
-    fn int_getter_parses_integer_valued_options() {
-        let get = |v: &str| int_from_stored_string(Ok(v.to_string()), "option o");
-        assert_eq!(get("8192").unwrap(), 8192);
-        assert_eq!(get("-5").unwrap(), -5);
-        assert_eq!(get("0").unwrap(), 0);
-    }
-
-    #[test]
-    fn bool_option_accepts_exact_true_false_and_rejects_int_typed_values() {
-        // The string forms are exactly "true"/"false": lenient spellings (case variants,
-        // 1/0, yes/no) are rejected with an error naming the option and the expected spellings.
-        assert!(bool_option(OptionValue::String("true".into()), "option o").unwrap());
-        assert!(!bool_option(OptionValue::String("false".into()), "option o").unwrap());
-        for s in ["TRUE", "1", "yes", "0", "No", "maybe"] {
-            let error = bool_option(OptionValue::String(s.into()), "option o").unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments, "string {s:?}");
-            assert!(error.message.contains("option o"), "{}", error.message);
-            assert!(
-                error.message.contains("\"true\" or \"false\""),
-                "{}",
-                error.message
-            );
-        }
-        // An int-typed set is rejected too: the getters serve the canonical
-        // "true"/"false" string, so accepting SetOptionInt(k, 1) would break the spec's set/get
-        // type symmetry — and no surveyed ADBC driver accepts an int set for a boolean option.
-        for i in [0, 1, -1] {
-            let error = bool_option(OptionValue::Int(i), "option o").unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments, "Int({i})");
-            assert!(error.message.contains("option o"), "{}", error.message);
-            assert!(
-                error.message.contains("\"true\"/\"false\""),
-                "{}",
-                error.message
-            );
-        }
-    }
-
-    #[test]
-    fn int_getter_reports_set_but_non_integer_values_as_invalid_arguments() {
-        // A value that exists but is not an integer must NOT be NotFound (that would read as
-        // "option unset"): it is an InvalidArguments error naming the option and the value.
-        for value in ["true", "max:10s", "1.5", "", "projects/p"] {
-            let error = int_from_stored_string(Ok(value.to_string()), "option o").unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments, "value {value:?}");
-            assert!(error.message.contains("option o"), "{}", error.message);
-            assert!(
-                error.message.contains(&format!("{value:?}")),
-                "{}",
-                error.message
-            );
-        }
-    }
-
-    #[test]
-    fn typed_getters_propagate_the_string_lookup_error_unchanged() {
-        // Unset (NotFound) and unknown-key errors from get_option_string pass through as-is.
-        let unset = || crate::error::option_not_set("o");
-        let expected = unset().message;
-        let error = int_from_stored_string(Err(unset()), "option o").unwrap_err();
-        assert_eq!(error.status, Status::NotFound);
-        assert_eq!(error.message, expected);
-        let error = double_from_stored_string(Err(unset()), "option o").unwrap_err();
-        assert_eq!(error.status, Status::NotFound);
-        assert_eq!(error.message, expected);
-    }
-
-    #[test]
-    fn double_getter_parses_and_rejects() {
-        let get = |v: &str| double_from_stored_string(Ok(v.to_string()), "option o");
-        assert_eq!(get("1.5").unwrap(), 1.5);
-        // Integer-valued options can always be represented as doubles.
-        assert_eq!(get("3600").unwrap(), 3600.0);
-        let error = get("true").unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-        assert!(error.message.contains("option o"), "{}", error.message);
-    }
-}
+mod tests;

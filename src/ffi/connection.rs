@@ -48,24 +48,15 @@ pub(super) unsafe extern "C" fn connection_init(
     database: *mut AdbcDatabase,
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
-    // Read once, up front: `install_cancel_handle` reaches the very object `with_state`
-    // dispatches on, through its `cancel` lock rather than its state lock.
     let slot = unsafe { slot_of(connection) };
     unsafe {
         with_state(connection, error, |state| {
             let options = state.pending(KIND)?;
-            // This call already holds the connection's dispatch turn; the database is locked
-            // briefly on its own, and only read from here.
+            // Lock the database while constructing the connection from it.
             let mut database = super::options::borrow(database)?;
             let database = database.ready(super::database::KIND)?;
-            // Going through `new_connection_with_opts` rather than applying options one by one
-            // keeps the driver's own ordering and validation rules in one place.
             let ready = database.new_connection_with_opts(options.entries.clone())?;
-            // Cloned out so `connection_cancel` can reach the cancellation machinery without
-            // taking this connection's dispatch turn -- and installed *before* the ready state
-            // is published, because that is the instant the connection becomes usable and a
-            // caller can start an operation to cancel. `statement_new` installs both handles at
-            // construction for the same reason.
+            // Install cancellation before publishing a state that can start operations.
             install_cancel_handle::<State>(slot, ready.get_cancel_handle());
             *state = State::Ready(ready);
             Ok(())
@@ -136,8 +127,7 @@ pub(super) unsafe extern "C" fn connection_get_info(
     unsafe {
         with_state(connection, error, |state| {
             required_output(out, "out")?;
-            // A null array means "everything the driver knows"; an empty non-null array is a
-            // caller genuinely asking for nothing, so the two must not be collapsed.
+            // Null requests all supported codes; an empty non-null array requests none.
             let codes = if info_codes.is_null() {
                 None
             } else {
@@ -176,15 +166,10 @@ pub(super) unsafe extern "C" fn connection_get_objects(
     unsafe {
         with_state(connection, error, |state| {
             required_output(out, "out")?;
-            // `ObjectDepth::try_from` reports an unknown depth as `InvalidData`, which describes
-            // bad data in a result set rather than a bad argument, and its message names neither
-            // the entry point nor the depths that would have worked. The depth came straight from
-            // the caller, so say so, and say what to pass instead.
+            // An unknown depth is a caller error; `ObjectDepth::try_from` uses `InvalidData`.
+            // ADBC_OBJECT_DEPTH_COLUMNS aliases ALL (0), so 4 is not a valid depth.
             let depth = ObjectDepth::try_from(depth).map_err(|_| {
                 invalid_argument(format!(
-                    // There is no fifth depth to offer: adbc.h defines ADBC_OBJECT_DEPTH_COLUMNS
-                    // as ADBC_OBJECT_DEPTH_ALL, so columns are what 0 already returns and 4 is
-                    // not a value the header names at all.
                     "AdbcConnectionGetObjects depth {depth} is not a valid ADBC object depth; \
                      use 0 (all, including columns), 1 (catalogs), 2 (db_schemas), or 3 (tables)"
                 ))

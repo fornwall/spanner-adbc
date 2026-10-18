@@ -1,9 +1,7 @@
 //! `AdbcStatement*` entry points.
 //!
-//! Unlike a database or a connection, a statement has no `Init` step: `AdbcStatementNew` already
-//! knows which connection it belongs to, so the driver object is built there and every option
-//! applies to a live statement. That is why this module stores [`SpannerStatement`] directly
-//! rather than a [`super::handle::Staged`] — there is nothing to buffer.
+//! `AdbcStatementNew` constructs a live [`SpannerStatement`] from its connection. Statements
+//! have no `Init` step, so options apply directly without a [`super::handle::Staged`] buffer.
 
 use std::ffi::{c_char, c_void};
 
@@ -47,8 +45,6 @@ impl FfiHandle for AdbcStatement {
     }
 }
 
-/// A statement is live from the moment it exists, so — unlike a database or a connection — options
-/// apply directly and there is no pre-init phase for the getters to refuse.
 impl super::options::OptionTarget for SpannerStatement {
     type Key = OptionStatement;
     type Options = Self;
@@ -73,18 +69,14 @@ pub(super) unsafe extern "C" fn statement_new(
     let Some(statement) = (unsafe { statement.as_mut() }) else {
         return finish(Err(invalid_argument("statement must not be null")), error);
     };
-    // As `new_handle` does for the objects with a pre-init phase: a populated slot is a statement
-    // the caller never released, and overwriting it would leak its clients and cancellation scope.
     if !statement.private_data.is_null() {
         return finish(Err(already_populated(KIND)), error);
     }
-    // `new_statement` runs driver code — cloning clients, building a cancellation scope — so it is
-    // contained like any other call even though there is no handle to poison yet.
+    // A panic here poisons the borrowed connection; the statement has no state yet.
     let created = catch(|| {
         let mut connection = unsafe { super::options::borrow(connection) }?;
         let state = connection.ready(super::connection::KIND)?.new_statement()?;
-        // Cloned out up front so `statement_cancel` can reach the cancellation machinery without
-        // taking the statement's dispatch turn.
+        // Cancellation must remain accessible while an operation holds the statement's lock.
         let cancel = state.get_cancel_handle();
         Ok((state, cancel))
     });
@@ -238,10 +230,7 @@ pub(super) unsafe extern "C" fn statement_execute_query(
                 write_rows_affected(rows_affected, affected);
                 return Ok(());
             }
-            // A query's row count is not known until the stream has been drained, so the header's
-            // spelling of "unknown" — -1 — is what the caller gets. Writing it is load-bearing:
-            // adbc.h has the driver set this out parameter on every path, and a caller that reads
-            // back whatever it happened to hold would see a stale count from an earlier execute.
+            // The streamed row count is unknown. Set -1 to overwrite any previous execute's count.
             let reader = state.execute()?;
             std::ptr::write_unaligned(
                 out,
@@ -299,15 +288,12 @@ pub(super) unsafe extern "C" fn statement_execute_partitions(
 ) -> AdbcStatusCode {
     unsafe {
         with_state(statement, error, |state| {
-            // Checked before executing: a missing out parameter is a caller bug, and discovering it
-            // afterwards would mean having billed a query whose result nobody can collect.
+            // Validate outputs before executing a query whose result the caller cannot collect.
             required_output(schema, "schema")?;
             required_output(partitions, "partitions")?;
 
             let result = state.execute_partitions()?;
-            // Export the schema first: it is the only remaining fallible step, and failing after
-            // writing the partitions would hand the caller a struct it must release to a call that
-            // reported failure.
+            // Export the schema before transferring either output so failure leaves both untouched.
             let exported = export_schema(&result.schema)?;
             std::ptr::write_unaligned(schema, exported);
             std::ptr::write_unaligned(partitions, export_partitions(result.partitions));
@@ -341,20 +327,11 @@ fn export_schema(schema: &Schema) -> Result<FFI_ArrowSchema> {
     })
 }
 
-/// Everything an exported [`AdbcPartitions`] points at.
-///
-/// The ABI hands the caller two parallel arrays and a single release callback, so the payloads and
-/// both arrays have to stay alive until that callback runs and then be freed together. Keeping
-/// them in one box means the callback frees exactly one allocation and never has to reconstruct a
-/// `Vec` capacity the C struct does not carry.
+/// Own the partition payloads and both C arrays until the release callback runs. Keeping the
+/// vectors intact lets the callback free them without reconstructing their capacities.
 struct PartitionsOwner {
-    /// Never read after construction: these exist so that what `pointers` points at stays alive
-    /// for as long as the caller holds the struct.
-    #[allow(
-        dead_code,
-        reason = "held only to keep the pointed-at payload bytes alive"
-    )]
-    payloads: Vec<Vec<u8>>,
+    /// Keeps the bytes referenced by `pointers` alive.
+    _payloads: Vec<Vec<u8>>,
     pointers: Vec<*const u8>,
     lengths: Vec<usize>,
 }
@@ -364,18 +341,11 @@ fn export_partitions(payloads: Vec<Vec<u8>>) -> AdbcPartitions {
     let pointers: Vec<*const u8> = payloads.iter().map(|payload| payload.as_ptr()).collect();
     let lengths: Vec<usize> = payloads.iter().map(Vec::len).collect();
     let mut owner = Box::new(PartitionsOwner {
-        payloads,
+        _payloads: payloads,
         pointers,
         lengths,
     });
-    // Taken off the boxed value rather than the locals: the heap buffers would survive the move
-    // either way, but reading them here is one less invariant a later edit can break.
-    //
-    // An empty `Vec` has no allocation, so `as_mut_ptr` yields the element type's alignment as a
-    // bare address -- non-null, dangling, and indistinguishable from a real array to anything
-    // that inspects the struct. No caller may dereference it at `num_partitions == 0`, but a
-    // sanitizer-instrumented or defensive driver manager is entitled to flag it, so the empty
-    // case says null and means it.
+    // Use null for empty arrays instead of exposing an empty Vec's dangling pointer.
     let (partitions, partition_lengths) = if num_partitions == 0 {
         (std::ptr::null_mut(), std::ptr::null_mut())
     } else {

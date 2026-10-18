@@ -1,98 +1,81 @@
 use super::*;
 use adbc_core::options::OptionValue;
 
-use crate::options::{F64Range, f64_option};
+use crate::options::SharedConfig;
 use crate::runtime::{
     CancelSignal, ChunkSource, block_on_cancellable, new_runtime, spawn_prefetch,
+};
+use crate::{
+    OPTION_RPC_TIMEOUT_FETCH as FETCH, OPTION_RPC_TIMEOUT_QUERY as QUERY,
+    OPTION_RPC_TIMEOUT_UPDATE as UPDATE,
 };
 
 fn s(v: &str) -> OptionValue {
     OptionValue::String(v.to_string())
 }
 
-/// The three arms of `impl_shared_option_dispatch` that set these fields, as functions the tests
-/// can call: each parses the value with `f64_option` in the non-negative-seconds range and stores
-/// it, leaving the previous value in place when the parse is rejected.
-fn set_query(config: &mut RpcTimeouts, value: OptionValue) -> Result<()> {
-    config.query = f64_option(
-        value,
-        crate::OPTION_RPC_TIMEOUT_QUERY,
-        F64Range::NonNegativeSeconds,
-    )?;
-    Ok(())
-}
-
-fn set_update(config: &mut RpcTimeouts, value: OptionValue) -> Result<()> {
-    config.update = f64_option(
-        value,
-        crate::OPTION_RPC_TIMEOUT_UPDATE,
-        F64Range::NonNegativeSeconds,
-    )?;
-    Ok(())
-}
-
-fn set_fetch(config: &mut RpcTimeouts, value: OptionValue) -> Result<()> {
-    config.fetch = f64_option(
-        value,
-        crate::OPTION_RPC_TIMEOUT_FETCH,
-        F64Range::NonNegativeSeconds,
-    )?;
-    Ok(())
-}
-
-/// The canonical `get_option` string of a stored seconds value, as the dispatch's getter arms
-/// render it.
-fn string(value: Option<f64>) -> Option<String> {
-    value.map(|s| s.to_string())
-}
-
 #[test]
 fn parses_numeric_strings_ints_and_doubles() {
-    let mut config = RpcTimeouts::default();
+    let mut config = SharedConfig::default();
     // Numeric strings (trimmed, fractions allowed).
-    set_query(&mut config, s(" 2.5 ")).unwrap();
-    assert_eq!(string(config.query).as_deref(), Some("2.5"));
-    assert_eq!(config.query_timeout(), Some(Duration::from_millis(2500)));
+    config.set_option(QUERY, s(" 2.5 ")).unwrap();
+    assert_eq!(config.option_string(QUERY).unwrap(), "2.5");
+    assert_eq!(
+        config.timeouts.query_timeout(),
+        Some(Duration::from_millis(2500))
+    );
     // Integers.
-    set_update(&mut config, OptionValue::Int(30)).unwrap();
-    assert_eq!(string(config.update).as_deref(), Some("30"));
-    assert_eq!(config.update_timeout(), Some(Duration::from_secs(30)));
+    config.set_option(UPDATE, OptionValue::Int(30)).unwrap();
+    assert_eq!(config.option_string(UPDATE).unwrap(), "30");
+    assert_eq!(
+        config.timeouts.update_timeout(),
+        Some(Duration::from_secs(30))
+    );
     // Doubles (the `get_option_double` / `set_option_double` shape).
-    set_fetch(&mut config, OptionValue::Double(0.05)).unwrap();
-    assert_eq!(string(config.fetch).as_deref(), Some("0.05"));
-    assert_eq!(config.fetch_timeout(), Some(Duration::from_millis(50)));
+    config.set_option(FETCH, OptionValue::Double(0.05)).unwrap();
+    assert_eq!(config.option_string(FETCH).unwrap(), "0.05");
+    assert_eq!(
+        config.timeouts.fetch_timeout(),
+        Some(Duration::from_millis(50))
+    );
 }
 
 #[test]
 fn zero_disables_but_still_round_trips() {
-    let mut config = RpcTimeouts::default();
+    let mut config = SharedConfig::default();
     for value in [s("0"), OptionValue::Int(0), OptionValue::Double(0.0)] {
-        set_query(&mut config, value).unwrap();
+        config.set_option(QUERY, value).unwrap();
         // The stored value reports back...
-        assert_eq!(string(config.query).as_deref(), Some("0"));
+        assert_eq!(config.option_string(QUERY).unwrap(), "0");
         // ...but no deadline is enforced.
-        assert_eq!(config.query_timeout(), None);
+        assert_eq!(config.timeouts.query_timeout(), None);
     }
 }
 
 #[test]
 fn empty_string_unsets() {
-    let mut config = RpcTimeouts::default();
-    set_fetch(&mut config, s("1.5")).unwrap();
-    assert!(string(config.fetch).is_some());
-    set_fetch(&mut config, s("")).unwrap();
-    assert_eq!(string(config.fetch), None);
-    assert_eq!(config.fetch_timeout(), None);
+    let mut config = SharedConfig::default();
+    config.set_option(FETCH, s("1.5")).unwrap();
+    assert!(config.option_string(FETCH).ok().is_some());
+    config.set_option(FETCH, s("")).unwrap();
+    assert_eq!(
+        config.option_string(FETCH).unwrap_err().status,
+        Status::NotFound
+    );
+    assert_eq!(config.timeouts.fetch_timeout(), None);
     // Whitespace-only counts as empty too (values are trimmed).
-    set_fetch(&mut config, s("2")).unwrap();
-    set_fetch(&mut config, s("  ")).unwrap();
-    assert_eq!(string(config.fetch), None);
+    config.set_option(FETCH, s("2")).unwrap();
+    config.set_option(FETCH, s("  ")).unwrap();
+    assert_eq!(
+        config.option_string(FETCH).unwrap_err().status,
+        Status::NotFound
+    );
 }
 
 #[test]
 fn rejects_nan_infinities_negatives_and_garbage() {
-    let mut config = RpcTimeouts::default();
-    set_query(&mut config, s("5")).unwrap();
+    let mut config = SharedConfig::default();
+    config.set_option(QUERY, s("5")).unwrap();
     let bad_values = [
         OptionValue::Double(f64::NAN),
         OptionValue::Double(f64::INFINITY),
@@ -110,16 +93,12 @@ fn rejects_nan_infinities_negatives_and_garbage() {
         OptionValue::Bytes(vec![1, 2, 3]),
     ];
     for value in bad_values {
-        let error = set_query(&mut config, value.clone()).unwrap_err();
+        let error = config.set_option(QUERY, value.clone()).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "value {value:?}");
-        assert!(
-            error.message.contains(crate::OPTION_RPC_TIMEOUT_QUERY),
-            "{}",
-            error.message
-        );
+        assert!(error.message.contains(QUERY), "{}", error.message);
         // A rejected value leaves the stored one untouched.
         assert_eq!(
-            string(config.query).as_deref(),
+            config.option_string(QUERY).ok().as_deref(),
             Some("5"),
             "value {value:?}"
         );
@@ -128,36 +107,40 @@ fn rejects_nan_infinities_negatives_and_garbage() {
 
 #[test]
 fn the_three_timeouts_are_independent() {
-    let mut config = RpcTimeouts::default();
-    set_query(&mut config, s("1")).unwrap();
-    set_update(&mut config, s("2")).unwrap();
-    set_fetch(&mut config, s("3")).unwrap();
-    set_update(&mut config, s("")).unwrap();
-    assert_eq!(string(config.query).as_deref(), Some("1"));
-    assert_eq!(string(config.update), None);
-    assert_eq!(string(config.fetch).as_deref(), Some("3"));
+    let mut config = SharedConfig::default();
+    config.set_option(QUERY, s("1")).unwrap();
+    config.set_option(UPDATE, s("2")).unwrap();
+    config.set_option(FETCH, s("3")).unwrap();
+    config.set_option(UPDATE, s("")).unwrap();
+    assert_eq!(config.option_string(QUERY).unwrap(), "1");
+    assert_eq!(
+        config.option_string(UPDATE).unwrap_err().status,
+        Status::NotFound
+    );
+    assert_eq!(config.option_string(FETCH).unwrap(), "3");
 }
 
-/// Statement inheritance is a plain clone of the connection's config (mirroring
-/// `ReadStaleness` / `RequestConfig`): the clone starts with the connection's values and
-/// overrides independently.
+/// Statement options inherit connection values, then override them independently.
 #[test]
-fn cloned_config_inherits_then_overrides_independently() {
-    let mut connection = RpcTimeouts::default();
-    set_query(&mut connection, s("10")).unwrap();
-    set_fetch(&mut connection, s("20")).unwrap();
+fn statement_inherits_then_overrides_independently() {
+    let mut connection = SharedConfig::default();
+    connection.set_option(QUERY, s("10")).unwrap();
+    connection.set_option(FETCH, s("20")).unwrap();
 
-    let mut statement = connection;
-    assert_eq!(string(statement.query).as_deref(), Some("10"));
-    assert_eq!(string(statement.fetch).as_deref(), Some("20"));
+    let mut statement = connection.inherit();
+    assert_eq!(statement.option_string(QUERY).unwrap(), "10");
+    assert_eq!(statement.option_string(FETCH).unwrap(), "20");
 
-    set_query(&mut statement, s("1.5")).unwrap();
-    set_fetch(&mut statement, s("")).unwrap();
-    assert_eq!(string(statement.query).as_deref(), Some("1.5"));
-    assert_eq!(string(statement.fetch), None);
+    statement.set_option(QUERY, s("1.5")).unwrap();
+    statement.set_option(FETCH, s("")).unwrap();
+    assert_eq!(statement.option_string(QUERY).unwrap(), "1.5");
+    assert_eq!(
+        statement.option_string(FETCH).unwrap_err().status,
+        Status::NotFound
+    );
     // The connection is unaffected by statement-level overrides.
-    assert_eq!(string(connection.query).as_deref(), Some("10"));
-    assert_eq!(string(connection.fetch).as_deref(), Some("20"));
+    assert_eq!(connection.option_string(QUERY).unwrap(), "10");
+    assert_eq!(connection.option_string(FETCH).unwrap(), "20");
 }
 
 #[test]
@@ -169,7 +152,7 @@ fn with_timeout_passes_a_completing_future_through() {
         let result: Result<i32> = block_on_cancellable(
             &runtime,
             &cancel,
-            with_timeout(limit, crate::OPTION_RPC_TIMEOUT_QUERY, async { Ok(7) }),
+            with_timeout(limit, QUERY, async { Ok(7) }),
         );
         assert_eq!(result.unwrap(), 7);
     }
@@ -186,17 +169,13 @@ fn with_timeout_fails_a_hung_operation_with_timeout_status() {
         &cancel,
         with_timeout(
             Some(Duration::from_millis(50)),
-            crate::OPTION_RPC_TIMEOUT_QUERY,
+            QUERY,
             std::future::pending(),
         ),
     );
     let error = result.unwrap_err();
     assert_eq!(error.status, Status::Timeout);
-    assert!(
-        error.message.contains(crate::OPTION_RPC_TIMEOUT_QUERY),
-        "{}",
-        error.message
-    );
+    assert!(error.message.contains(QUERY), "{}", error.message);
     assert!(error.message.contains("0.05s"), "{}", error.message);
 }
 
@@ -212,7 +191,7 @@ impl ChunkSource for StallingSource {
     fn next_chunk(&mut self) -> impl std::future::Future<Output = Result<Vec<i32>>> + Send {
         with_timeout(
             self.timeout,
-            crate::OPTION_RPC_TIMEOUT_FETCH,
+            FETCH,
             std::future::pending::<Result<Vec<i32>>>(),
         )
     }
@@ -233,11 +212,7 @@ fn fetch_timeout_fires_inside_the_prefetch_task() {
     );
     let error = rx.blocking_recv().unwrap().unwrap_err();
     assert_eq!(error.status, Status::Timeout);
-    assert!(
-        error.message.contains(crate::OPTION_RPC_TIMEOUT_FETCH),
-        "{}",
-        error.message
-    );
+    assert!(error.message.contains(FETCH), "{}", error.message);
     // The errored source closes the channel and the task ends.
     assert!(rx.blocking_recv().is_none());
     runtime.block_on(task).unwrap();

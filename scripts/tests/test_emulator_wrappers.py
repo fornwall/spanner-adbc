@@ -59,9 +59,9 @@ print("200", end="")
         executable.write_text(f"#!{sys.executable}\n{source}")
         executable.chmod(0o755)
 
-    def run_wrapper(self, wrapper, exit_code=0):
+    def run_wrapper(self, wrapper, exit_code=0, command=None):
         result = subprocess.run(
-            ["bash", str(SCRIPTS / wrapper), "bash", "-c", f"exit {exit_code}"],
+            ["bash", str(SCRIPTS / wrapper), *(command or ["bash", "-c", f"exit {exit_code}"])],
             env=self.env,
             capture_output=True,
             text=True,
@@ -150,6 +150,26 @@ print("200", end="")
         self.assertEqual(
             self.removed_ids(), ["owned-existing-proxy", "owned-existing-emulator"]
         )
+
+    def test_wrappers_override_ambient_backend_selection(self):
+        for wrapper, target in (
+            ("with-emulator.sh", {"SPANNER_EMULATOR_HOST": "localhost:9010"}),
+            ("with-toxiproxy.sh", {"SPANNER_EMULATOR_HOST": "127.0.0.1:8666"}),
+            ("with-omni.sh", {"SPANNER_OMNI_ENDPOINT": "http://localhost:15000"}),
+        ):
+            with self.subTest(wrapper=wrapper):
+                self.env.update(
+                    SPANNER_EMULATOR_HOST="old-emulator:9010",
+                    SPANNER_OMNI_ENDPOINT="http://old-omni:15000",
+                    SPANNER_GCP_DATABASE="old.project.database",
+                )
+                result = self.run_wrapper(wrapper, command=["env"])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                actual = dict(
+                    line.split("=", 1) for line in result.stdout.splitlines()
+                    if line.startswith(("SPANNER_EMULATOR_HOST=", "SPANNER_OMNI_ENDPOINT=", "SPANNER_GCP_DATABASE="))
+                )
+                self.assertEqual(actual, target)
 
     def test_http_requests_are_bounded_and_bypass_ambient_proxies(self):
         self.assertEqual(self.run_wrapper("with-toxiproxy.sh").returncode, 0)

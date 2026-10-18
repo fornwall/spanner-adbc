@@ -10,8 +10,8 @@ Spanner emulator. See [the testing overview](../docs/testing.md) for the other s
 scripts/with-toxiproxy.sh cargo test --test resilience -- --nocapture --test-threads=1
 ```
 
-The helper starts and removes both containers. It needs Docker with host networking and a
-host-reachable container bridge IP, as used by Linux CI. Run serially: all tests share one proxy.
+The helper starts and removes both containers. It needs Docker with a host-reachable container
+bridge IP, as used by Linux CI. Run serially: all tests share one proxy.
 Without `TOXIPROXY_URL` and `SPANNER_EMULATOR_HOST`, tests skip; `ADBC_TEST_REQUIRE_TARGET=1` makes
 missing configuration fail instead.
 
@@ -62,6 +62,7 @@ schema setup ----------------> emulator directly (:9010 / :9020)
 ```
 
 The helper exports `SPANNER_EMULATOR_HOST` for proxied data traffic and
-`SPANNER_EMULATOR_DIRECT` for setup. Direct setup preserves the pinned client's `9010` to `9020`
-admin-port mapping. The emulator publishes no host ports; proxy ports and container names are
+`SPANNER_EMULATOR_DIRECT` for setup. Setup configures the admin clients explicitly for port
+`9020`, without changing the process environment. The emulator publishes no host ports; proxy
+ports and container names are
 configurable in [`with-toxiproxy.sh`](../scripts/with-toxiproxy.sh).

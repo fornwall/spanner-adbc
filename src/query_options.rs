@@ -19,7 +19,7 @@ use google_cloud_spanner::statement::StatementBuilder;
 /// [`ReadStaleness`](crate::staleness::ReadStaleness) are inherited.
 ///
 /// Both fields are set and read directly by
-/// [`impl_shared_option_dispatch`](crate::options::impl_shared_option_dispatch), which parses each
+/// [`SharedConfig`](crate::options::SharedConfig), which parses each
 /// with [`non_empty_string_option`](crate::options::non_empty_string_option).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct QueryOptionsConfig {

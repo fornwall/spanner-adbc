@@ -46,8 +46,7 @@ pub(super) trait OptionTarget {
     /// Apply an option, buffering it when the object has a pre-init phase it is still in.
     fn set(&mut self, key: Self::Key, value: OptionValue) -> Result<()>;
 
-    /// The live optionable state the typed getters read `key` from, or the one status adbc.h
-    /// gives those getters — `NOT_FOUND` — when there is no such state yet.
+    /// The initialized object, or `NOT_FOUND` when the option cannot be read yet.
     fn options(&mut self, kind: &str, key: &Self::Key) -> Result<&mut Self::Options>;
 }
 
@@ -59,11 +58,8 @@ where
     type Key = K;
     type Options = S;
 
-    /// A pre-`Init` set is buffered verbatim and validated when `Init` replays it through the
-    /// driver's own constructor.
-    ///
-    /// Validation uses the driver's setter at `Init`. Each key retains its last value and
-    /// position, allowing corrections after a failed init while preserving URI precedence.
+    /// Buffer pre-init options for validation by the constructor, retaining each key's last
+    /// value and position so failed initialization can be corrected without changing precedence.
     fn set(&mut self, key: K, value: OptionValue) -> Result<()> {
         match self {
             Self::Pending(options) => {
@@ -74,11 +70,8 @@ where
         }
     }
 
-    /// adbc.h documents exactly one failure return for `Get*Option*` -- "ADBC_STATUS_NOT_FOUND if
-    /// the option is not recognized" -- and licenses no other, so a pre-`Init` object reports the
-    /// key as absent rather than the handle as unusable. The refusal itself stands: what a caller
-    /// buffered is not a value the driver has accepted, and reporting it back would claim a
-    /// validation that has not happened yet.
+    /// Pending options have not been validated. Report `NOT_FOUND` until initialization rather
+    /// than returning buffered values as though the driver had accepted them.
     fn options(&mut self, kind: &str, key: &K) -> Result<&mut S> {
         match self {
             Self::Ready(state) => Ok(state),
@@ -138,12 +131,8 @@ where
     unsafe { dispatch::<H::State, _>(slot_of(handle), H::KIND, error, f) }
 }
 
-/// A `*New` on a handle that already carries an object.
-///
-/// adbc.h has the caller "pass in a zero-initialized" struct to every `New`, so a populated
-/// `private_data` is caller error either way. Overwriting it would drop the caller's only pointer
-/// to the previous object and leak it silently -- for a statement, live Spanner clients and a
-/// cancellation scope. Refusing costs a null check and turns that into something a caller can see.
+/// Reject `*New` on a populated handle to avoid leaking the existing object. ADBC requires
+/// callers to pass a zero-initialized struct.
 pub(super) fn already_populated(kind: &str) -> adbc_core::error::Error {
     invalid_state(format!(
         "{kind} already holds a driver object; release it before creating another, and pass a \
@@ -157,9 +146,8 @@ pub(super) fn already_populated(kind: &str) -> adbc_core::error::Error {
 ///
 /// # Safety
 /// `handle` must be null or point to a valid ABI struct.
-// Guard-exempt: no driver state exists yet and nothing here can unwind — the default state
-// allocates nothing, the `Exported` box's allocation aborts rather than panics on failure, and
-// the rest is plain pointer writes.
+// Guard-exempt: the database and connection defaults allocate nothing; allocating `Exported`
+// aborts on allocation failure. This exemption depends on those Default implementations.
 pub(super) unsafe extern "C" fn new_handle<H: FfiHandle>(
     handle: *mut H,
     error: *mut AdbcError,

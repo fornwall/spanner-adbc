@@ -38,15 +38,13 @@ use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, ReadWriteTr
 use crate::bind;
 use crate::connection::{SharedTxn, TxnKind, lock_txn, runner_builder};
 use crate::conversion::{
-    BoundStatementSource, TimestampPrecision, result_set_to_batch, stream_bound_query, stream_query,
+    BoundStatementSource, result_set_to_batch, stream_bound_query, stream_query,
 };
 use crate::driver::SharedDatabaseAdmin;
 use crate::error::{
     err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option, unsupported,
 };
-use crate::options::{
-    SharedConfig, bool_option, impl_shared_option_dispatch, impl_typed_option_getters,
-};
+use crate::options::{SharedConfig, bool_option, impl_typed_option_getters};
 use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable};
 use crate::timeout::with_timeout;
 
@@ -154,11 +152,6 @@ pub struct SpannerStatement {
 }
 
 impl SpannerStatement {
-    // Shared `set_shared_option` / `shared_option_string` for the "staleness-pattern" options
-    // (request priority/tag, directed read, max_commit_delay, commit_stats, query optimizer opts,
-    // RPC timeouts, retry tuning, …) that the statement and connection dispatch identically.
-    impl_shared_option_dispatch!();
-
     /// `config` is the connection's [`SharedConfig::inherit`]ed configuration; everything else is a
     /// handle cloned from the connection's client stack.
     pub(crate) fn new(
@@ -863,11 +856,11 @@ impl Optionable for SpannerStatement {
                 self.data_boost = bool_option(value, "option spanner.data_boost")?;
             }
             // Every remaining `spanner.*` option the statement and connection dispatch identically
-            // goes through the shared table. An unrecognised key returns `None`, mapped to
+            // goes through the shared table. An unrecognised key returns `false`, mapped to
             // `NotImplemented` (so the connection-only `spanner.transaction.tag`, absent from the
             // shared table, stays unsupported here).
             OptionStatement::Other(k) => {
-                if self.set_shared_option(k, value)?.is_none() {
+                if !self.config.set_option(k, value)? {
                     return Err(unknown_option("statement", k));
                 }
             }
@@ -915,7 +908,7 @@ impl Optionable for SpannerStatement {
             // goes through the shared table (each the effective value: the connection's, unless
             // overridden on this statement), which returns the same `NotFound` for an unset (or
             // unknown) key that the fall-through below would.
-            OptionStatement::Other(k) => return self.shared_option_string(k),
+            OptionStatement::Other(k) => return self.config.option_string(k),
             _ => None,
         };
         value.ok_or_else(|| option_not_set(key.as_ref()))

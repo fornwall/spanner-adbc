@@ -90,6 +90,7 @@ if [ "$create_code" != "201" ] && [ "$create_code" != "200" ]; then
   exit 1
 fi
 
+unset SPANNER_OMNI_ENDPOINT SPANNER_GCP_DATABASE
 export SPANNER_EMULATOR_HOST="127.0.0.1:${TOXIPROXY_LISTEN_PORT}"
 export SPANNER_EMULATOR_DIRECT="${EMULATOR_IP}:9010"
 export TOXIPROXY_URL TOXIPROXY_PROXY

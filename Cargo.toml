@@ -58,7 +58,7 @@ name = "conversion"
 harness = false
 
 [dependencies]
-# Keep each git dependency family on one revision; see CLAUDE.md for migration steps.
+# Keep each git dependency family on one revision; see CONTRIBUTING.md for migration steps.
 # ADBC main supplies InfoCode::Other, needed to omit unknown info codes.
 # The C ABI is implemented in src/ffi/; adbc_ffi is only a test dependency.
 adbc_core = { git = "https://github.com/apache/arrow-adbc", rev = "0a40cf30d0458867cea48d0fbc5283340b59b40f" }
@@ -160,7 +160,7 @@ bytes = "1"
 
 # Arrow 60.0.0 hides FFI_ArrowArrayStream fields; main adds the needed accessors
 # (apache/arrow-rs#11125). Patch all Arrow crates so adbc_core shares our types.
-# Remove once a release includes them; see CLAUDE.md’s dependency migration checklist.
+# Remove once a release includes them; see CONTRIBUTING.md’s registry migration checklist.
 [patch.crates-io]
 arrow-array = { git = "https://github.com/apache/arrow-rs", rev = "6db2d4fd99c766ecd65a90419cea717ad5fbb619" }
 arrow-buffer = { git = "https://github.com/apache/arrow-rs", rev = "6db2d4fd99c766ecd65a90419cea717ad5fbb619" }

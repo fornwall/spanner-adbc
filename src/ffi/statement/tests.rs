@@ -406,10 +406,10 @@ fn exported_partitions_point_into_the_owned_payloads() {
     let payloads = vec![vec![9_u8; 4096]];
     let mut exported = export_partitions(payloads);
     let owner = unsafe { &*exported.private_data.cast::<PartitionsOwner>() };
-    assert_eq!(owner.payloads.len(), 1);
+    assert_eq!(owner._payloads.len(), 1);
     assert_eq!(
         unsafe { *exported.partitions },
-        owner.payloads[0].as_ptr(),
+        owner._payloads[0].as_ptr(),
         "the exported pointer must be the payload's own buffer"
     );
     assert_eq!(unsafe { *exported.partition_lengths }, 4096);

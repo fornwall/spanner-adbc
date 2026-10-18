@@ -1,91 +1,98 @@
-use super::*;
-use adbc_core::error::{Result, Status};
+use adbc_core::error::Status;
 use adbc_core::options::OptionValue;
 
-use crate::options::non_empty_string_option;
+use crate::options::SharedConfig;
+use crate::{
+    OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE as STATISTICS_PACKAGE,
+    OPTION_QUERY_OPTIMIZER_VERSION as VERSION,
+};
 
 fn s(v: &str) -> OptionValue {
     OptionValue::String(v.to_string())
 }
 
-/// The two arms of `impl_shared_option_dispatch` that set these fields, as functions the tests can
-/// call: each parses the value with `non_empty_string_option` and stores it.
-fn set_optimizer_version(config: &mut QueryOptionsConfig, value: OptionValue) -> Result<()> {
-    config.optimizer_version =
-        non_empty_string_option(value, crate::OPTION_QUERY_OPTIMIZER_VERSION)?;
-    Ok(())
-}
-
-fn set_optimizer_statistics_package(
-    config: &mut QueryOptionsConfig,
-    value: OptionValue,
-) -> Result<()> {
-    config.optimizer_statistics_package =
-        non_empty_string_option(value, crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE)?;
-    Ok(())
-}
-
 #[test]
 fn options_round_trip_verbatim_and_unset_on_empty() {
-    let mut config = QueryOptionsConfig::default();
-    assert_eq!(config.optimizer_version.as_deref(), None);
-    assert_eq!(config.optimizer_statistics_package.as_deref(), None);
+    let mut config = SharedConfig::default();
+    assert_eq!(
+        config.option_string(VERSION).unwrap_err().status,
+        Status::NotFound
+    );
+    assert_eq!(
+        config.option_string(STATISTICS_PACKAGE).unwrap_err().status,
+        Status::NotFound
+    );
 
     // Opaque values are stored verbatim (no trimming or case folding).
-    set_optimizer_version(&mut config, s("latest")).unwrap();
-    assert_eq!(config.optimizer_version.as_deref(), Some("latest"));
-    set_optimizer_statistics_package(&mut config, s("auto_20240101")).unwrap();
+    config.set_option(VERSION, s("latest")).unwrap();
+    assert_eq!(config.option_string(VERSION).unwrap(), "latest");
+    config
+        .set_option(STATISTICS_PACKAGE, s("auto_20240101"))
+        .unwrap();
     assert_eq!(
-        config.optimizer_statistics_package.as_deref(),
-        Some("auto_20240101")
+        config.option_string(STATISTICS_PACKAGE).unwrap(),
+        "auto_20240101"
     );
 
     // The two fields are independent.
-    set_optimizer_version(&mut config, s("")).unwrap();
-    assert_eq!(config.optimizer_version.as_deref(), None);
+    config.set_option(VERSION, s("")).unwrap();
     assert_eq!(
-        config.optimizer_statistics_package.as_deref(),
-        Some("auto_20240101")
+        config.option_string(VERSION).unwrap_err().status,
+        Status::NotFound
     );
-    set_optimizer_statistics_package(&mut config, s("")).unwrap();
-    assert_eq!(config.optimizer_statistics_package.as_deref(), None);
+    assert_eq!(
+        config.option_string(STATISTICS_PACKAGE).unwrap(),
+        "auto_20240101"
+    );
+    config.set_option(STATISTICS_PACKAGE, s("")).unwrap();
+    assert_eq!(
+        config.option_string(STATISTICS_PACKAGE).unwrap_err().status,
+        Status::NotFound
+    );
 }
 
 #[test]
 fn non_string_values_are_rejected() {
-    let mut config = QueryOptionsConfig::default();
+    let mut config = SharedConfig::default();
     for value in [OptionValue::Int(1), OptionValue::Double(1.0)] {
-        let error = set_optimizer_version(&mut config, value.clone()).unwrap_err();
+        let error = config.set_option(VERSION, value.clone()).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
-        let error = set_optimizer_statistics_package(&mut config, value).unwrap_err();
+        let error = config.set_option(STATISTICS_PACKAGE, value).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
     }
 }
 
-/// Statement inheritance is a plain clone of the connection's config (mirroring `RequestConfig`):
-/// the clone starts with the connection's values and overrides each field independently.
+/// Statement options inherit connection values, then override them independently.
 #[test]
-fn cloned_config_inherits_then_overrides_independently() {
-    let mut connection = QueryOptionsConfig::default();
-    set_optimizer_version(&mut connection, s("6")).unwrap();
-    set_optimizer_statistics_package(&mut connection, s("pkg_conn")).unwrap();
+fn statement_inherits_then_overrides_independently() {
+    let mut connection = SharedConfig::default();
+    connection.set_option(VERSION, s("6")).unwrap();
+    connection
+        .set_option(STATISTICS_PACKAGE, s("pkg_conn"))
+        .unwrap();
 
-    let mut statement = connection.clone();
-    assert_eq!(statement.optimizer_version.as_deref(), Some("6"));
+    let mut statement = connection.inherit();
+    assert_eq!(statement.option_string(VERSION).unwrap(), "6");
     assert_eq!(
-        statement.optimizer_statistics_package.as_deref(),
-        Some("pkg_conn")
+        statement.option_string(STATISTICS_PACKAGE).unwrap(),
+        "pkg_conn"
     );
 
-    set_optimizer_version(&mut statement, s("latest")).unwrap();
-    set_optimizer_statistics_package(&mut statement, s("")).unwrap();
-    assert_eq!(statement.optimizer_version.as_deref(), Some("latest"));
-    assert_eq!(statement.optimizer_statistics_package.as_deref(), None);
-    // The connection is unaffected by statement-level overrides.
-    assert_eq!(connection.optimizer_version.as_deref(), Some("6"));
+    statement.set_option(VERSION, s("latest")).unwrap();
+    statement.set_option(STATISTICS_PACKAGE, s("")).unwrap();
+    assert_eq!(statement.option_string(VERSION).unwrap(), "latest");
     assert_eq!(
-        connection.optimizer_statistics_package.as_deref(),
-        Some("pkg_conn")
+        statement
+            .option_string(STATISTICS_PACKAGE)
+            .unwrap_err()
+            .status,
+        Status::NotFound
+    );
+    // The connection is unaffected by statement-level overrides.
+    assert_eq!(connection.option_string(VERSION).unwrap(), "6");
+    assert_eq!(
+        connection.option_string(STATISTICS_PACKAGE).unwrap(),
+        "pkg_conn"
     );
 }
 
@@ -96,17 +103,21 @@ fn cloned_config_inherits_then_overrides_independently() {
 #[test]
 fn apply_to_statement_sets_query_options_only_when_configured() {
     let builder = || google_cloud_spanner::statement::Statement::builder("SELECT 1");
-    let rendered =
-        |config: &QueryOptionsConfig| format!("{:?}", config.apply_to_statement(builder()).build());
+    let rendered = |config: &SharedConfig| {
+        format!(
+            "{:?}",
+            config.query_options.apply_to_statement(builder()).build()
+        )
+    };
 
     // Unset: the statement carries no query options at all.
-    let unset = QueryOptionsConfig::default();
+    let unset = SharedConfig::default();
     let built = rendered(&unset);
     assert!(built.contains("query_options: None"), "{built}");
 
     // Each knob alone sets only its own field, leaving the other empty.
-    let mut version_only = QueryOptionsConfig::default();
-    set_optimizer_version(&mut version_only, s("latest")).unwrap();
+    let mut version_only = SharedConfig::default();
+    version_only.set_option(VERSION, s("latest")).unwrap();
     let built = rendered(&version_only);
     assert!(built.contains(r#"optimizer_version: "latest""#), "{built}");
     assert!(
@@ -116,7 +127,8 @@ fn apply_to_statement_sets_query_options_only_when_configured() {
 
     // Both: both values pass through verbatim.
     let mut both = version_only;
-    set_optimizer_statistics_package(&mut both, s("auto_20240101")).unwrap();
+    both.set_option(STATISTICS_PACKAGE, s("auto_20240101"))
+        .unwrap();
     let built = rendered(&both);
     assert!(built.contains(r#"optimizer_version: "latest""#), "{built}");
     assert!(

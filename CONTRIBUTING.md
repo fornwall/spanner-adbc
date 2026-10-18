@@ -1,7 +1,7 @@
 # Contributing
 
-Repository conventions are in [CLAUDE.md](CLAUDE.md); test setup and CI coverage are in
-[docs/testing.md](docs/testing.md).
+Build and check changes with the commands below. See [docs/testing.md](docs/testing.md) for
+backend setup, test suites and CI coverage.
 
 ## Building and testing
 
@@ -23,6 +23,22 @@ have separate commands in the testing guide. Rust integration tests can also use
 Before pushing code changes, run formatting, clippy, tests and emulator tests. CI also checks
 rustdoc, the build without default features, Python integration, workflows and dependencies.
 Keep pull requests focused and explain non-obvious constraints in nearby comments.
+
+## Coding conventions
+
+- Keep unit tests in sibling `src/<module>/tests.rs` files, not inline.
+- Explain non-obvious reasons in comments; keep behavioral detail in nearby rustdoc.
+  Omit review-ticket IDs and narratives about removed code; history belongs in git.
+- Keep SQL lexing, splitting, quoting and parameter extraction in `src/sql.rs`.
+- Reuse the driver's Tokio runtime to bridge synchronous ADBC methods to the async client.
+  The C ABI uses one process-wide driver via `shared_driver()` in `src/ffi/database.rs`.
+- Confine `unsafe` to `src/ffi/`; preserve the `--no-default-features` build without unsafe code.
+- Define option keys as `pub const OPTION_*` in `src/lib.rs`; reuse constants instead of literals
+  and document each option in [docs/options.md](docs/options.md).
+- DDL executes immediately through the admin API, independently of manual transactions:
+  rollback cannot undo it, and DDL runs before buffered DML. See [transactions](docs/transactions.md).
+- Internal metadata reads inherit priority, replica selection, retry bounds and RPC timeouts,
+  but remain untagged; request/transaction tags attribute user statements.
 
 ## Versioning
 
@@ -67,7 +83,18 @@ from the top-level workspace; adding this crate as a git dependency does not inh
 Without the overrides, registry Arrow 60 lacks the stream constructor and callback accessors
 used by the FFI implementation.
 
-Read revisions from `Cargo.toml`/`Cargo.lock` and follow the
-[migration checklist](CLAUDE.md#registry-migration-checklist) when switching to registry releases.
-Keep each family on one revision, including the ADBC C++ validation header. Check published API
-availability before removing a pin.
+Read revisions from `Cargo.toml`/`Cargo.lock`. Keep each family on one revision, including the
+ADBC C++ validation header. Check published API availability before removing a pin.
+
+### Registry migration checklist
+
+When moving a dependency family to crates.io, update these locations together:
+
+- All affected dependencies and dev-dependencies in `Cargo.toml`; downstream `adbc_core` must match.
+- `ARROW_ADBC_TAG` in `adbc-validation/CMakeLists.txt` and the definitions in `src/ffi/abi.rs`
+  when changing the ADBC revision.
+- `deny.toml` allow-git entries once a repository has no remaining git dependencies.
+- Dependency notes in `README.md`, this guide and [AGENTS.md](AGENTS.md#working-with-pinned-dependencies).
+
+Keep release `publish = false` until all families permit publishing. Check registry availability
+and publish compatibility of `spanner-grpc-mock` too, and revisit Arrow version ranges with `adbc_core`.

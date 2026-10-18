@@ -20,7 +20,7 @@ use crate::error::err;
 /// the effective [`Duration`] (`None` when unset **or** set to `0`, both meaning "no timeout").
 ///
 /// The three fields are set and read directly by
-/// [`impl_shared_option_dispatch`](crate::options::impl_shared_option_dispatch), which parses each
+/// [`SharedConfig`](crate::options::SharedConfig), which parses each
 /// with [`f64_option`](crate::options::f64_option) in the
 /// [`NonNegativeSeconds`](crate::options::F64Range::NonNegativeSeconds) range.
 #[derive(Debug, Clone, Copy, Default)]

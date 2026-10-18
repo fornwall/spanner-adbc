@@ -1,37 +1,13 @@
-//! Transport-level fault-injection / resilience tests for the ADBC driver.
-//!
-//! These drive the driver against the Spanner **emulator reached through a Toxiproxy TCP proxy**,
-//! toggling transport faults (latency, connection reset) via Toxiproxy's HTTP admin API and
-//! asserting the driver behaves sanely. They are **skipped automatically** unless both
-//! `TOXIPROXY_URL` (the admin API base) and `SPANNER_EMULATOR_HOST` (pointed at the proxy) are set,
-//! so a plain `cargo test` stays green everywhere — exactly like `tests/integration.rs`.
-//!
-//! Bring the topology up and run them with:
+//! Transport fault tests against a Spanner emulator behind Toxiproxy.
 //!
 //! ```sh
-//! scripts/with-toxiproxy.sh cargo test --test resilience -- --nocapture
+//! scripts/with-toxiproxy.sh cargo test --test resilience -- --test-threads=1
 //! ```
 //!
-//! ## Honest scope (read `tests/RESILIENCE.md`)
-//!
-//! Toxiproxy injects **transport** faults only — latency, bandwidth, connection resets/timeouts. It
-//! cannot make the emulator emit a gRPC status such as `ABORTED`, so these tests do **not** exercise
-//! Spanner's ABORTED-driven transaction replay. What they *do* exercise (each test's own doc comment
-//! carries the detail):
-//!
-//! - **`cancel_interrupts_in_flight_query`** — `Statement::cancel` interrupts a query blocked in a
-//!   throttled streamed fetch. The strongest assertion: it drives real driver code.
-//! - **`reset_peer_surfaces_error_then_recovers`** — a reset makes RPCs fail cleanly, and the driver
-//!   recovers once the toxic is removed.
-//! - **`commit_under_transport_fault_never_loses_the_write`** — a manual-transaction `commit()`
-//!   under a reset must not lose the buffered DML.
-//! - **`update_timeout_bounds_a_faulted_write_then_recovers_when_unset`** —
-//!   `spanner.rpc.timeout_seconds.update` turns an otherwise unbounded faulted write into a prompt
-//!   `Status::Timeout`, and unsetting it lets the same write succeed.
-//! - **`mid_stream_disconnect_after_batches_surfaces_error_then_recovers`** — a reset *after* real
-//!   batches were consumed surfaces an error on the next chunk fetch, then recovers.
-//! - **`truncated_stream_surfaces_error_then_recovers`** — a `limit_data` byte cap truncates the
-//!   stream mid-flight; the reader must error, never return a silently-short "successful" result.
+//! Tests skip unless `TOXIPROXY_URL` and `SPANNER_EMULATOR_HOST` are set;
+//! `ADBC_TEST_REQUIRE_TARGET=1` makes missing configuration fail instead.
+//! See `tests/RESILIENCE.md` for coverage and limitations. Logical gRPC errors
+//! such as `ABORTED` are covered separately in `tests/mock_spanner.rs`.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,8 +20,10 @@ use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, Opti
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::ArrowError;
+use google_cloud_auth::credentials::anonymous::Builder as AnonymousCredentials;
 use google_cloud_lro::Poller;
-use google_cloud_spanner::client::Spanner;
+use google_cloud_spanner_admin_database_v1::client::DatabaseAdmin;
+use google_cloud_spanner_admin_instance_v1::client::InstanceAdmin;
 use google_cloud_spanner_admin_instance_v1::model::Instance;
 use spanner_adbc::{SpannerConnection, SpannerDatabase, SpannerDriver};
 
@@ -206,20 +184,7 @@ fn curl(args: &[&str]) -> (u16, String) {
 /// (see [`SerialGuard`]); this backs the runtime assertion that enforces it.
 static ACTIVE_TESTS: AtomicUsize = AtomicUsize::new(0);
 
-/// RAII guard asserting the resilience suite runs **serially** (`--test-threads=1`).
-///
-/// [`ensure_setup`] temporarily repoints the process-global `SPANNER_EMULATOR_HOST` env var (via
-/// `std::env::set_var`) while creating the database/schema against the emulator's direct admin
-/// endpoint, then restores it. Process env is process-global, so that swap — and `set_var` itself,
-/// which is not thread-safe against concurrent `getenv` — is only sound if no other test thread is
-/// running at the same time (opening a driver connection reads the env; entering setup mutates it).
-/// The whole harness is therefore designed to run single-threaded: both `scripts/with-toxiproxy.sh`
-/// and `.github/workflows/resilience.yml` pass `--test-threads=1`.
-///
-/// Constructing this guard at the start of each test's *body* (after the self-skip check, so a
-/// plain multi-threaded `cargo test` with the env unset still skips cleanly) detects a violation —
-/// two test bodies overlapping — and fails loudly with an actionable message instead of racing the
-/// env swap silently. Dropped at the end of the test, it releases the slot for the next one.
+/// Reject overlapping tests: each test changes faults on the same proxy.
 struct SerialGuard;
 
 impl SerialGuard {
@@ -228,9 +193,7 @@ impl SerialGuard {
         assert_eq!(
             previous, 0,
             "resilience tests must run serially, but another test body is already running. \
-             tests/resilience.rs mutates the process-global SPANNER_EMULATOR_HOST env var in \
-             ensure_setup(), which races with concurrent test threads. Re-run with \
-             `--test-threads=1` (scripts/with-toxiproxy.sh and resilience.yml already do)."
+             all tests share one proxy. Re-run with `--test-threads=1`."
         );
         SerialGuard
     }
@@ -242,17 +205,7 @@ impl Drop for SerialGuard {
     }
 }
 
-/// Create the instance, database and the streaming test table once per binary. Best-effort: the
-/// create calls fail with `AlreadyExists` on a re-run, which is fine.
-///
-/// Schema/DDL setup goes to the emulator's **real** `<ip>:9010` endpoint (`SPANNER_EMULATOR_DIRECT`),
-/// not the proxy: the google-cloud-rust admin client only remaps the emulator admin port for an
-/// endpoint ending in `:9010`, so DB/table creation through the proxy's port would send the admin
-/// request to the wrong place and fail. Only the driver-under-test's data-plane traffic uses the
-/// proxy. We temporarily repoint `SPANNER_EMULATOR_HOST` for the duration of setup, then restore it
-/// so the tests' driver connections go through the proxy again. (Setup runs once under the mutex,
-/// before any driver connection; and every test holds a [`SerialGuard`] for its whole body, which
-/// asserts no other test runs concurrently — so the transient env swap has no concurrent reader.)
+/// Create fixtures through the emulator's direct REST endpoint, bypassing faults.
 fn ensure_setup() {
     static DONE: Mutex<bool> = Mutex::new(false);
     let mut done = DONE.lock().expect("setup lock poisoned");
@@ -260,20 +213,24 @@ fn ensure_setup() {
         return;
     }
 
-    let proxy_host = std::env::var("SPANNER_EMULATOR_HOST").expect("SPANNER_EMULATOR_HOST");
-    // Fall back to the proxy host if no direct endpoint is provided (e.g. a manual run that already
-    // points HOST at a real `:9010`).
-    let direct = std::env::var("SPANNER_EMULATOR_DIRECT").unwrap_or_else(|_| proxy_host.clone());
-    // SAFETY: setup runs once under the `DONE` mutex, before any driver connection or other thread
-    // touches the environment, so this transient swap has no concurrent readers.
-    unsafe { std::env::set_var("SPANNER_EMULATOR_HOST", &direct) };
+    let direct = std::env::var("SPANNER_EMULATOR_DIRECT")
+        .or_else(|_| std::env::var("SPANNER_EMULATOR_HOST"))
+        .expect("SPANNER_EMULATOR_DIRECT or SPANNER_EMULATOR_HOST");
+    let direct = direct.trim_end_matches('/');
+    let host = direct
+        .strip_prefix("http://")
+        .unwrap_or(direct)
+        .strip_suffix(":9010")
+        .expect("the direct emulator endpoint must use gRPC port 9010");
+    let endpoint = format!("http://{host}:9020");
+    let credentials = AnonymousCredentials::new().build();
 
     tokio::runtime::Runtime::new()
         .expect("setup runtime")
         .block_on(async {
-            let spanner = Spanner::builder().build().await.expect("build client");
-            let instance_admin = spanner
-                .instance_admin_builder()
+            let instance_admin = InstanceAdmin::builder()
+                .with_endpoint(&endpoint)
+                .with_credentials(credentials.clone())
                 .build()
                 .await
                 .expect("instance admin");
@@ -295,8 +252,9 @@ fn ensure_setup() {
             if let Err(e) = &instance {
                 eprintln!("create_instance: {e}");
             }
-            let database_admin = spanner
-                .database_admin_builder()
+            let database_admin = DatabaseAdmin::builder()
+                .with_endpoint(&endpoint)
+                .with_credentials(credentials)
                 .build()
                 .await
                 .expect("database admin");
@@ -319,9 +277,6 @@ fn ensure_setup() {
             }
         });
 
-    // Restore the proxy endpoint so the driver-under-test's data plane goes through Toxiproxy.
-    // SAFETY: still under the `DONE` mutex, before any driver connection — see the note above.
-    unsafe { std::env::set_var("SPANNER_EMULATOR_HOST", &proxy_host) };
     *done = true;
 }
 
@@ -704,10 +659,6 @@ fn update_timeout_bounds_a_faulted_write_then_recovers_when_unset() {
         eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
         return;
     };
-    // Placed after the skip check so a plain multi-threaded `cargo test` (env unset) still skips.
-    // Required like every sibling test: `ensure_setup()` below mutates the process-global
-    // SPANNER_EMULATOR_HOST via `std::env::set_var`, which is a data race against any concurrent
-    // test thread — and this test is a prime candidate for being run alone, by name, by hand.
     let _serial = SerialGuard::new();
     ensure_setup();
 

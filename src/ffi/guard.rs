@@ -1,8 +1,7 @@
 //! Panic containment and the small pointer/string conversions every entry point needs.
 //!
-//! Unwinding out of an `extern "C"` function is undefined behavior, so every exported entry point
-//! runs its body inside [`catch`]; [`super::handle`] then confines the panic to the one object
-//! whose call panicked rather than the whole process.
+//! A Rust panic escaping an `extern "C"` function aborts the process. Entry points that can run
+//! driver code use [`catch`]; [`super::handle`] poisons the states locked by a panicking call.
 
 use std::any::Any;
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -11,6 +10,7 @@ use std::panic::AssertUnwindSafe;
 use adbc_core::error::{Error, Result, Status};
 
 use crate::error::invalid_argument;
+
 /// Run `f`, converting a panic into an `Internal` error rather than letting it cross the ABI.
 pub(crate) fn catch<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     std::panic::catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|cause| Err(caught_panic(cause)))

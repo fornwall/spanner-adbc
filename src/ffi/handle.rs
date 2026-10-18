@@ -111,9 +111,8 @@ impl<S: Send> Exported<S> {
         Self::into_private_data_with_cancel(state, None)
     }
 
-    /// As [`Self::into_private_data`], also storing the handle the one lock-free entry point --
-    /// [`cancel`] -- reaches without the state. Objects whose state is only initialized later
-    /// install it via [`install_cancel_handle`] instead.
+    /// Store a cancel handle separately so [`cancel`] can run while the state is locked.
+    /// Objects initialized later use [`install_cancel_handle`] instead.
     pub(crate) fn into_private_data_with_cancel(
         state: S,
         cancel: Option<Box<dyn CancelHandle>>,
@@ -157,9 +156,7 @@ fn poisoned(kind: &str) -> Error {
 
 /// Borrow the object behind `slot` without taking a reference of one's own.
 ///
-/// This is what every entry point but [`cancel`] uses: adbc.h leaves a `Release` that overlaps
-/// another call on the same object undefined, so borrowing the handle's own reference is exactly
-/// as strong a claim as those entry points are entitled to make.
+/// The caller must prevent `Release` from overlapping the borrow.
 ///
 /// # Safety
 /// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
@@ -211,7 +208,7 @@ where
     finish(outcome, error)
 }
 
-/// Cancel the object's in-flight operation without taking its dispatch turn.
+/// Cancel the object's in-flight operation without taking its state lock.
 ///
 /// Uses the separate cancel lock, including after the state has been poisoned, so a blocked or
 /// panicked operation can still be cancelled.
@@ -256,10 +253,8 @@ pub(crate) unsafe fn install_cancel_handle<S>(slot: *mut c_void, handle: Box<dyn
 
 /// Lock the state behind `slot` without dispatching a call on it.
 ///
-/// This exists for the entry points that need a second object beyond the one they dispatch on —
-/// `AdbcConnectionInit` reads the database while dispatching on the connection, and
-/// `AdbcStatementNew` has no statement yet when it reaches into the connection. The lock makes
-/// that access serialize with the other object's own calls.
+/// `AdbcConnectionInit` borrows its database and `AdbcStatementNew` borrows its connection.
+/// Both must serialize with calls on the borrowed object and propagate mutex poisoning.
 ///
 /// # Safety
 /// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
@@ -300,9 +295,8 @@ pub(crate) fn finish(result: Result<()>, error: *mut AdbcError) -> AdbcStatusCod
         Ok(()) => ADBC_STATUS_OK,
         Err(failure) => {
             let status = AdbcStatusCode::from(failure.status);
-            // Exporting allocates and may run a stale release callback the caller left in the
-            // struct, so it is contained like driver code. On a caught panic the caller still
-            // gets the status code, with the error struct left as it was.
+            // Exporting can run the caller's previous release callback. Contain panics while
+            // preserving the original status; error details may be unavailable on failure.
             let contained = catch(|| {
                 unsafe { export_error(error, failure) };
                 Ok(())

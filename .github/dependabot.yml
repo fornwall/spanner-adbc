@@ -1,5 +1,5 @@
 # Monitor GitHub Actions and registry Cargo dependencies. Coordinate git-pinned
-# dependency updates across Cargo and validation harnesses; see CLAUDE.md.
+# dependency updates across Cargo and validation harnesses; see CONTRIBUTING.md.
 version: 2
 updates:
   - package-ecosystem: github-actions

@@ -355,11 +355,7 @@ pub mod fuzzing {
 
     #[cfg(test)]
     mod tests {
-        /// Every declared fuzz target must have a harness file, reach CI's matrix, and be
-        /// documented. `fuzz.yml` derives its matrix from `fuzz/Cargo.toml` (a hardcoded list once
-        /// left three targets unfuzzed for several releases); this test pins the links that
-        /// derivation does not cover: harness file ↔ `[[bin]]` declaration, the workflow still
-        /// deriving rather than hardcoding, and the docs naming every target.
+        /// Keep fuzz harnesses, manifest entries, CI discovery and documentation in sync.
         #[test]
         fn every_fuzz_target_is_wired_and_documented() {
             let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -405,7 +401,7 @@ pub mod fuzzing {
                  hardcoded target list silently skips new targets"
             );
 
-            for doc in ["docs/testing.md", "CLAUDE.md"] {
+            for doc in ["docs/testing.md", "AGENTS.md"] {
                 let text = std::fs::read_to_string(root.join(doc)).unwrap();
                 for target in &declared {
                     assert!(

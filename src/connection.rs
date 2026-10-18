@@ -25,7 +25,7 @@ use crate::driver::{Connected, SharedDatabaseAdmin};
 use crate::error::{
     err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option, unsupported,
 };
-use crate::options::{SharedConfig, impl_shared_option_dispatch, impl_typed_option_getters};
+use crate::options::{SharedConfig, impl_typed_option_getters};
 use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable};
 use crate::sql::qualified_table;
 use crate::statement::{DEFAULT_ROWS_PER_BATCH, SpannerStatement};
@@ -95,11 +95,6 @@ pub struct SpannerConnection {
 }
 
 impl SpannerConnection {
-    // Shared `set_shared_option` / `shared_option_string` for the "staleness-pattern" options
-    // (request priority/tag, directed read, max_commit_delay, commit_stats, query optimizer opts,
-    // RPC timeouts, retry tuning, …) that the connection and statement dispatch identically.
-    impl_shared_option_dispatch!();
-
     pub(crate) fn new(runtime: SharedRuntime, connected: Connected) -> Self {
         Self {
             runtime,
@@ -221,10 +216,10 @@ impl Optionable for SpannerConnection {
                 self.config.request.set_transaction_tag(value)?;
             }
             // Every other `spanner.*` option the connection and statement dispatch identically
-            // goes through the shared table; an unrecognised key returns `None`, mapped to
+            // goes through the shared table; an unrecognised key returns `false`, mapped to
             // `NotImplemented`.
             OptionConnection::Other(k) => {
-                if self.set_shared_option(k, value)?.is_none() {
+                if !self.config.set_option(k, value)? {
                     return Err(unknown_option("connection", key.as_ref()));
                 }
             }
@@ -261,7 +256,7 @@ impl Optionable for SpannerConnection {
                 .ok_or_else(|| option_not_set(crate::OPTION_TRANSACTION_TAG)),
             // Every other `spanner.*` option the connection and statement report identically —
             // including `spanner.commit_stats.mutation_count` — goes through the shared table.
-            OptionConnection::Other(k) => self.shared_option_string(k),
+            OptionConnection::Other(k) => self.config.option_string(k),
             // The connection's one catalog is its database (see `catalog`); its default schema is
             // the unnamed one, `""` in INFORMATION_SCHEMA.
             OptionConnection::CurrentCatalog => Ok(self.catalog().to_string()),

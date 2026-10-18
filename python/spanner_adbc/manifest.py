@@ -16,9 +16,7 @@ import argparse
 import json
 import os
 import pathlib
-import platform
 import sys
-import sysconfig
 import tempfile
 from collections.abc import Sequence
 
@@ -29,65 +27,10 @@ __all__ = [
     "default_install_dir",
     "install",
     "manifest_text",
-    "platform_tuple",
 ]
 
 #: Matches ``driver="spanner"`` and the ``spanner://`` URI scheme.
 MANIFEST_NAME = "spanner.toml"
-
-# ADBC architecture names for the platforms with published wheels.
-_ARCHES = {
-    "x86_64": "amd64",
-    "amd64": "amd64",
-    "aarch64": "arm64",
-    "arm64": "arm64",
-}
-
-_OSES = {
-    "linux": "linux",
-    "darwin": "macos",
-    "win32": "windows",
-    "cygwin": "windows",
-    "freebsd": "freebsd",
-    "openbsd": "openbsd",
-}
-
-
-def _is_musl() -> bool:
-    """Infer the driver manager wheel's libc from the interpreter's platform."""
-    if sys.platform != "linux":
-        return False
-    # Some distributions include musl in the platform tag; Alpine does not.
-    if "musl" in (sysconfig.get_platform() or ""):
-        return True
-    try:
-        # glibc reports e.g. ("glibc", "2.35"); a musl build reports ("", "").
-        name, _version = platform.libc_ver()
-    except OSError:  # pragma: no cover - platform.libc_ver is very forgiving
-        return False
-    return not name
-
-
-def platform_tuple() -> str:
-    """The ``<os>_<arch>[_<env>]`` tuple the driver manager looks up.
-
-    Mirrors ``InternalAdbcCurrentArch()`` in the C driver manager
-    (``c/driver_manager/adbc_driver_manager.cc``) and ``arch_triplet()`` in the
-    Rust one.
-    """
-    os_name = _OSES.get(sys.platform)
-    if os_name is None and sys.platform.startswith("freebsd"):
-        os_name = "freebsd"
-    machine = platform.machine().lower()
-    arch = _ARCHES.get(machine)
-    if os_name is None or arch is None:
-        raise RuntimeError(
-            "spanner_adbc: cannot derive an ADBC platform tuple for "
-            f"sys.platform={sys.platform!r} machine={platform.machine()!r}; "
-            "this platform is not one the Spanner driver ships binaries for."
-        )
-    suffix = "_musl" if os_name == "linux" and _is_musl() else ""
-    return f"{os_name}_{arch}{suffix}"
 
 
 def _toml_string(value: str) -> str:
@@ -105,8 +48,7 @@ def manifest_text(library: str | os.PathLike[str] | None = None) -> str:
         Absolute path to the driver shared library. Defaults to the library
         bundled in this wheel.
 
-    ``Driver.shared`` uses an absolute path, so platform-tuple detection is
-    unnecessary. The manifest describes only this installation.
+    ``Driver.shared`` uses an absolute path to the library in this installation.
     """
     path = pathlib.Path(library) if library is not None else pathlib.Path(_driver_path())
     path = path.resolve()

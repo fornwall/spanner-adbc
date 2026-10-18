@@ -56,7 +56,7 @@ fn a_panicking_call_poisons_only_that_object() {
         unsafe { dispatch::<u32, _>(first, "statement", null(), |_| panic!("inside the driver")) };
     assert_eq!(status, AdbcStatusCode::from(Status::Internal));
 
-    // The panicking object refuses further work...
+    // The panicking object refuses further work.
     let status = unsafe {
         dispatch::<u32, _>(first, "statement", null(), |state| {
             *state = 1;
@@ -65,8 +65,7 @@ fn a_panicking_call_poisons_only_that_object() {
     };
     assert_eq!(status, AdbcStatusCode::from(Status::Internal));
 
-    // ...while an unrelated object is unaffected. Under the framework's global flag this
-    // second call would also have failed.
+    // An unrelated object remains usable.
     let status = unsafe {
         dispatch::<u32, _>(second, "statement", null(), |state| {
             *state = 1;
@@ -140,8 +139,8 @@ impl CancelHandle for BlockingCancel {
     }
 }
 
-/// `Cancel` takes a reference of its own, so the object it is working on outlives a `Release`
-/// that lands mid-cancel. With a plain box this freed the mutex the cancel was holding a guard on.
+/// Once cancellation has acquired an owned reference, releasing the handle must not free the
+/// mutex it holds. Callers must still synchronize initial acquisition with release.
 #[test]
 fn a_release_during_a_cancel_does_not_free_the_object_under_it() {
     let (entered_sender, entered_receiver) = channel::<()>();

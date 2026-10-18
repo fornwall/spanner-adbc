@@ -13,7 +13,30 @@ An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver f
 emulator and Omni; managed-cloud and authentication tests run locally. See [testing](docs/testing.md).
 
 The driver supports GoogleSQL databases; PostgreSQL-dialect databases are not supported.
-For Python installation and examples, see [python/README.md](python/README.md).
+
+## Quickstart
+
+Install the Python package (Python 3.11+):
+
+```sh
+pip install "spanner-adbc[dbapi]"
+```
+
+With an existing database and [Application Default Credentials](#authentication):
+
+```python
+import spanner_adbc.dbapi as spanner
+
+with spanner.connect(db_kwargs={
+    "uri": "spanner:///projects/my-project/instances/my-instance/databases/my-db",
+}) as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 AS one")
+        print(cur.fetch_arrow_table())
+```
+
+See the [Python guide](python/README.md) for parameters, DataFrames, authentication and ingest,
+or [build the shared library](#shared-library-loadable-driver) for another ADBC client.
 
 ## Supported functionality
 

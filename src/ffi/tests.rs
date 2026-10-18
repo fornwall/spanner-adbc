@@ -1,8 +1,8 @@
 use super::*;
 use crate::ffi::test_support::{null, zeroed_error};
 
-/// Every function slot in the vtable, named, in header order. A slot left `None` is a null
-/// pointer the host will call, so the whole table is swept rather than a sample of it.
+/// Every operation slot in header order. This driver installs callbacks for unsupported
+/// operations too, so callers receive `NOT_IMPLEMENTED` from a populated slot.
 fn slots(table: &AdbcDriver) -> Vec<(&'static str, bool)> {
     macro_rules! slots {
         ($($field:ident),+ $(,)?) => {
@@ -97,7 +97,7 @@ fn populates_a_1_1_0_vtable() {
         "every AdbcDriver function field must be listed"
     );
     for (name, populated) in slots {
-        assert!(populated, "{name} is a null pointer the host would call");
+        assert!(populated, "{name} is missing from the vtable");
     }
 }
 
