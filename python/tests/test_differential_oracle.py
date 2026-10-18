@@ -1,24 +1,8 @@
-"""Differential (oracle) tests for the Spanner -> Arrow type mapping.
+"""Compare Arrow values with the official Python client on the same Spanner target.
 
-The highest-signal way to catch bugs in ``src/conversion.rs`` is to run the same
-query through two independent clients against the *same* emulator database and
-assert the results agree after normalization:
-
-* our ADBC driver (``spanner_adbc``), which returns Apache Arrow, and
-* the official ``google-cloud-spanner`` Python client, which returns native
-  Python objects and acts as the oracle for "what the value really is".
-
-We seed a table with a curated set of type-mapping-sensitive values (i64 min/max,
-float NaN/+-Inf/-0.0, unicode/empty strings, empty/non-empty bytes, epoch/far
-dates, sub-second timestamps, high-precision/negative NUMERIC, assorted JSON,
-empty/populated/NULL arrays, and an all-NULL row), read it back through both
-clients, and compare column by column.
-
-Both clients honor ``SPANNER_EMULATOR_HOST`` (the official client picks up the
-emulator + anonymous credentials automatically), so no real GCP credentials are
-needed. The whole module self-skips without the emulator, and ``importorskip``
-keeps a bare ``pytest`` green when ``pyarrow`` / ``google-cloud-spanner`` are
-absent.
+The corpus covers numeric boundaries, non-finite floats, Unicode, bytes, dates,
+nanosecond timestamps, NUMERIC, JSON, arrays and nulls. Both clients use either
+the emulator or Omni selected by conftest.
 """
 
 import base64
@@ -30,12 +14,10 @@ import pytest
 
 pa = pytest.importorskip("pyarrow")
 pc = pytest.importorskip("pyarrow.compute")
-spanner = pytest.importorskip("google.cloud.spanner")
+pytest.importorskip("google.cloud.spanner")
 
 import spanner_adbc.dbapi as spanner_adbc
-from spanner_adbc import DatabaseOptions
-
-from conftest import DATABASE, INSTANCE, PROJECT
+from conftest import database_options, official_client
 
 TABLE = "AdbcOracle"
 
@@ -204,11 +186,10 @@ def _values_equal(kind, a, b):
 
 
 @pytest.fixture(scope="module")
-def official_database(emulator_database):
-    """The official-client ``Database`` handle for the same emulator database."""
-    client = spanner.Client(project=PROJECT)
-    instance = client.instance(INSTANCE)
-    return instance.database(DATABASE)
+def official_database(spanner_database):
+    """The official client's handle for the same target as the ADBC connection."""
+    _, project, _, instance, _, database = spanner_database.split("/")
+    return official_client(project).instance(instance).database(database)
 
 
 def _official_query(database, sql):
@@ -219,12 +200,9 @@ def _official_query(database, sql):
 # --- tests ----------------------------------------------------------------
 
 
-def test_scalar_and_array_types_match_oracle(emulator_database, official_database):
+def test_scalar_and_array_types_match_oracle(spanner_database, official_database):
     conn = spanner_adbc.connect(
-        db_kwargs={
-            DatabaseOptions.URI.value: f"spanner:///{emulator_database}",
-            DatabaseOptions.EMULATOR.value: "true",
-        },
+        db_kwargs=database_options(spanner_database),
         autocommit=True,
     )
     try:
@@ -270,7 +248,7 @@ def test_scalar_and_array_types_match_oracle(emulator_database, official_databas
     assert not mismatches, "differential mismatches:\n" + "\n".join(mismatches)
 
 
-def test_array_of_struct_matches_oracle(emulator_database, official_database):
+def test_array_of_struct_matches_oracle(spanner_database, official_database):
     # Spanner only returns a STRUCT wrapped in an ARRAY (a top-level STRUCT is
     # UNIMPLEMENTED on real Spanner), so probe ARRAY<STRUCT<a,b,c>> via
     # ARRAY(SELECT AS STRUCT ...). Our driver maps it to List<Struct>; the
@@ -285,10 +263,7 @@ def test_array_of_struct_matches_oracle(emulator_database, official_database):
     )
 
     conn = spanner_adbc.connect(
-        db_kwargs={
-            DatabaseOptions.URI.value: f"spanner:///{emulator_database}",
-            DatabaseOptions.EMULATOR.value: "true",
-        },
+        db_kwargs=database_options(spanner_database),
         autocommit=True,
     )
     try:

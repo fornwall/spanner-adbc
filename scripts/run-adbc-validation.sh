@@ -310,7 +310,7 @@ if [ "$CHECK_DRIFT_ONLY" -eq 1 ]; then
 fi
 
 # No target configured: run under a throwaway emulator, then re-enter this script.
-if [ -z "${SPANNER_EMULATOR_HOST:-}" ] && [ -z "${SPANNER_GCP_DATABASE:-}" ]; then
+if [ -z "${SPANNER_EMULATOR_HOST:-}" ] && [ -z "${SPANNER_OMNI_ENDPOINT:-}" ] && [ -z "${SPANNER_GCP_DATABASE:-}" ]; then
   exec "$REPO_ROOT/scripts/with-emulator.sh" "$0" "$@"
 fi
 

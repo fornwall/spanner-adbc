@@ -1,23 +1,15 @@
-"""Shared fixtures for the emulator end-to-end tests.
-
-These tests only run when ``SPANNER_EMULATOR_HOST`` points at a Spanner emulator
-(matching the Rust integration test); otherwise they self-skip so a plain
-``pytest`` is green everywhere.
-
-The ADBC driver connects to an existing *database*, but it cannot create the
-enclosing instance/database (those are instance-admin operations). We bootstrap
-them here with plain REST calls to the emulator's admin API (port 9020) using
-only the standard library — no ``google-cloud-*`` Python dependency — reusing the
-same ids and ``emulator-config`` the Rust setup uses.
-"""
+"""Shared targets for the same end-to-end tests against the emulator and Omni."""
 
 import json
 import os
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 import pytest
+
+from spanner_adbc import DatabaseOptions
 
 PROJECT = "test-project"
 INSTANCE = "test-instance"
@@ -74,25 +66,58 @@ def _await_operation(op):
 
 
 def _require_target():
-    """Whether ``ADBC_TEST_REQUIRE_TARGET`` demands a configured emulator (CI sets it).
-
-    When truthy, the emulator fixture fails the run instead of skipping when
-    ``SPANNER_EMULATOR_HOST`` is unset, so a broken workflow env wiring cannot turn the whole
-    end-to-end suite green with zero behavioral coverage.
-    """
+    """CI requires a configured target instead of silently skipping integration tests."""
     return os.environ.get("ADBC_TEST_REQUIRE_TARGET", "").lower() in ("1", "true", "yes")
 
 
+def database_options(database):
+    options = {DatabaseOptions.URI: f"spanner:///{database}"}
+    if endpoint := os.environ.get("SPANNER_OMNI_ENDPOINT"):
+        options[DatabaseOptions.INSTANCE_TYPE] = "omni"
+        options[DatabaseOptions.ENDPOINT] = endpoint
+    else:
+        options[DatabaseOptions.EMULATOR] = "true"
+    return options
+
+
+def official_client(project):
+    from google.cloud import spanner
+
+    if endpoint := os.environ.get("SPANNER_OMNI_ENDPOINT"):
+        parsed = urlsplit(endpoint)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError("SPANNER_OMNI_ENDPOINT must be an http:// or https:// endpoint")
+        return spanner.Client(
+            project=project,
+            instance_type="omni",
+            client_options={"api_endpoint": parsed.netloc},
+            use_plain_text=parsed.scheme == "http",
+        )
+    return spanner.Client(project=project)
+
+
 @pytest.fixture(scope="session")
-def emulator_database():
+def spanner_database():
     """Ensure the instance + database exist and return the database path."""
+    if os.environ.get("SPANNER_OMNI_ENDPOINT"):
+        if os.environ.get("SPANNER_EMULATOR_HOST"):
+            pytest.fail("Configure only one of SPANNER_OMNI_ENDPOINT and SPANNER_EMULATOR_HOST")
+        from google.api_core.exceptions import AlreadyExists
+
+        database = official_client("default").instance("default").database(DATABASE)
+        try:
+            database.create().result(timeout=60)
+        except AlreadyExists:
+            pass
+        return f"projects/default/instances/default/databases/{DATABASE}"
+
     if not os.environ.get("SPANNER_EMULATOR_HOST"):
         if _require_target():
             pytest.fail(
-                "ADBC_TEST_REQUIRE_TARGET is set but SPANNER_EMULATOR_HOST is not configured; "
-                "run through scripts/with-emulator.sh or set the emulator endpoint."
+                "ADBC_TEST_REQUIRE_TARGET is set but no Spanner target is configured; "
+                "set SPANNER_EMULATOR_HOST or SPANNER_OMNI_ENDPOINT."
             )
-        pytest.skip("SPANNER_EMULATOR_HOST not set; skipping emulator end-to-end tests")
+        pytest.skip("set SPANNER_EMULATOR_HOST or SPANNER_OMNI_ENDPOINT for integration tests")
 
     base = _rest_base()
     _await_operation(

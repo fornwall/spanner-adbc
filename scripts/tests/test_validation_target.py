@@ -22,7 +22,7 @@ class ValidationTarget(unittest.TestCase):
         self.log = self.root / "requests.jsonl"
         self.env = dict(os.environ, PATH=f"{self.root}{os.pathsep}{os.environ['PATH']}")
         self.env.update(SPANNER_EMULATOR_HOST="localhost:9010", REQUEST_LOG=str(self.log))
-        for key in ("POST_CODE", "CURL_EXIT", "SPANNER_EMULATOR_REST_PORT", "SPANNER_GCP_DATABASE"):
+        for key in ("POST_CODE", "CURL_EXIT", "SPANNER_EMULATOR_REST_PORT", "SPANNER_OMNI_ENDPOINT", "SPANNER_GCP_DATABASE"):
             self.env.pop(key, None)
         curl = self.root / "curl"
         curl.write_text(f"#!{sys.executable}\n" + '''
@@ -83,6 +83,17 @@ else:
         result = self.run_helper()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "spanner:///projects/my-project/instances/my-instance/databases/my-db")
+        self.assertFalse(self.log.exists())
+
+    def test_omni_target_encodes_endpoint_without_emulator_setup(self):
+        self.env["SPANNER_OMNI_ENDPOINT"] = "http://localhost:15000"
+        result = self.run_helper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            "spanner:///projects/default/instances/default/databases/adbc-test"
+            "?spanner.instance_type=omni&spanner.endpoint=http%3A%2F%2Flocalhost%3A15000",
+        )
         self.assertFalse(self.log.exists())
 
     def test_malformed_real_targets_fail_clearly(self):

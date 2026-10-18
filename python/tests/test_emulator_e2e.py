@@ -1,27 +1,20 @@
-"""End-to-end tests exercising the whole Python package against the emulator.
-
-This drives the installed wheel exactly as a user would: open a DBAPI connection,
-run DDL/DML, pull results back as Arrow and pandas, bulk-ingest an Arrow table,
-and verify the manual buffer-and-commit transaction model. It self-skips without
-``SPANNER_EMULATOR_HOST`` (see conftest).
-"""
+"""Exercise SQL, Arrow results, ingest and transactions on the configured Spanner target."""
 
 import pytest
+
+from conftest import database_options
 
 pa = pytest.importorskip("pyarrow")
 
 import spanner_adbc
 import spanner_adbc.dbapi as spanner
 from adbc_driver_manager import ProgrammingError
-from spanner_adbc import DatabaseOptions, StatementOptions
+from spanner_adbc import StatementOptions
 
 
 def _connect(database, *, autocommit):
     return spanner.connect(
-        db_kwargs={
-            DatabaseOptions.URI.value: f"spanner:///{database}",
-            DatabaseOptions.EMULATOR.value: "true",
-        },
+        db_kwargs=database_options(database),
         autocommit=autocommit,
     )
 
@@ -31,8 +24,8 @@ def test_driver_library_is_bundled():
     assert spanner_adbc._driver_path()
 
 
-def test_ddl_dml_query_roundtrip(emulator_database):
-    conn = _connect(emulator_database, autocommit=True)
+def test_ddl_dml_query_roundtrip(spanner_database):
+    conn = _connect(spanner_database, autocommit=True)
     try:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS Singers")
@@ -59,9 +52,9 @@ def test_ddl_dml_query_roundtrip(emulator_database):
         conn.close()
 
 
-def test_fetch_dataframe(emulator_database):
+def test_fetch_dataframe(spanner_database):
     pytest.importorskip("pandas")
-    conn = _connect(emulator_database, autocommit=True)
+    conn = _connect(spanner_database, autocommit=True)
     try:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS AdbcPyDf")
@@ -81,8 +74,8 @@ def test_fetch_dataframe(emulator_database):
         conn.close()
 
 
-def test_bulk_ingest_append(emulator_database):
-    conn = _connect(emulator_database, autocommit=True)
+def test_bulk_ingest_append(spanner_database):
+    conn = _connect(spanner_database, autocommit=True)
     try:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS AdbcPyIngest")
@@ -111,13 +104,9 @@ def test_bulk_ingest_append(emulator_database):
         conn.close()
 
 
-def test_execute_partitions_round_trip(emulator_database):
-    # Partitioned execution: adbc_execute_partitions splits a scan into opaque
-    # descriptors and adbc_read_partition reads each back; their union must be the
-    # full result set, each row once. Data Boost is a statement option set on the
-    # underlying ADBC statement (the emulator ignores Data Boost but still accepts
-    # the flag, exercising the plumbing).
-    conn = _connect(emulator_database, autocommit=True)
+def test_execute_partitions_round_trip(spanner_database):
+    # The union of partitions must contain every row once, with the full schema.
+    conn = _connect(spanner_database, autocommit=True)
     try:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS AdbcPyPartition")
@@ -141,6 +130,16 @@ def test_execute_partitions_round_trip(emulator_database):
         assert schema is not None
         assert schema.names == ["Id"]
 
+        if database_options(spanner_database).get("spanner.instance_type") == "omni":
+            with conn.cursor() as cur:
+                with pytest.raises(spanner.ProgrammingError, match="does not support DataBoost"):
+                    cur.adbc_read_partition(partitions[0])
+            # Omni supports partitioned reads on its own compute, without Data Boost.
+            with conn.cursor() as cur:
+                partitions, schema = cur.adbc_execute_partitions("SELECT Id FROM AdbcPyPartition")
+            assert partitions
+            assert schema.names == ["Id"]
+
         # Read every partition back — a fresh cursor per descriptor — and union ids.
         seen: set[int] = set()
         for token in partitions:
@@ -158,11 +157,11 @@ def test_execute_partitions_round_trip(emulator_database):
         conn.close()
 
 
-def test_manual_commit_and_rollback(emulator_database):
+def test_manual_commit_and_rollback(spanner_database):
     # autocommit off => statements group into manual transactions, each one kind of work
     # (queries or DML) fixed by its first statement. DDL is not transaction-aware: it
     # applies immediately, regardless of the transaction.
-    conn = _connect(emulator_database, autocommit=False)
+    conn = _connect(spanner_database, autocommit=False)
     try:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS AdbcPyTxn")  # DDL runs immediately

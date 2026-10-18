@@ -19,6 +19,8 @@ class DatabaseOptions(enum.StrEnum):
     URI = "uri"
     #: Override the Spanner gRPC endpoint (e.g. an emulator ``host:port``).
     ENDPOINT = "spanner.endpoint"
+    #: Backend type: ``"cloud"`` (default) or ``"omni"`` for a self-hosted endpoint.
+    INSTANCE_TYPE = "spanner.instance_type"
     #: ``"true"`` to connect with anonymous credentials (emulator mode).
     EMULATOR = "spanner.emulator"
     #: Path to a service-account / credential JSON file.

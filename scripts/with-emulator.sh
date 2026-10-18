@@ -63,6 +63,7 @@ if [ "$ready" -ne 1 ]; then
   exit 1
 fi
 
+unset SPANNER_OMNI_ENDPOINT SPANNER_GCP_DATABASE
 export SPANNER_EMULATOR_HOST="localhost:${GRPC_PORT}"
 echo ">> SPANNER_EMULATOR_HOST=${SPANNER_EMULATOR_HOST}"
 echo ">> running: $*"

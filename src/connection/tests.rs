@@ -195,6 +195,55 @@ fn partition_descriptor_envelope_round_trips() {
     assert_eq!(encode_partition(&again).expect("re-encode"), encoded);
 }
 
+#[test]
+fn partition_descriptor_preserves_fallback_types_and_reader_precision() {
+    use crate::conversion::TimestampPrecision;
+    use arrow_schema::DataType;
+    use google_cloud_spanner::model::{StructType, Type, TypeCode, struct_type};
+
+    let mut descriptor = decode_partition(include_bytes!(
+        "../../fuzz/seeds/partition/enveloped-query-descriptor"
+    ))
+    .unwrap();
+    assert!(
+        descriptor
+            .schema(TimestampPrecision::default())
+            .unwrap()
+            .is_none()
+    );
+    descriptor.row_type = Some(
+        StructType::new().set_fields([
+            struct_type::Field::new()
+                .set_name("ts")
+                .set_type(Type::new().set_code(TypeCode::Timestamp)),
+            struct_type::Field::new()
+                .set_name("payload")
+                .set_type(Type::new().set_code(TypeCode::Json)),
+        ]),
+    );
+    let bytes = encode_partition(&descriptor).unwrap();
+    let decoded = decode_partition(&bytes).unwrap();
+    assert_eq!(encode_partition(&decoded).unwrap(), bytes);
+    let schema = decoded
+        .schema(TimestampPrecision::Microseconds)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        schema.field(0).data_type(),
+        &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
+    );
+    assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+    assert_eq!(
+        schema.field(1).metadata()["ARROW:extension:name"],
+        "arrow.json"
+    );
+
+    let mut malformed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    malformed["row_type"] = serde_json::json!(17);
+    let error = decode_partition(&serde_json::to_vec(&malformed).unwrap()).unwrap_err();
+    assert_eq!(error.status, Status::InvalidArguments);
+}
+
 /// A pre-envelope bare descriptor (no `"v"` key) is now rejected — the driver has never had
 /// users, so there are no legacy descriptors to accept, and a descriptor carries a live
 /// session/transaction identity that could not outlive a driver upgrade anyway.

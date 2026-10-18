@@ -1,16 +1,12 @@
-"""Tests for credential kwargs and the typed option-key enums.
-
-Most of these are offline (they only inspect the enums / connect signatures); the
-last one drives a ``spanner.*`` vendor option through ``conn_kwargs`` end-to-end
-against the emulator and self-skips (via the ``emulator_database`` fixture) when no
-``SPANNER_EMULATOR_HOST`` is configured.
-"""
+"""Option-key parity and option round trips through the Python wrappers."""
 
 import inspect
 import re
 from pathlib import Path
 
 import pytest
+
+from conftest import database_options
 
 import spanner_adbc
 import spanner_adbc.dbapi
@@ -209,14 +205,11 @@ def test_low_level_connect_accepts_option_members_directly(monkeypatch):
     ]
 
 
-def test_connection_option_round_trips_through_kwargs(emulator_database):
+def test_connection_option_round_trips_through_kwargs(spanner_database):
     """A ``spanner.*`` vendor option passed via ``conn_kwargs`` takes effect
     end-to-end: it round-trips through ``get_option`` and a query runs under it."""
     conn = spanner.connect(
-        db_kwargs={
-            DatabaseOptions.URI: f"spanner:///{emulator_database}",
-            DatabaseOptions.EMULATOR: "true",
-        },
+        db_kwargs=database_options(spanner_database),
         conn_kwargs={ConnectionOptions.REQUEST_TAG: "adbc-py-e2e"},
         autocommit=True,
     )

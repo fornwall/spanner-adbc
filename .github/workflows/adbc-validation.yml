@@ -23,36 +23,18 @@ env:
 
 jobs:
   validation:
-    name: validation (${{ matrix.name }})
+    name: validation (${{ matrix.name }}, ${{ matrix.backend }})
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
-    # Three legs over the SAME gate/expected-failure/stale checks:
-    #   - plain      — fast, uninstrumented (the original run).
-    #   - asan-ubsan — the whole C++ side built with gcc -fsanitize=address,undefined, driving the
-    #                  (uninstrumented, stable) cdylib. ASan's process-wide malloc/free/memcpy
-    #                  interceptors catch double-free / overflow / use-after-free on the C-ABI
-    #                  structs the driver hands across the FFI boundary (release callbacks,
-    #                  AdbcError private_data), plus UB in the C/C++ code. This catches only bugs
-    #                  that reach a libc-allocator interceptor at the boundary.
-    #   - rust-asan  — the cdylib ITSELF built with nightly Rust's -Zsanitizer=address (+ -Zbuild-std
-    #                  so std is instrumented too), driven by a clang -fsanitize=address C++ side.
-    #                  This is the piece the asan-ubsan leg cannot do: it catches memory bugs *inside*
-    #                  Rust (out-of-bounds store, use-after-free on Rust-owned heap) that never touch
-    #                  a malloc/free interceptor. The C++ side is built with clang (not the gcc
-    #                  default) because Rust's -Zsanitizer=address uses LLVM compiler-rt ASan and the
-    #                  two ASan runtimes must match in one process; UBSan is dropped on this leg's C++
-    #                  side (no -Zsanitizer=undefined cdylib equivalent, and the asan-ubsan leg already
-    #                  carries full C-side UB coverage), keeping the runtime match to just ASan.
-    #                  This leg additionally runs a cross-boundary ASan CANARY before the suite (the
-    #                  run script builds the cdylib with --cfg asan_canary and calls an intentionally-
-    #                  out-of-bounds Rust symbol from a clang -fsanitize=address program against a
-    #                  C++-allocated buffer): if ASan does NOT report the heap-buffer-overflow the
-    #                  instrumentation is disarmed and the leg fails loudly, so a silent
-    #                  -Zsanitizer=address regression can't leave it green as a no-op.
-    # fail-fast: false so one leg failing does not cancel the others.
+    # Exercise both backends with plain, C++ ASan/UBSan, and Rust ASan builds.
+    # Rust ASan also instruments std and runs a cross-boundary overflow canary.
+    # Its C++ harness uses clang so both sides share LLVM's ASan runtime.
     strategy:
       fail-fast: false
       matrix:
+        name: [plain, asan-ubsan, rust-asan]
+        backend: [emulator, omni]
         include:
           - name: plain
             sanitize: ""
@@ -67,16 +49,7 @@ jobs:
             rust-sanitize: address
             toolchain: nightly
 
-    # A Spanner emulator to validate against, same as the main CI job.
-    services:
-      spanner:
-        image: gcr.io/cloud-spanner-emulator/emulator
-        ports:
-          - 9010:9010
-          - 9020:9020
-
     env:
-      SPANNER_EMULATOR_HOST: localhost:9010
       # Forwarded to scripts/run-adbc-validation.sh → -DSPANNER_VALIDATION_SANITIZE (C++ side).
       # Empty for the plain leg. Distinct build dir per leg so the flag sets never share a cache/tree.
       ADBC_VALIDATION_SANITIZE: ${{ matrix.sanitize }}
@@ -88,11 +61,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Two toolchain steps, one per matrix leg. The stable leg installs the version pinned in
-      # rust-toolchain.toml via the setup-rust composite (the single source of truth); the nightly
-      # leg below pins its own dtolnay/rust-toolchain SHA (the action reads the toolchain from its
-      # ref name, so the SHA and the requested toolchain must agree). A plain `if:` per leg keeps
-      # each step's SHA a literal.
       - name: Install Rust toolchain (stable)
         if: matrix.toolchain == 'stable'
         uses: ./.github/actions/setup-rust
@@ -126,43 +94,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: Wait for the Spanner emulator
-        run: |
-          # Gate on a real admin-API response, not just the gRPC TCP port (which
-          # opens ~1s early); the run script creates the instance/database over
-          # this REST API.
-          for _ in $(seq 1 60); do
-            if [ "$(curl -s -o /dev/null -w '%{http_code}' \
-                http://localhost:9020/v1/projects/emulator/instanceConfigs)" = "200" ]; then
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "Spanner emulator admin API did not become ready" >&2
-          exit 1
-
-      # Persist the C++ validation build tree (fetched + compiled arrow-adbc and
-      # GoogleTest under .adbc-validation-build, plus our own harness objects) so the
-      # slow FetchContent clone + compile is reused across runs. The key is bound to
-      # the runner OS, the matrix leg (plain / asan-ubsan / rust-asan build the same sources
-      # with different flags — and rust-asan with a different compiler, clang vs gcc — so they
-      # must NOT share a tree) and a hash of
-      # adbc-validation/CMakeLists.txt and this workflow — which carry the pinned ARROW_ADBC_TAG,
-      # build flags and tool versions — so changing any of them mints a fresh key.
-      #
-      # Deliberately NO restore-keys: a partial-key hit would restore a build tree
-      # (including its CMakeCache.txt) from a run on the *old* arrow-adbc rev, and
-      # FetchContent may then keep the stale checkout instead of re-fetching the new
-      # tag — masking the rev bump and compiling against the wrong arrow-adbc source.
-      # An exact key match is safe (same sources, tools and flags); a rev bump
-      # is an exact miss → empty tree → clean clone of the correct rev. The cost is a
-      # cold rebuild of arrow-adbc + GoogleTest on each CMakeLists change, which is
-      # rare (only rev/flag bumps) and worth the correctness guarantee.
+      # Compiler and sanitizer settings require a distinct build tree per leg.
+      # No restore-keys: an old CMakeCache could retain a stale upstream checkout.
       - name: Cache the ADBC C++ validation build tree
         uses: actions/cache@v6
         with:
           path: ${{ env.ADBC_VALIDATION_BUILD_DIR }}
           key: adbc-validation-${{ runner.os }}-${{ matrix.name }}-${{ hashFiles('adbc-validation/CMakeLists.txt', '.github/workflows/adbc-validation.yml') }}
 
-      - name: Run the ADBC C++ validation suite (gated subset)
-        run: scripts/run-adbc-validation.sh
+      - name: Build validation harness and check upstream test inventory
+        run: scripts/run-adbc-validation.sh --check-drift
+
+      - name: Run the ADBC C++ validation suite (${{ matrix.backend }})
+        run: scripts/with-${{ matrix.backend }}.sh scripts/run-adbc-validation.sh

@@ -351,12 +351,13 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
 
   // The driver reports the database id as the ADBC catalog, so every case that
   // filters by, sets, or asserts the current catalog must use the same name.
-  // ADBC_SPANNER_URI is always spanner:///projects/<p>/instances/<i>/databases/<d>
+  // Ignore connection options following the database path.
   // with no query parameters, so the last path segment is the database id.
   std::string catalog() const override {
     const std::string uri = EnvOr("ADBC_SPANNER_URI", "");
-    const auto slash = uri.find_last_of('/');
-    return slash == std::string::npos ? uri : uri.substr(slash + 1);
+    const std::string path = uri.substr(0, uri.find_first_of("?#"));
+    const auto slash = path.find_last_of('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
   }
   std::string db_schema() const override { return ""; }
 

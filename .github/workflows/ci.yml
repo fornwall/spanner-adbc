@@ -20,22 +20,14 @@ env:
 
 jobs:
   test:
+    name: Rust (${{ matrix.backend }})
     runs-on: ubuntu-latest
-
-    # Run the Spanner emulator as a service container so the integration test has
-    # a real Spanner to talk to.
-    services:
-      spanner:
-        image: gcr.io/cloud-spanner-emulator/emulator
-        ports:
-          - 9010:9010
-          - 9020:9020
-
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [emulator, omni]
     env:
-      SPANNER_EMULATOR_HOST: localhost:9010
-      # Make the emulator test gates fail LOUD (panic) instead of self-skipping if the target env
-      # wiring above is ever dropped/misspelled in a refactor — otherwise the whole integration
-      # suite would pass vacuously with zero behavioral coverage.
       ADBC_TEST_REQUIRE_TARGET: "1"
 
     steps:
@@ -49,69 +41,49 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check formatting
+        if: matrix.backend == 'emulator'
         run: cargo fmt --all --check
 
       - name: Clippy
+        if: matrix.backend == 'emulator'
         # --all-features so the `fuzzing` helper module is linted too.
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Docs (deny warnings / broken links)
+        if: matrix.backend == 'emulator'
         env:
           RUSTDOCFLAGS: "-D warnings"
         # --all-features to match how docs.rs builds the docs.
         run: cargo doc --no-deps --all-features
 
       - name: Build without default features (ffi off)
+        if: matrix.backend == 'emulator'
         run: cargo build --no-default-features
 
       - name: Build the shared library (for the FFI smoke test)
         run: cargo build
 
       - name: Mock-server fault-injection tests
-        # Fully offline, deterministic gRPC fault-injection suite (in-process mock
-        # server) — needs no emulator, so run it before the emulator setup below.
+        if: matrix.backend == 'emulator'
         run: cargo test --test mock_spanner
 
-      - name: Wait for the Spanner emulator
-        run: |
-          # Wait for the admin API to actually serve RPCs, not just for the gRPC
-          # TCP port to open — the forwarded port accepts connections ~1s before
-          # the emulator is ready, and starting the test that early makes its
-          # create_instance fail silently ("Instance not found").
-          for _ in $(seq 1 60); do
-            if [ "$(curl -s -o /dev/null -w '%{http_code}' \
-                http://127.0.0.1:9020/v1/projects/emulator/instanceConfigs)" = "200" ]; then
-              echo "emulator admin API is up"; exit 0
-            fi
-            sleep 1
-          done
-          echo "emulator did not become ready" >&2
-          exit 1
-
       - name: Unit tests
-        # --features fuzzing so the `#[cfg(feature = "fuzzing")]` unit tests run in CI too — in
-        # particular `fuzzing::tests::partition_seed_corpus_satisfies_the_oracle`, which guards the
-        # fuzz seed corpus against the decode oracle. The feature only adds the `fuzzing` helper
-        # module (pulling in `arbitrary`); it needs no nightly, and libFuzzer is not involved (the
-        # nightly `fuzz.yml` runs `cargo fuzz run`, which never executes these `#[test]`s).
+        if: matrix.backend == 'emulator'
+        # Include fuzz helper tests and seed-corpus checks without libFuzzer.
         run: cargo test --lib --features fuzzing
 
       - name: Doctests
+        if: matrix.backend == 'emulator'
         # Neither `--lib` nor `--all-targets` runs doctests, so run them
         # explicitly. --all-features so feature-gated examples compile too.
         run: cargo test --doc --all-features
 
-      - name: Integration tests (Spanner emulator)
-        # Name every emulator-backed binary explicitly. A new `tests/*.rs` does NOT
-        # run here until it is added, so adding one means editing this line too.
-        run: cargo test --test integration --test ffi_lifecycle
+      - name: Integration tests (${{ matrix.backend }})
+        # Register new target-dependent test binaries here.
+        run: scripts/with-${{ matrix.backend }}.sh cargo test --test integration --test ffi_lifecycle
 
-  # End-to-end test of the Python package (python/) against the emulator: build
-  # the driver, drop it into the package exactly as the wheel job does, install
-  # it, and exercise the whole DBAPI/Arrow surface (DDL, DML, ingest, manual
-  # transactions) the way a real user would.
   python:
-    name: Python package (emulator, py${{ matrix.python-version }})
+    name: Python package (${{ matrix.backend }}, py${{ matrix.python-version }})
     runs-on: ubuntu-latest
 
     # Run against the minimum supported Python (pyproject `requires-python`) and
@@ -122,18 +94,11 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.x"]
+        backend: [emulator, omni]
 
-    services:
-      spanner:
-        image: gcr.io/cloud-spanner-emulator/emulator
-        ports:
-          - 9010:9010
-          - 9020:9020
-
+    # New Python releases may need native dependency builds before wheels ship.
+    timeout-minutes: 60
     env:
-      SPANNER_EMULATOR_HOST: localhost:9010
-      # Fail loud (pytest.fail) rather than self-skip if the emulator env wiring is ever dropped, so
-      # the Python end-to-end / oracle suites can't turn CI green with zero coverage.
       ADBC_TEST_REQUIRE_TARGET: "1"
 
     steps:
@@ -148,11 +113,18 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           check-latest: true
+          cache: pip
+          cache-dependency-path: |
+            python/pyproject.toml
+            scripts/run-foundry-validation.sh
 
       - name: Build the driver shared library
         run: cargo build
 
       - name: Install the Python package with the freshly built driver
+        env:
+          # Bound DuckDB source-build memory while cp315 wheels are unavailable.
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: |
           set -euo pipefail
           cp target/debug/libspanner_adbc.so python/spanner_adbc/
@@ -160,22 +132,10 @@ jobs:
           # pyarrow/pandas/polars/duckdb exercise the Arrow + DataFrame paths, including the
           # README cookbook snippets that import them. google-cloud-spanner is the oracle for the
           # differential type-mapping test (test_differential_oracle.py).
-          python -m pip install --upgrade ./python pyarrow pandas polars duckdb pytest google-cloud-spanner
-
-      - name: Wait for the Spanner emulator
-        run: |
-          for _ in $(seq 1 60); do
-            if [ "$(curl -s -o /dev/null -w '%{http_code}' \
-                http://127.0.0.1:9020/v1/projects/emulator/instanceConfigs)" = "200" ]; then
-              echo "emulator admin API is up"; exit 0
-            fi
-            sleep 1
-          done
-          echo "emulator did not become ready" >&2
-          exit 1
+          python -m pip install --upgrade ./python pyarrow pandas polars duckdb pytest google-cloud-spanner 'setuptools>=77'
 
       - name: End-to-end tests
-        run: python -m pytest python/tests -v
+        run: scripts/with-${{ matrix.backend }}.sh python -m pytest python/tests -v
 
   # Lint the workflow files themselves. The pinned Docker image bundles
   # actionlint plus its shellcheck/pyflakes integrations, so `run:` scripts are
@@ -191,7 +151,7 @@ jobs:
         # trailing comment names the tag the digest was resolved from.
         run: docker run --rm -v "${PWD}:/repo" --workdir /repo rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color # 1.7.12
 
-      - name: Test emulator wrapper cleanup
+      - name: Test backend wrappers and setup
         run: python3 -m unittest discover -s scripts/tests -v
 
   # Supply-chain + hygiene checks (no build / emulator needed):

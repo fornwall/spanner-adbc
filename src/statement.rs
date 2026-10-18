@@ -29,21 +29,20 @@ use adbc_core::{CancelHandle, Optionable, PartitionedResult, Statement};
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use google_cloud_lro::Poller as _;
-use google_cloud_spanner::client::{DatabaseClient, Spanner};
+use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::model::PartitionOptions;
 use google_cloud_spanner::model::execute_sql_request::QueryMode;
 use google_cloud_spanner::statement::{Statement as SpannerSql, StatementBuilder};
 use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, ReadWriteTransaction};
 
 use crate::bind;
-use crate::connection::{SharedTxn, TxnKind, build_runner, lock_txn};
+use crate::connection::{SharedTxn, TxnKind, lock_txn, runner_builder};
 use crate::conversion::{
     BoundStatementSource, TimestampPrecision, result_set_to_batch, stream_bound_query, stream_query,
 };
 use crate::driver::SharedDatabaseAdmin;
 use crate::error::{
-    err, from_builder, from_spanner, invalid_argument, invalid_state, option_not_set,
-    unknown_option, unsupported,
+    err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option, unsupported,
 };
 use crate::options::{
     SharedConfig, bool_option, impl_shared_option_dispatch, impl_typed_option_getters,
@@ -98,7 +97,6 @@ impl BoundStatementSource for LazyBoundStatements {
 pub struct SpannerStatement {
     runtime: SharedRuntime,
     client: DatabaseClient,
-    spanner: Spanner,
     database: String,
     /// The lazily-built Database Admin client for the DDL path, shared across every connection and
     /// statement minted from the database's cached client stack (see [`SharedDatabaseAdmin`]).
@@ -166,7 +164,6 @@ impl SpannerStatement {
     pub(crate) fn new(
         runtime: SharedRuntime,
         client: DatabaseClient,
-        spanner: Spanner,
         database: String,
         admin: SharedDatabaseAdmin,
         config: SharedConfig,
@@ -175,7 +172,6 @@ impl SpannerStatement {
         Self {
             runtime,
             client,
-            spanner,
             database,
             admin,
             config,
@@ -359,6 +355,7 @@ impl SpannerStatement {
                         batch_size,
                         precision,
                         fetch_timeout,
+                        None,
                     )
                     .await
                 }),
@@ -462,6 +459,7 @@ impl SpannerStatement {
                         batch_size,
                         precision,
                         fetch_timeout,
+                        None,
                     )
                     .await
                 },
@@ -482,7 +480,6 @@ impl SpannerStatement {
                 "cannot execute DDL: the connection is read-only",
             ));
         }
-        let spanner = self.spanner.clone();
         let admin_cell = self.admin.clone();
         let database = self.database.clone();
         block_on_cancellable(
@@ -495,15 +492,7 @@ impl SpannerStatement {
                     // Built once per cached client stack and reused: it holds its connection pool
                     // behind an `Arc`, so rebuilding it per DDL statement would redo the
                     // endpoint/credential setup for nothing. A failed build stays uncached.
-                    let admin = admin_cell
-                        .get_or_try_init(|| async {
-                            spanner
-                                .database_admin_builder()
-                                .build()
-                                .await
-                                .map_err(from_builder)
-                        })
-                        .await?;
+                    let admin = admin_cell.client().await?;
                     admin
                         .update_database_ddl()
                         .set_database(database)
@@ -584,6 +573,18 @@ impl SpannerStatement {
                 .execute_query(plan_stmt)
                 .await
                 .map_err(from_spanner)?;
+            let metadata = plan_rs.metadata();
+            let row_type = google_cloud_spanner::model::StructType::new().set_fields(
+                metadata
+                    .column_names()
+                    .iter()
+                    .zip(metadata.column_types())
+                    .map(|(name, ty)| {
+                        google_cloud_spanner::model::struct_type::Field::new()
+                            .set_name(name)
+                            .set_type(google_cloud_spanner::model::Type::from(ty.clone()))
+                    }),
+            );
             let (schema, _batch) = result_set_to_batch(plan_rs, precision).await?;
 
             // Partition the query across a batch read-only transaction.
@@ -606,7 +607,12 @@ impl SpannerStatement {
                 } else {
                     partition
                 };
-                tokens.push(crate::connection::encode_partition(&partition)?);
+                tokens.push(crate::connection::encode_partition(
+                    &crate::connection::PartitionDescriptor {
+                        partition,
+                        row_type: Some(row_type.clone()),
+                    },
+                )?);
             }
             Ok::<_, Error>((schema, tokens))
         };
@@ -699,7 +705,7 @@ impl SpannerStatement {
                 self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
-                    let runner = build_runner(&client, isolation, &request, retry);
+                    let runner = runner_builder(&client, isolation, &request, retry).build();
                     let outcome = runner
                         .run(move |transaction: ReadWriteTransaction| {
                             let statement = plan_stmt.clone();

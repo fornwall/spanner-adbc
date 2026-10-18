@@ -17,7 +17,8 @@ use adbc_core::{CancelHandle, Connection, Optionable};
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use google_cloud_spanner::batch::Partition;
-use google_cloud_spanner::client::{DatabaseClient, Spanner};
+use google_cloud_spanner::client::DatabaseClient;
+use google_cloud_spanner::model::StructType;
 use google_cloud_spanner::mutation::Mutation;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 
@@ -36,8 +37,8 @@ mod exec;
 mod txn;
 
 use crate::metadata::{check_lookup_catalog, like_match, metadata_sql_builder, table_exists};
-pub(crate) use exec::{build_runner, run_batch_txn, write_mutations_txn};
 use exec::{isolation_to_adbc_string, parse_isolation_level};
+pub(crate) use exec::{run_batch_txn, runner_builder, write_mutations_txn};
 use txn::{ManualTxn, check_commit_writable};
 pub(crate) use txn::{SharedTxn, TxnKind, TxnState, lock_txn};
 
@@ -77,7 +78,6 @@ pub(crate) use txn::{SharedTxn, TxnKind, TxnState, lock_txn};
 pub struct SpannerConnection {
     runtime: SharedRuntime,
     client: DatabaseClient,
-    spanner: Spanner,
     database: String,
     /// The lazily-built Database Admin client for the DDL path, shared (`Arc`) with every statement
     /// the connection creates and — via the cached [`Connected`] stack — every other connection on
@@ -106,7 +106,6 @@ impl SpannerConnection {
         Self {
             runtime,
             client: connected.client,
-            spanner: connected.spanner,
             database: connected.database,
             admin: connected.admin,
             config: SharedConfig::default(),
@@ -297,7 +296,6 @@ impl Connection for SpannerConnection {
         Ok(SpannerStatement::new(
             self.runtime.clone(),
             self.client.clone(),
-            self.spanner.clone(),
             self.database.clone(),
             self.admin.clone(),
             self.config.inherit(),
@@ -552,7 +550,7 @@ impl Connection for SpannerConnection {
         // Decode the opaque descriptor produced by `Statement::execute_partitions`. It carries the
         // session, transaction id, partition token and Data Boost flag, so it executes on this
         // connection's client (which shares the same multiplexed session) with no further setup.
-        let partition = decode_partition(partition.as_ref())?;
+        let descriptor = decode_partition(partition.as_ref())?;
         let client = self.client.clone();
         let runtime = self.runtime.clone();
         let cancel = self.cancel.current();
@@ -563,6 +561,7 @@ impl Connection for SpannerConnection {
         // connection's query timeout bounds the initial execute + first chunk; its fetch timeout
         // bounds each later chunk inside the prefetch task.
         let precision = self.config.timestamp_precision;
+        let fallback_schema = descriptor.schema(precision)?;
         let fetch_timeout = self.config.timeouts.fetch_timeout();
         let reader = block_on_cancellable(
             &self.runtime,
@@ -571,7 +570,11 @@ impl Connection for SpannerConnection {
                 self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
-                    let result_set = partition.execute(&client).await.map_err(from_spanner)?;
+                    let result_set = descriptor
+                        .partition
+                        .execute(&client)
+                        .await
+                        .map_err(from_spanner)?;
                     stream_query(
                         runtime,
                         cancel,
@@ -579,6 +582,7 @@ impl Connection for SpannerConnection {
                         DEFAULT_ROWS_PER_BATCH,
                         precision,
                         fetch_timeout,
+                        fallback_schema,
                     )
                     .await
                 },
@@ -596,18 +600,48 @@ impl Connection for SpannerConnection {
 /// error instead of a confusing shape mismatch.
 pub(crate) const PARTITION_DESCRIPTOR_VERSION: u64 = 1;
 
+/// The executable SDK partition plus optional column types for empty partition responses.
+#[derive(Debug)]
+pub(crate) struct PartitionDescriptor {
+    pub(crate) partition: Partition,
+    pub(crate) row_type: Option<StructType>,
+}
+
+impl PartitionDescriptor {
+    fn schema(&self, precision: TimestampPrecision) -> Result<Option<Arc<Schema>>> {
+        self.row_type
+            .as_ref()
+            .map(|row_type| {
+                let fields = row_type
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        let ty = field.r#type.as_deref().cloned().unwrap_or_default().into();
+                        crate::conversion::arrow_field(&field.name, &ty, true, precision)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Arc::new(Schema::new(fields)))
+            })
+            .transpose()
+    }
+}
+
 /// Encode a [`Partition`] into an opaque ADBC partition descriptor: the versioned JSON envelope
-/// `{"v":1,"partition":<serde form of the client's Partition>}`. The inverse of
-/// [`decode_partition`].
-pub(crate) fn encode_partition(partition: &Partition) -> Result<Vec<u8>> {
+/// `{"v":1,"partition":<SDK partition>,"row_type":<column metadata>}`. The optional `row_type`
+/// preserves column types when an empty partition returns no metadata. Inverse of [`decode_partition`].
+pub(crate) fn encode_partition(descriptor: &PartitionDescriptor) -> Result<Vec<u8>> {
     let internal = |e: serde_json::Error| {
         err(
             format!("failed to serialize partition descriptor: {e}"),
             Status::Internal,
         )
     };
-    let payload = serde_json::to_value(partition).map_err(internal)?;
-    let envelope = serde_json::json!({ "v": PARTITION_DESCRIPTOR_VERSION, "partition": payload });
+    let payload = serde_json::to_value(&descriptor.partition).map_err(internal)?;
+    let mut envelope =
+        serde_json::json!({ "v": PARTITION_DESCRIPTOR_VERSION, "partition": payload });
+    if let Some(row_type) = &descriptor.row_type {
+        envelope["row_type"] = serde_json::to_value(row_type).map_err(internal)?;
+    }
     serde_json::to_vec(&envelope).map_err(internal)
 }
 
@@ -616,7 +650,7 @@ pub(crate) fn encode_partition(partition: &Partition) -> Result<Vec<u8>> {
 /// or unsupported version, and anything that does not decode (empty input, non-JSON bytes, or
 /// valid JSON of the wrong shape) are [`Status::InvalidArguments`] errors, never a panic. A pure
 /// function so the rejection paths are unit-testable without a connection.
-pub(crate) fn decode_partition(descriptor: &[u8]) -> Result<Partition> {
+pub(crate) fn decode_partition(descriptor: &[u8]) -> Result<PartitionDescriptor> {
     let invalid =
         |e: serde_json::Error| invalid_argument(format!("invalid partition descriptor: {e}"));
     let value: serde_json::Value = serde_json::from_slice(descriptor).map_err(invalid)?;
@@ -638,7 +672,15 @@ pub(crate) fn decode_partition(descriptor: &[u8]) -> Result<Partition> {
     let payload = value.get("partition").cloned().ok_or_else(|| {
         invalid_argument("invalid partition descriptor: missing \"partition\" field")
     })?;
-    serde_json::from_value(payload).map_err(invalid)
+    let partition = serde_json::from_value(payload).map_err(invalid)?;
+    let row_type = value
+        .get("row_type")
+        .map(|row_type| serde_json::from_value(row_type.clone()).map_err(invalid))
+        .transpose()?;
+    Ok(PartitionDescriptor {
+        partition,
+        row_type,
+    })
 }
 
 /// Validate a `current_catalog` / `current_schema` set request. A connection is pinned to one

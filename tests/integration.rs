@@ -1,6 +1,6 @@
 //! End-to-end integration test that runs the ADBC driver against Cloud Spanner.
 //!
-//! The test is **skipped automatically** unless one of two environment variables is set, so a plain
+//! The test is **skipped automatically** unless a target environment variable is set, so a plain
 //! `cargo test` stays green without any external dependency:
 //!
 //! - `SPANNER_EMULATOR_HOST` — run against a local Spanner **emulator**. The helper script starts
@@ -9,6 +9,8 @@
 //!   ```sh
 //!   scripts/with-emulator.sh cargo test --test integration -- --nocapture
 //!   ```
+//!
+//! - `SPANNER_OMNI_ENDPOINT` — run against Spanner Omni, using the default project and instance.
 //!
 //! - `SPANNER_GCP_DATABASE` — run against a **real** Cloud Spanner database, reached with
 //!   Application Default Credentials (`gcloud auth application-default login`, a service-account
@@ -21,8 +23,8 @@
 //!
 //!   The instance must already exist; the test best-effort creates the database and the tables it
 //!   needs (the `Singers` table and the property-test tables, all idempotent), and clears or drops
-//!   its scratch data, so it is safe to re-run against a persistent database. If both variables are
-//!   set, the emulator wins.
+//!   its scratch data, so it is safe to re-run against a persistent database. Omni takes precedence
+//!   over the emulator, which takes precedence over a Cloud target.
 //!
 //! Setup (creating the database and table) uses the Spanner admin clients directly; the actual query
 //! and DML round-trip goes through the `spanner-adbc` driver being tested.
@@ -46,106 +48,14 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{NaiveDate, SecondsFormat};
 use google_cloud_lro::Poller;
-use google_cloud_spanner::client::Spanner;
 use google_cloud_spanner_admin_instance_v1::model::Instance;
 use proptest::prelude::*;
 use spanner_adbc::{SpannerConnection, SpannerDatabase, SpannerDriver, SpannerStatement};
 
-// Identifiers used against the emulator, which starts empty and lets us create everything.
-const PROJECT: &str = "test-project";
-const INSTANCE: &str = "test-instance";
-const DATABASE: &str = "adbc-test";
-
-/// Where the integration tests should run, resolved from the environment.
-struct TestTarget {
-    project: String,
-    instance: String,
-    database: String,
-    /// `true` when pointed at the local emulator (via `SPANNER_EMULATOR_HOST`), `false` for a real
-    /// Cloud Spanner database reached with Application Default Credentials.
-    is_emulator: bool,
-}
-
-impl TestTarget {
-    fn database_path(&self) -> String {
-        format!(
-            "projects/{}/instances/{}/databases/{}",
-            self.project, self.instance, self.database
-        )
-    }
-
-    /// The database path wrapped as a `spanner://` connection URI, the form the `uri` option
-    /// requires (a bare path is rejected).
-    fn database_uri(&self) -> String {
-        format!("spanner:///{}", self.database_path())
-    }
-
-    fn instance_path(&self) -> String {
-        format!("projects/{}/instances/{}", self.project, self.instance)
-    }
-}
-
-/// Whether the `ADBC_TEST_REQUIRE_TARGET` env var demands a configured target (CI sets it).
-///
-/// When set to a truthy value, the "no target configured" / "no cdylib built" skip branches
-/// `panic!` instead of quietly returning, so a broken env wiring (e.g. a dropped or misspelled
-/// `env:` line in a workflow refactor) fails the run loudly rather than passing vacuously with zero
-/// behavioral coverage.
-fn require_target() -> bool {
-    matches!(
-        std::env::var("ADBC_TEST_REQUIRE_TARGET").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    )
-}
-
-/// Resolve the test target from the environment, or `None` to skip.
-///
-/// `SPANNER_EMULATOR_HOST` selects the emulator with fixed identifiers. `SPANNER_GCP_DATABASE`, in
-/// `project.instance.database` form, points the tests at a real Cloud Spanner database reached with
-/// Application Default Credentials. The emulator takes precedence if both are set.
-///
-/// When `ADBC_TEST_REQUIRE_TARGET` is truthy (CI) and no target is configured, this panics instead
-/// of returning `None`, so the suite cannot silently skip all of its behavioral coverage.
-fn test_target() -> Option<TestTarget> {
-    let target = resolve_test_target();
-    if target.is_none() && require_target() {
-        panic!(
-            "ADBC_TEST_REQUIRE_TARGET is set but neither SPANNER_EMULATOR_HOST nor \
-             SPANNER_GCP_DATABASE is configured — the Spanner target env wiring is missing, so \
-             this suite would skip all behavioral coverage. Refusing to pass vacuously."
-        );
-    }
-    target
-}
-
-/// Inner resolver for [`test_target`]; returns `None` when no target env is set.
-fn resolve_test_target() -> Option<TestTarget> {
-    if std::env::var("SPANNER_EMULATOR_HOST").is_ok_and(|s| !s.is_empty()) {
-        return Some(TestTarget {
-            project: PROJECT.to_string(),
-            instance: INSTANCE.to_string(),
-            database: DATABASE.to_string(),
-            is_emulator: true,
-        });
-    }
-
-    let spec = std::env::var("SPANNER_GCP_DATABASE")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    // Spanner project / instance / database ids cannot themselves contain a dot, so a plain split
-    // unambiguously recovers the three components.
-    match spec.split('.').collect::<Vec<_>>().as_slice() {
-        [project, instance, database] => Some(TestTarget {
-            project: project.to_string(),
-            instance: instance.to_string(),
-            database: database.to_string(),
-            is_emulator: false,
-        }),
-        _ => {
-            panic!("SPANNER_GCP_DATABASE must be in 'project.instance.database' form, got {spec:?}")
-        }
-    }
-}
+mod common;
+use common::{TestTarget, require_target, test_target};
+#[path = "common/omni.rs"]
+mod omni_setup;
 
 /// DDL for the `Singers` table the tests read from. `if_not_exists` guards it for a pre-existing
 /// real database, where `create_database`'s extra statements do not run.
@@ -195,12 +105,15 @@ fn prop_tables_ddl(if_not_exists: bool) -> Vec<String> {
 /// re-issued with `IF NOT EXISTS`, since on an already-existing database `create_database`'s extra
 /// statements never run.
 async fn ensure_database(target: &TestTarget) {
-    // The client auto-detects `SPANNER_EMULATOR_HOST` (anonymous credentials) and otherwise uses
-    // Application Default Credentials — the same resolution the driver under test performs.
-    let spanner = Spanner::builder()
-        .build()
-        .await
-        .expect("failed to build Spanner client for setup");
+    if let Some(endpoint) = &target.omni_endpoint {
+        let mut statements = vec![singers_ddl(true)];
+        statements.extend(prop_tables_ddl(true));
+        omni_setup::update_ddl(endpoint, target.database_path(), statements, Vec::new())
+            .await
+            .expect("initialize Omni test tables");
+        return;
+    }
+    let spanner = target.spanner().await;
 
     if target.is_emulator {
         let instance_admin = spanner
@@ -288,7 +201,7 @@ fn ensure_database_once(target: &TestTarget) {
 fn connect_via_connection_uri() {
     let Some(target) = test_target() else {
         eprintln!(
-            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
+            "no Spanner target configured — \
              skipping Spanner integration test"
         );
         return;
@@ -306,7 +219,7 @@ fn connect_via_connection_uri() {
             target.database_path()
         )
     } else {
-        format!("spanner:///{}", target.database_path())
+        target.database_uri()
     };
 
     let mut driver = SpannerDriver::try_new().expect("create driver");
@@ -333,6 +246,21 @@ fn connect_via_connection_uri() {
                 .get_option_string(OptionDatabase::Other("spanner.emulator".into()))
                 .unwrap(),
             "true"
+        );
+    } else if let Some(endpoint) = &target.omni_endpoint {
+        assert_eq!(
+            database
+                .get_option_string(OptionDatabase::Other(
+                    spanner_adbc::OPTION_INSTANCE_TYPE.into()
+                ))
+                .unwrap(),
+            "omni"
+        );
+        assert_eq!(
+            database
+                .get_option_string(OptionDatabase::Other(spanner_adbc::OPTION_ENDPOINT.into()))
+                .unwrap(),
+            *endpoint
         );
     }
 
@@ -647,13 +575,12 @@ fn hostile_identifiers_are_rejected_before_any_ddl_runs() {
         );
     }
 
-    // A legitimate name that merely needs quoting still works: reserved words and spaces are
-    // exactly what backticks are for.
+    // Reserved words remain valid column names when quoted.
     let quoted_ok = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("Id", DataType::Int64, false),
             Field::new("select", DataType::Int64, false),
-            Field::new("spaced name", DataType::Int64, false),
+            Field::new("from", DataType::Int64, false),
         ])),
         vec![
             Arc::new(Int64Array::from(vec![1_i64])),
@@ -4624,9 +4551,7 @@ fn required_cdylib_path() -> Option<std::path::PathBuf> {
 #[test]
 fn ffi_driver_manager_smoke() {
     let Some(target) = test_target() else {
-        eprintln!(
-            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — skipping FFI smoke test"
-        );
+        eprintln!("no Spanner target configured — skipping FFI smoke test");
         return;
     };
     let Some(cdylib) = required_cdylib_path() else {
@@ -5399,7 +5324,7 @@ fn fixture_unguarded() -> Option<Fixture> {
 fn build_fixture(serial: bool) -> Option<Fixture> {
     let Some(target) = test_target() else {
         eprintln!(
-            "neither SPANNER_EMULATOR_HOST nor SPANNER_GCP_DATABASE set — \
+            "no Spanner target configured — \
              skipping Spanner integration test"
         );
         return None;
@@ -6405,16 +6330,34 @@ fn dml_then_return_round_trip() {
         ],
     )
     .unwrap();
-    bound.bind(batch).expect("bind");
-    let rows: usize = bound
+    bound.bind(batch.clone()).expect("bind");
+    let batches = bound
         .execute()
         .expect("bound insert then return")
         .collect::<Result<Vec<_>, _>>()
-        .expect("collect bound returned rows")
+        .expect("collect bound returned rows");
+    let ids: Vec<_> = batches
         .iter()
-        .map(RecordBatch::num_rows)
-        .sum();
-    assert_eq!(rows, 2);
+        .flat_map(|batch| col::<Int64Array>(batch.column(0)).values().iter().copied())
+        .collect();
+    assert_eq!(ids, [10, 11]);
+    assert_eq!(count_rows(connection, "AdbcReturn"), 4);
+
+    // A failed later row must roll back the entire bound batch, including its first insert.
+    let duplicate = RecordBatch::try_new(
+        batch.schema(),
+        vec![
+            Arc::new(Int64Array::from(vec![20, 20])),
+            batch.column(1).clone(),
+        ],
+    )
+    .unwrap();
+    bound.bind(duplicate).unwrap();
+    let Err(error) = bound.execute() else {
+        panic!("duplicate second row must fail");
+    };
+    assert_eq!(error.status, Status::AlreadyExists, "{error}");
+    assert_eq!(count_rows(connection, "AdbcReturn"), 4);
 
     // Manual transaction mode: rejected up front with a clear error; the buffer stays usable.
     connection
@@ -6483,7 +6426,7 @@ fn execute_partitions_round_trip() {
     statement
         .set_sql_query("SELECT Id FROM AdbcPartition")
         .unwrap();
-    let partitioned = statement.execute_partitions().expect("execute_partitions");
+    let mut partitioned = statement.execute_partitions().expect("execute_partitions");
 
     // The schema is known up front, independent of how many partitions come back.
     assert_eq!(partitioned.schema.fields().len(), 1);
@@ -6513,6 +6456,21 @@ fn execute_partitions_round_trip() {
             serde_json::Value::Bool(true),
             "spanner.data_boost=true must be baked into the descriptor: {descriptor}"
         );
+    }
+
+    if fx.target.omni_endpoint.is_some() {
+        // Omni supports partitioned reads but rejects the Cloud-only Data Boost service.
+        let Err(error) = connection.read_partition(&partitioned.partitions[0]) else {
+            panic!("Omni unexpectedly accepted Data Boost");
+        };
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("DataBoost"), "{error}");
+        statement
+            .set_option(data_boost_key(), "false".into())
+            .unwrap();
+        partitioned = statement
+            .execute_partitions()
+            .expect("partition without Data Boost");
     }
 
     // Read every partition back through the connection and union the ids.
@@ -7253,10 +7211,9 @@ struct SchemaFidelityCase {
 
 /// The table of (type, SQL expression) pairs covering **every** mapped Spanner type: all the
 /// scalars, `ARRAY` of each scalar, and `ARRAY<STRUCT<..>>` including a nested `STRUCT` and a
-/// nested `ARRAY`. Top-level (non-array) `STRUCT` columns are excluded because real Cloud Spanner
-/// rejects returning structs except inside arrays ("Spanner does not yet support returning STRUCT
-/// except as arrays-of-structs"), so `ARRAY(SELECT AS STRUCT ...)` is the only portable spelling —
-/// it still exercises the whole recursive `STRUCT` mapping, one array level down.
+/// nested `ARRAY`. Struct results use `ARRAY(SELECT AS STRUCT ...)` because Spanner restricts
+/// top-level struct values. Nested arrays of structs exercise the recursive mapping on every
+/// target; scalar structs nested directly inside structs are covered by conversion unit tests.
 fn schema_fidelity_cases() -> Vec<SchemaFidelityCase> {
     let json_metadata = || {
         std::collections::HashMap::from([
@@ -7272,6 +7229,13 @@ fn schema_fidelity_cases() -> Vec<SchemaFidelityCase> {
         expr,
         field: Field::new(name, data_type, true),
     };
+    let nested_child = DataType::Struct(
+        vec![
+            Field::new("d", DataType::Date32, true),
+            Field::new("xs", list(item(DataType::Int64)), true),
+        ]
+        .into(),
+    );
     vec![
         case("BoolCol", "TRUE", DataType::Boolean),
         case("Int64Col", "1", DataType::Int64),
@@ -7336,25 +7300,14 @@ fn schema_fidelity_cases() -> Vec<SchemaFidelityCase> {
                 .into(),
             ))),
         ),
-        // A nested STRUCT and a nested ARRAY inside the array-of-structs element, so the recursive
-        // struct-field mapping (struct-in-struct, list-in-struct) is covered on every schema path.
         case(
-            "ArrNestedStruct",
+            "ArrNestedStructArray",
             "ARRAY(SELECT AS STRUCT \
-                 STRUCT(DATE '2024-01-15' AS d, [1, 2] AS xs) AS child, 2.5 AS ratio)",
+                 ARRAY(SELECT AS STRUCT DATE '2024-01-15' AS d, [1, 2] AS xs) AS child, \
+                 2.5 AS ratio)",
             list(item(DataType::Struct(
                 vec![
-                    Field::new(
-                        "child",
-                        DataType::Struct(
-                            vec![
-                                Field::new("d", DataType::Date32, true),
-                                Field::new("xs", list(item(DataType::Int64)), true),
-                            ]
-                            .into(),
-                        ),
-                        true,
-                    ),
+                    Field::new("child", list(item(nested_child)), true),
                     Field::new("ratio", DataType::Float64, true),
                 ]
                 .into(),
@@ -7597,7 +7550,7 @@ fn rpc_timeouts() {
     run(
         connection,
         "DROP TABLE IF EXISTS AdbcRpcTimeout; \
-         CREATE TABLE AdbcRpcTimeout (Id INT64) PRIMARY KEY (Id)",
+         CREATE TABLE AdbcRpcTimeout (Id INT64, Value INT64) PRIMARY KEY (Id)",
     );
     let mut insert = connection.new_statement().expect("new statement");
     insert
@@ -7665,7 +7618,7 @@ fn rpc_timeouts() {
         )
         .expect("set a microsecond update deadline");
     tiny_dml
-        .set_sql_query("UPDATE AdbcRpcTimeout SET Id = Id WHERE FALSE")
+        .set_sql_query("UPDATE AdbcRpcTimeout SET Value = Value WHERE FALSE")
         .unwrap();
     let error = tiny_dml
         .execute_update()
@@ -7943,6 +7896,7 @@ mod auth_end_to_end {
                 instance: instance.to_string(),
                 database: database.to_string(),
                 is_emulator: false,
+                omni_endpoint: None,
             }),
             _ => panic!(
                 "SPANNER_GCP_DATABASE must be in 'project.instance.database' form, got {spec:?}"
@@ -8141,10 +8095,21 @@ fn ensure_proto_bundle_once(target: &TestTarget) {
     tokio::runtime::Runtime::new()
         .expect("failed to build setup runtime")
         .block_on(async {
-            let spanner = google_cloud_spanner::client::Spanner::builder()
-                .build()
-                .await
-                .expect("failed to build Spanner client for proto-bundle setup");
+            if let Some(endpoint) = &target.omni_endpoint {
+                let result = omni_setup::update_ddl(
+                    endpoint,
+                    target.database_path(),
+                    vec!["CREATE PROTO BUNDLE (`adbc.test.Color`, `adbc.test.Point`)".to_string()],
+                    adbc_test_proto_descriptors(),
+                )
+                .await;
+                match result {
+                    Ok(()) => return,
+                    Err(error) if error.code() == tonic::Code::AlreadyExists => return,
+                    Err(error) => panic!("register Omni proto bundle: {error}"),
+                }
+            }
+            let spanner = target.spanner().await;
             let database_admin = spanner
                 .database_admin_builder()
                 .build()

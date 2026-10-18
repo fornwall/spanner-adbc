@@ -6,11 +6,11 @@ use adbc_core::error::{Error, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use google_cloud_spanner::statement::Statement as SpannerSql;
-use google_cloud_spanner::transaction::ReadWriteTransaction;
+use google_cloud_spanner::transaction::{BeginTransactionOption, ReadWriteTransaction};
 
 use super::{SpannerStatement, check_all_dml_batch, check_partitioned_dml};
 use crate::bind;
-use crate::connection::{build_runner, lock_txn};
+use crate::connection::{lock_txn, runner_builder};
 use crate::error::{from_spanner, invalid_argument, invalid_state, not_implemented};
 use crate::runtime::block_on_cancellable;
 use crate::timeout::with_timeout;
@@ -109,8 +109,14 @@ impl SpannerStatement {
         // DML with THEN RETURN is a write path: the update timeout bounds the whole transaction.
         let update_timeout = self.config.timeouts.update_timeout();
         let transaction = async move {
-            let runner = build_runner(&client, isolation, &request, retry);
+            let mut runner = runner_builder(&client, isolation, &request, retry);
+            if statements.len() > 1 {
+                // Omni can return a different metadata transaction ID for each streaming DML.
+                // Explicit begin pins the original ID across the batch and its atomic commit.
+                runner = runner.set_begin_transaction_option(BeginTransactionOption::ExplicitBegin);
+            }
             let outcome = runner
+                .build()
                 .run(move |transaction: ReadWriteTransaction| {
                     let statements = statements.clone();
                     async move {

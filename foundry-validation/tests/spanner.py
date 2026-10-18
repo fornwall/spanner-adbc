@@ -50,7 +50,7 @@ class SpannerQuirks(model.DriverQuirks):
         current_schema="",
     )
 
-    # database options are filled in by get_quirks() (emulator vs real target).
+    # Database options are filled in by get_quirks() for the selected backend.
     setup = model.DriverSetup(
         database={"uri": model.FromEnv("ADBC_SPANNER_URI")},
     )
@@ -122,7 +122,14 @@ class SpannerQuirks(model.DriverQuirks):
 def get_quirks(vendor_version: str | None = None) -> SpannerQuirks:
     q = SpannerQuirks()
     database = {"uri": model.FromEnv("ADBC_SPANNER_URI")}
-    if os.environ.get("SPANNER_EMULATOR_HOST"):
+    if endpoint := os.environ.get("SPANNER_OMNI_ENDPOINT"):
+        if os.environ.get("SPANNER_EMULATOR_HOST"):
+            raise ValueError("Configure only one of SPANNER_OMNI_ENDPOINT and SPANNER_EMULATOR_HOST")
+        database.update({"spanner.instance_type": "omni", "spanner.endpoint": endpoint})
+        q.short_version = "omni"
+    elif os.environ.get("SPANNER_EMULATOR_HOST"):
         database["spanner.emulator"] = "true"
+    if vendor_version is not None:
+        q.short_version = vendor_version
     q.setup = model.DriverSetup(database=database)
     return q

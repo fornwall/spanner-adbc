@@ -131,6 +131,11 @@ with spanner.connect(db_kwargs={
 
 Emulator mode rejects explicit credential options; ambient ADC is ignored.
 
+For Spanner Omni, set `DatabaseOptions.INSTANCE_TYPE` to `"omni"` and
+`DatabaseOptions.ENDPOINT` to the server endpoint, such as `"http://localhost:15000"`.
+Use `spanner:///projects/default/instances/default/databases/<database>` as the URI.
+Omni uses its own transport; leave `DatabaseOptions.EMULATOR` unset.
+
 ## Options
 
 | `connect()` argument | Purpose |
@@ -312,22 +317,17 @@ Autocommit loads may commit in multiple chunks, so a failed load can leave rows 
 
 ## Partitioned reads and Data Boost
 
-A large scan can be split into independent partitions and read in parallel — optionally on Spanner's
-serverless [Data Boost] compute, so the work is isolated from your provisioned instance. This uses
-the ADBC partitioned-execution extension (`adbc_execute_partitions` / `adbc_read_partition`):
+A large scan can be split into independent partitions and read in parallel with the ADBC
+partitioned-execution extension (`adbc_execute_partitions` / `adbc_read_partition`):
 
 ```python
 import spanner_adbc.dbapi as spanner
-from spanner_adbc import DatabaseOptions, StatementOptions
+from spanner_adbc import DatabaseOptions
 
 with spanner.connect(
     db_kwargs={DatabaseOptions.URI.value: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
 ) as conn:
     with conn.cursor() as cur:
-        # Optional statement options, set on the underlying ADBC statement:
-        cur.adbc_statement.set_options(**{
-            StatementOptions.DATA_BOOST.value: "true",  # run on Data Boost
-        })
         partitions, schema = cur.adbc_execute_partitions("SELECT SingerId FROM Singers")
 
     # Each descriptor is opaque bytes; it can be shipped to another worker,
@@ -338,6 +338,10 @@ with spanner.connect(
             table = cur.fetch_arrow_table()
             ...
 ```
+
+Cloud Spanner can run partitions on serverless [Data Boost] compute. Enable it on the producing
+cursor with `adbc_stmt_kwargs={StatementOptions.DATA_BOOST: "true"}` after importing
+`StatementOptions`. Spanner Omni does not support Data Boost.
 
 Spanner decides partitionability from the query plan. Simple scans are suitable; joins, ordering,
 and aggregation can prevent partitioning. See the [partitionability rules][parallel-reads].

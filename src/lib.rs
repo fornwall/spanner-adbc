@@ -440,6 +440,7 @@ pub mod fuzzing {
                 ("enveloped-bad-version", false),
                 ("enveloped-bignum-query-descriptor", true),
                 ("enveloped-query-descriptor", true),
+                ("enveloped-query-with-row-type", true),
             ]
             .into_iter()
             .map(|(name, accepted)| (name.to_string(), accepted))
@@ -478,6 +479,11 @@ pub const OPTION_ENDPOINT: &str = "spanner.endpoint";
 /// it with an explicitly configured credential or [`OPTION_QUOTA_PROJECT`] is refused at connect
 /// time rather than silently ignoring them.
 pub const OPTION_EMULATOR: &str = "spanner.emulator";
+
+/// Driver-specific database option: `cloud` (default) or `omni`.
+/// Omni requires an explicit [`OPTION_ENDPOINT`] and cannot use [`OPTION_EMULATOR`].
+/// It defaults to anonymous credentials unless authentication options are supplied.
+pub const OPTION_INSTANCE_TYPE: &str = "spanner.instance_type";
 
 /// Driver-specific database option: path to a service-account JSON key file (dbt's `keyfile`).
 /// Overridden by [`OPTION_KEYFILE_JSON`] if both are set. Being a path rather than a secret, it is
@@ -540,6 +546,7 @@ pub const OPTION_ROWS_PER_BATCH: &str = "spanner.rows_per_batch";
 /// [`Statement::execute_partitions`](adbc_core::Statement::execute_partitions), so each partition
 /// executes on Spanner's serverless, workload-isolated compute. Baked into every partition
 /// descriptor, so any connection or worker reading one back honours it. A boolean, default `false`.
+/// Supported by Cloud Spanner; Omni rejects Data Boost requests.
 pub const OPTION_DATA_BOOST: &str = "spanner.data_boost";
 
 /// Statement option controlling how bound Arrow columns pair with the query's `@name` parameters,
@@ -830,6 +837,7 @@ mod options_doc_tests {
             // Driver-specific options (this crate's OPTION_* constants).
             crate::OPTION_ENDPOINT,
             crate::OPTION_EMULATOR,
+            crate::OPTION_INSTANCE_TYPE,
             crate::OPTION_KEYFILE,
             crate::OPTION_KEYFILE_JSON,
             crate::OPTION_IMPERSONATE_TARGET_PRINCIPAL,

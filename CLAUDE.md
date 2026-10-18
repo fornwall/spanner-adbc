@@ -14,9 +14,9 @@ cargo test                                            # target-dependent suites 
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 scripts/with-emulator.sh cargo test                    # Docker-backed integration tests
+scripts/with-omni.sh cargo test                        # Spanner Omni integration tests
 scripts/with-toxiproxy.sh cargo test --test resilience  # transport fault injection
 scripts/run-adbc-validation.sh                        # Apache ADBC C++ validation
-cargo +nightly fuzz run <target>
 ```
 
 For code changes, run relevant tests; before pushing, run fmt, clippy, tests and emulator tests.
@@ -38,16 +38,16 @@ See [docs/testing.md](docs/testing.md) for additional suites and CI coverage.
 - Internal metadata reads inherit priority, replica selection, retry bounds and RPC timeouts,
   but remain untagged; request/transaction tags attribute user statements.
 
-## Testing against the emulator (or a real database)
+## Testing against Spanner backends
 
 - Prefer `scripts/with-emulator.sh <cmd>`: it starts Docker, waits for the admin API and cleans up.
-- The emulator's gRPC endpoint must use port `9010`; the pinned client derives REST port `9020`
-  from that suffix. For parallel emulators, use separate Docker-network IPs without published ports.
-- Rust integration tests prefer `SPANNER_EMULATOR_HOST`, then `SPANNER_GCP_DATABASE`
-  (`project.instance.database`, using ADC); Python end-to-end tests require the emulator.
-  Without a target they self-skip; `ADBC_TEST_REQUIRE_TARGET=1` makes a missing target fail.
-- CI runs functional suites against the emulator; real-database and auth end-to-end tests are local.
-- Register new emulator-backed test binaries in `.github/workflows/ci.yml`; CI lists them explicitly.
+- Emulator test setup uses gRPC port `9010` and REST port `9020`; the driver itself uses gRPC.
+- Functional CI matrices cover the emulator and Spanner Omni (`scripts/with-omni.sh`).
+- Rust integration tests prefer `SPANNER_OMNI_ENDPOINT`, then `SPANNER_EMULATOR_HOST`, then
+  `SPANNER_GCP_DATABASE` (`project.instance.database`, using ADC). Python supports both local backends.
+  Without a target they skip; `ADBC_TEST_REQUIRE_TARGET=1` makes this fail.
+- Cloud and auth tests are local; resilience CI uses the emulator.
+- Register new target-dependent test binaries in `.github/workflows/ci.yml`; CI lists them explicitly.
 
 ### Fuzzing
 

@@ -53,6 +53,7 @@ keep their current stack. Environment-derived values are not reflected by option
 | `uri` | `spanner://` URI | required | set, verbatim | Database path plus optional endpoint/query options; see [URIs](#connection-uris). Missing URI fails connection creation with `InvalidState`. |
 | `spanner.endpoint` | gRPC endpoint URL | production endpoint | set | Overrides the endpoint from `SPANNER_EMULATOR_HOST`. |
 | `spanner.emulator` | boolean | `false` | always | Uses anonymous credentials. A nonempty emulator environment variable also enables this mode. |
+| `spanner.instance_type` | `cloud`, `omni` | `cloud` | always | Selects Cloud Spanner or Spanner Omni. Omni requires an explicit endpoint, ignores `SPANNER_EMULATOR_HOST`, and cannot combine with `spanner.emulator=true`. Without explicit credentials, Omni uses anonymous authentication. |
 | `spanner.auth.keyfile` | credential JSON file path | ADC | set | Supports `service_account`, `authorized_user`, `impersonated_service_account` and `external_account` JSON. |
 | `spanner.auth.keyfile_json` | inline credential JSON | ADC | write-only | Same credential formats; takes precedence over `keyfile`. Not allowed in URIs. |
 | `spanner.auth.impersonate.target_principal` | service-account email | unset | set | Impersonates the target using keyfile/ADC base credentials. |
@@ -159,7 +160,7 @@ settings and timeouts, but no request/transaction tags.
 | Option | Values | Default | Get | Effect |
 | --- | --- | --- | --- | --- |
 | `spanner.rows_per_batch` | positive integer | `8192` | always | Maximum rows per Arrow batch, also subject to the conversion byte budget. |
-| `spanner.data_boost` | boolean | `false` | always | Enables [Data Boost](https://docs.cloud.google.com/spanner/docs/databoost/databoost-overview) for partitioned execution; carried in partition descriptors. |
+| `spanner.data_boost` | boolean | `false` | always | Enables [Data Boost](https://docs.cloud.google.com/spanner/docs/databoost/databoost-overview) for partitioned execution on Cloud Spanner; Omni does not support it. Carried in partition descriptors. |
 | `adbc.statement.bind_by_name` | boolean | `false` | always | By default, columns bind to distinct parameters in SQL order. `true` matches column names, case-insensitively as Spanner resolves them; unknown names return `InvalidArguments`. |
 | `adbc.statement.exec.incremental` | boolean, only `false` supported | `false` | always | `true` returns `NotImplemented`; incremental partition generation is unsupported. |
 | `adbc.ingest.target_table` | table name | unset | set | Selects bulk ingest and clears SQL. Setting SQL clears this target. Names containing a backtick, a backslash or a control character, and the empty name, return `InvalidArguments`. |
@@ -282,10 +283,10 @@ Backoff settings are independent of attempt/time caps.
 ## Environment
 
 - `SPANNER_EMULATOR_HOST` is consulted when the shared client stack is built. A nonempty value
-  forces emulator mode and supplies an endpoint unless `spanner.endpoint` overrides it. Bare
-  `host:port` gains `http://`. Use gRPC port `9010`: the pinned client derives the admin REST
-  endpoint by replacing it with `9020`.
-- Without explicit credentials or emulator mode, the auth library resolves
+  forces emulator mode and supplies an endpoint unless `spanner.endpoint` overrides it.
+  It is ignored in Omni mode. Bare `host:port` gains `http://`; use the gRPC endpoint (normally `9010`).
+  The driver uses gRPC for queries and schema changes on every backend.
+- Without explicit credentials, emulator mode or Omni mode, the auth library resolves
   [Application Default Credentials](https://docs.cloud.google.com/docs/authentication/application-default-credentials),
   including `GOOGLE_APPLICATION_CREDENTIALS`, local gcloud ADC and the metadata server.
 - `GOOGLE_CLOUD_QUOTA_PROJECT` overrides the quota-project option during ADC resolution.

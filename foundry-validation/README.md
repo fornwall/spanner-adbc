@@ -17,9 +17,14 @@ Rust, git and curl, plus Docker when starting an emulator. `PYTHON` selects the 
 The script builds the driver, installs the pinned suite if needed, creates the emulator
 instance/database and runs pytest. The upstream revision is selected by `ADBC_VALIDATION_REF`
 in the script; `ADBC_VALIDATION_REPO` can select another repository.
+`ADBC_SPANNER_LIBRARY` selects an existing shared library when invoking pytest directly.
 
-An existing `SPANNER_EMULATOR_HOST` takes precedence over `SPANNER_GCP_DATABASE`. With neither,
-the script starts a disposable emulator. A real target must already exist and use ADC; the
+Set `SPANNER_OMNI_ENDPOINT=http://localhost:15000` to run the same suite against a local Omni
+instance, using database `projects/default/instances/default/databases/adbc-test`. Do not set
+`SPANNER_EMULATOR_HOST` for Omni. The driver selects the Omni transport explicitly.
+
+An existing `SPANNER_EMULATOR_HOST` takes precedence over `SPANNER_GCP_DATABASE`. With no target,
+the script starts a disposable emulator. A cloud target must already exist and use ADC; the
 current quirks expect database/catalog `adbc-test`, so adjust that expectation when using a
 differently named test database.
 
@@ -56,7 +61,8 @@ CI enables two guards in `tests/conftest.py`:
 - `FOUNDRY_VALIDATION_REQUIRE_PASSES=1` rejects an otherwise successful run with no passing tests.
 - `FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE=1` compares skipped pytest node IDs with
   `skip_baseline.txt`, rejecting unlisted skips and entries that no longer skip. Trailing reason
-  annotations are for readers and are not compared.
+  annotations are for readers and are not compared. Omni uses the same inventory; its backend
+  label is normalized to `emulator` for this comparison only.
 
 The baseline comparison is bypassed for `-k`/`-m` runs. Use a complete run for baseline checks or
 updates. An explicit `.txtcase` skip prevents execution, so the guard cannot discover that a

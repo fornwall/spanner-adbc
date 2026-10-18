@@ -1,33 +1,22 @@
-"""DataFrame-library usability tests: Polars and pandas against the emulator.
-
-Dataframe libraries are how most users actually consume ADBC, so this drives the
-driver the way they do -- ``pl.read_database`` / ``cur.fetch_df`` for reads,
-``df.to_arrow`` for the Arrow hand-off, and the bulk-ingest path from a frame --
-across a spread of the type-mapping-sensitive columns (INT64, STRING, BOOL,
-FLOAT64, TIMESTAMP, DATE, NUMERIC, ARRAY). It self-skips without
-``SPANNER_EMULATOR_HOST`` (see conftest); the Foundry suite owns the exhaustive
-type matrix, so this stays small.
-"""
+"""Polars and pandas reads and ingest against the configured Spanner target."""
 
 import datetime
 import decimal
 
 import pytest
 
+from conftest import database_options
+
 pa = pytest.importorskip("pyarrow")
 pl = pytest.importorskip("polars")
 from polars.testing import assert_frame_equal
 
 import spanner_adbc.dbapi as spanner
-from spanner_adbc import DatabaseOptions
 
 
 def _connect(database):
     return spanner.connect(
-        db_kwargs={
-            DatabaseOptions.URI.value: f"spanner:///{database}",
-            DatabaseOptions.EMULATOR.value: "true",
-        },
+        db_kwargs=database_options(database),
         autocommit=True,
     )
 
@@ -92,8 +81,8 @@ def _create_and_fill(cur, name):
         )
 
 
-def test_polars_read_dtypes_and_values(emulator_database):
-    conn = _connect(emulator_database)
+def test_polars_read_dtypes_and_values(spanner_database):
+    conn = _connect(spanner_database)
     try:
         with conn.cursor() as cur:
             _create_and_fill(cur, "AdbcPlRead")
@@ -129,8 +118,8 @@ def test_polars_read_dtypes_and_values(emulator_database):
         conn.close()
 
 
-def test_polars_to_arrow_round_trip(emulator_database):
-    conn = _connect(emulator_database)
+def test_polars_to_arrow_round_trip(spanner_database):
+    conn = _connect(spanner_database)
     try:
         with conn.cursor() as cur:
             _create_and_fill(cur, "AdbcPlArrow")
@@ -147,9 +136,9 @@ def test_polars_to_arrow_round_trip(emulator_database):
         conn.close()
 
 
-def test_pandas_read_dtypes_and_values(emulator_database):
+def test_pandas_read_dtypes_and_values(spanner_database):
     pd = pytest.importorskip("pandas")
-    conn = _connect(emulator_database)
+    conn = _connect(spanner_database)
     try:
         with conn.cursor() as cur:
             _create_and_fill(cur, "AdbcPdRead")
@@ -182,11 +171,11 @@ def test_pandas_read_dtypes_and_values(emulator_database):
         conn.close()
 
 
-def test_bulk_ingest_from_dataframe(emulator_database):
+def test_bulk_ingest_from_dataframe(spanner_database):
     # Build a Polars frame, hand it to the ADBC bulk-ingest path via Arrow, and
     # read it back. ARRAY is now part of the bind/ingest surface, so the frame
     # carries the full column spread including an ARRAY<INT64> (Tags).
-    conn = _connect(emulator_database)
+    conn = _connect(spanner_database)
     try:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS AdbcDfIngest")
@@ -238,12 +227,12 @@ def test_bulk_ingest_from_dataframe(emulator_database):
         conn.close()
 
 
-def test_bulk_ingest_array_element_types(emulator_database):
+def test_bulk_ingest_array_element_types(spanner_database):
     # Exercise every now-supported ARRAY element type through the bind/ingest path,
     # including per-element nulls and a fully-null array. The DATE / TIMESTAMP /
     # NUMERIC elements bind as strings that Spanner coerces to ARRAY<DATE|TIMESTAMP|
     # NUMERIC> from column context; assert they round-trip exactly.
-    conn = _connect(emulator_database)
+    conn = _connect(spanner_database)
     try:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS AdbcArrIngest")

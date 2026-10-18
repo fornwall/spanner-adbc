@@ -2779,7 +2779,10 @@ dependencies = [
  "futures-util",
  "google-cloud-auth",
  "google-cloud-gax",
+ "google-cloud-gax-internal",
+ "google-cloud-longrunning",
  "google-cloud-lro",
+ "google-cloud-rpc",
  "google-cloud-spanner",
  "google-cloud-spanner-admin-database-v1",
  "google-cloud-spanner-admin-instance-v1",
@@ -2794,6 +2797,7 @@ dependencies = [
  "spanner-grpc-mock",
  "tokio",
  "tonic",
+ "tonic-prost",
 ]
 
 [[package]]

@@ -29,7 +29,7 @@ def pytest_collection_modifyitems(
 
 def pytest_addoption(parser):
     adbc_drivers_validation.tests.conftest.pytest_addoption(parser)
-    parser.addoption("--vendor-version", action="store", default="emulator")
+    parser.addoption("--vendor-version", action="store", default=None)
 
 
 # The committed skip-inventory baseline (see _skip_baseline_guard below and the
@@ -121,7 +121,9 @@ def _collect_skipped(session: pytest.Session) -> dict[str, str]:
     if reporter is None:  # pragma: no cover - terminal reporter is a default plugin
         return skipped
     for report in reporter.stats.get("skipped", []):
-        skipped[report.nodeid] = _skip_reason(report)
+        # Both backends run the same cases and share one reviewed skip inventory.
+        nodeid = report.nodeid.replace("[spanner:omni", "[spanner:emulator", 1)
+        skipped[nodeid] = _skip_reason(report)
     return skipped
 
 
@@ -231,6 +233,8 @@ def driver(request, pytestconfig) -> adbc_drivers_validation.model.DriverQuirks:
 
 @pytest.fixture(scope="session")
 def driver_path(driver) -> str:
+    if library := os.environ.get("ADBC_SPANNER_LIBRARY"):
+        return str(Path(library).resolve())
     ext = {"win32": "dll", "darwin": "dylib"}.get(sys.platform, "so")
     # Built cdylib at the repo root: foundry-validation/tests -> repo root.
     return str(Path(__file__).resolve().parents[2] / f"target/debug/libspanner_adbc.{ext}")

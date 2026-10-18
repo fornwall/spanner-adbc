@@ -1,17 +1,15 @@
-"""Execute the README's Cookbook snippets against the emulator, so the docs can't drift.
+"""Run README Python examples against the configured Spanner target.
 
-Each ```python fenced block in ../README.md is extracted and run as-is (blocks tagged
-`docs-test: skip` in the fence info string — e.g. ```python docs-test: skip — or that don't open a
-connection, are ignored; a legacy `# docs-test: skip` first line is still honoured too). The only
-rewrite is transparent: `spanner.connect(...)` is redirected at the emulator test database, so the
-illustrative `projects/my-project/...` path in the docs stays readable. Self-skips without
-`SPANNER_EMULATOR_HOST` (see conftest).
+Blocks marked ``docs-test: skip`` or without ``spanner.connect`` are excluded.
+Connection options are redirected to the test database; snippets run unchanged.
 """
 
 import pathlib
 import re
 
 import pytest
+
+from conftest import database_options
 
 pytest.importorskip("pyarrow")  # every snippet returns Arrow
 
@@ -40,16 +38,12 @@ def test_readme_has_runnable_snippets():
 
 
 @pytest.fixture(scope="module")
-def cookbook_env(emulator_database):
-    """Seed the `Singers` table and redirect `spanner.connect` at the emulator database."""
+def cookbook_env(spanner_database):
+    """Seed `Singers` and redirect the examples to the configured test database."""
     import spanner_adbc.dbapi as sp
-    from spanner_adbc import DatabaseOptions
 
     conn = sp.connect(
-        db_kwargs={
-            DatabaseOptions.URI.value: f"spanner:///{emulator_database}",
-            DatabaseOptions.EMULATOR.value: "true",
-        },
+        db_kwargs=database_options(spanner_database),
         autocommit=True,
     )
     try:
@@ -68,11 +62,7 @@ def cookbook_env(emulator_database):
     original = sp.connect
 
     def redirected(db_kwargs=None, **kwargs):
-        # Override the illustrative uri with the emulator database and force
-        # emulator mode, preserving any other db_kwargs the snippet set.
-        merged = dict(db_kwargs or {})
-        merged[DatabaseOptions.URI.value] = f"spanner:///{emulator_database}"
-        merged[DatabaseOptions.EMULATOR.value] = "true"
+        merged = {**(db_kwargs or {}), **database_options(spanner_database)}
         return original(db_kwargs=merged, **kwargs)
 
     sp.connect = redirected

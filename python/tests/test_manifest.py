@@ -1,17 +1,11 @@
-"""Tests for the ADBC driver manifest this package generates.
-
-The offline tests check the manifest's shape against the specification
-(``docs/source/format/driver_manifests.rst`` in apache/arrow-adbc). The emulator
-test is the one that actually proves discovery works: it writes a manifest into
-a scratch directory, points ``ADBC_DRIVER_PATH`` at it, and connects through the
-plain ``adbc_driver_manager`` — once by ``driver="spanner"`` and once by URI
-scheme alone, with no ``driver`` option at all.
-"""
+"""Validate manifest rendering and driver discovery by name and URI scheme."""
 
 import os
 import tomllib
 
 import pytest
+
+from conftest import database_options
 
 import spanner_adbc
 from spanner_adbc import manifest as manifest_mod
@@ -200,7 +194,7 @@ def test_default_install_dir_is_a_searched_directory():
 
 @needs_library
 def test_manifest_makes_the_driver_discoverable_by_name(
-    emulator_database, tmp_path, monkeypatch
+    spanner_database, tmp_path, monkeypatch
 ):
     """End-to-end: resolve the driver through a manifest, not a library path."""
     pytest.importorskip("pyarrow")  # dbapi result fetching needs it
@@ -209,8 +203,8 @@ def test_manifest_makes_the_driver_discoverable_by_name(
     manifest_mod.install(tmp_path)
     monkeypatch.setenv("ADBC_DRIVER_PATH", str(tmp_path))
 
-    db_kwargs = {"spanner.emulator": "true"}
-    uri = f"spanner:///{emulator_database}"
+    db_kwargs = database_options(spanner_database)
+    uri = db_kwargs.pop("uri")
 
     # (1) By driver name.
     with adbc_driver_manager.dbapi.connect(

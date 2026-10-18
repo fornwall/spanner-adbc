@@ -270,9 +270,14 @@ pub(crate) async fn stream_query(
     batch_size: usize,
     precision: TimestampPrecision,
     fetch_timeout: Option<Duration>,
+    fallback_schema: Option<SchemaRef>,
 ) -> Result<SpannerBatchReader> {
     let first = pull_chunk(&mut rs, batch_size).await?;
-    let schema = build_schema(Some(rs.metadata()), first.first(), precision)?;
+    let schema = if first.is_empty() && rs.metadata().column_names().is_empty() {
+        fallback_schema.unwrap_or_else(|| Arc::new(Schema::empty()))
+    } else {
+        build_schema(Some(rs.metadata()), first.first(), precision)?
+    };
     let source = ResultSetChunks {
         result_set: rs,
         batch_size,

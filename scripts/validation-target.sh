@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Source from either validation runner to configure ADBC_SPANNER_URI.
 
-if [ -n "${SPANNER_EMULATOR_HOST:-}" ]; then
+if [ -n "${SPANNER_OMNI_ENDPOINT:-}" ]; then
+  # with-omni.sh provisions this database through Omni's bundled gRPC CLI.
+  endpoint="$(python3 -c 'import sys; from urllib.parse import quote; print(quote(sys.argv[1], safe=""))' "$SPANNER_OMNI_ENDPOINT")"
+  ADBC_SPANNER_URI="spanner:///projects/default/instances/default/databases/adbc-test?spanner.instance_type=omni&spanner.endpoint=$endpoint"
+elif [ -n "${SPANNER_EMULATOR_HOST:-}" ]; then
   ADBC_SPANNER_URI="spanner:///projects/test-project/instances/test-instance/databases/adbc-test"
   rest="http://${SPANNER_EMULATOR_HOST%:*}:${SPANNER_EMULATOR_REST_PORT:-9020}"
   echo ">> creating emulator instance/database via $rest"
@@ -46,6 +50,7 @@ if [ -n "${SPANNER_EMULATOR_HOST:-}" ]; then
     echo "emulator database adbc-test did not become ready at $rest within 10s" >&2
     exit 1
   fi
+
 else
   if [[ ! "${SPANNER_GCP_DATABASE:-}" =~ ^[^./[:space:]]+\.[^./[:space:]]+\.[^./[:space:]]+$ ]]; then
     echo "SPANNER_GCP_DATABASE must be project.instance.database; got '${SPANNER_GCP_DATABASE:-}'" >&2

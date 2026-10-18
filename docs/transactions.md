@@ -96,7 +96,7 @@ and [statement.rs](../src/statement.rs).
 | `Rollback` | The client's cleanup after a non-`ABORTED` transaction-body failure. |
 | `PartitionQuery` | Produces descriptors for `execute_partitions`. |
 | `BatchWrite` | Opt-in autocommit ingest. |
-| `UpdateDatabaseDdl` | Schema changes through the separate Database Admin API, followed by operation polling. |
+| `UpdateDatabaseDdl` | Schema changes through the gRPC Database Admin API, followed by operation polling. |
 
 The driver does not use unary `ExecuteSql`, key-based `Read`/`StreamingRead`/`PartitionRead`, or
 session-pool APIs (`BatchCreateSessions`, `GetSession`, `ListSessions`, `DeleteSession`).
@@ -108,6 +108,7 @@ have independent ADBC transaction state. The pinned client maintains a multiplex
 checks its age hourly, and rotates it after seven days. There is no session pool. Setting a
 database option invalidates the cache for new connections; existing connections retain their
 stack. The admin client is built lazily on the first DDL operation and shared with the same stack.
+Queries and schema changes use gRPC on Cloud Spanner, the emulator and Omni.
 
 Read/write and manual read-only transactions normally begin inline with their first request.
 Building the manual read-only handle therefore sends no RPC. Write-only, partitioned-DML and
@@ -115,7 +116,7 @@ batch read-only transactions issue an explicit begin.
 
 ### Commit and rollback
 
-[build_runner](../src/connection/exec.rs) centralizes read/write transaction configuration for
+[runner_builder](../src/connection/exec.rs) centralizes read/write transaction configuration for
 batch DML, returning DML and DML parameter planning. Write-only commits use the client's `write`
 method: explicit begin plus `Commit(transaction_id)`, which protects against replay. The driver
 does not use the client's at-least-once single-use mutation commit.

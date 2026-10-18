@@ -13,7 +13,7 @@
 //! suite's schema serialization (`serial_guard`). All it needs is a reachable database and a built
 //! cdylib.
 //!
-//! Like `tests/integration.rs` the file **skips itself** unless `SPANNER_EMULATOR_HOST` or
+//! Like `tests/integration.rs` the file **skips itself** unless `SPANNER_OMNI_ENDPOINT`, `SPANNER_EMULATOR_HOST` or
 //! `SPANNER_GCP_DATABASE` is set, so a plain `cargo test` stays green:
 //!
 //! ```sh
@@ -31,100 +31,13 @@ use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_driver_manager::ManagedDriver;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use google_cloud_lro::Poller;
-use google_cloud_spanner::client::Spanner;
 use google_cloud_spanner_admin_instance_v1::model::Instance;
 use spanner_adbc::{SpannerConnection, SpannerDatabase, SpannerDriver};
 
 // Identifiers used against the emulator, matching `tests/integration.rs` so both binaries drive the
 // same emulator database interchangeably, whichever runs first.
-const PROJECT: &str = "test-project";
-const INSTANCE: &str = "test-instance";
-const DATABASE: &str = "adbc-test";
-
-/// Where these tests should run, resolved from the environment.
-struct TestTarget {
-    project: String,
-    instance: String,
-    database: String,
-    /// `true` when pointed at the local emulator (via `SPANNER_EMULATOR_HOST`), `false` for a real
-    /// Cloud Spanner database reached with Application Default Credentials.
-    is_emulator: bool,
-}
-
-impl TestTarget {
-    fn database_path(&self) -> String {
-        format!(
-            "projects/{}/instances/{}/databases/{}",
-            self.project, self.instance, self.database
-        )
-    }
-
-    /// The database path wrapped as a `spanner://` connection URI, the form the `uri` option
-    /// requires (a bare path is rejected).
-    fn database_uri(&self) -> String {
-        format!("spanner:///{}", self.database_path())
-    }
-
-    fn instance_path(&self) -> String {
-        format!("projects/{}/instances/{}", self.project, self.instance)
-    }
-}
-
-/// Whether the `ADBC_TEST_REQUIRE_TARGET` env var demands a configured target (CI sets it).
-///
-/// When set to a truthy value, the "no target configured" / "no cdylib built" skip branches
-/// `panic!` instead of quietly returning, so a broken env wiring (e.g. a dropped or misspelled
-/// `env:` line in a workflow refactor) fails the run loudly rather than passing vacuously with zero
-/// behavioral coverage.
-fn require_target() -> bool {
-    matches!(
-        std::env::var("ADBC_TEST_REQUIRE_TARGET").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    )
-}
-
-/// Resolve the test target from the environment, or `None` to skip — panicking instead when
-/// `ADBC_TEST_REQUIRE_TARGET` is truthy, so this suite cannot silently skip in CI.
-fn test_target() -> Option<TestTarget> {
-    let target = resolve_test_target();
-    if target.is_none() && require_target() {
-        panic!(
-            "ADBC_TEST_REQUIRE_TARGET is set but neither SPANNER_EMULATOR_HOST nor \
-             SPANNER_GCP_DATABASE is configured — the Spanner target env wiring is missing, so \
-             this suite would skip all behavioral coverage. Refusing to pass vacuously."
-        );
-    }
-    target
-}
-
-/// Inner resolver for [`test_target`]; returns `None` when no target env is set.
-fn resolve_test_target() -> Option<TestTarget> {
-    if std::env::var("SPANNER_EMULATOR_HOST").is_ok_and(|s| !s.is_empty()) {
-        return Some(TestTarget {
-            project: PROJECT.to_string(),
-            instance: INSTANCE.to_string(),
-            database: DATABASE.to_string(),
-            is_emulator: true,
-        });
-    }
-
-    let spec = std::env::var("SPANNER_GCP_DATABASE")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    // Spanner project / instance / database ids cannot themselves contain a dot, so a plain split
-    // unambiguously recovers the three components.
-    match spec.split('.').collect::<Vec<_>>().as_slice() {
-        [project, instance, database] => Some(TestTarget {
-            project: project.to_string(),
-            instance: instance.to_string(),
-            database: database.to_string(),
-            is_emulator: false,
-        }),
-        _ => {
-            panic!("SPANNER_GCP_DATABASE must be in 'project.instance.database' form, got {spec:?}")
-        }
-    }
-}
+mod common;
+use common::{TestTarget, require_target, test_target};
 
 /// Create the emulator instance and the test database if they do not already exist.
 ///
@@ -135,12 +48,11 @@ fn resolve_test_target() -> Option<TestTarget> {
 /// which is intentionally ignored. A **real** instance is assumed to exist already (creating one is
 /// slow and billable).
 async fn ensure_database(target: &TestTarget) {
-    // The client auto-detects `SPANNER_EMULATOR_HOST` (anonymous credentials) and otherwise uses
-    // Application Default Credentials — the same resolution the driver under test performs.
-    let spanner = Spanner::builder()
-        .build()
-        .await
-        .expect("failed to build Spanner client for setup");
+    if target.omni_endpoint.is_some() {
+        // scripts/with-omni.sh provisions the database through the bundled CLI.
+        return;
+    }
+    let spanner = target.spanner().await;
 
     if target.is_emulator {
         let instance_admin = spanner

@@ -9,7 +9,7 @@ use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::model::transaction_options::IsolationLevel;
 use google_cloud_spanner::mutation::Mutation;
 use google_cloud_spanner::statement::Statement as SpannerSql;
-use google_cloud_spanner::transaction::{ReadWriteTransaction, TransactionRunner};
+use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use crate::error::{from_spanner, invalid_argument};
 use crate::options::SharedConfig;
@@ -31,20 +31,16 @@ pub(super) fn apply_isolation(
     }
 }
 
-/// Build the read/write transaction runner every DML path shares: the connection's isolation
-/// level, its commit priority and transaction tag, and its retry/backoff bounds, applied in that
-/// order. The one place a read/write transaction is opened from driver-owned code.
-pub(crate) fn build_runner(
+/// Configure a read/write transaction runner with isolation, request options and retry bounds.
+pub(crate) fn runner_builder(
     client: &DatabaseClient,
     isolation: IsolationLevel,
     request: &RequestConfig,
     retry: RetryConfig,
-) -> TransactionRunner {
-    retry
-        .apply_to_runner(
-            request.apply_to_runner(apply_isolation(client.read_write_transaction(), isolation)),
-        )
-        .build()
+) -> TransactionRunnerBuilder {
+    retry.apply_to_runner(
+        request.apply_to_runner(apply_isolation(client.read_write_transaction(), isolation)),
+    )
 }
 
 /// Map ADBC isolation levels to Spanner's SERIALIZABLE or REPEATABLE_READ.
@@ -129,7 +125,7 @@ pub(crate) fn run_batch_txn(
     let transaction = async move {
         // The commit priority and transaction tag ride on the runner; the request tag rides on the
         // ExecuteBatchDml batch inside the (retryable) closure.
-        let runner = build_runner(&client, isolation, &request, retry);
+        let runner = runner_builder(&client, isolation, &request, retry).build();
         let outcome = runner
             .run(move |transaction: ReadWriteTransaction| {
                 let statements = statements.clone();

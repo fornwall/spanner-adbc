@@ -1,5 +1,6 @@
 //! The [`SpannerDriver`] and [`SpannerDatabase`] — the two top levels of the ADBC hierarchy.
 
+mod admin;
 mod credentials;
 mod uri;
 
@@ -8,7 +9,10 @@ pub(crate) use uri::ensure_scheme;
 use adbc_core::error::{Result, Status};
 use adbc_core::options::{OptionDatabase, OptionValue};
 use adbc_core::{Database, Driver, Optionable};
+use google_cloud_auth::credentials::Credentials;
+use google_cloud_gax::client_builder::internal::ClientConfig;
 use google_cloud_spanner::client::{DatabaseAdmin, DatabaseClient, Spanner};
+use google_cloud_spanner::omni::{InstanceType, SpannerBuilderExt};
 
 use crate::connection::SpannerConnection;
 use crate::error::{
@@ -20,7 +24,7 @@ use crate::runtime::{SharedRuntime, new_runtime};
 use crate::{
     OPTION_ACCESS_TOKEN, OPTION_EMULATOR, OPTION_ENDPOINT, OPTION_IMPERSONATE_DELEGATES,
     OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES, OPTION_IMPERSONATE_TARGET_PRINCIPAL,
-    OPTION_KEYFILE, OPTION_KEYFILE_JSON, OPTION_QUOTA_PROJECT,
+    OPTION_INSTANCE_TYPE, OPTION_KEYFILE, OPTION_KEYFILE_JSON, OPTION_QUOTA_PROJECT,
 };
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
@@ -99,6 +103,7 @@ pub struct SpannerDatabase {
     database: Option<String>,
     endpoint: Option<String>,
     emulator: bool,
+    instance_type: InstanceType,
     keyfile: Option<String>,
     keyfile_json: Option<String>,
     /// The service account to impersonate. When `Some`, impersonation is layered on top of the base
@@ -137,6 +142,7 @@ impl std::fmt::Debug for SpannerDatabase {
             .field("database", &self.database)
             .field("endpoint", &self.endpoint)
             .field("emulator", &self.emulator)
+            .field("instance_type", &self.instance_type)
             .field("keyfile", &redact(&self.keyfile))
             .field("keyfile_json", &redact(&self.keyfile_json))
             .field(
@@ -171,6 +177,7 @@ impl SpannerDatabase {
             database: None,
             endpoint: None,
             emulator: false,
+            instance_type: InstanceType::Cloud,
             keyfile: None,
             keyfile_json: None,
             impersonate_target_principal: None,
@@ -198,7 +205,24 @@ impl SpannerDatabase {
 
         let mut endpoint = self.endpoint.clone();
         let mut emulator = self.emulator;
-        if let Ok(host) = std::env::var("SPANNER_EMULATOR_HOST")
+        let omni = self.instance_type == InstanceType::Omni;
+        if omni {
+            if emulator {
+                return Err(invalid_state(
+                    "spanner.instance_type=omni cannot be combined with spanner.emulator=true",
+                ));
+            }
+            if endpoint
+                .as_ref()
+                .is_none_or(|endpoint| endpoint.trim().is_empty())
+            {
+                return Err(invalid_state(
+                    "spanner.instance_type=omni requires an explicit spanner.endpoint URL",
+                ));
+            }
+        }
+        if !omni
+            && let Ok(host) = std::env::var("SPANNER_EMULATOR_HOST")
             && !host.is_empty()
         {
             if endpoint.is_none() {
@@ -254,15 +278,28 @@ impl SpannerDatabase {
         let credentials_json = self.credentials_json()?;
 
         self.runtime.block_on(async move {
-            let mut builder = Spanner::builder();
-            if let Some(endpoint) = endpoint {
+            let mut builder = Spanner::builder().with_instance_type(self.instance_type);
+            if let Some(endpoint) = endpoint.clone() {
                 builder = builder.with_endpoint(endpoint);
             }
-            // Inside the runtime on purpose — see `build_credentials`. `None` means no explicit
-            // credential: Application Default Credentials, resolved by the client.
-            if let Some(credentials) = self.build_credentials(emulator, credentials_json)? {
-                builder = builder.with_credentials(credentials);
+            let credentials = self
+                .build_credentials(emulator, credentials_json)?
+                .or_else(|| {
+                    (omni
+                        || endpoint.as_deref().is_some_and(|value| {
+                            value
+                                .trim()
+                                .get(..7)
+                                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
+                        }))
+                    .then(|| google_cloud_auth::credentials::anonymous::Builder::new().build())
+                });
+            if let Some(credentials) = &credentials {
+                builder = builder.with_credentials(credentials.clone());
             }
+            let mut admin_config = ClientConfig::default();
+            admin_config.endpoint = endpoint;
+            admin_config.cred = credentials;
             let spanner = builder.build().await.map_err(from_builder)?;
             let client = spanner
                 .database_client(database.clone())
@@ -271,9 +308,11 @@ impl SpannerDatabase {
                 .map_err(from_spanner)?;
             Ok(Connected {
                 client,
-                spanner,
                 database,
-                admin: Arc::new(OnceCell::new()),
+                admin: Arc::new(DatabaseAdminState {
+                    client: OnceCell::new(),
+                    config: admin_config,
+                }),
             })
         })
     }
@@ -298,9 +337,7 @@ impl SpannerDatabase {
     }
 }
 
-/// An established connection's handles: the data-plane [`DatabaseClient`], the [`Spanner`] client
-/// (used to reach the Database Admin API for DDL), the resolved database path, and the shared
-/// [Database Admin client cell](SharedDatabaseAdmin).
+/// The data-plane client, resolved database path, and shared lazy Database Admin client.
 ///
 /// `Clone` is cheap by design — the client types share their channel pool and multiplexed session
 /// across clones — which is what lets [`SpannerDatabase`] cache one stack and clone it per
@@ -308,7 +345,6 @@ impl SpannerDatabase {
 #[derive(Clone, Debug)]
 pub(crate) struct Connected {
     pub(crate) client: DatabaseClient,
-    pub(crate) spanner: Spanner,
     pub(crate) database: String,
     pub(crate) admin: SharedDatabaseAdmin,
 }
@@ -321,7 +357,32 @@ pub(crate) struct Connected {
 /// never run DDL — and cheaply cloned thereafter. Living inside [`Connected`] ties its lifetime to
 /// the data-plane stack's, so a database option that invalidates the cached stack rebuilds the admin
 /// client from the new endpoint/credentials too. A failed build caches nothing (`get_or_try_init`).
-pub(crate) type SharedDatabaseAdmin = Arc<OnceCell<DatabaseAdmin>>;
+pub(crate) type SharedDatabaseAdmin = Arc<DatabaseAdminState>;
+
+pub(crate) struct DatabaseAdminState {
+    client: OnceCell<DatabaseAdmin>,
+    config: ClientConfig<Credentials>,
+}
+
+impl std::fmt::Debug for DatabaseAdminState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseAdminState")
+            .field("initialized", &self.client.initialized())
+            .finish()
+    }
+}
+
+impl DatabaseAdminState {
+    pub(crate) async fn client(&self) -> Result<&DatabaseAdmin> {
+        self.client
+            .get_or_try_init(|| async {
+                admin::database_admin(self.config.clone())
+                    .await
+                    .map_err(from_builder)
+            })
+            .await
+    }
+}
 
 impl Optionable for SpannerDatabase {
     type Option = OptionDatabase;
@@ -341,6 +402,17 @@ impl Optionable for SpannerDatabase {
             }
             OptionDatabase::Other(name) if name == OPTION_EMULATOR => {
                 self.emulator = bool_value(&key, value)?
+            }
+            OptionDatabase::Other(name) if name == OPTION_INSTANCE_TYPE => {
+                self.instance_type = match string_value(&key, value)?.as_str() {
+                    "cloud" => InstanceType::Cloud,
+                    "omni" => InstanceType::Omni,
+                    _ => {
+                        return Err(invalid_argument(
+                            "spanner.instance_type expects cloud or omni",
+                        ));
+                    }
+                };
             }
             OptionDatabase::Other(name) if name == OPTION_KEYFILE => {
                 self.keyfile = Some(string_value(&key, value)?)
@@ -395,6 +467,14 @@ impl Optionable for SpannerDatabase {
             OptionDatabase::Other(name) if name == OPTION_EMULATOR => {
                 Some(self.emulator.to_string())
             }
+            OptionDatabase::Other(name) if name == OPTION_INSTANCE_TYPE => Some(
+                if self.instance_type == InstanceType::Omni {
+                    "omni"
+                } else {
+                    "cloud"
+                }
+                .to_string(),
+            ),
             OptionDatabase::Other(name) if name == OPTION_KEYFILE => self.keyfile.clone(),
             OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_TARGET_PRINCIPAL => {
                 self.impersonate_target_principal.clone()

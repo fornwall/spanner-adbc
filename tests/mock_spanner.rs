@@ -22,11 +22,9 @@
 //! wire protos match. The harness here ([`MockServer`]) binds it to an ephemeral localhost port
 //! and points the driver at it via `spanner.endpoint` + `spanner.emulator=true` (anonymous
 //! credentials over plaintext HTTP/2 — the same path a real emulator uses). Only **data-plane**
-//! RPCs are scripted here: the mock speaks `google.spanner.v1.Spanner`, not the REST admin API the
-//! driver's DDL path uses. Because the harness binds an ephemeral port, the client's emulator-only
-//! `:9010`→`:9020` admin-endpoint remap never applies, so an admin client built in these tests
-//! targets the harness's own socket — which [`GatedEndpoint`] exploits to bound the DDL path
-//! deterministically without serving admin RPCs at all.
+//! RPCs are scripted here: the mock speaks `google.spanner.v1.Spanner`, not the gRPC admin API the
+//! driver's DDL path uses. The admin client targets the same socket through a separate channel;
+//! [`GatedEndpoint`] makes that channel silent to test DDL deadlines and cancellation.
 //!
 //! Scripting rules (mockall matches expectations in FIFO order):
 //! - the harness always serves `CreateSession` (the client creates one multiplexed session per
@@ -230,18 +228,10 @@ macro_rules! watchdog {
 /// A TCP gate in front of a [`MockServer`], used to make the driver's **admin** (DDL) endpoint
 /// unanswerable *by construction* — the one thing this data-plane mock cannot script itself.
 ///
-/// The client derives the admin endpoint from the data-plane one, remapping the port only for an
-/// endpoint ending in `:9010` (`map_emulator_admin_endpoint` in the pinned client); the harness
-/// binds an *ephemeral* port, so the remap never applies and **both clients target this one
-/// socket**. That is what lets a DDL test run offline: the driver reaches the mock through the
-/// gate, and once it is [switched silent](Self::go_silent) every *new* connection is accepted and
-/// then never answered — a black hole. Accepted sockets are deliberately **held open** rather than
-/// dropped: a closed socket would surface as a transport *error*, whereas the point here is a
-/// request that hangs.
-///
-/// Ordering is explicit at the call site: connect first (letting `CreateSession` through), then go
-/// silent, then issue the DDL — whose admin client dials a *fresh* HTTP/1.1 connection (a separate
-/// pool from the already-established h2c data-plane channel) and waits forever.
+/// The data and admin gRPC clients share the endpoint but use separate channels. Connecting
+/// first lets `CreateSession` through; after the gate goes silent, the lazy admin channel's new
+/// socket is accepted and held open without a response. This makes DDL wait until cancellation
+/// or its configured deadline, independent of server timing.
 struct GatedEndpoint {
     /// Plaintext endpoint (`http://127.0.0.1:<port>`) to hand to `spanner.endpoint`.
     endpoint: String,
@@ -640,6 +630,50 @@ fn serve_begin_transaction(mock: &mut MockSpanner) {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn omni_connects_with_explicit_endpoint_and_default_anonymous_credentials() {
+    let _watchdog = watchdog!();
+    let server = MockServer::start(|mock| {
+        mock.expect_execute_streaming_sql().returning(|_| {
+            Ok(stream_of(vec![Ok(partial_result_set(
+                true,
+                &["omni"],
+                b"",
+                true,
+            ))]))
+        });
+    });
+    let mut driver = SpannerDriver::try_new().unwrap();
+    let database = driver
+        .new_database_with_opts([
+            (OptionDatabase::Uri, format!("spanner:///{DATABASE}").into()),
+            (
+                OptionDatabase::Other(spanner_adbc::OPTION_INSTANCE_TYPE.into()),
+                "omni".into(),
+            ),
+            (
+                OptionDatabase::Other(spanner_adbc::OPTION_ENDPOINT.into()),
+                server.endpoint.clone().into(),
+            ),
+        ])
+        .unwrap();
+    assert_eq!(
+        database
+            .get_option_string(OptionDatabase::Other(spanner_adbc::OPTION_EMULATOR.into()))
+            .unwrap(),
+        "false"
+    );
+    let mut connection = database.new_connection().unwrap();
+    let mut statement = connection.new_statement().unwrap();
+    statement.set_sql_query("SELECT 'omni'").unwrap();
+    let batches = statement
+        .execute()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "omni");
+}
+
+#[test]
 fn bound_dml_strips_leading_and_trailing_terminators() {
     let _watchdog = watchdog!();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -725,6 +759,96 @@ fn bound_dml_returning_and_partitioned_preserve_parameters() {
         assert!(request.params.as_ref().unwrap().fields.contains_key("p"));
     }
     assert_eq!(requests.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn bound_returning_dml_commits_with_the_explicit_transaction_id() {
+    let _watchdog = watchdog!();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let commits = Arc::new(Mutex::new(Vec::new()));
+    let (record_requests, record_commits) = (requests.clone(), commits.clone());
+    let server = MockServer::start(move |mock| {
+        mock.expect_begin_transaction().once().returning(|request| {
+            assert!(matches!(
+                request.into_inner().options.unwrap().mode,
+                Some(v1::transaction_options::Mode::ReadWrite(_))
+            ));
+            Ok(tonic::Response::new(v1::Transaction {
+                id: b"original-txn".to_vec(),
+                ..Default::default()
+            }))
+        });
+        mock.expect_execute_streaming_sql()
+            .times(2)
+            .returning(move |request| {
+                let request = request.into_inner();
+                let value = format!("v{}", request.seqno - 1);
+                let mut result = partial_result_set(true, &[&value], b"dml", true);
+                // Omni can return a different opaque ID in each streaming DML response.
+                result.metadata.as_mut().unwrap().transaction = Some(v1::Transaction {
+                    id: format!("response-txn-{}", request.seqno).into_bytes(),
+                    ..Default::default()
+                });
+                result.precommit_token = Some(v1::MultiplexedSessionPrecommitToken {
+                    precommit_token: format!("token-{}", request.seqno).into_bytes(),
+                    seq_num: request.seqno.try_into().unwrap(),
+                });
+                record_requests.lock().unwrap().push(request);
+                Ok(stream_of(vec![Ok(result)]))
+            });
+        mock.expect_commit().once().returning(move |request| {
+            record_commits.lock().unwrap().push(request.into_inner());
+            commit_ok()
+        });
+    });
+    let mut connection = server.connect();
+    let mut statement = connection.new_statement().unwrap();
+    statement
+        .set_sql_query("INSERT INTO MockTable (c) VALUES (@c) THEN RETURN c")
+        .unwrap();
+    statement.bind(ingest_batch(2)).unwrap();
+    let batches = statement
+        .execute()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(batches.len(), 2);
+    for (index, batch) in batches.iter().enumerate() {
+        assert_eq!(
+            batch.column(0).as_string::<i32>().value(0),
+            format!("v{index}")
+        );
+    }
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(request.seqno, index as i64 + 1);
+        assert_eq!(
+            request.transaction.as_ref().unwrap().selector,
+            Some(v1::transaction_selector::Selector::Id(
+                b"original-txn".to_vec()
+            ))
+        );
+        assert_eq!(
+            request.params.as_ref().unwrap().fields["c"],
+            string_value(&format!("v{index}"))
+        );
+    }
+    let commits = commits.lock().unwrap();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(
+        commits[0].transaction,
+        Some(v1::commit_request::Transaction::TransactionId(
+            b"original-txn".to_vec()
+        ))
+    );
+    assert_eq!(
+        commits[0].precommit_token,
+        Some(v1::MultiplexedSessionPrecommitToken {
+            precommit_token: b"token-2".to_vec(),
+            seq_num: 2,
+        })
+    );
 }
 
 #[test]
@@ -1227,6 +1351,88 @@ fn execute_partitions_rejects_multiple_bound_rows_and_consumes_them() {
         0,
         "bound rows must not survive execute_partitions on a reused statement handle"
     );
+}
+
+#[test]
+fn empty_partitions_retain_the_planned_types_at_the_readers_timestamp_precision() {
+    let _watchdog = watchdog!();
+    let server = MockServer::start(|mock| {
+        serve_begin_transaction(mock);
+        mock.expect_partition_query().once().returning(|request| {
+            assert_eq!(
+                request.into_inner().sql,
+                "SELECT Id, Ts, Doc FROM MockTable"
+            );
+            Ok(tonic::Response::new(v1::PartitionResponse {
+                partitions: vec![v1::Partition {
+                    partition_token: b"empty-partition".to_vec(),
+                }],
+                ..Default::default()
+            }))
+        });
+        mock.expect_execute_streaming_sql()
+            .times(2)
+            .returning(|request| {
+                let request = request.into_inner();
+                let metadata = if request.partition_token.is_empty() {
+                    assert_eq!(
+                        request.query_mode,
+                        v1::execute_sql_request::QueryMode::Plan as i32
+                    );
+                    Some(result_metadata(&[
+                        ("Id", v1::TypeCode::Int64),
+                        ("Ts", v1::TypeCode::Timestamp),
+                        ("Doc", v1::TypeCode::Json),
+                    ]))
+                } else {
+                    assert_eq!(request.partition_token, b"empty-partition");
+                    // Omni can omit the row type for a partition with no rows.
+                    Some(v1::ResultSetMetadata::default())
+                };
+                Ok(stream_of(vec![Ok(v1::PartialResultSet {
+                    metadata,
+                    last: true,
+                    ..Default::default()
+                })]))
+            });
+    });
+    let mut producer = server.connect();
+    let mut statement = producer.new_statement().unwrap();
+    statement
+        .set_sql_query("SELECT Id, Ts, Doc FROM MockTable")
+        .unwrap();
+    let partitions = statement.execute_partitions().unwrap();
+    assert_eq!(partitions.partitions.len(), 1);
+    assert_eq!(
+        partitions.schema.field(1).data_type(),
+        &DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("UTC".into()))
+    );
+    drop(statement);
+
+    let mut consumer = server.connect();
+    consumer
+        .set_option(
+            OptionConnection::Other(spanner_adbc::OPTION_MAX_TIMESTAMP_PRECISION.into()),
+            "microseconds".into(),
+        )
+        .unwrap();
+    let reader = consumer.read_partition(&partitions.partitions[0]).unwrap();
+    let schema = reader.schema();
+    assert_eq!(schema.fields().len(), 3);
+    assert_eq!(schema.field(0).name(), "Id");
+    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(schema.field(1).name(), "Ts");
+    assert_eq!(
+        schema.field(1).data_type(),
+        &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
+    );
+    assert_eq!(schema.field(2), partitions.schema.field(2));
+    assert_eq!(
+        schema.field(2).metadata()["ARROW:extension:name"],
+        "arrow.json"
+    );
+    let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
 }
 
 #[test]

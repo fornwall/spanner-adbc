@@ -601,6 +601,72 @@ fn positional_struct_keeps_duplicate_and_anonymous_fields() {
     assert_eq!((col(0), col(1), col(2)), (1, 2, 3));
 }
 
+#[test]
+fn scalar_struct_nested_in_struct_preserves_schema_values_and_nulls() {
+    use google_cloud_spanner::model::{StructType, Type as WireType, TypeCode, struct_type};
+
+    let child = WireType::new().set_code(TypeCode::Struct).set_struct_type(
+        StructType::new().set_fields([
+            struct_type::Field::new()
+                .set_name("id")
+                .set_type(WireType::new().set_code(TypeCode::Int64)),
+            struct_type::Field::new()
+                .set_name("label")
+                .set_type(WireType::new().set_code(TypeCode::String)),
+        ]),
+    );
+    let outer: Type = WireType::new()
+        .set_code(TypeCode::Struct)
+        .set_struct_type(
+            StructType::new()
+                .set_fields([struct_type::Field::new().set_name("child").set_type(child)]),
+        )
+        .into();
+    let field = arrow_field("outer", &outer, true, TimestampPrecision::default()).unwrap();
+    let expected = DataType::Struct(Fields::from(vec![Field::new(
+        "child",
+        DataType::Struct(Fields::from(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("label", DataType::Utf8, true),
+        ])),
+        true,
+    )]));
+    assert_eq!(field.data_type(), &expected);
+    let empty = build_array(field.data_type(), &[]).unwrap();
+    assert_eq!(empty.data_type(), &expected);
+    assert!(empty.is_empty());
+
+    let value = vec![vec![7i64.to_value(), "nested".to_value()].to_value()].to_value();
+    let null_child = vec![None::<i64>.to_value()].to_value();
+    let array = build_array(field.data_type(), &[Some(&value), Some(&null_child), None]).unwrap();
+    let outer = array.as_any().downcast_ref::<StructArray>().unwrap();
+    let child = outer
+        .column(0)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    assert_eq!(
+        child
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0),
+        7
+    );
+    assert_eq!(
+        child
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "nested"
+    );
+    assert!(child.is_null(1));
+    assert!(outer.is_null(2));
+}
+
 /// Genuine wire NULLs still round-trip as nulls under strict list/struct decoding: SQL NULL
 /// (and absent) column values become null list/struct slots, and NULL elements/fields become
 /// null child slots — only *present* undecodable values error.

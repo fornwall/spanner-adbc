@@ -7,10 +7,10 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver for
-[Google Cloud Spanner](https://cloud.google.com/spanner), available as a
+[Google Cloud Spanner](https://cloud.google.com/spanner) and Spanner Omni, available as a
 [Python package](https://pypi.org/project/spanner-adbc/), a Rust crate from git, and a
-[loadable shared library](#shared-library-loadable-driver). CI tests against the Spanner emulator;
-real-database and authentication tests run locally.
+[loadable shared library](#shared-library-loadable-driver). CI tests against both the Spanner
+emulator and Omni; managed-cloud and authentication tests run locally. See [testing](docs/testing.md).
 
 For Python installation and examples, see [python/README.md](python/README.md).
 
@@ -30,7 +30,7 @@ For Python installation and examples, see [python/README.md](python/README.md).
   leaves primary-key generation to Spanner's
   [hidden `rowid`](https://docs.cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys).
 - **Partitioned queries:** `execute_partitions()` and `read_partition()`, optionally with
-  [Data Boost](https://docs.cloud.google.com/spanner/docs/databoost/databoost-overview).
+  [Data Boost](https://docs.cloud.google.com/spanner/docs/databoost/databoost-overview) on Cloud Spanner.
 - **Schema discovery:** `execute_schema()` and `get_parameter_schema()` use PLAN probes;
   undetermined parameter types are reported as Arrow `Null`.
 - **Metadata:** `get_info()`, `get_objects()` (including foreign keys and native type names),

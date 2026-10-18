@@ -97,6 +97,14 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 arbitrary = { version = "1", features = ["derive"], optional = true }
 # Forward structured gRPC status details into ADBC errors.
 google-cloud-gax = { git = "https://github.com/googleapis/google-cloud-rust", rev = "415dbbb8ec607f4ba927ed0e38366194cb09530d" }
+# Use gRPC for DDL on every backend; Omni does not expose the SDK admin client's REST API.
+google-cloud-gax-internal = { git = "https://github.com/googleapis/google-cloud-rust", rev = "415dbbb8ec607f4ba927ed0e38366194cb09530d", features = ["_internal-grpc-client"] }
+google-cloud-spanner-admin-database-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "415dbbb8ec607f4ba927ed0e38366194cb09530d" }
+google-cloud-longrunning = { git = "https://github.com/googleapis/google-cloud-rust", rev = "415dbbb8ec607f4ba927ed0e38366194cb09530d" }
+google-cloud-rpc = { git = "https://github.com/googleapis/google-cloud-rust", rev = "415dbbb8ec607f4ba927ed0e38366194cb09530d" }
+# Wire messages for the two DDL RPCs; already used by the Spanner client.
+prost = "0.14"
+prost-types = "0.14"
 
 [lints.rust]
 # The C++ ASan validation harness enables this tripwire via rustflags.
@@ -143,15 +151,13 @@ adbc_ffi = { git = "https://github.com/apache/arrow-adbc", rev = "0a40cf30d04588
 libloading = "0.9"
 # Create emulator test instances and databases; keep Google Cloud revisions aligned.
 google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "415dbbb8ec607f4ba927ed0e38366194cb09530d" }
-google-cloud-spanner-admin-database-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "415dbbb8ec607f4ba927ed0e38366194cb09530d" }
 # Offline benchmarks without plotters/rayon.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # Offline gRPC fault injection using the pinned client’s own mock server.
 spanner-grpc-mock = { git = "https://github.com/googleapis/google-cloud-rust", rev = "415dbbb8ec607f4ba927ed0e38366194cb09530d" }
 # Wire messages and error details for the mock server; match the Google Cloud graph.
 tonic = "0.14"
-prost = "0.14"
-prost-types = "0.14"
+tonic-prost = "0.14"
 bytes = "1"
 
 # Arrow 60.0.0 hides FFI_ArrowArrayStream fields; main adds the needed accessors

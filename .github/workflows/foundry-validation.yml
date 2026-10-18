@@ -22,18 +22,17 @@ permissions:
 
 jobs:
   foundry-validation:
-    name: Foundry validation (emulator)
+    name: Foundry validation (${{ matrix.backend }})
     runs-on: ubuntu-latest
 
-    services:
-      spanner:
-        image: gcr.io/cloud-spanner-emulator/emulator
-        ports:
-          - 9010:9010
-          - 9020:9020
+    # Cold installs may build DuckDB and the driver manager for the newest Python.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [emulator, omni]
 
     env:
-      SPANNER_EMULATOR_HOST: localhost:9010
       # Fail the job if the suite runs but exercises no real coverage — i.e. every
       # collected case was skipped/errored rather than actually passing — so a broken
       # harness can't masquerade as an all-expected-dialect-skips green run. Enforced
@@ -59,18 +58,15 @@ jobs:
           # Run the suite on the latest stable Python (it requires >= 3.13).
           python-version: "3.x"
           check-latest: true
+          cache: pip
+          cache-dependency-path: |
+            python/pyproject.toml
+            scripts/run-foundry-validation.sh
 
-      - name: Wait for the Spanner emulator
-        run: |
-          for _ in $(seq 1 60); do
-            if [ "$(curl -s -o /dev/null -w '%{http_code}' \
-                http://127.0.0.1:9020/v1/projects/emulator/instanceConfigs)" = "200" ]; then
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "emulator did not become ready" >&2
-          exit 1
+      - name: Build the driver and install validation dependencies
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
+        run: PYTHON=python scripts/run-foundry-validation.sh --prepare
 
       - name: Run the Foundry validation suite
-        run: PYTHON=python scripts/run-foundry-validation.sh
+        run: PYTHON=python scripts/with-${{ matrix.backend }}.sh scripts/run-foundry-validation.sh

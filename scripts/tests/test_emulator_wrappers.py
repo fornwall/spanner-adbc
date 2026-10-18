@@ -13,7 +13,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 
 
 @unittest.skipUnless(shutil.which("bash"), "requires Bash")
-class EmulatorWrappers(unittest.TestCase):
+class BackendWrappers(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -27,6 +27,7 @@ class EmulatorWrappers(unittest.TestCase):
             SPANNER_EMULATOR_CONTAINER="existing-emulator",
             SPANNER_EMULATOR_GRPC_PORT="9010",
             SPANNER_EMULATOR_REST_PORT="9020",
+            SPANNER_OMNI_CONTAINER="existing-omni",
             TOXIPROXY_CONTAINER="existing-proxy",
         )
         self.tool("docker", '''
@@ -81,6 +82,27 @@ print("200", end="")
         self.env["FAIL_CONTAINER"] = "existing-emulator"
         self.assertEqual(self.run_wrapper("with-emulator.sh").returncode, 125)
         self.assertEqual(self.removed_ids(), [])
+
+    def test_omni_collision_preserves_existing_container(self):
+        self.env["FAIL_CONTAINER"] = "existing-omni"
+        self.assertEqual(self.run_wrapper("with-omni.sh").returncode, 125)
+        self.assertEqual(self.removed_ids(), [])
+
+    def test_omni_start_failure_cleans_up_created_container_and_volume(self):
+        self.env.update(FAIL_CONTAINER="existing-omni", FAIL_AFTER_CREATE="1")
+        self.assertEqual(self.run_wrapper("with-omni.sh").returncode, 125)
+        self.assertIn(["docker", "rm", "-fv", "owned-existing-omni"], self.calls)
+
+    def test_omni_preserves_child_status_and_cleans_up(self):
+        self.assertEqual(self.run_wrapper("with-omni.sh", 23).returncode, 23)
+        self.assertEqual(self.removed_ids(), ["owned-existing-omni"])
+        start = next(call for call in self.calls if call[:2] == ["docker", "run"])
+        self.assertIn("--listen-addresses=0.0.0.0", start)
+        self.assertIn("127.0.0.1:15000-15025:15000-15025", start)
+        commands = [call for call in self.calls if call[:2] == ["docker", "exec"]]
+        self.assertEqual(len(commands), 2)
+        self.assertIn("list", commands[0])
+        self.assertIn("adbc-test", commands[1])
 
     def test_emulator_rejects_unusable_port_mapping_before_starting_docker(self):
         for variable, port in (

@@ -44,6 +44,47 @@ fn database_options_round_trip() {
 }
 
 #[test]
+fn omni_options_validate_before_connecting() {
+    let mut db = new_database();
+    let key = || OptionDatabase::Other(OPTION_INSTANCE_TYPE.into());
+    assert_eq!(db.get_option_string(key()).unwrap(), "cloud");
+    db.set_option(
+        OptionDatabase::Uri,
+        "spanner:///projects/default/instances/default/databases/test?spanner.instance_type=omni"
+            .into(),
+    )
+    .unwrap();
+    assert_eq!(db.get_option_string(key()).unwrap(), "omni");
+    let error = db.connect().unwrap_err();
+    assert_eq!(error.status, Status::InvalidState);
+    assert!(
+        error
+            .message
+            .contains("requires an explicit spanner.endpoint")
+    );
+    for invalid in ["", "Omni", "other"] {
+        assert_eq!(
+            db.set_option(key(), invalid.into()).unwrap_err().status,
+            Status::InvalidArguments
+        );
+        assert_eq!(db.get_option_string(key()).unwrap(), "omni");
+    }
+    db.set_option(
+        OptionDatabase::Other(OPTION_ENDPOINT.into()),
+        "http://localhost:15000".into(),
+    )
+    .unwrap();
+    db.set_option(OptionDatabase::Other(OPTION_EMULATOR.into()), "true".into())
+        .unwrap();
+    assert!(
+        db.connect()
+            .unwrap_err()
+            .message
+            .contains("cannot be combined")
+    );
+}
+
+#[test]
 fn debug_redacts_credential_fields() {
     let mut db = new_database();
     db.database = Some("projects/p/instances/i/databases/d".into());
