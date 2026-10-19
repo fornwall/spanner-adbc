@@ -268,6 +268,15 @@ fn manual_transaction_kinds_round_trip() {
         1,
         "a query transaction's snapshot must not move mid-transaction"
     );
+    // A later failed query must not drop the begun transaction and its snapshot.
+    let mut typo = connection.new_statement().expect("new statement");
+    typo.set_sql_query("SELECT * FROM AdbcReadTxnMissing").unwrap();
+    assert!(typo.execute().is_err(), "a query on a missing table must fail");
+    assert_eq!(
+        count_rows(connection, "AdbcReadTxn"),
+        1,
+        "a failed query must keep the transaction's snapshot"
+    );
 
     let mut insert = connection.new_statement().expect("new statement");
     insert
