@@ -19,7 +19,7 @@ env:
 
 jobs:
   # Derive the target matrix from fuzz/Cargo.toml so new targets run automatically.
-  # The unit test every_fuzz_target_is_wired_and_documented checks this wiring.
+  # The unit test every_fuzz_target_is_wired checks this wiring.
   discover:
     name: discover fuzz targets
     runs-on: ubuntu-latest
@@ -80,7 +80,11 @@ jobs:
         # Override the prebuilt cargo-fuzz binary's musl target: sanitizers need dynamic libc.
         # Write new inputs to the first corpus directory; read committed seeds if present.
         # Pass workflow inputs through env to keep them out of shell source.
+        # The release profile's thin LTO strips coverage counters from the cdylib+rlib crate,
+        # which leaves libFuzzer blind; keep symbols for readable crash stacks.
         env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_STRIP: "false"
           FUZZ_TARGET: ${{ matrix.target }}
           MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '1200' }}
         run: |

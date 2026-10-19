@@ -1,0 +1,1 @@
+spanner://localhost:9010/projects/example.com%3Ap/instances/i/databases/d?spanner.emulator=true&spanner.instance_type=cloud

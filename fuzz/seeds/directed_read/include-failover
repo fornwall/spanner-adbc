@@ -1,0 +1,1 @@
+include:us-east1:read_only, us-west1;auto_failover_disabled

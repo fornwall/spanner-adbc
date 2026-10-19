@@ -1,0 +1,1 @@
+SPANNER:///projects/p/instances/i/databases/d?spanner.auth.impersonate.lifetime=3600&spanner.auth.impersonate.delegates=a%40x.iam,b
