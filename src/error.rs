@@ -128,7 +128,7 @@ pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
 /// Appended to `PERMISSION_DENIED` messages, which already name the missing permission. It names
 /// no role, since suggesting one risks steering callers to an over-broad grant.
 const PERMISSION_DENIED_GUIDANCE: &str =
-    "; grant an IAM role that includes it — see https://cloud.google.com/spanner/docs/iam";
+    "; grant an IAM role that includes it; see https://cloud.google.com/spanner/docs/iam";
 
 /// Map status details as described on [`from_spanner`]. Details that cannot be mapped are
 /// skipped rather than failing the error path.

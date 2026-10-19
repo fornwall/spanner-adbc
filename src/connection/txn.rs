@@ -116,7 +116,7 @@ impl TxnState {
         }
         Err(invalid_state(format!(
             "cannot run {} in a manual transaction that began with {}: {}. A manual transaction \
-             is either queries or DML — its kind is fixed by its first statement. Commit or \
+             is either queries or DML, fixed by its first statement. Commit or \
              roll back the transaction first.",
             attempted.what(),
             active.what(),
