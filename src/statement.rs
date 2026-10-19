@@ -316,23 +316,18 @@ impl SpannerStatement {
     }
 
     /// Run `sql` as a read-only query and return a streaming reader. Shared by `execute` and the
-    /// query arm of `execute_update`.
+    /// query arm of `execute_update`, whose callers consume the bound rows.
     ///
     /// Trailing `;` terminators are stripped: Spanner's query API rejects them, but clients often
     /// append one. In a manual transaction the query uses the transaction's shared snapshot.
     fn execute_query_reader(
-        &mut self,
+        &self,
         sql: &str,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let sql = crate::sql::strip_trailing_terminators(sql);
         self.ensure_query_allowed()?;
-        // Consume an empty bound stream's schema so it cannot leak into a later ingest.
-        self.ingest_schema = None;
         if !self.bound.is_empty() {
-            // Bound rows are consumed even if the query fails.
-            let result = self.execute_bound_query(&sql);
-            self.clear_bound();
-            return result;
+            return self.execute_bound_query(&sql);
         }
         let manual_txn = self.manual_read_transaction()?;
         let client = self.client.clone();
@@ -418,6 +413,57 @@ impl SpannerStatement {
             .ok_or_else(|| invalid_state("no SQL query set on statement; call set_sql_query first"))
     }
 
+    /// Body of `execute` for SQL, split out so the caller clears bound data however it ends.
+    fn run_sql(&self, sql: &str) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        if crate::sql::is_ddl(sql) {
+            self.run_ddl(crate::sql::split_statements(sql))?;
+            return Ok(Self::empty_reader());
+        }
+        // Clients such as the Python DBAPI and R send every statement through `ExecuteQuery`, so
+        // DML must take the read/write path here; the read-only path would reject it.
+        // `THEN RETURN` returns its rows; plain DML yields an empty result.
+        if crate::sql::is_dml(sql) {
+            return match self.run_dml(sql)? {
+                DmlOutcome::Returning {
+                    batches, schema, ..
+                } => {
+                    let batches: Vec<std::result::Result<RecordBatch, ArrowError>> =
+                        split_batches(batches, self.rows_per_batch)
+                            .into_iter()
+                            .map(Ok)
+                            .collect();
+                    Ok(Box::new(RecordBatchIterator::new(batches, schema)))
+                }
+                DmlOutcome::Plain(_) => Ok(Self::empty_reader()),
+            };
+        }
+        self.execute_query_reader(sql)
+    }
+
+    /// Body of `execute_update` for SQL, split out so the caller clears bound data however it
+    /// ends.
+    fn run_sql_update(&self, sql: &str) -> Result<Option<i64>> {
+        if crate::sql::is_ddl(sql) {
+            self.run_ddl(crate::sql::split_statements(sql))?;
+            return Ok(None);
+        }
+        // A query: `adbc.h` allows executing any statement without a result set, so run it like
+        // `execute` and discard the rows. On the DML path it would fail in `ExecuteBatchDml`, or
+        // in a manual transaction be buffered and break the commit.
+        if !crate::sql::is_dml(sql) {
+            // A `;`-batch starting with a query is rejected like any other mixed batch.
+            check_all_dml_batch(&crate::sql::split_statements(sql))?;
+            let reader = self.execute_query_reader(sql)?;
+            drain_discarding_rows(reader)?;
+            return Ok(None);
+        }
+        match self.run_dml(sql)? {
+            // This interface only reports the count, so returned rows are discarded.
+            DmlOutcome::Returning { affected, .. } => Ok(Some(affected)),
+            DmlOutcome::Plain(count) => Ok(count),
+        }
+    }
+
     /// Build a query statement for `sql`, binding the first bound parameter row if there is one;
     /// `plan` selects `QueryMode::Plan`.
     fn build_query_statement(&self, sql: &str, plan: bool) -> Result<SpannerSql> {
@@ -448,6 +494,15 @@ impl SpannerStatement {
 
     /// Body of `execute_partitions`, split out so the caller clears bound data however it ends.
     fn run_partition_query(&self, sql: &str) -> Result<PartitionedResult> {
+        check_query_only(
+            sql,
+            "execute_partitions",
+            "partitioned in a batch read-only transaction",
+        )?;
+        let sql = &crate::sql::strip_trailing_terminators(sql);
+        // Partitioned reads never use a manual transaction's snapshot, but they would still miss
+        // its buffered writes.
+        self.ensure_query_allowed()?;
         self.check_single_bound_row()?;
         // Each partition carries its session, transaction id and token, so it serializes into a
         // self-contained descriptor. The multiplexed session lives as long as the
@@ -547,6 +602,8 @@ impl SpannerStatement {
         }
         let plan_builder = self.read_sql_builder(&sql).set_query_mode(QueryMode::Plan);
         let client = self.client.clone();
+        // Plan against the schema version the query will read, as `plan_query_schema` does.
+        let read_bound = self.config.read_staleness.timestamp_bound()?;
         block_on_cancellable(
             &self.runtime,
             &self.cancel.current(),
@@ -554,7 +611,7 @@ impl SpannerStatement {
                 self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
-                    let transaction = client.single_use().build();
+                    let transaction = crate::staleness::single_use(&client, read_bound);
                     let result_set = transaction
                         .execute_query(plan_builder.build())
                         .await
@@ -812,29 +869,11 @@ impl Statement for SpannerStatement {
         }
         self.check_bound_has_destination()?;
         let sql = self.sql()?;
-        if crate::sql::is_ddl(&sql) {
-            self.run_ddl(crate::sql::split_statements(&sql))?;
-            self.clear_bound();
-            return Ok(Self::empty_reader());
-        }
-        // Clients such as the Python DBAPI and R send every statement through `ExecuteQuery`, so
-        // DML must take the read/write path here; the read-only path would reject it.
-        // `THEN RETURN` returns its rows; plain DML yields an empty result.
-        if crate::sql::is_dml(&sql) {
-            let result = self.run_dml(&sql);
-            self.clear_bound();
-            return match result? {
-                DmlOutcome::Returning {
-                    batches, schema, ..
-                } => {
-                    let batches: Vec<std::result::Result<RecordBatch, ArrowError>> =
-                        batches.into_iter().map(Ok).collect();
-                    Ok(Box::new(RecordBatchIterator::new(batches, schema)))
-                }
-                DmlOutcome::Plain(_) => Ok(Self::empty_reader()),
-            };
-        }
-        self.execute_query_reader(&sql)
+        // Bound rows are consumed even if execution fails, so a reused handle can't apply them
+        // to a later statement.
+        let result = self.run_sql(&sql);
+        self.clear_bound();
+        result
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
@@ -845,30 +884,10 @@ impl Statement for SpannerStatement {
             return self.run_ingest(&table);
         }
         self.check_bound_has_destination()?;
-
         let sql = self.sql()?;
-        if crate::sql::is_ddl(&sql) {
-            self.run_ddl(crate::sql::split_statements(&sql))?;
-            self.clear_bound();
-            return Ok(None);
-        }
-        // A query: `adbc.h` allows executing any statement without a result set, so run it like
-        // `execute` and discard the rows. On the DML path it would fail in `ExecuteBatchDml`, or
-        // in a manual transaction be buffered and break the commit.
-        if !crate::sql::is_dml(&sql) {
-            // A `;`-batch starting with a query is rejected like any other mixed batch.
-            check_all_dml_batch(&crate::sql::split_statements(&sql))?;
-            let reader = self.execute_query_reader(&sql)?;
-            drain_discarding_rows(reader)?;
-            return Ok(None);
-        }
-        let result = self.run_dml(&sql);
+        let result = self.run_sql_update(&sql);
         self.clear_bound();
-        match result? {
-            // This interface only reports the count, so returned rows are discarded.
-            DmlOutcome::Returning { affected, .. } => Ok(Some(affected)),
-            DmlOutcome::Plain(count) => Ok(count),
-        }
+        result
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
@@ -900,15 +919,6 @@ impl Statement for SpannerStatement {
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
         self.cancel.begin_operation();
         let sql = self.sql()?;
-        check_query_only(
-            &sql,
-            "execute_partitions",
-            "partitioned in a batch read-only transaction",
-        )?;
-        let sql = crate::sql::strip_trailing_terminators(&sql);
-        // Partitioned reads never use a manual transaction's snapshot, but they would still miss
-        // its buffered writes.
-        self.ensure_query_allowed()?;
         let result = self.run_partition_query(&sql);
         self.clear_bound();
         result
@@ -966,8 +976,12 @@ impl Statement for SpannerStatement {
 
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> Result<()> {
         self.sql = Some(query.as_ref().to_string());
-        // A query and an ingest target are mutually exclusive; see `set_option`.
+        // A query and an ingest target are mutually exclusive; see `set_option`. Clear the whole
+        // target, as the reference drivers do: the DBAPI only sets the schema when given one, so
+        // a stale schema would redirect a reused cursor's next ingest to another table.
         self.target_table = None;
+        self.target_db_schema = None;
+        self.target_catalog = None;
         Ok(())
     }
 
@@ -1055,6 +1069,24 @@ fn check_partitioned_dml(sql: &str, autocommit: bool, bound_rows: usize) -> Resu
         )));
     }
     Ok(())
+}
+
+/// Slice `batches` so none exceeds `max_rows`, as query results are. Slices share buffers.
+fn split_batches(batches: Vec<RecordBatch>, max_rows: usize) -> Vec<RecordBatch> {
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        if batch.num_rows() <= max_rows {
+            out.push(batch);
+            continue;
+        }
+        let mut offset = 0;
+        while offset < batch.num_rows() {
+            let len = max_rows.min(batch.num_rows() - offset);
+            out.push(batch.slice(offset, len));
+            offset += len;
+        }
+    }
+    out
 }
 
 /// Drain a query's rows, discarding them; mid-stream failures still surface. The streaming layer

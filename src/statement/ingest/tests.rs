@@ -207,3 +207,37 @@ fn ingest_batch_write_option_coerces_and_unsets_on_empty() {
     let error = ingest_batch_write_option(OptionValue::Int(1)).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
 }
+
+/// A small slice of a large batch keeps the parent's buffers; counting them would put each of its
+/// rows in a commit of its own.
+#[test]
+fn row_size_estimate_counts_only_a_slices_rows() {
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    let rows = 200_000;
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..rows)),
+            Arc::new(StringArray::from_iter_values(
+                (0..rows).map(|i| format!("{i:0>32}")),
+            )),
+        ],
+    )
+    .unwrap();
+    // 8 bytes of id, 4 of offset and 32 of string per row.
+    let slice = batch.slice(1_000, 10);
+    assert_eq!(estimated_row_bytes(&slice), 44);
+    assert_eq!(estimated_row_bytes(&batch), 44);
+    let mut budget = IngestChunkBudget::default();
+    for _ in 0..slice.num_rows() {
+        assert!(budget.fits(slice.num_columns(), estimated_row_bytes(&slice)));
+        budget.add(slice.num_columns(), estimated_row_bytes(&slice));
+    }
+}

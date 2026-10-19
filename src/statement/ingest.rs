@@ -3,7 +3,7 @@
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch};
 use google_cloud_spanner::mutation::{Mutation, MutationGroup};
 
 use super::{SpannerStatement, string_option};
@@ -123,9 +123,6 @@ impl SpannerStatement {
     /// An ingest that fits in one chunk is atomic. Larger ones commit chunk by chunk, so a failure
     /// leaves earlier chunks committed; the error reports how many rows.
     pub(super) fn run_ingest(&mut self, table: &str) -> Result<Option<i64>> {
-        if self.config.is_read_only() {
-            return Err(invalid_state("cannot ingest: the connection is read-only"));
-        }
         // An empty bound stream still provides a schema, enough to create the table.
         if self.bound.is_empty() && self.ingest_schema.is_none() {
             return Err(invalid_state("cannot ingest: no data has been bound"));
@@ -138,6 +135,9 @@ impl SpannerStatement {
     /// Body of [`run_ingest`](Self::run_ingest), split out so the caller clears bound data on
     /// every exit path.
     fn run_bound_ingest(&self, table: &str) -> Result<Option<i64>> {
+        if self.config.is_read_only() {
+            return Err(invalid_state("cannot ingest: the connection is read-only"));
+        }
         // Check the transaction kind before the DDL, which runs immediately and would otherwise
         // create or drop the table before the ingest is rejected. The check is repeated under the
         // lock at buffer time; holding the connection-wide lock across the admin RPC instead
@@ -233,9 +233,7 @@ impl SpannerStatement {
         let mut row_index = 0_usize;
         for batch in &self.bound {
             let columns = batch.num_columns();
-            // The batch's Arrow memory per row. It counts capacity, so it errs high, which is the
-            // safe direction for a budget.
-            let row_bytes = batch.get_array_memory_size() / batch.num_rows().max(1);
+            let row_bytes = estimated_row_bytes(batch);
             for _ in 0..batch.num_rows() {
                 if !budget.fits(columns, row_bytes) {
                     total += self.commit_ingest_range(&target, chunk_start, row_index, total)?;
@@ -494,6 +492,24 @@ fn is_mutation_limit_exceeded(error: &Error) -> bool {
             .message
             .to_ascii_lowercase()
             .contains("too many mutations")
+}
+
+/// The batch's Arrow bytes per row. Counts only the rows a sliced batch references: a slice keeps
+/// its parent's buffers, so their capacity would make every row of a small slice look huge and
+/// commit it alone. Dictionary values, list children and view buffers are still counted whole,
+/// which errs high, the safe direction for a budget.
+fn estimated_row_bytes(batch: &RecordBatch) -> usize {
+    let bytes: usize = batch
+        .columns()
+        .iter()
+        .map(|column| {
+            column
+                .to_data()
+                .get_slice_memory_size()
+                .unwrap_or_else(|_| column.get_array_memory_size())
+        })
+        .sum();
+    bytes / batch.num_rows().max(1)
 }
 
 /// Mutations per ingest chunk. Spanner allows about 80,000 per commit, but secondary-index entries

@@ -1,5 +1,6 @@
 use super::*;
 use adbc_core::error::Status;
+use arrow_array::Array;
 
 #[test]
 fn ingest_temporary_accepts_false_and_rejects_true() {
@@ -254,4 +255,286 @@ fn rows_per_batch_option_rejects_zero_negative_and_malformed() {
     }
     let error = parse(OptionValue::Double(3.0)).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
+}
+
+#[test]
+fn split_batches_caps_rows_per_batch() {
+    let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+    let batch = |n: i64| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int64Array::from_iter_values(0..n))],
+        )
+        .unwrap()
+    };
+    let rows = |batches: &[RecordBatch]| {
+        batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows(&split_batches(vec![batch(5), batch(0), batch(2)], 2)),
+        [2, 2, 1, 0, 2]
+    );
+    assert_eq!(rows(&split_batches(vec![batch(3)], 3)), [3]);
+    let split = split_batches(vec![batch(5)], 2);
+    let last = split[2]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>();
+    assert_eq!(last.unwrap().values(), &[4]);
+}
+
+/// Statements on an in-process mock server that only serves sessions and records queries, which
+/// it rejects with a non-retryable status.
+mod mock {
+    use std::sync::{Arc, Mutex};
+
+    use adbc_core::error::Status;
+    use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Optionable, Statement};
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use spanner_grpc_mock::MockSpanner;
+    use spanner_grpc_mock::google::spanner::v1;
+
+    use crate::{SpannerConnection, SpannerDriver, SpannerStatement};
+
+    type Requests = Arc<Mutex<Vec<v1::ExecuteSqlRequest>>>;
+
+    struct MockServer {
+        endpoint: String,
+        requests: Requests,
+        server: tokio::task::JoinHandle<()>,
+        _runtime: tokio::runtime::Runtime,
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    fn start() -> MockServer {
+        let requests = Requests::default();
+        let mut mock = MockSpanner::new();
+        mock.expect_create_session().returning(|request| {
+            Ok(tonic::Response::new(v1::Session {
+                name: format!("{}/sessions/mock", request.into_inner().database),
+                multiplexed: true,
+                ..Default::default()
+            }))
+        });
+        let record = requests.clone();
+        mock.expect_execute_streaming_sql()
+            .returning(move |request| {
+                record.lock().unwrap().push(request.into_inner());
+                Err(tonic::Status::unimplemented("mock spanner server"))
+            });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (endpoint, server) = runtime
+            .block_on(spanner_grpc_mock::start("127.0.0.1:0", mock))
+            .unwrap();
+        MockServer {
+            endpoint,
+            requests,
+            server,
+            _runtime: runtime,
+        }
+    }
+
+    fn connect(server: &MockServer) -> SpannerConnection {
+        let mut driver = SpannerDriver::try_new().unwrap();
+        driver
+            .new_database_with_opts([
+                (
+                    OptionDatabase::Uri,
+                    OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
+                ),
+                (
+                    OptionDatabase::Other(crate::OPTION_ENDPOINT.into()),
+                    OptionValue::String(server.endpoint.clone()),
+                ),
+                (
+                    OptionDatabase::Other(crate::OPTION_EMULATOR.into()),
+                    OptionValue::String("true".into()),
+                ),
+            ])
+            .unwrap()
+            .new_connection()
+            .unwrap()
+    }
+
+    fn set_connection_option(connection: &mut SpannerConnection, key: OptionConnection, v: &str) {
+        connection
+            .set_option(key, OptionValue::String(v.into()))
+            .unwrap();
+    }
+
+    fn one_row() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("p", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .unwrap()
+    }
+
+    fn bound_statement(connection: &mut SpannerConnection, sql: &str) -> SpannerStatement {
+        let mut statement = connection.new_statement().unwrap();
+        statement.set_sql_query(sql).unwrap();
+        statement.bind(one_row()).unwrap();
+        statement
+    }
+
+    /// Every execution consumes bound rows, even one rejected before any RPC, so a reused handle
+    /// cannot apply them to its next statement.
+    #[test]
+    fn rejected_executions_consume_bound_rows() {
+        let server = start();
+        let mut connection = connect(&server);
+
+        let mut statement = bound_statement(&mut connection, "SELECT 1; DELETE FROM t WHERE true");
+        let error = statement.execute_update().unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments, "{error}");
+        assert!(
+            statement.bound.is_empty(),
+            "mixed batch kept its bound rows"
+        );
+
+        let mut statement = bound_statement(&mut connection, "DELETE FROM t WHERE c = @p");
+        let error = statement.execute_partitions().unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments, "{error}");
+        assert!(
+            statement.bound.is_empty(),
+            "execute_partitions kept its bound rows"
+        );
+
+        set_connection_option(&mut connection, OptionConnection::ReadOnly, "true");
+        for update in [false, true] {
+            let mut statement = bound_statement(&mut connection, "DROP TABLE t");
+            let error = if update {
+                statement.execute_update().unwrap_err()
+            } else {
+                statement.execute().err().unwrap()
+            };
+            assert_eq!(error.status, Status::InvalidState, "{error}");
+            assert!(statement.bound.is_empty(), "failed DDL kept its bound rows");
+        }
+        let mut ingest = connection.new_statement().unwrap();
+        ingest
+            .set_option(
+                OptionStatement::TargetTable,
+                OptionValue::String("t".into()),
+            )
+            .unwrap();
+        ingest.bind(one_row()).unwrap();
+        let error = ingest.execute_update().unwrap_err();
+        assert_eq!(error.status, Status::InvalidState, "{error}");
+        assert!(
+            ingest.bound.is_empty(),
+            "read-only ingest kept its bound rows"
+        );
+        set_connection_option(&mut connection, OptionConnection::ReadOnly, "false");
+
+        set_connection_option(&mut connection, OptionConnection::AutoCommit, "false");
+        let mut insert = connection.new_statement().unwrap();
+        insert
+            .set_sql_query("INSERT INTO t (c) VALUES (1)")
+            .unwrap();
+        assert_eq!(insert.execute_update().unwrap(), None);
+        let mut query = bound_statement(&mut connection, "SELECT c FROM t WHERE c = @p");
+        let error = query.execute().err().unwrap();
+        assert_eq!(error.status, Status::InvalidState, "{error}");
+        assert!(
+            query.bound.is_empty(),
+            "query rejected by the DML guard kept its bound rows"
+        );
+        connection.rollback().unwrap();
+        assert!(server.requests.lock().unwrap().is_empty());
+    }
+
+    /// The DBAPI reuses one statement for SQL and ingest and sets the schema only when given one,
+    /// so setting SQL must clear the whole ingest target.
+    #[test]
+    fn setting_sql_clears_the_whole_ingest_target() {
+        let server = start();
+        let mut connection = connect(&server);
+        let mut statement = connection.new_statement().unwrap();
+        for (key, value) in [
+            (OptionStatement::TargetDbSchema, "s1"),
+            (OptionStatement::TargetCatalog, "d"),
+            (OptionStatement::TargetTable, "t"),
+        ] {
+            statement
+                .set_option(key, OptionValue::String(value.into()))
+                .unwrap();
+        }
+        statement.set_sql_query("SELECT 1").unwrap();
+        for key in [
+            OptionStatement::TargetTable,
+            OptionStatement::TargetDbSchema,
+            OptionStatement::TargetCatalog,
+        ] {
+            let error = statement.get_option_string(key.clone()).unwrap_err();
+            assert_eq!(error.status, Status::NotFound, "{key:?}");
+        }
+        statement
+            .set_option(
+                OptionStatement::TargetTable,
+                OptionValue::String("t".into()),
+            )
+            .unwrap();
+        assert_eq!(statement.target_db_schema, None);
+    }
+
+    /// Parameters are typed against the schema version the query reads, like `execute_schema`.
+    #[test]
+    fn parameter_plan_probe_reads_at_the_statements_staleness() {
+        use v1::transaction_options::read_only::TimestampBound as WireBound;
+
+        let server = start();
+        let mut connection = connect(&server);
+        let mut statement = connection.new_statement().unwrap();
+        statement
+            .set_option(
+                OptionStatement::Other(crate::OPTION_READ_STALENESS.into()),
+                OptionValue::String("exact:10s".into()),
+            )
+            .unwrap();
+        statement
+            .set_sql_query("SELECT c FROM t WHERE c = @p")
+            .unwrap();
+        // The mock rejects the probe, which leaves the type unknown.
+        let schema = statement.get_parameter_schema().unwrap();
+        assert_eq!(schema.field(0).data_type(), &DataType::Null);
+
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].query_mode,
+            v1::execute_sql_request::QueryMode::Plan as i32
+        );
+        let Some(v1::transaction_selector::Selector::SingleUse(options)) = requests[0]
+            .transaction
+            .as_ref()
+            .and_then(|t| t.selector.as_ref())
+        else {
+            panic!("expected a single-use read: {:?}", requests[0]);
+        };
+        let Some(v1::transaction_options::Mode::ReadOnly(read_only)) = &options.mode else {
+            panic!("expected read-only options: {options:?}");
+        };
+        assert_eq!(
+            read_only.timestamp_bound,
+            Some(WireBound::ExactStaleness(prost_types::Duration {
+                seconds: 10,
+                nanos: 0,
+            }))
+        );
+    }
 }
