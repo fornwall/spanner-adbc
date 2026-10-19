@@ -1015,3 +1015,13 @@ fn values_outside_spanner_domain_report_the_column_and_value() {
         );
     }
 }
+
+/// A result with no columns, such as a PLAN probe of a statement that returns nothing, still
+/// converts. Arrow cannot infer a batch's length from zero columns.
+#[test]
+fn zero_column_result_converts_to_an_empty_batch() {
+    let (schema, batch) = rows_to_batch(None, &[], TimestampPrecision::default()).unwrap();
+    assert!(schema.fields().is_empty());
+    assert_eq!(batch.num_columns(), 0);
+    assert_eq!(batch.num_rows(), 0);
+}

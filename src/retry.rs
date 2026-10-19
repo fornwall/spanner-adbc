@@ -22,6 +22,10 @@ use google_cloud_spanner::statement::StatementBuilder;
 
 use crate::error::invalid_argument;
 
+/// About 30 years, tokio's own far-future deadline: indistinguishable from no limit, and safe to
+/// add to an `Instant` on every platform.
+const MAX_ELAPSED_LIMIT: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
+
 // Client transaction builders share Begin/Commit policy setters but no common trait.
 macro_rules! apply_to_commit_builder {
     ($(#[$attr:meta])* $name:ident($builder:ty)) => {
@@ -80,9 +84,13 @@ impl RetryConfig {
     }
 
     /// The retry time budget. The value was validated when set, so conversion cannot fail.
+    ///
+    /// Capped at [`MAX_ELAPSED_LIMIT`]: gax adds the limit to an `Instant` before every attempt,
+    /// which panics on overflow for limits that still fit in a `Duration`.
     fn max_elapsed_duration(&self) -> Option<Duration> {
         self.max_elapsed_seconds
             .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            .map(|limit| limit.min(MAX_ELAPSED_LIMIT))
     }
 
     /// The client's default [`SpannerRetryPolicy`] bounded by the configured limits, or `None`

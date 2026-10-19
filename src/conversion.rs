@@ -23,8 +23,8 @@ use arrow_array::types::{
     Int64Type, TimestampMicrosecondType,
 };
 use arrow_array::{
-    ArrayRef, ListArray, PrimitiveArray, RecordBatch, RecordBatchReader, StructArray,
-    TimestampNanosecondArray,
+    ArrayRef, ListArray, PrimitiveArray, RecordBatch, RecordBatchOptions, RecordBatchReader,
+    StructArray, TimestampNanosecondArray,
 };
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
@@ -641,7 +641,9 @@ fn build_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
         })
         .collect::<Result<_>>()?;
 
-    RecordBatch::try_new(schema, arrays).map_err(|e| {
+    // An explicit row count lets a result with no columns form a batch.
+    let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+    RecordBatch::try_new_with_options(schema, arrays, &options).map_err(|e| {
         err(
             format!("failed to build record batch: {e}"),
             Status::Internal,

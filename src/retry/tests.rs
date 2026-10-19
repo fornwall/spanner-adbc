@@ -386,3 +386,21 @@ fn backoff_knobs_are_clamped_into_the_gax_recommended_ranges() {
          scaling: 3.0 })"
     );
 }
+
+/// Option validation accepts any value that fits in a `Duration`, but gax adds the limit to an
+/// `Instant` before the first attempt, which panics on overflow.
+#[test]
+fn huge_elapsed_limit_does_not_overflow_instant_arithmetic() {
+    use google_cloud_gax::retry_policy::RetryPolicy;
+    use google_cloud_gax::retry_state::RetryState;
+
+    let mut config = SharedConfig::default();
+    config.set_option(MAX_ELAPSED_SECONDS, s("1e19")).unwrap();
+    assert_eq!(
+        config.option_string(MAX_ELAPSED_SECONDS).unwrap(),
+        "10000000000000000000"
+    );
+    let policy: std::sync::Arc<dyn RetryPolicy> = config.retry.retry_policy_arg().unwrap().into();
+    let remaining = policy.remaining_time(&RetryState::new(true));
+    assert!(remaining.is_some_and(|r| r > Duration::from_secs(365 * 24 * 60 * 60)));
+}
