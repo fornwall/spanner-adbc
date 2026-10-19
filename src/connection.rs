@@ -30,7 +30,7 @@ use crate::timeout::with_timeout;
 mod exec;
 mod txn;
 
-use crate::metadata::{check_lookup_catalog, like_match, metadata_sql_builder, table_exists};
+use crate::metadata::{check_lookup_catalog, like_match, metadata_sql_builder, table_exists_at};
 use exec::{isolation_to_adbc_string, parse_isolation_level};
 pub(crate) use exec::{run_batch_txn, runner_builder, write_mutations_txn};
 use txn::{ManualTxn, check_commit_writable};
@@ -308,6 +308,7 @@ impl Connection for SpannerConnection {
         // Use the connection's precision so the schema matches what its queries stream.
         let precision = self.config.timestamp_precision;
         let statement = metadata_sql_builder(&self.config, sql).build();
+        let probe_bound = bound.clone();
         let result = block_on_cancellable(
             &self.runtime,
             &self.cancel.current(),
@@ -328,13 +329,17 @@ impl Connection for SpannerConnection {
             Ok((schema, _batch)) => Ok((*schema).clone()),
             // A missing table is INVALID_ARGUMENT ("Table not found") from the query analyzer, but
             // ADBC wants NotFound. Probe INFORMATION_SCHEMA only on failure, so the common case
-            // stays one query.
-            Err(error) => {
-                let exists = table_exists(
+            // stays one query. Other statuses skip the probe: after a timeout it would add a
+            // second deadline, and INFORMATION_SCHEMA hides tables a role cannot read, which
+            // would turn a permission error into NotFound.
+            Err(error) if matches!(error.status, Status::InvalidArguments | Status::NotFound) => {
+                // At the query's bound, so a table created after a stale read is still missing.
+                let exists = table_exists_at(
                     &self.runtime,
                     &self.client,
                     &self.cancel.current(),
                     &self.config,
+                    probe_bound,
                     db_schema.unwrap_or(""),
                     table_name,
                 );
@@ -347,6 +352,7 @@ impl Connection for SpannerConnection {
                     Ok(true) | Err(_) => Err(error),
                 }
             }
+            Err(error) => Err(error),
         }
     }
 

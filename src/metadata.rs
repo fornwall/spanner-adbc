@@ -5,7 +5,7 @@ use adbc_core::error::{Error, Result, Status};
 use arrow_array::{RecordBatch, StringArray};
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::{Statement as SpannerSql, StatementBuilder};
-use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
+use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, TimestampBound};
 
 use crate::conversion::{TimestampPrecision, result_set_to_batch};
 use crate::error::{err, from_spanner};
@@ -35,7 +35,8 @@ pub(crate) fn check_lookup_catalog(catalog: Option<&str>, reported: &str) -> Res
     }
 }
 
-/// Whether a table exists. The default schema is `""` in Spanner.
+/// Whether a table exists now, read strongly as writes see it. The default schema is `""` in
+/// Spanner.
 ///
 /// Callers probe on error paths to refine an error into the status ADBC requires, such as
 /// `NotFound` or `AlreadyExists`. If the probe itself fails (a transport error, a cancel, or no
@@ -46,6 +47,20 @@ pub(crate) fn table_exists(
     client: &DatabaseClient,
     cancel: &CancelSignal,
     config: &SharedConfig,
+    db_schema: &str,
+    table_name: &str,
+) -> Result<bool> {
+    table_exists_at(runtime, client, cancel, config, None, db_schema, table_name)
+}
+
+/// [`table_exists`] at a read `bound`, so a probe that refines a failed read sees the same
+/// snapshot as that read. `None` is a strong read.
+pub(crate) fn table_exists_at(
+    runtime: &SharedRuntime,
+    client: &DatabaseClient,
+    cancel: &CancelSignal,
+    config: &SharedConfig,
+    bound: Option<TimestampBound>,
     db_schema: &str,
     table_name: &str,
 ) -> Result<bool> {
@@ -66,7 +81,7 @@ pub(crate) fn table_exists(
                 .add_param("schema", &schema)
                 .add_param("table", &table)
                 .build();
-                let transaction = client.single_use().build();
+                let transaction = crate::staleness::single_use(&client, bound);
                 let result_set = transaction
                     .execute_query(statement)
                     .await

@@ -302,3 +302,195 @@ fn partition_descriptor_round_trips_large_floats() {
         "re-encoding the encoder's output must be byte-stable"
     );
 }
+
+/// `get_table_schema` against an in-process mock Spanner server, for its existence probe.
+mod table_schema_probe {
+    use std::sync::{Arc, Mutex};
+
+    use adbc_core::error::Status;
+    use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Optionable};
+    use spanner_grpc_mock::MockSpanner;
+    use spanner_grpc_mock::google::spanner::v1;
+
+    use crate::{SpannerConnection, SpannerDriver};
+
+    type Requests = Arc<Mutex<Vec<v1::ExecuteSqlRequest>>>;
+    type Sender = tokio::sync::mpsc::Sender<tonic::Result<v1::PartialResultSet>>;
+
+    /// What the mock answers to the `SELECT * ... LIMIT 0` schema query.
+    enum SchemaQuery {
+        Fails(tonic::Code),
+        /// Never answers, so the query timeout fires.
+        Silent,
+    }
+
+    struct MockServer {
+        endpoint: String,
+        requests: Requests,
+        server: tokio::task::JoinHandle<()>,
+        _runtime: tokio::runtime::Runtime,
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// Serves sessions, answers the schema query per `schema_query`, and answers any
+    /// `INFORMATION_SCHEMA` probe with no rows: the table does not exist.
+    fn start(schema_query: SchemaQuery) -> MockServer {
+        let requests = Requests::default();
+        let silent: Arc<Mutex<Vec<Sender>>> = Arc::default();
+        let mut mock = MockSpanner::new();
+        mock.expect_create_session().returning(|request| {
+            Ok(tonic::Response::new(v1::Session {
+                name: format!("{}/sessions/mock", request.into_inner().database),
+                multiplexed: true,
+                ..Default::default()
+            }))
+        });
+        let record = requests.clone();
+        mock.expect_execute_streaming_sql()
+            .returning(move |request| {
+                let request = request.into_inner();
+                let probe = request.sql.contains("INFORMATION_SCHEMA");
+                record.lock().unwrap().push(request);
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                if probe {
+                    tx.try_send(Ok(v1::PartialResultSet {
+                        metadata: Some(v1::ResultSetMetadata {
+                            row_type: Some(v1::StructType {
+                                fields: vec![v1::struct_type::Field {
+                                    name: "TABLE_NAME".into(),
+                                    r#type: Some(v1::Type {
+                                        code: v1::TypeCode::String as i32,
+                                        ..Default::default()
+                                    }),
+                                }],
+                            }),
+                            ..Default::default()
+                        }),
+                        last: true,
+                        ..Default::default()
+                    }))
+                    .unwrap();
+                    return Ok(tonic::Response::new(rx));
+                }
+                match &schema_query {
+                    SchemaQuery::Fails(code) => Err(tonic::Status::new(*code, "mock failure")),
+                    SchemaQuery::Silent => {
+                        silent.lock().unwrap().push(tx);
+                        Ok(tonic::Response::new(rx))
+                    }
+                }
+            });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (endpoint, server) = runtime
+            .block_on(spanner_grpc_mock::start("127.0.0.1:0", mock))
+            .unwrap();
+        MockServer {
+            endpoint,
+            requests,
+            server,
+            _runtime: runtime,
+        }
+    }
+
+    fn connect(server: &MockServer) -> SpannerConnection {
+        let mut driver = SpannerDriver::try_new().unwrap();
+        driver
+            .new_database_with_opts([
+                (
+                    OptionDatabase::Uri,
+                    OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
+                ),
+                (
+                    OptionDatabase::Other(crate::OPTION_ENDPOINT.into()),
+                    OptionValue::String(server.endpoint.clone()),
+                ),
+                (
+                    OptionDatabase::Other(crate::OPTION_EMULATOR.into()),
+                    OptionValue::String("true".into()),
+                ),
+            ])
+            .unwrap()
+            .new_connection()
+            .unwrap()
+    }
+
+    fn single_use_bound(
+        request: &v1::ExecuteSqlRequest,
+    ) -> Option<v1::transaction_options::read_only::TimestampBound> {
+        let Some(v1::transaction_selector::Selector::SingleUse(options)) = request
+            .transaction
+            .as_ref()
+            .and_then(|t| t.selector.as_ref())
+        else {
+            panic!("expected a single-use read: {request:?}");
+        };
+        let Some(v1::transaction_options::Mode::ReadOnly(read_only)) = &options.mode else {
+            panic!("expected read-only options: {options:?}");
+        };
+        read_only.timestamp_bound
+    }
+
+    /// A table created after a stale read's timestamp is missing at that timestamp, so the probe
+    /// must read at the same bound and report NotFound.
+    #[test]
+    fn probe_reads_at_the_connections_staleness() {
+        use v1::transaction_options::read_only::TimestampBound as WireBound;
+
+        let server = start(SchemaQuery::Fails(tonic::Code::InvalidArgument));
+        let mut connection = connect(&server);
+        connection
+            .set_option(
+                OptionConnection::Other(crate::OPTION_READ_STALENESS.into()),
+                OptionValue::String("exact:10s".into()),
+            )
+            .unwrap();
+        let error = connection
+            .get_table_schema(None, None, "Missing")
+            .unwrap_err();
+        assert_eq!(error.status, Status::NotFound, "{}", error.message);
+
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "the schema query and one probe");
+        let expected = Some(WireBound::ExactStaleness(prost_types::Duration {
+            seconds: 10,
+            nanos: 0,
+        }));
+        assert_eq!(single_use_bound(&requests[0]), expected);
+        assert!(requests[1].sql.contains("INFORMATION_SCHEMA"));
+        assert_eq!(single_use_bound(&requests[1]), expected);
+    }
+
+    /// Only a missing-table status is refined. Probing after a timeout would add a second query
+    /// deadline, and after a permission error the probe cannot see the table.
+    #[test]
+    fn probe_is_skipped_for_other_failures() {
+        let server = start(SchemaQuery::Fails(tonic::Code::PermissionDenied));
+        let error = connect(&server)
+            .get_table_schema(None, None, "Hidden")
+            .unwrap_err();
+        assert_eq!(error.status, Status::Unauthorized, "{}", error.message);
+        assert_eq!(server.requests.lock().unwrap().len(), 1, "no probe");
+
+        let server = start(SchemaQuery::Silent);
+        let mut connection = connect(&server);
+        connection
+            .set_option(
+                OptionConnection::Other(crate::OPTION_RPC_TIMEOUT_QUERY.into()),
+                OptionValue::Double(0.2),
+            )
+            .unwrap();
+        let error = connection.get_table_schema(None, None, "Slow").unwrap_err();
+        assert_eq!(error.status, Status::Timeout, "{}", error.message);
+        assert_eq!(server.requests.lock().unwrap().len(), 1, "no probe");
+    }
+}
