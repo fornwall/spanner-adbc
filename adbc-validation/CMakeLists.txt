@@ -73,3 +73,18 @@ target_include_directories(
 include(GoogleTest)
 enable_testing()
 gtest_discover_tests(spanner_validation)
+
+# ADBC_BUILD_TESTS also registers arrow-adbc's own tests, which are never built here.
+# Have CTest (used by --full) ignore them instead of reporting them as failures.
+function(spanner_collect_tests dir out)
+  get_property(tests DIRECTORY "${dir}" PROPERTY TESTS)
+  get_property(subdirs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+  foreach(subdir IN LISTS subdirs)
+    spanner_collect_tests("${subdir}" subdir_tests)
+    list(APPEND tests ${subdir_tests})
+  endforeach()
+  set(${out} "${tests}" PARENT_SCOPE)
+endfunction()
+spanner_collect_tests("${arrow_adbc_SOURCE_DIR}/c" upstream_tests)
+file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
+     "set(CTEST_CUSTOM_TESTS_IGNORE \"${upstream_tests}\")\n")
