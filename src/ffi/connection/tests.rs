@@ -13,9 +13,8 @@ use super::super::options::{
 use super::*;
 use crate::ffi::test_support::{error_message, null, release_error, zeroed_error};
 
-/// A handle in the state `AdbcConnectionNew` leaves it in: allocated, options buffered, not
-/// yet initialized. Everything below can be exercised from here without touching the network,
-/// because argument validation and the not-initialized check both come first.
+/// A connection after `AdbcConnectionNew`. Argument validation and the readiness check need no
+/// backend.
 fn pending() -> AdbcConnection {
     let mut connection = AdbcConnection {
         private_data: null(),
@@ -36,8 +35,7 @@ fn drop_pending(connection: &mut AdbcConnection) {
     );
 }
 
-/// Copy the buffered options out of a not-yet-initialized handle, to assert on what the
-/// setters recorded.
+/// The options buffered by a pending connection.
 fn buffered(connection: &mut AdbcConnection) -> Vec<(OptionConnection, OptionValue)> {
     let mut state =
         unsafe { super::super::handle::lock_state::<State>(connection.private_data, KIND) }
@@ -58,8 +56,7 @@ fn a_null_handle_is_a_bad_argument_not_a_crash() {
         unsafe { release_handle::<AdbcConnection>(null(), null()) },
         ADBC_STATUS_INVALID_ARGUMENT
     );
-    // A handle whose `private_data` was never populated is not a bad pointer, it is an object
-    // used out of order, so it reports InvalidState instead.
+    // An unpopulated `private_data` is an object used out of order, not a bad argument.
     let mut connection = AdbcConnection {
         private_data: null(),
         private_driver: null(),
@@ -87,9 +84,8 @@ fn releasing_twice_reports_invalid_state_rather_than_double_freeing() {
 #[test]
 fn options_set_before_init_are_buffered_in_order_with_last_write_winning() {
     let mut connection = pending();
-    // Four keys, one per typed setter. Their *values* are deliberately mistyped: the buffer
-    // records what it was handed, and all validation — of the key as well as the value — stays
-    // deferred to `Init`, which replays the buffer through the driver's own setter.
+    // One key per typed setter. The values need not suit their keys: keys and values are
+    // validated only when `Init` replays the buffer.
     let first = CString::new(adbc_core::constants::ADBC_CONNECTION_OPTION_AUTOCOMMIT).unwrap();
     let second = CString::new(crate::OPTION_RETRY_MAX_ATTEMPTS).unwrap();
     let third = CString::new(crate::OPTION_READ_STALENESS).unwrap();
@@ -129,7 +125,7 @@ fn options_set_before_init_are_buffered_in_order_with_last_write_winning() {
     let entries = buffered(&mut connection);
     assert_eq!(entries.len(), 4, "the repeated key must not add an entry");
     assert_eq!(entries[0].0, OptionConnection::AutoCommit);
-    // `OptionValue` is not `PartialEq`, so the payloads are matched structurally.
+    // `OptionValue` is not `PartialEq`.
     assert!(matches!(&entries[0].1, OptionValue::String(value) if value == "false"));
     assert!(matches!(entries[1].1, OptionValue::Int(4096)));
     assert!(matches!(entries[2].1, OptionValue::Double(value) if value == 0.5));
@@ -143,7 +139,7 @@ fn setters_reject_a_null_or_non_utf8_key_or_value() {
     let mut connection = pending();
     let key = CString::new(adbc_core::constants::ADBC_CONNECTION_OPTION_AUTOCOMMIT).unwrap();
     let value = CString::new("true").unwrap();
-    // 0xFF cannot start a UTF-8 sequence, so this is a NUL-terminated non-UTF-8 string.
+    // 0xFF never occurs in UTF-8.
     let invalid = [0xFF_u8, 0x00];
     let invalid = invalid.as_ptr().cast::<c_char>();
 
@@ -164,9 +160,7 @@ fn setters_reject_a_null_or_non_utf8_key_or_value() {
     drop_pending(&mut connection);
 }
 
-/// adbc.h gives the four option getters one documented failure, `ADBC_STATUS_NOT_FOUND`, and no
-/// other. A connection that has only buffered options has no value to report, so it reports the
-/// key as absent rather than the connection as unusable.
+/// `NOT_FOUND` is the getters' only failure in adbc.h, and a pending connection has no values.
 #[test]
 fn getters_report_a_pre_init_connection_option_as_not_found() {
     let mut connection = pending();
@@ -199,7 +193,7 @@ fn getters_report_a_pre_init_connection_option_as_not_found() {
     ] {
         assert_eq!(status, ADBC_STATUS_NOT_FOUND);
     }
-    // A bad key is rejected before the state is consulted, so it wins over the missing option.
+    // A bad key is rejected before the state is consulted.
     assert_eq!(
         unsafe { get_option_int(&raw mut connection, null(), &raw mut integer, null()) },
         ADBC_STATUS_INVALID_ARGUMENT
@@ -215,7 +209,7 @@ fn transaction_cancel_and_init_entry_points_check_their_state() {
         unsafe { connection_commit(&raw mut connection, null()) },
         unsafe { connection_rollback(&raw mut connection, null()) },
         unsafe { connection_cancel(&raw mut connection, null()) },
-        // Init reports an unusable (null) database rather than taking it on faith.
+        // A null database.
         unsafe { connection_init(&raw mut connection, null(), null()) },
     ] {
         assert_eq!(status, ADBC_STATUS_INVALID_STATE);
@@ -255,7 +249,7 @@ fn metadata_streams_require_an_initialized_connection() {
         assert_eq!(status, ADBC_STATUS_INVALID_STATE);
     }
 
-    // A null partition with a length is a bad argument, caught before the state check.
+    // Caught before the state check.
     assert_eq!(
         unsafe {
             connection_read_partition(&raw mut connection, null(), 7, out.as_mut_ptr(), null())
@@ -325,7 +319,6 @@ fn metadata_outputs_are_checked_before_initialization_or_network_work() {
         release_error(&mut error);
     }
 
-    // The rejected calls preserve the connection's pre-init state and option buffer.
     assert!(buffered(&mut connection).is_empty());
     drop_pending(&mut connection);
 }
@@ -354,8 +347,8 @@ fn get_objects_accepts_every_documented_depth_and_rejects_the_rest() {
         )
     };
 
-    // 0..=3 are ADBC_OBJECT_DEPTH_{ALL,CATALOGS,DB_SCHEMAS,TABLES}; COLUMNS is an alias of ALL,
-    // so 4 is not a depth at all. Getting past the depth check lands on the state check.
+    // 0..=3 are ADBC_OBJECT_DEPTH_{ALL,CATALOGS,DB_SCHEMAS,TABLES}; COLUMNS is an alias of ALL.
+    // A valid depth gets as far as the state check.
     for depth in 0..=3 {
         assert_eq!(get_objects(depth, null()), ADBC_STATUS_INVALID_STATE);
     }
@@ -363,8 +356,7 @@ fn get_objects_accepts_every_documented_depth_and_rejects_the_rest() {
         assert_eq!(get_objects(depth, null()), ADBC_STATUS_INVALID_ARGUMENT);
     }
 
-    // The advice must not send the caller back with a depth that lands here again: 4 is one of
-    // the values rejected just above, because `ADBC_OBJECT_DEPTH_COLUMNS` is `ADBC_OBJECT_DEPTH_ALL`.
+    // The message must not suggest 4 for columns.
     let mut error = zeroed_error();
     assert_eq!(get_objects(4, &raw mut error), ADBC_STATUS_INVALID_ARGUMENT);
     let message = error_message(&error).expect("the rejection carries a message");
@@ -402,7 +394,6 @@ fn get_table_schema_requires_a_table_name() {
         ADBC_STATUS_INVALID_ARGUMENT,
         "a non-UTF-8 db_schema is still a bad argument even though the field is optional"
     );
-    // With every argument acceptable, the uninitialized connection is what stops the call.
     assert_eq!(
         get_table_schema(null(), table.as_ptr()),
         ADBC_STATUS_INVALID_STATE
@@ -414,7 +405,6 @@ fn get_table_schema_requires_a_table_name() {
 #[test]
 fn borrow_rejects_an_uninitialized_or_released_connection() {
     let mut connection = pending();
-    // The lock is available, but the state behind it is still pending.
     let mut state = unsafe { borrow(&raw mut connection) }.unwrap();
     assert_eq!(state.ready(KIND).unwrap_err().status, Status::InvalidState);
     drop(state);
@@ -433,9 +423,8 @@ fn borrow_rejects_an_uninitialized_or_released_connection() {
     );
 }
 
-/// Cancel must not queue behind the connection's dispatch turn: while a worker thread holds
-/// it, `connection_cancel` still returns promptly (here `InvalidState`, since this pending
-/// connection has no installed handle) instead of blocking or misreporting a panic.
+/// While another thread holds the state lock, cancel returns at once (`InvalidState`, since a
+/// pending connection has no cancel handle).
 #[test]
 fn cancel_does_not_wait_for_the_connection_dispatch_turn() {
     let mut connection = pending();
@@ -462,11 +451,8 @@ fn cancel_does_not_wait_for_the_connection_dispatch_turn() {
     drop_pending(&mut connection);
 }
 
-/// The pre-`Init` half of adbc.h's `SetOption` contract, as this driver answers it: there is no
-/// classifier to consult before `Init`, so *every* key — standard, `spanner.*`, and outright
-/// unknown — is accepted and buffered verbatim. The rejection an unknown key earns comes later,
-/// from the driver's own setter, when `Init` replays the buffer through
-/// `new_connection_with_opts`.
+/// Before `Init` every key is buffered, including unknown ones; the driver's setter rejects
+/// unknown keys when `Init` replays the buffer.
 #[test]
 fn every_key_is_buffered_before_init_whether_the_driver_knows_it_or_not() {
     let mut connection = pending();
@@ -500,11 +486,8 @@ fn every_key_is_buffered_before_init_whether_the_driver_knows_it_or_not() {
     drop_pending(&mut connection);
 }
 
-/// A Spanner database has no switchable current catalog or schema — both are fixed at `""`, so
-/// the live setter takes `""` as a conformant no-op and refuses anything else. Before `Init`
-/// there is no live connection to ask, so both keys are buffered like every other key and the
-/// refusal of a non-empty value waits for the replay at `Init`. A *get*, meanwhile, has no value
-/// to report yet, and adbc.h licenses only `NOT_FOUND` to say so with.
+/// The current catalog and schema are fixed at `""`, and a live connection refuses other values.
+/// Before `Init` both keys buffer like any other, and reads report `NOT_FOUND`.
 #[test]
 fn the_current_namespace_keys_buffer_before_init_and_read_back_as_not_found() {
     let mut connection = pending();
@@ -560,14 +543,12 @@ fn the_current_namespace_keys_buffer_before_init_and_read_back_as_not_found() {
     assert_eq!(
         buffered(&mut connection).len(),
         2,
-        "both keys were buffered, to be validated when Init replays them"
+        "both keys were buffered"
     );
     drop_pending(&mut connection);
 }
 
-/// The connection counterpart of the statement's `every_entry_point_refuses_a_released_handle`.
-/// A released handle is a null `private_data`, which every entry point must recognize before it
-/// touches anything behind it; one that forgot would dereference null instead of reporting.
+/// A released handle has null `private_data`, which every entry point must check before use.
 #[test]
 fn every_entry_point_refuses_a_released_handle() {
     let mut handle = AdbcConnection {
@@ -640,9 +621,7 @@ fn every_entry_point_refuses_a_released_handle() {
     }
 }
 
-/// `AdbcStatementNew` reaches into the connection without dispatching on a statement it does not
-/// have yet, so it has its own state check to get wrong. A connection that exists but was never
-/// initialized has no driver object to make a statement from.
+/// `AdbcStatementNew` borrows the connection without `dispatch`, so it checks readiness itself.
 #[test]
 fn creating_a_statement_needs_an_initialized_connection() {
     let mut connection = pending();
@@ -668,9 +647,7 @@ fn creating_a_statement_needs_an_initialized_connection() {
     drop_pending(&mut connection);
 }
 
-/// `AdbcConnectionInit` locks the database it is given without dispatching on it, so the
-/// database's own state has to be checked there. A database that was allocated but never
-/// initialized is a different failure from a null one, which short-circuits earlier.
+/// `AdbcConnectionInit` borrows the database without `dispatch`, so it checks readiness itself.
 #[test]
 fn init_against_an_allocated_but_uninitialized_database_is_refused() {
     let mut connection = pending();
@@ -692,8 +669,7 @@ fn init_against_an_allocated_but_uninitialized_database_is_refused() {
     release_error(&mut error);
     assert!(message.contains("database"), "{message}");
 
-    // The connection kept its pre-init state, so a retry after the database is initialized is
-    // still possible.
+    // The connection stays pending, so `Init` can be retried.
     assert!(matches!(
         &*unsafe { super::super::handle::lock_state::<State>(connection.private_data, KIND) }
             .unwrap(),

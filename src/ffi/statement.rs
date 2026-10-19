@@ -1,7 +1,7 @@
 //! `AdbcStatement*` entry points.
 //!
-//! `AdbcStatementNew` constructs a live [`SpannerStatement`] from its connection. Statements
-//! have no `Init` step, so options apply directly without a [`super::handle::Staged`] buffer.
+//! Statements have no `Init`: `AdbcStatementNew` builds a live [`SpannerStatement`] from its
+//! connection, and options apply directly instead of through a [`super::handle::Staged`] buffer.
 
 use std::ffi::{c_char, c_void};
 
@@ -76,7 +76,7 @@ pub(super) unsafe extern "C" fn statement_new(
     let created = catch(|| {
         let mut connection = unsafe { super::options::borrow(connection) }?;
         let state = connection.ready(super::connection::KIND)?.new_statement()?;
-        // Cancellation must remain accessible while an operation holds the statement's lock.
+        // Stored outside the state lock so a running call can be cancelled.
         let cancel = state.get_cancel_handle();
         Ok((state, cancel))
     });
@@ -135,9 +135,8 @@ pub(super) unsafe extern "C" fn statement_cancel(
     statement: *mut AdbcStatement,
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
-    // Dispatch-free on purpose, through the handle stored at `statement_new`; see
-    // `handle::cancel`. `InvalidState` is reported only for a released handle — a cancel with no
-    // operation in flight returns OK, a documented deviation (see `SlotCancelHandle`).
+    // Bypasses `dispatch` so it can interrupt a running call. A released handle reports
+    // `InvalidState`; with nothing in flight it returns OK (see `SlotCancelHandle`).
     unsafe { super::handle::cancel::<State>(slot_of(statement), KIND, error) }
 }
 
@@ -152,7 +151,7 @@ pub(super) unsafe extern "C" fn statement_bind(
 ) -> AdbcStatusCode {
     unsafe {
         with_state(statement, error, |state| {
-            // Arrow's importer can panic on released inputs. Reject them before taking ownership
+            // Arrow's importer can panic on released inputs. Reject them before taking ownership,
             // so a caller mistake neither consumes the other input nor poisons the statement.
             let Some(values_ref) = values.as_ref() else {
                 return Err(invalid_argument("values must not be null"));
@@ -166,7 +165,7 @@ pub(super) unsafe extern "C" fn statement_bind(
             if schema_ref.release().is_none() {
                 return Err(invalid_argument("schema has already been released"));
             }
-            // ADBC transfers both inputs. Moving only the array would leak the caller's schema.
+            // ADBC transfers ownership of both inputs.
             let values = FFI_ArrowArray::from_raw(values);
             let schema = FFI_ArrowSchema::from_raw(schema);
             let data = from_ffi(values, &schema).map_err(|failure| {
@@ -223,14 +222,14 @@ pub(super) unsafe extern "C" fn statement_execute_query(
 ) -> AdbcStatusCode {
     unsafe {
         with_state(statement, error, |state| {
-            // A null `out` is how the ABI says "run this, I do not want the rows" — the update
-            // path, and the only one that can report a row count other than -1.
+            // A null `out` asks for an update without results, the only path that can report a
+            // row count.
             if out.is_null() {
                 let affected = state.execute_update()?.unwrap_or(-1);
                 write_rows_affected(rows_affected, affected);
                 return Ok(());
             }
-            // The streamed row count is unknown. Set -1 to overwrite any previous execute's count.
+            // The row count of a stream is unknown; -1 also overwrites any previous count.
             let reader = state.execute()?;
             std::ptr::write_unaligned(
                 out,
@@ -288,12 +287,12 @@ pub(super) unsafe extern "C" fn statement_execute_partitions(
 ) -> AdbcStatusCode {
     unsafe {
         with_state(statement, error, |state| {
-            // Validate outputs before executing a query whose result the caller cannot collect.
+            // Check outputs before running a query whose result the caller cannot collect.
             required_output(schema, "schema")?;
             required_output(partitions, "partitions")?;
 
             let result = state.execute_partitions()?;
-            // Export the schema before transferring either output so failure leaves both untouched.
+            // Export the schema before writing either output, so a failure leaves both untouched.
             let exported = export_schema(&result.schema)?;
             std::ptr::write_unaligned(schema, exported);
             std::ptr::write_unaligned(partitions, export_partitions(result.partitions));
@@ -303,8 +302,7 @@ pub(super) unsafe extern "C" fn statement_execute_partitions(
     }
 }
 
-/// `rows_affected` is optional wherever it appears, so a null pointer means "not interested"
-/// rather than a bad argument.
+/// `rows_affected` is optional, so null is ignored.
 ///
 /// # Safety
 /// `dst` must be null or point to a writable `i64`.
@@ -314,10 +312,7 @@ unsafe fn write_rows_affected(dst: *mut i64, value: i64) {
     }
 }
 
-/// Move a schema onto the C data interface.
-///
-/// A schema the driver itself produced but cannot export is a driver-side failure, not a caller
-/// mistake, so the `ArrowError` becomes `Status::Internal`.
+/// Export a driver-produced schema. Failure is a driver bug, hence `Internal`.
 fn export_schema(schema: &Schema) -> Result<FFI_ArrowSchema> {
     FFI_ArrowSchema::try_from(schema).map_err(|failure| {
         Error::with_message_and_status(
@@ -327,8 +322,8 @@ fn export_schema(schema: &Schema) -> Result<FFI_ArrowSchema> {
     })
 }
 
-/// Own the partition payloads and both C arrays until the release callback runs. Keeping the
-/// vectors intact lets the callback free them without reconstructing their capacities.
+/// Owns the partition payloads and both C arrays until the release callback runs. Keeping the
+/// vectors whole lets the callback free them without reconstructing their capacities.
 struct PartitionsOwner {
     /// Keeps the bytes referenced by `pointers` alive.
     _payloads: Vec<Vec<u8>>,
@@ -345,7 +340,7 @@ fn export_partitions(payloads: Vec<Vec<u8>>) -> AdbcPartitions {
         pointers,
         lengths,
     });
-    // Use null for empty arrays instead of exposing an empty Vec's dangling pointer.
+    // Null rather than an empty `Vec`'s dangling pointer.
     let (partitions, partition_lengths) = if num_partitions == 0 {
         (std::ptr::null_mut(), std::ptr::null_mut())
     } else {
@@ -362,8 +357,7 @@ fn export_partitions(payloads: Vec<Vec<u8>>) -> AdbcPartitions {
 
 /// # Safety
 /// `partitions` must be null or point to an `AdbcPartitions` produced by [`export_partitions`].
-// Guard-exempt: must not unwind and cannot — dropping the owner box frees plain memory, and the
-// rest is non-panicking pointer writes.
+// Guard-exempt: dropping the owner box frees plain memory and cannot panic.
 unsafe extern "C" fn release_partitions(partitions: *mut AdbcPartitions) {
     let Some(partitions) = (unsafe { partitions.as_mut() }) else {
         return;
@@ -372,11 +366,11 @@ unsafe extern "C" fn release_partitions(partitions: *mut AdbcPartitions) {
         drop(unsafe { Box::from_raw(partitions.private_data.cast::<PartitionsOwner>()) });
         partitions.private_data = std::ptr::null_mut();
     }
-    // The arrays borrowed from the box that just went away, so they must not be left readable.
+    // The arrays pointed into the freed box.
     partitions.num_partitions = 0;
     partitions.partitions = std::ptr::null_mut();
     partitions.partition_lengths = std::ptr::null_mut();
-    // Clearing this makes the callback idempotent, which the header requires.
+    // adbc.h requires release to be idempotent.
     partitions.release = None;
 }
 

@@ -1,12 +1,32 @@
 use adbc_core::error::Status;
 
 use super::*;
+use crate::ffi::abi::AdbcDriver;
 use crate::ffi::test_support::{null, zeroed_error};
 
 fn message_of(error: &AdbcError) -> String {
     unsafe { std::ffi::CStr::from_ptr(error.message) }
         .to_string_lossy()
         .into_owned()
+}
+
+/// A 1.0.0 error whose trailing bytes, outside the caller's allocation, hold the given values.
+fn v100_error(private_data: *mut c_void, private_driver: *const AdbcDriver) -> AdbcError {
+    AdbcError {
+        message: null(),
+        vendor_code: 0,
+        sqlstate: [0; 5],
+        release: None,
+        private_data,
+        private_driver,
+    }
+}
+
+/// Run the 1.0.0 release callback `export_error` installed.
+fn release_v100(out: &mut AdbcError) {
+    let release: unsafe extern "C" fn(*mut AdbcErrorV100) =
+        unsafe { std::mem::transmute(out.release.unwrap()) };
+    unsafe { release((&raw mut *out).cast::<AdbcErrorV100>()) };
 }
 
 #[test]
@@ -25,7 +45,7 @@ fn exports_a_message_and_releases_idempotently() {
     unsafe { release(&raw mut out) };
     assert!(out.message.is_null());
     assert!(out.release.is_none());
-    // A second release must be a no-op rather than a double free.
+    // A second release is a no-op.
     unsafe { release(&raw mut out) };
 }
 
@@ -46,21 +66,13 @@ fn reusing_an_out_parameter_releases_the_previous_error() {
     unsafe { (out.release.unwrap())(&raw mut out) };
 }
 
-/// The 1.0.0 layout has no `private_data`/`private_driver`; a caller that allocated only the
-/// prefix must get those bytes back untouched. This mirrors the C++ suite's
+/// A 1.0.0 caller's bytes after the prefix stay untouched. Mirrors the C++ suite's
 /// `StatementTest.ErrorCompatibility`.
 #[test]
 fn a_1_0_0_caller_keeps_its_trailing_bytes() {
-    let sentinel_driver = 0x5eed_usize as *const super::super::abi::AdbcDriver;
+    let sentinel_driver = 0x5eed_usize as *const AdbcDriver;
     let sentinel_data = 0xf00d_usize as *mut c_void;
-    let mut out = AdbcError {
-        message: null(),
-        vendor_code: 0, // not the sentinel, so: 1.0.0
-        sqlstate: [0; 5],
-        release: None,
-        private_data: sentinel_data,
-        private_driver: sentinel_driver,
-    };
+    let mut out = v100_error(sentinel_data, sentinel_driver);
     let mut error = Error::with_message_and_status("legacy", Status::NotFound);
     error.vendor_code = 42;
     unsafe { export_error(&raw mut out, error) };
@@ -70,28 +82,17 @@ fn a_1_0_0_caller_keeps_its_trailing_bytes() {
     assert_eq!(out.private_data, sentinel_data);
     assert_eq!(out.private_driver, sentinel_driver);
 
-    let release: unsafe extern "C" fn(*mut AdbcErrorV100) =
-        unsafe { std::mem::transmute(out.release.unwrap()) };
-    unsafe { release((&raw mut out).cast::<AdbcErrorV100>()) };
+    release_v100(&mut out);
     assert_eq!(out.private_data, sentinel_data);
 }
 
-/// A driver error may legitimately carry `i32::MIN` as its vendor code, and storing it verbatim
-/// in a 1.0.0 caller's struct would make the *next* export read it back as the 1.1.0 sentinel and
-/// write the 48-byte struct into the caller's 32 bytes. The second export below is exactly that
-/// call; what it must not do is touch the tail.
+/// A vendor code equal to the sentinel, stored in a 1.0.0 struct, would make the next export
+/// write a 1.1.0 struct past the caller's allocation.
 #[test]
 fn a_1_0_0_caller_is_not_relabelled_by_a_sentinel_valued_vendor_code() {
-    let sentinel_driver = 0x5eed_usize as *const super::super::abi::AdbcDriver;
+    let sentinel_driver = 0x5eed_usize as *const AdbcDriver;
     let sentinel_data = 0xf00d_usize as *mut c_void;
-    let mut out = AdbcError {
-        message: null(),
-        vendor_code: 0, // not the sentinel, so: 1.0.0
-        sqlstate: [0; 5],
-        release: None,
-        private_data: sentinel_data,
-        private_driver: sentinel_driver,
-    };
+    let mut out = v100_error(sentinel_data, sentinel_driver);
 
     let mut error = Error::with_message_and_status("first", Status::Internal);
     error.vendor_code = ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA;
@@ -108,9 +109,7 @@ fn a_1_0_0_caller_is_not_relabelled_by_a_sentinel_valued_vendor_code() {
     assert_eq!(out.private_data, sentinel_data);
     assert_eq!(out.private_driver, sentinel_driver);
 
-    let release: unsafe extern "C" fn(*mut AdbcErrorV100) =
-        unsafe { std::mem::transmute(out.release.unwrap()) };
-    unsafe { release((&raw mut out).cast::<AdbcErrorV100>()) };
+    release_v100(&mut out);
 }
 
 #[test]
@@ -136,7 +135,7 @@ fn round_trips_error_details() {
         b"v1"
     );
 
-    // Out-of-range indices, in both directions, must yield the documented empty detail.
+    // Out-of-range indices yield an empty detail.
     assert!(unsafe { error_get_detail(&raw const out, 2) }.key.is_null());
     assert!(
         unsafe { error_get_detail(&raw const out, -1) }
@@ -148,31 +147,23 @@ fn round_trips_error_details() {
     assert_eq!(unsafe { error_get_detail_count(&raw const out) }, 0);
 }
 
-/// The detail getters honour the sentinel just as the export does: without it `private_data`
-/// is not a field of the caller's allocation, and the bytes there hold a pointer that is not
-/// the driver's.
+/// Without the sentinel, `private_data` is outside the caller's allocation. A 1.0.0 error
+/// keeps its gRPC code in `vendor_code` and exposes no details.
 #[test]
 fn the_detail_getters_ignore_private_data_on_a_1_0_0_error() {
-    let mut out = AdbcError {
-        message: null(),
-        vendor_code: 0, // not the sentinel, so: 1.0.0
-        sqlstate: [0; 5],
-        release: None,
-        private_data: 0xf00d_usize as *mut c_void,
-        private_driver: null(),
-    };
-    let mut error = Error::with_message_and_status("legacy", Status::Internal);
-    error.details = Some(vec![("k1".to_string(), b"v1".to_vec())]);
+    let sentinel_data = 0xf00d_usize as *mut c_void;
+    let mut out = v100_error(sentinel_data, null());
+    let mut error = Error::with_message_and_status("aborted", Status::IO);
+    error.vendor_code = 10; // gRPC ABORTED
+    error.details = Some(vec![("google.rpc.retryinfo".to_string(), b"{}".to_vec())]);
     unsafe { export_error(&raw mut out, error) };
 
-    // The export left the tail alone, and the getters must not go looking in it either.
-    assert_eq!(out.private_data, 0xf00d_usize as *mut c_void);
+    assert_eq!(out.vendor_code, 10);
+    assert_eq!(out.private_data, sentinel_data);
     assert_eq!(unsafe { error_get_detail_count(&raw const out) }, 0);
     assert!(unsafe { error_get_detail(&raw const out, 0) }.key.is_null());
 
-    let release: unsafe extern "C" fn(*mut AdbcErrorV100) =
-        unsafe { std::mem::transmute(out.release.unwrap()) };
-    unsafe { release((&raw mut out).cast::<AdbcErrorV100>()) };
+    release_v100(&mut out);
 }
 
 #[test]
@@ -200,8 +191,7 @@ fn a_message_with_an_interior_nul_is_still_reported() {
     unsafe { (out.release.unwrap())(&raw mut out) };
 }
 
-/// adbc.h:304: `private_data` "is NULLPTR iff the error is uninitialized/freed", so a populated
-/// 1.1.0 error carries a detail box even when it has no details to put in it.
+/// adbc.h: `private_data` "is NULLPTR iff the error is uninitialized/freed".
 #[test]
 fn a_detail_free_error_still_marks_itself_initialized() {
     let mut out = zeroed_error();
@@ -218,16 +208,16 @@ fn a_detail_free_error_still_marks_itself_initialized() {
     assert!(out.private_data.is_null());
 }
 
-/// The driver manager writes `private_driver` before the call and reads it back afterwards to
-/// route the detail getters, so releasing a previous error -- here one whose callback clears the
-/// whole struct, as the reference C++ framework's does -- must not take the field with it.
+/// The driver manager sets `private_driver` before the call and reads it afterwards, so it must
+/// survive releasing a previous error, even with a callback that zeroes the whole struct as the
+/// reference C++ framework's does.
 #[test]
 fn a_foreign_release_cannot_take_private_driver_with_it() {
     unsafe extern "C" fn clearing_release(error: *mut AdbcError) {
         unsafe { std::ptr::write_bytes(error.cast::<u8>(), 0, size_of::<AdbcError>()) };
     }
 
-    let sentinel_driver = 0x5eed_usize as *const super::super::abi::AdbcDriver;
+    let sentinel_driver = 0x5eed_usize as *const AdbcDriver;
     let mut out = AdbcError {
         message: null(),
         vendor_code: ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA,
@@ -247,8 +237,7 @@ fn a_foreign_release_cannot_take_private_driver_with_it() {
     unsafe { (out.release.unwrap())(&raw mut out) };
 }
 
-/// Every detail currently attached to `error`, as `(key, value)` pairs, read back the way a C
-/// caller does: through the two getter entry points rather than the driver-side box.
+/// The error's details, read through the getter entry points.
 fn details_of(error: &AdbcError) -> Vec<(String, Vec<u8>)> {
     (0..unsafe { error_get_detail_count(&raw const *error) })
         .map(|index| {
@@ -262,10 +251,8 @@ fn details_of(error: &AdbcError) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// The 1.1.0 layout spends `vendor_code` on the `private_data` sentinel, so the numeric gRPC code
-/// `from_spanner` documents as recoverable there has to come back some other way: as a detail
-/// keyed `adbc.spanner.vendor_code`, appended *after* the forwarded `google.rpc.*` ones so the
-/// indices a caller already walks keep pointing at the same details.
+/// The 1.1.0 sentinel occupies `vendor_code`, so the gRPC code becomes a detail, appended after
+/// the forwarded `google.rpc.*` details so their indices stay stable.
 #[test]
 fn a_1_1_0_error_reports_its_vendor_code_as_a_detail() {
     let mut error = Error::with_message_and_status("aborted", Status::IO);
@@ -287,15 +274,14 @@ fn a_1_1_0_error_reports_its_vendor_code_as_a_detail() {
         ["google.rpc.retryinfo", VENDOR_CODE_DETAIL_KEY],
         "the forwarded detail must stay at index 0"
     );
-    // Decimal ASCII, not raw bytes: the keys carry no `-bin` suffix, which promises text values.
+    // Text, since the key has no `-bin` suffix.
     assert_eq!(details[1].1, b"10");
 
     unsafe { (out.release.unwrap())(&raw mut out) };
 }
 
-/// `from_spanner` stores `vendor_code` 0 for a failure that carried no gRPC status at all
-/// (transport/serialization), so an entry there would assert a code — `OK`, of all things — that
-/// never existed. The detail is emitted only for a real one.
+/// `from_spanner` uses vendor code 0 when there was no gRPC status; reporting it would claim
+/// `OK`.
 #[test]
 fn a_zero_vendor_code_adds_no_detail() {
     let mut error = Error::with_message_and_status("transport failure", Status::Internal);
@@ -311,33 +297,4 @@ fn a_zero_vendor_code_adds_no_detail() {
     );
 
     unsafe { (out.release.unwrap())(&raw mut out) };
-}
-
-/// The 1.0.0 layout is untouched by any of that: it has no details vector to put an entry in, and
-/// it does not need one — nothing overwrites `vendor_code` there, so the numeric code reaches the
-/// caller in the field `from_spanner` documents.
-#[test]
-fn a_1_0_0_error_needs_no_vendor_code_detail() {
-    let sentinel_data = 0xf00d_usize as *mut c_void;
-    let mut out = AdbcError {
-        message: null(),
-        vendor_code: 0, // not the sentinel, so: 1.0.0
-        sqlstate: [0; 5],
-        release: None,
-        private_data: sentinel_data,
-        private_driver: null(),
-    };
-    let mut error = Error::with_message_and_status("aborted", Status::IO);
-    error.vendor_code = 10; // gRPC ABORTED
-    error.details = Some(vec![("google.rpc.retryinfo".to_string(), b"{}".to_vec())]);
-    unsafe { export_error(&raw mut out, error) };
-
-    assert_eq!(out.vendor_code, 10);
-    // No detail box was written, so the caller's trailing bytes still hold what it put there.
-    assert_eq!(out.private_data, sentinel_data);
-    assert!(details_of(&out).is_empty());
-
-    let release: unsafe extern "C" fn(*mut AdbcErrorV100) =
-        unsafe { std::mem::transmute(out.release.unwrap()) };
-    unsafe { release((&raw mut out).cast::<AdbcErrorV100>()) };
 }

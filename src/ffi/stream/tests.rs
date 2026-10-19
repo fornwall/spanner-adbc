@@ -9,9 +9,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use super::*;
 use crate::ffi::test_support::null;
 
-/// A stream from a caller that populated no `private_driver`, which is what a directly linked
-/// consumer does. The forwarding of a real one is covered by
-/// `a_stream_error_carries_the_handles_driver_vtable`.
+/// Export with no `private_driver`, as for a directly linked caller.
 fn exported(reader: Box<dyn RecordBatchReader + Send>) -> FFI_ArrowArrayStream {
     export_reader(reader, null())
 }
@@ -51,6 +49,7 @@ fn exports_an_ordinary_reader() {
     assert!(reader.next().is_none());
 }
 
+/// The C++ suite's `SqlQueryCancel` requires `get_next` to return `ECANCELED` after a cancel.
 #[test]
 fn exports_adbc_statuses_as_errno() {
     for (status, expected) in [
@@ -84,7 +83,7 @@ fn exports_adbc_statuses_as_errno() {
         assert!(message.contains("ADBC stream failure"), "{message}");
     }
 
-    // The ADBC status is found even when nested behind another external error.
+    // Found even when nested in another external error.
     let error = Error::with_message_and_status("cancelled", Status::Cancelled);
     let error = ArrowError::ExternalError(Box::new(ArrowError::ExternalError(Box::new(error))));
     let mut stream = error_stream(error);
@@ -94,7 +93,7 @@ fn exports_adbc_statuses_as_errno() {
         ECANCELED
     );
 
-    // A plain Arrow error keeps arrow's own errno mapping.
+    // A plain Arrow error keeps Arrow's errno mapping.
     let mut stream = error_stream(ArrowError::NotYetImplemented("not supported".into()));
     assert_eq!(
         unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
@@ -106,70 +105,7 @@ fn exports_adbc_statuses_as_errno() {
     assert!(message.contains("not supported"), "{message}");
 }
 
-/// The C++ `adbc_validation` case `SpannerStatementTest.SqlQueryCancel` requires the result stream's
-/// `get_next` to return exactly `ECANCELED` (or 0) once the statement has been cancelled.
-///
-/// The error built here is byte for byte what a cancelled read hands this layer in production:
-/// `runtime.rs` raises `("operation cancelled", Status::Cancelled)`, `SpannerBatchReader` wraps it
-/// with `conversion.rs`'s `to_arrow_error` -- i.e. `ArrowError::ExternalError(Box::new(error))` --
-/// and this module downcasts through the error chain to recover the ADBC status and map it to
-/// the required errno.
-#[test]
-fn a_cancelled_read_reports_ecanceled_for_sql_query_cancel() {
-    use super::super::abi::ADBC_STATUS_CANCELLED;
-
-    let cancelled = Error::with_message_and_status("operation cancelled", Status::Cancelled);
-    let mut stream = error_stream(ArrowError::ExternalError(Box::new(cancelled)));
-
-    let mut out = FFI_ArrowArray::empty();
-    assert_eq!(
-        unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
-        ECANCELED,
-        "SqlQueryCancel accepts only ECANCELED or 0 from get_next"
-    );
-    let message = unsafe { CStr::from_ptr(stream.get_last_error().unwrap()(&raw mut stream)) }
-        .to_str()
-        .unwrap();
-    assert!(message.contains("operation cancelled"), "{message}");
-
-    // The structured error a manager-mediated caller reads agrees with the errno.
-    let mut status: AdbcStatusCode = 0xEE;
-    let exported = unsafe { error_from_array_stream(&raw mut stream, &raw mut status) };
-    assert!(!exported.is_null());
-    assert_eq!(status, ADBC_STATUS_CANCELLED);
-
-    unsafe { stream.release().unwrap()(&raw mut stream) };
-}
-
-/// The timeout twin of `a_cancelled_read_reports_ecanceled_for_sql_query_cancel`: an RPC deadline
-/// from `spanner.rpc.timeout_seconds.{query,fetch}` reaches the reader as the same boxed driver
-/// error, only with `Status::Timeout`, and must come out as `ETIMEDOUT`.
-#[test]
-fn a_timed_out_read_reports_etimedout() {
-    use super::super::abi::ADBC_STATUS_TIMEOUT;
-
-    let timed_out = Error::with_message_and_status(
-        "the query did not complete within spanner.rpc.timeout_seconds.query",
-        Status::Timeout,
-    );
-    let mut stream = error_stream(ArrowError::ExternalError(Box::new(timed_out)));
-
-    let mut out = FFI_ArrowArray::empty();
-    assert_eq!(
-        unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
-        ETIMEDOUT
-    );
-
-    let mut status: AdbcStatusCode = 0xEE;
-    let exported = unsafe { error_from_array_stream(&raw mut stream, &raw mut status) };
-    assert!(!exported.is_null());
-    assert_eq!(status, ADBC_STATUS_TIMEOUT);
-
-    unsafe { stream.release().unwrap()(&raw mut stream) };
-}
-
-/// A nonconforming host may keep the callback pointer and call it after release, when
-/// `private_data` is already null; that must yield a null message, not undefined behavior.
+/// A nonconforming host may call a saved callback after release.
 #[test]
 fn get_last_error_tolerates_a_released_or_null_stream() {
     let mut stream = error_stream(ArrowError::ComputeError("boom".to_owned()));
@@ -192,8 +128,7 @@ fn error_from_array_stream_exposes_the_pending_error() {
     use super::super::error::{error_get_detail, error_get_detail_count};
 
     let mut error = Error::with_message_and_status("stream blew up", Status::Cancelled);
-    // A detail in the shape `error::from_spanner` forwards: the lowercased proto type name of a
-    // `google.rpc.Status` detail, keyed to its ProtoJSON bytes.
+    // Shaped like the details `error::from_spanner` forwards.
     error.details = Some(vec![(
         "google.rpc.retryinfo".to_string(),
         br#"{"retryDelay":"1s"}"#.to_vec(),
@@ -209,8 +144,7 @@ fn error_from_array_stream_exposes_the_pending_error() {
     let exported = unsafe { error_from_array_stream(&raw mut stream, &raw mut status) };
     assert!(!exported.is_null());
     assert_eq!(status, ADBC_STATUS_CANCELLED);
-    // The structured error carries the driver's own message, not the Arrow chain prefix
-    // that `get_last_error` reports.
+    // The driver's message, without the Arrow prefix `get_last_error` shows.
     let message = unsafe { CStr::from_ptr((*exported).message) }
         .to_str()
         .unwrap();
@@ -226,13 +160,12 @@ fn error_from_array_stream_exposes_the_pending_error() {
         br#"{"retryDelay":"1s"}"#
     );
 
-    // Asking again re-exports the same error without leaking the previous export, and a
-    // null status pointer must simply not be written.
+    // Exporting again must not leak; a null status is not written.
     let exported = unsafe { error_from_array_stream(&raw mut stream, null()) };
     assert!(!exported.is_null());
     assert_eq!(unsafe { error_get_detail_count(exported) }, 1);
 
-    // Releasing the stream invalidates the error and de-recognizes the stream.
+    // A released stream is no longer recognized.
     unsafe { stream.release().unwrap()(&raw mut stream) };
     let mut status: AdbcStatusCode = 0xEE;
     assert!(unsafe { error_from_array_stream(&raw mut stream, &raw mut status) }.is_null());
@@ -265,7 +198,7 @@ fn error_from_array_stream_rejects_foreign_and_null_streams() {
     let mut status: AdbcStatusCode = 0xEE;
     assert!(unsafe { error_from_array_stream(null(), &raw mut status) }.is_null());
 
-    // A stream some other library produced: valid pointers, but not this driver's release.
+    // Another library's stream.
     let mut foreign = unsafe {
         FFI_ArrowArrayStream::new_unchecked(
             None,
@@ -298,7 +231,7 @@ fn contains_reader_panics_in_get_next() {
         .unwrap();
     assert!(message.contains("next contains a NUL: ?"), "{message}");
 
-    // Once a reader has panicked, do not enter its potentially inconsistent state again.
+    // A reader that panicked is not entered again.
     assert_eq!(
         unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
         EINVAL
@@ -356,10 +289,8 @@ fn contains_reader_panics_in_release() {
     assert!(stream.private_data().is_null());
 }
 
-/// `AdbcErrorFromArrayStream` hands back an `AdbcError` in the driver's own storage, so nothing
-/// else will ever fill in its `private_driver` — and the driver manager reaches an error's
-/// details only through that field. A stream that dropped the vtable of the handle it came from
-/// therefore produced errors whose details no manager-mediated caller could read.
+/// The driver manager reads error details through `private_driver`, which nothing but the driver
+/// can fill in for an error in driver-owned storage.
 #[test]
 fn a_stream_error_carries_the_handles_driver_vtable() {
     let vtable = 0x5eed_usize as *const AdbcDriver;
@@ -380,13 +311,10 @@ fn a_stream_error_carries_the_handles_driver_vtable() {
     let exported = unsafe { error_from_array_stream(&raw mut stream, &raw mut status) };
     assert!(!exported.is_null());
     assert_eq!(unsafe { (*exported).private_driver }, vtable);
-    // Present on the empty export too, which is the same storage.
     unsafe { stream.release().unwrap()(&raw mut stream) };
 }
 
-/// A nonconforming host may release a stream twice, or keep the callback pointers it copied and
-/// call them afterwards. The Arrow C Stream Interface says a released stream has null callbacks
-/// and null `private_data`; the driver must survive being treated as though it did not.
+/// A nonconforming host may release a stream twice or call saved callbacks after release.
 #[test]
 fn a_released_stream_survives_a_second_release_and_stale_callbacks() {
     let batch =
@@ -409,11 +337,11 @@ fn a_released_stream_survives_a_second_release_and_stale_callbacks() {
     assert!(stream.get_schema().is_none());
     assert!(stream.release().is_none());
 
-    // A second release is a no-op, not a double free.
+    // A second release is a no-op.
     unsafe { release(&raw mut stream) };
     assert!(stream.private_data().is_null());
 
-    // Stale callbacks report EINVAL rather than dereferencing the null they were left with.
+    // Saved callbacks report EINVAL.
     let mut array = FFI_ArrowArray::empty();
     let mut out_schema = FFI_ArrowSchema::empty();
     assert_eq!(unsafe { get_next(&raw mut stream, &raw mut array) }, EINVAL);
@@ -421,16 +349,14 @@ fn a_released_stream_survives_a_second_release_and_stale_callbacks() {
         unsafe { get_schema(&raw mut stream, &raw mut out_schema) },
         EINVAL
     );
-    // And on a null stream pointer, which is what a zeroed struct amounts to.
+    // Likewise for a null stream.
     assert_eq!(unsafe { get_next(null(), &raw mut array) }, EINVAL);
     assert_eq!(unsafe { get_schema(null(), &raw mut out_schema) }, EINVAL);
-    // Releasing a null stream must also be tolerated.
     unsafe { release(null()) };
 }
 
-/// A failed read followed by a successful one must not leave the old error standing:
-/// `AdbcErrorFromArrayStream` reports "the ADBC status code, or ADBC_STATUS_OK if there is no
-/// error", and `get_last_error`'s pointer is only promised to last until the next operation.
+/// After a successful read, neither `get_last_error` nor `AdbcErrorFromArrayStream` reports the
+/// earlier failure.
 #[test]
 fn a_successful_read_clears_the_previous_failure() {
     use super::super::abi::ADBC_STATUS_OK;
@@ -444,7 +370,7 @@ fn a_successful_read_clears_the_previous_failure() {
         schema,
     )));
 
-    // A null output is the one failure a caller can provoke without a failing reader.
+    // Fail with a null output.
     assert_eq!(
         unsafe { stream.get_next().unwrap()(&raw mut stream, null()) },
         EINVAL
@@ -467,12 +393,8 @@ fn a_successful_read_clears_the_previous_failure() {
     unsafe { stream.release().unwrap()(&raw mut stream) };
 }
 
-/// Reading the schema after a failed `get_next` must not make the failure disappear.
-///
-/// `get_schema` is callable at any point in a stream's life -- the Arrow C Stream Interface puts
-/// no ordering on it -- and it consumes nothing, so its success is no evidence that the read
-/// recovered. A caller that reaches for the schema while working out how to report the failure
-/// would otherwise be told by `AdbcErrorFromArrayStream` that there was none.
+/// `get_schema` may be called at any time and consumes nothing, so it must not clear a read
+/// failure the caller has yet to report.
 #[test]
 fn reading_the_schema_after_a_failed_read_keeps_the_failure() {
     use super::super::abi::ADBC_STATUS_CANCELLED;

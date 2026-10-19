@@ -2,6 +2,7 @@
 //!
 //! A Rust panic escaping an `extern "C"` function aborts the process. Entry points that can run
 //! driver code use [`catch`]; [`super::handle`] poisons the states locked by a panicking call.
+//! Entry points without panic containment say why they cannot panic in a `Guard-exempt:` comment.
 
 use std::any::Any;
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -11,13 +12,12 @@ use adbc_core::error::{Error, Result, Status};
 
 use crate::error::invalid_argument;
 
-/// Run `f`, converting a panic into an `Internal` error rather than letting it cross the ABI.
+/// Run `f`, turning a panic into an `Internal` error.
 pub(crate) fn catch<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     std::panic::catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|cause| Err(caught_panic(cause)))
 }
 
-// The payload formatting is independent of the callback and result types. Keep one copy
-// instead of inlining it into every instantiation of `catch`.
+// Outlined so the instantiations of `catch` share one copy.
 #[cold]
 #[inline(never)]
 fn caught_panic(cause: Box<dyn Any + Send>) -> Error {
@@ -32,8 +32,8 @@ fn caught_panic(cause: Box<dyn Any + Send>) -> Error {
     failure
 }
 
-/// A user-defined panic payload can panic when dropped. Contain that cleanup too; a second
-/// payload is leaked because attempting its destructor could repeat indefinitely.
+/// Drop a panic payload, whose destructor may itself panic. A second payload is leaked, since
+/// dropping it could panic again indefinitely.
 #[cold]
 #[inline(never)]
 pub(crate) fn drop_panic_payload(cause: Box<dyn Any + Send>) {
@@ -51,17 +51,9 @@ pub(crate) fn panic_message(cause: &(dyn Any + Send)) -> &str {
         .unwrap_or("unknown panic payload")
 }
 
-/// Renders text as a C string, replacing interior NULs rather than losing what follows them.
-///
-/// Replacing NULs with `?` preserves the rest of vendor diagnostics.
+/// Convert to a C string, replacing interior NULs with `?` so the text after them survives.
 pub(crate) fn sanitized_cstring(text: &str) -> CString {
-    let mut bytes = text.as_bytes().to_vec();
-    for byte in &mut bytes {
-        if *byte == 0 {
-            *byte = b'?';
-        }
-    }
-    CString::new(bytes).unwrap_or_default()
+    CString::new(text.replace('\0', "?")).unwrap_or_default()
 }
 
 /// Borrow a required C string argument.
@@ -114,8 +106,7 @@ pub(crate) unsafe fn optional_str_list<'a>(
     Ok(Some(items))
 }
 
-/// Borrow a pointer/length byte argument, treating a null pointer as empty only when the length
-/// agrees.
+/// Borrow a pointer/length byte argument. A null pointer is accepted only with a zero length.
 ///
 /// # Safety
 /// `ptr` must be null or point to `len` initialized bytes that outlive `'a`.
@@ -131,8 +122,8 @@ pub(crate) unsafe fn byte_slice<'a>(ptr: *const u8, len: usize, name: &str) -> R
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
-/// Validate GetOption's buffer capacity. A null buffer is valid only for a zero-length size
-/// probe: reporting success with sufficient capacity promises that the value was written.
+/// Validate a GetOption buffer. A null buffer is valid only as a zero-length size probe:
+/// success with sufficient capacity tells the caller the value was written.
 ///
 /// # Safety
 /// `length` must be null or point to a readable, writable `usize`.
@@ -150,9 +141,9 @@ unsafe fn available_space(dst: *const c_void, length: *mut usize) -> Result<usiz
     Ok(available)
 }
 
-/// Write a string into the caller's buffer following the ADBC GetOption protocol: `length` is
-/// in/out, always set to the space required (including the NUL), and the buffer is written only if
-/// it is big enough. A caller that passed too little is expected to retry with the reported size.
+/// Write a string following the ADBC GetOption protocol: `length` is in/out and always set to the
+/// space required, including the NUL. The buffer is written only if it is big enough; otherwise
+/// the caller retries with the reported size.
 ///
 /// # Safety
 /// `length` must be non-null, and `dst` null or point to at least `*length` writable bytes.
@@ -177,7 +168,7 @@ pub(crate) unsafe fn write_string(value: &str, dst: *mut c_char, length: *mut us
     Ok(())
 }
 
-/// The byte-valued counterpart of [`write_string`]. No NUL terminator is involved.
+/// Like [`write_string`], without a NUL terminator.
 ///
 /// # Safety
 /// `length` must be non-null, and `dst` null or point to at least `*length` writable bytes.
@@ -199,8 +190,7 @@ pub(crate) fn required_output<T>(dst: *mut T, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// The message does not depend on the pointee type, so it is built once rather than in each of
-/// [`required_output`]'s and [`write_out`]'s instantiations.
+// Outlined from the generic callers.
 #[cold]
 #[inline(never)]
 pub(crate) fn missing_argument(name: &str) -> Error {

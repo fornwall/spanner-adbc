@@ -11,7 +11,7 @@ use crate::ffi::options::{
 };
 use crate::ffi::test_support::{null, release_error, zeroed_error};
 
-/// The database path every test below points at. Nothing here connects, so it need not exist.
+/// Nothing here connects, so the database need not exist.
 const DATABASE: &str = "projects/a-project/instances/an-instance/databases/a-database";
 
 fn pending() -> AdbcDatabase {
@@ -47,7 +47,7 @@ fn get(database: &mut AdbcDatabase, key: &str) -> std::result::Result<String, Ad
     let key = CString::new(key).unwrap();
     let mut error = zeroed_error();
     let mut length = 0_usize;
-    // First pass asks for the size, as the ADBC GetOption protocol requires.
+    // Ask for the size first.
     let status = unsafe {
         get_option_string(
             &raw mut *database,
@@ -80,10 +80,8 @@ fn get(database: &mut AdbcDatabase, key: &str) -> std::result::Result<String, Ad
         .into_owned())
 }
 
-/// Emulator mode against an endpoint nothing listens on: enough to build a real database without
-/// credentials or network access. `Init` only replays the buffered options through the driver's
-/// own setters — the Spanner client stack is built later, on the first connection — so nothing
-/// here reaches the network.
+/// An emulator-mode database pointed at an endpoint nothing listens on. `Init` makes no network
+/// calls; the client is built by the first connection.
 fn initialized() -> AdbcDatabase {
     let mut database = pending();
     for (key, value) in [
@@ -111,9 +109,7 @@ fn release(database: &mut AdbcDatabase) -> AdbcStatusCode {
     status
 }
 
-/// adbc.h has the caller pass a zero-initialized struct to `AdbcDatabaseNew`, so a populated slot
-/// is caller error. Overwriting it would drop the caller's only pointer to the first object and
-/// leak it silently; the refusal leaves that object reachable, so it can still be released.
+/// Overwriting a populated handle would leak its object; the refusal leaves it releasable.
 #[test]
 fn a_second_new_on_a_populated_handle_is_refused() {
     let mut database = pending();
@@ -128,8 +124,6 @@ fn a_second_new_on_a_populated_handle_is_refused() {
     assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
 
-/// The buffer collapses repeats, so setting the URI twice must leave exactly the later one for
-/// `Init` to replay.
 #[test]
 fn setting_the_same_option_twice_keeps_the_later_value() {
     let mut database = pending();
@@ -153,8 +147,7 @@ fn setting_the_same_option_twice_keeps_the_later_value() {
         set(&mut database, crate::OPTION_EMULATOR, "true"),
         ADBC_STATUS_OK
     );
-    // Before init there is nothing to read back yet, however many sets were buffered, and
-    // adbc.h gives the getters only `NOT_FOUND` to say so with.
+    // Nothing is readable before `Init`.
     assert_eq!(
         get(&mut database, adbc_core::constants::ADBC_OPTION_URI).unwrap_err(),
         ADBC_STATUS_NOT_FOUND
@@ -213,8 +206,6 @@ fn repeated_options_keep_their_order_relative_to_uri_expansion() {
     }
 }
 
-/// A failed `Init` must keep the buffered options so the offending one can be corrected and
-/// `Init` retried, rather than silently reinitializing from an empty buffer.
 #[test]
 fn a_failed_init_keeps_the_buffered_options_for_a_retry() {
     let mut database = pending();
@@ -230,7 +221,7 @@ fn a_failed_init_keeps_the_buffered_options_for_a_retry() {
         set(&mut database, crate::OPTION_ENDPOINT, "http://127.0.0.1:1"),
         ADBC_STATUS_OK
     );
-    // Buffered without validation; rejected when Init applies it.
+    // Buffered now, rejected by `Init`.
     assert_eq!(
         set(&mut database, crate::OPTION_EMULATOR, "maybe"),
         ADBC_STATUS_OK
@@ -242,7 +233,6 @@ fn a_failed_init_keeps_the_buffered_options_for_a_retry() {
     );
     release_error(&mut error);
 
-    // The buffer is last-write-wins per key, so correcting the value replaces the bad one.
     assert_eq!(
         set(&mut database, crate::OPTION_EMULATOR, "true"),
         ADBC_STATUS_OK
@@ -309,7 +299,7 @@ fn null_handles_and_keys_are_rejected() {
     );
     release_error(&mut error);
 
-    // A null value is rejected before the handle is even consulted.
+    // Rejected before the handle is consulted.
     let key = CString::new(adbc_core::constants::ADBC_OPTION_URI).unwrap();
     let mut error = zeroed_error();
     assert_eq!(
@@ -320,8 +310,8 @@ fn null_handles_and_keys_are_rejected() {
     assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
 
-/// Typed getters exist, but every database option this driver has is a string, so the typed
-/// ones must report that rather than silently returning a default.
+/// Every database option is a string, so the typed getters must fail rather than return a
+/// default.
 #[test]
 fn typed_getters_reject_string_options() {
     let mut database = initialized();
@@ -343,9 +333,8 @@ fn typed_getters_reject_string_options() {
     assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
 
-/// Nothing about a pre-`Init` set is validated — not the key, not the value's type. The typed
-/// setter's payload is retained verbatim and the live database applies its ordinary type
-/// validation when `Init` replays the buffer.
+/// Pre-`Init` sets are unvalidated; the live database checks the value type when `Init` replays
+/// the buffer.
 #[test]
 fn a_typed_set_is_validated_by_the_live_database() {
     let mut database = pending();
@@ -379,12 +368,9 @@ fn a_typed_set_is_validated_by_the_live_database() {
     assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
 
-/// adbc.h would rather have `SetOption` answer `ADBC_STATUS_NOT_IMPLEMENTED` for a key it does
-/// not recognize at the call that carried it. This driver cannot: a database option can rewrite
-/// several fields at once (`adbc.uri` expands into the individual keys), so its setter is its own
-/// validator and there is no pure classifier to consult before there is a database. A typo is
-/// therefore buffered like any other key, and reported when `Init` replays it through
-/// `new_database_with_opts` — naming the key, so the caller can still find the mistake.
+/// adbc.h prefers `SetOption` to reject an unknown key immediately with `NOT_IMPLEMENTED`. Here
+/// the database's setter is the only validator (`adbc.uri` expands into several keys), so a typo
+/// is buffered and reported by `Init`, which names the key.
 #[test]
 fn a_typo_before_init_is_reported_when_init_replays_it() {
     let mut database = pending();
@@ -412,9 +398,7 @@ fn a_typo_before_init_is_reported_when_init_replays_it() {
     assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
 
-/// The `Init` boundary moves *when* a key is classified, not *whether* it is: before `Init` every
-/// key is accepted and buffered, and the live database is the one that knows which keys it has.
-/// The live setter is the oracle here — the candidate list is not.
+/// Before `Init` every key is buffered; afterwards the live database rejects the unknown ones.
 #[test]
 fn a_pre_init_set_accepts_every_key_the_live_database_classifies() {
     let mut live = initialized();
@@ -444,8 +428,7 @@ fn a_pre_init_set_accepts_every_key_the_live_database_classifies() {
             key.as_ref()
         );
         assert_eq!(release(&mut database), ADBC_STATUS_OK);
-        // Only the live database refuses a key outright; a bad *value* (here, `""` for a key that
-        // wants a URI or a boolean) is a different, non-`NOT_IMPLEMENTED` failure.
+        // An unknown key is `NOT_IMPLEMENTED`; an invalid value such as `""` for a URI is not.
         if set(&mut live, key.as_ref(), "") == ADBC_STATUS_NOT_IMPLEMENTED {
             unknown += 1;
         }
@@ -457,15 +440,11 @@ fn a_pre_init_set_accepts_every_key_the_live_database_classifies() {
     assert_eq!(release(&mut live), ADBC_STATUS_OK);
 }
 
-/// Every `AdbcDatabaseInit` must use the process-wide [`shared_driver`], so databases share
-/// one Tokio runtime rather than allocating a thread pool each.
-///
-/// `every_database_a_driver_creates_shares_the_drivers_runtime` in `src/driver/tests.rs`
-/// checks that the shared driver gives every database the same runtime.
+/// Every `AdbcDatabaseInit` uses the process-wide [`shared_driver`], so databases share one
+/// Tokio runtime. `src/driver/tests.rs` checks that one driver's databases share its runtime.
 #[test]
 fn every_database_is_initialized_through_one_shared_driver() {
     let before = shared_driver().unwrap();
-    // Two databases, initialized independently through the real entry point.
     let mut first = initialized();
     let mut second = initialized();
     let after = shared_driver().unwrap();
@@ -474,13 +453,8 @@ fn every_database_is_initialized_through_one_shared_driver() {
         std::ptr::eq(before, after),
         "AdbcDatabaseInit must not replace the process-wide driver"
     );
-    // A separately built driver is a different object, so the identity above is a real check and
-    // not one any two `&Mutex<SpannerDriver>` would satisfy.
-    let fresh = Mutex::new(SpannerDriver::try_new().unwrap());
-    assert!(!std::ptr::eq(before, &fresh));
-
     assert_eq!(release(&mut first), ADBC_STATUS_OK);
     assert_eq!(release(&mut second), ADBC_STATUS_OK);
-    // Releasing every database leaves the shared driver in place for the next one.
+    // Releasing every database keeps the shared driver.
     assert!(std::ptr::eq(before, shared_driver().unwrap()));
 }

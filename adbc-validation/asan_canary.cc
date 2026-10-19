@@ -51,12 +51,12 @@ int main(int argc, char** argv) {
       len);
   std::fflush(stderr);
 
-  // Instrumented Rust writes buf[len] — one past the end. ASan should abort here.
+  // Instrumented Rust writes buf[len], one past the end. ASan should abort here.
   canary(buf, len);
 
   // Returning normally means the out-of-bounds write went undetected.
-  std::fprintf(
-      stderr, "canary: RETURNED without an ASan report — the cdylib is not ASan-armed\n");
+  std::fprintf(stderr,
+               "canary: RETURNED without an ASan report; the cdylib is not ASan-armed\n");
   delete[] buf;
   return 0;
 }

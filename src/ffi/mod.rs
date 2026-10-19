@@ -1,30 +1,22 @@
-//! The ADBC C ABI export layer.
+//! The ADBC C ABI.
 //!
-//! This module connects C driver managers to the Rust driver:
+//! The shared library exports [`AdbcSpannerInit`] and [`AdbcDriverInit`], the fallback a driver
+//! manager tries when given no entrypoint name. Both fill in an ADBC 1.0.0 or 1.1.0 vtable.
 //!
-//! * [`abi`] — the C header transcribed. Declarations only, no logic.
-//! * [`error`] — writing a driver error back through the caller's `AdbcError`, at whichever ABI
-//!   revision the caller allocated.
-//! * [`guard`] — panic containment and the pointer/string conversions every entry point needs.
-//! * [`handle`] — what lives behind `private_data`, and how a call reaches it safely.
-//! * [`options`] — the handle prologues and option entry points every object repeats, written
-//!   once as generic `extern "C"` functions the vtable instantiates per object.
-//! * [`database`], [`connection`], [`statement`] — the entry points themselves, one module per
-//!   ADBC object, each a thin translation onto the driver's own types.
+//! * [`abi`]: the C header, transcribed. Declarations only.
+//! * [`error`]: writes driver errors into the caller's `AdbcError` at the revision it allocated.
+//! * [`guard`]: panic containment and conversion of pointer and string arguments.
+//! * [`handle`]: the object behind each handle's `private_data`, and how calls reach it.
+//! * [`options`]: `New`, `Release` and the option entry points, written once as generic
+//!   `extern "C"` functions that the vtable instantiates per object.
+//! * [`database`], [`connection`], [`statement`]: the remaining entry points, each a thin
+//!   translation onto the driver's own types.
+//! * [`stream`], [`import`]: Arrow C stream export and import.
 //!
-//! The shared library (`libspanner_adbc.so` / `.dylib` / `spanner_adbc.dll`) exports
-//! [`AdbcSpannerInit`] — the driver-specific init symbol, named per the ADBC convention — and
-//! [`AdbcDriverInit`], the fallback a driver manager tries when it was told no symbol name. Load
-//! it from any ADBC driver manager by pointing at the library path, e.g. from Python:
-//!
-//! ```python
-//! import adbc_driver_manager
-//! db = adbc_driver_manager.AdbcDatabase(
-//!     driver="/path/to/libspanner_adbc.so",
-//!     entrypoint="AdbcSpannerInit",
-//!     uri="spanner:///projects/p/instances/i/databases/d",
-//! )
-//! ```
+//! Each handle's `private_data` holds an `Arc` to its driver object behind a mutex, so calls on
+//! one handle serialize and a panic poisons only the objects its call locked. Entry points contain
+//! panics with [`guard::catch`] and report errors through the caller's `AdbcError`. Exported
+//! streams own their readers and stay valid after the handles that produced them are released.
 
 mod abi;
 mod connection;
@@ -53,9 +45,7 @@ use abi::{
 };
 use handle::finish;
 
-/// Build the vtable. Slots the driver does not implement stay `None`, which the ABI reads as
-/// "not implemented". The handle prologues and the option slots are instantiations of the generic
-/// bodies in [`options`], one per exported object.
+/// Every slot is populated; unsupported operations report `NOT_IMPLEMENTED` from their callback.
 fn vtable() -> AdbcDriver {
     AdbcDriver {
         private_data: std::ptr::null_mut(),
@@ -125,8 +115,7 @@ fn vtable() -> AdbcDriver {
 
 /// # Safety
 /// `driver` must be null or point to a valid `AdbcDriver` this driver initialized.
-// Guard-exempt: touches only the caller's own struct with non-panicking pointer operations; the
-// error path is contained inside `finish`.
+// Guard-exempt: only pointer operations on the caller's struct; `finish` contains its own panics.
 unsafe extern "C" fn release_driver(
     driver: *mut AdbcDriver,
     error: *mut AdbcError,
@@ -150,9 +139,8 @@ unsafe extern "C" fn release_driver(
 ///
 /// # Safety
 /// `driver` must point to an `AdbcDriver` allocation of at least the size implied by `version`.
-// Guard-exempt (also covers the two exported wrappers below): builds a vtable of plain function
-// pointers and copies it with non-panicking pointer operations; the error paths are contained
-// inside `finish`.
+// Guard-exempt, as are the two exported wrappers: builds and copies a table of function pointers;
+// `finish` contains its own panics.
 unsafe fn init(version: c_int, driver: *mut c_void, error: *mut AdbcError) -> AdbcStatusCode {
     if driver.is_null() {
         return finish(
@@ -167,9 +155,8 @@ unsafe fn init(version: c_int, driver: *mut c_void, error: *mut AdbcError) -> Ad
             std::ptr::write_unaligned(driver.cast::<AdbcDriver>(), table);
         },
         ADBC_VERSION_1_0_0 => {
-            // The caller allocated only the 1.0.0 prefix, so copying the whole struct would run
-            // off the end of its allocation. Copy exactly the bytes it owns and leak nothing: the
-            // 1.1.0 tail holds only function pointers, which own no memory.
+            // The caller allocated only the 1.0.0 prefix. Truncating leaks nothing: the 1.1.0
+            // tail holds only function pointers.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     (&raw const table).cast::<u8>(),
@@ -179,8 +166,7 @@ unsafe fn init(version: c_int, driver: *mut c_void, error: *mut AdbcError) -> Ad
             }
         }
         _ => {
-            // The header tells callers to retry at a lower revision on NOT_IMPLEMENTED, so an
-            // unsupported version must not be reported as a bad argument.
+            // adbc.h tells callers to retry with an older version on NOT_IMPLEMENTED.
             return finish(
                 Err(Error::with_message_and_status(
                     format!(
@@ -209,7 +195,7 @@ pub(crate) unsafe extern "C" fn AdbcSpannerInit(
     unsafe { init(version, driver, error) }
 }
 
-/// The generic entry point, used by driver managers that were not told a symbol name.
+/// The generic entry point, for driver managers given no symbol name.
 ///
 /// # Safety
 /// See [`init`].

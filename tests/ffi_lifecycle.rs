@@ -1,24 +1,20 @@
-//! Stream lifetime and handle lifecycle tests for the ADBC driver's C ABI export.
+//! Stream lifetime and handle lifecycle tests, mostly through the C ABI.
 //!
-//! A result stream is an independent C ABI object. Consuming or releasing it must remain safe
-//! after the statement, connection or database that produced it has been released or reused.
-//! These tests include the C++ `adbc_validation` suite's TestResultIndependence and
-//! TestResultInvalidation scenarios.
+//! A result stream is an independent C ABI object: consuming or releasing it must stay safe after
+//! the statement, connection or database that produced it is released or reused. This covers the
+//! C++ `adbc_validation` suite's TestResultIndependence and TestResultInvalidation scenarios.
 //!
-//! Every query generates rows with `GENERATE_ARRAY`, so these tests need no tables or schema
-//! serialization (`serial_guard`). They require a reachable database; raw C ABI tests also
-//! require a built cdylib.
-//!
-//! Tests skip unless `SPANNER_OMNI_ENDPOINT`, `SPANNER_EMULATOR_HOST` or
-//! `SPANNER_GCP_DATABASE` is set:
+//! Queries generate rows with `GENERATE_ARRAY`, so no tables are needed. Tests skip unless
+//! `SPANNER_OMNI_ENDPOINT`, `SPANNER_EMULATOR_HOST` or `SPANNER_GCP_DATABASE` is set:
 //!
 //! ```sh
 //! scripts/with-emulator.sh cargo test --test ffi_lifecycle -- --nocapture
 //! ```
 //!
-//! The raw-C-ABI test additionally needs the cdylib built next to the test binary
-//! (`cargo build`); it skips when it is absent, unless `ADBC_TEST_REQUIRE_TARGET` is set.
+//! C ABI tests also need the cdylib built next to the test binary (`cargo build`). They skip
+//! without it, unless `ADBC_TEST_REQUIRE_TARGET` is set.
 
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use adbc_core::error::Status;
@@ -28,21 +24,15 @@ use adbc_driver_manager::ManagedDriver;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use google_cloud_lro::Poller;
 use google_cloud_spanner_admin_instance_v1::model::Instance;
-use spanner_adbc::{SpannerConnection, SpannerDatabase, SpannerDriver};
+use spanner_adbc::SpannerDriver;
 
-// Identifiers used against the emulator, matching `tests/integration.rs` so both binaries drive the
-// same emulator database interchangeably, whichever runs first.
+// Shares its target and database names with `tests/integration.rs`.
 mod common;
 use common::{TestTarget, require_target, test_target};
 
-/// Create the emulator instance and the test database if they do not already exist.
-///
-/// Deliberately creates **no tables**: every query in this file is a table-less `GENERATE_ARRAY`.
-/// `tests/integration.rs` reconciles its own schema unconditionally, so whichever binary `cargo
-/// test` happens to run first, the other still finds what it needs. `create_instance` /
-/// `create_database` are best-effort: on an already-populated target they fail with `AlreadyExists`,
-/// which is intentionally ignored. A **real** instance is assumed to exist already (creating one is
-/// slow and billable).
+/// Create the emulator instance and the test database if they do not exist; errors such as
+/// `AlreadyExists` are ignored. Creates no tables, which `tests/integration.rs` sets up itself.
+/// A Cloud instance must already exist.
 async fn ensure_database(target: &TestTarget) {
     if target.omni_endpoint.is_some() {
         // scripts/with-omni.sh provisions the database through the bundled CLI.
@@ -88,19 +78,14 @@ async fn ensure_database(target: &TestTarget) {
         .await;
 }
 
-/// Run [`ensure_database`] exactly once for the whole test binary.
-///
-/// These tests run in parallel and share one database, so letting several drive the admin setup
-/// concurrently races (the emulator can report `Instance not found` if two `create_instance` calls
-/// overlap). Guard it behind a mutex + "already done" flag.
+/// Run [`ensure_database`] once per test binary. Concurrent setup races: the emulator can report
+/// `Instance not found` when two `create_instance` calls overlap.
 fn ensure_database_once(target: &TestTarget) {
     static DONE: Mutex<bool> = Mutex::new(false);
-    // Ignore poisoning: if the first arrival's setup panicked, that failure should surface on its
-    // own rather than cascade into every later test as a "poisoned lock" panic. `done` is still
-    // false then, so the next test simply retries the idempotent setup.
+    // After a panic in setup, `done` is still false and the next test retries; poisoning would
+    // only repeat the first failure in every later test.
     let mut done = DONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if !*done {
-        // A throwaway runtime just for the async admin setup.
         tokio::runtime::Runtime::new()
             .expect("failed to build setup runtime")
             .block_on(ensure_database(target));
@@ -108,9 +93,9 @@ fn ensure_database_once(target: &TestTarget) {
     }
 }
 
-/// Open a connection, retrying briefly: a freshly-created emulator database can be momentarily
-/// invisible to the data plane right after the admin `create_database` returns.
-fn connect_with_retry(database: &SpannerDatabase) -> SpannerConnection {
+/// Open a connection, retrying briefly: a new emulator database can be invisible to the data
+/// plane for a moment after `create_database` returns.
+fn connect_with_retry<D: Database>(database: &D) -> D::ConnectionType {
     let mut last_err = None;
     for _ in 0..20 {
         match database.new_connection() {
@@ -124,9 +109,8 @@ fn connect_with_retry(database: &SpannerDatabase) -> SpannerConnection {
     panic!("create connection failed after retries: {last_err:?}");
 }
 
-/// Locate the built `cdylib` (`libspanner_adbc.so` / `.dylib` / `.dll`) next to the test binary.
-fn cdylib_path() -> Option<std::path::PathBuf> {
-    // The test binary lives in `target/<profile>/deps/`; the cdylib is in `target/<profile>/`.
+/// The built cdylib, which lives in `target/<profile>/`, one level above the test binary.
+fn cdylib_path() -> Option<PathBuf> {
     let dir = std::env::current_exe()
         .ok()?
         .parent()?
@@ -143,18 +127,42 @@ fn cdylib_path() -> Option<std::path::PathBuf> {
     path.exists().then_some(path)
 }
 
-/// Locate the built cdylib, or `None` to skip — but panic instead of skipping when
-/// `ADBC_TEST_REQUIRE_TARGET` is set, so a missing build cannot silently pass the FFI tests in CI.
-fn required_cdylib_path() -> Option<std::path::PathBuf> {
+/// The built cdylib, or `None` to skip. Panics instead when `ADBC_TEST_REQUIRE_TARGET` is set,
+/// so CI cannot pass the C ABI tests without running them.
+fn required_cdylib_path() -> Option<PathBuf> {
     let path = cdylib_path();
     if path.is_none() && require_target() {
         panic!(
             "ADBC_TEST_REQUIRE_TARGET is set but the cdylib \
              (libspanner_adbc.so / .dylib / spanner_adbc.dll) is not built next to the test \
-             binary — run `cargo build` first. Refusing to skip the FFI test vacuously."
+             binary; run `cargo build` first."
         );
     }
     path
+}
+
+/// The test target with its database provisioned, or `None` to skip.
+fn setup(test: &str) -> Option<TestTarget> {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set; skipping {test}");
+        return None;
+    };
+    ensure_database_once(&target);
+    Some(target)
+}
+
+/// Like [`setup`], but also requires the built cdylib.
+fn ffi_setup(test: &str) -> Option<(TestTarget, PathBuf)> {
+    let Some(target) = test_target() else {
+        eprintln!("no Spanner target set; skipping {test}");
+        return None;
+    };
+    let Some(cdylib) = required_cdylib_path() else {
+        eprintln!("cdylib not built; skipping {test} (run `cargo build` first)");
+        return None;
+    };
+    ensure_database_once(&target);
+    Some((target, cdylib))
 }
 
 /// SQL producing `n` ordered INT64 rows without touching any table.
@@ -162,10 +170,9 @@ fn rows_sql(n: usize) -> String {
     format!("SELECT n FROM UNNEST(GENERATE_ARRAY(1, {n})) AS n ORDER BY n")
 }
 
-/// Load the driver through the driver manager and open a database + connection, retrying the
-/// connection briefly (a freshly-created emulator database can lag behind the admin API).
+/// Load the driver through the driver manager and open a database and connection.
 fn ffi_connect(
-    cdylib: &std::path::Path,
+    cdylib: &Path,
     target: &TestTarget,
 ) -> (
     ManagedDriver,
@@ -184,31 +191,17 @@ fn ffi_connect(
             OptionValue::String(target.database_uri()),
         )])
         .expect("new_database via FFI");
-    let mut connection = None;
-    let mut last = None;
-    for _ in 0..20 {
-        match database.new_connection() {
-            Ok(c) => {
-                connection = Some(c);
-                break;
-            }
-            Err(e) => {
-                last = Some(e);
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            }
-        }
-    }
-    let connection = connection.unwrap_or_else(|| panic!("FFI connect failed: {last:?}"));
+    let connection = connect_with_retry(&database);
     (driver, database, connection)
 }
 
-/// New statement over `connection` querying `rows` generated rows with `spanner.rows_per_batch`
-/// set to `batch`, so the result streams across several lazily-fetched chunks.
-fn ffi_streaming_statement(
-    connection: &mut adbc_driver_manager::ManagedConnection,
+/// A statement querying `rows` rows in batches of `batch`, so the result streams across several
+/// fetched chunks.
+fn streaming_statement<C: Connection>(
+    connection: &mut C,
     rows: usize,
     batch: i64,
-) -> adbc_driver_manager::ManagedStatement {
+) -> C::StatementType {
     let mut statement = connection.new_statement().expect("new statement");
     statement
         .set_option(
@@ -220,7 +213,7 @@ fn ffi_streaming_statement(
     statement
 }
 
-/// Total row count of a fully-consumed reader, failing the test on any stream error.
+/// Total row count of a reader, failing on any stream error.
 fn drain_rows(reader: Box<dyn RecordBatchReader + Send>) -> usize {
     reader
         .collect::<Result<Vec<_>, _>>()
@@ -230,56 +223,41 @@ fn drain_rows(reader: Box<dyn RecordBatchReader + Send>) -> usize {
         .sum()
 }
 
-/// TestResultIndependence, through the C ABI: a live result stream must keep working — or at
-/// worst error, never crash — after the statement, connection and database that produced it have
-/// all been released. In particular, releasing the hierarchy must not tear down the shared Tokio
-/// runtime while the stream's reader still blocks on it (the exported reader owns `Arc` handles
-/// to the runtime and client precisely so it can outlive its producers).
+/// TestResultIndependence: a result stream keeps working after its statement, connection and
+/// database are released. The exported reader holds the runtime and client, so releasing the
+/// handles must not shut down the runtime it blocks on.
 #[test]
 fn ffi_stream_survives_statement_connection_database_release() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping ffi_stream_survives_… test");
+    let test = "ffi_stream_survives_statement_connection_database_release";
+    let Some((target, cdylib)) = ffi_setup(test) else {
         return;
     };
-    let Some(cdylib) = required_cdylib_path() else {
-        eprintln!("cdylib not built — skipping FFI lifecycle test (run `cargo build` first)");
-        return;
-    };
-    ensure_database_once(&target);
 
     let (driver, database, mut connection) = ffi_connect(&cdylib, &target);
-    let mut statement = ffi_streaming_statement(&mut connection, 1000, 100);
+    let mut statement = streaming_statement(&mut connection, 1000, 100);
     let mut reader = statement.execute().expect("execute via FFI");
-    // Pull the first batch while everything is still alive, so the stream is genuinely in flight.
     let first = reader.next().expect("first batch").expect("first batch ok");
     assert_eq!(first.num_rows(), 100);
 
-    // Release the entire producing hierarchy under the live stream. The `ManagedDriver` handle
-    // itself must outlive the stream: dropping the last one unloads the shared library, and with
-    // it the code the stream's function pointers point into — the same contract as the C driver
-    // manager, which keeps the library loaded until `AdbcDriverRelease`.
+    // The driver must outlive the stream: dropping the last `ManagedDriver` unloads the library
+    // the stream's callbacks live in. The C driver manager likewise keeps the library loaded
+    // until `AdbcDriverRelease`.
     drop(statement);
     drop(connection);
     drop(database);
 
-    // Keep consuming. This driver keeps orphaned streams fully functional (the reader holds the
-    // runtime and client alive), so assert complete success rather than merely "no crash".
     let rest = drain_rows(reader);
     assert_eq!(first.num_rows() + rest, 1000);
     drop(driver);
 }
 
-/// Pure-Rust (non-FFI) variant of
-/// [`ffi_stream_survives_statement_connection_database_release`]: the reader returned by
-/// `execute` keeps the shared runtime alive after statement, connection, database *and driver*
-/// are all dropped.
+/// The native Rust variant of [`ffi_stream_survives_statement_connection_database_release`].
+/// With no library to keep loaded, the driver can be dropped too.
 #[test]
 fn stream_survives_statement_connection_database_release() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping stream_survives_… test");
+    let Some(target) = setup("stream_survives_statement_connection_database_release") else {
         return;
     };
-    ensure_database_once(&target);
 
     let mut driver = SpannerDriver::try_new().expect("create driver");
     let database = driver
@@ -289,20 +267,12 @@ fn stream_survives_statement_connection_database_release() {
         )])
         .expect("create database");
     let mut connection = connect_with_retry(&database);
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
-            OptionValue::Int(100),
-        )
-        .expect("set rows_per_batch");
-    statement.set_sql_query(rows_sql(1000)).unwrap();
+    let mut statement = streaming_statement(&mut connection, 1000, 100);
 
     let mut reader = statement.execute().expect("execute");
     let first = reader.next().expect("first batch").expect("first batch ok");
     assert_eq!(first.num_rows(), 100);
 
-    // Unlike the FFI variant there is no shared library to keep loaded, so *everything* can go.
     drop(statement);
     drop(connection);
     drop(database);
@@ -312,24 +282,17 @@ fn stream_survives_statement_connection_database_release() {
     assert_eq!(first.num_rows() + rest, 1000);
 }
 
-/// TestResultInvalidation, through the C ABI: executing again on a statement whose previous
-/// result stream is still open must not crash. The second result must be complete and correct;
-/// the first stream may be invalidated (erroring on its next pull) or keep working — this driver
-/// hands out independent streams — but either way draining it afterwards must be safe.
+/// TestResultInvalidation: executing a statement again while its previous stream is open. The
+/// second result must be complete; draining the first may yield rows or an error, but must not
+/// crash.
 #[test]
 fn ffi_execute_twice_with_first_stream_still_open() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping ffi_execute_twice_… test");
+    let Some((target, cdylib)) = ffi_setup("ffi_execute_twice_with_first_stream_still_open") else {
         return;
     };
-    let Some(cdylib) = required_cdylib_path() else {
-        eprintln!("cdylib not built — skipping FFI lifecycle test (run `cargo build` first)");
-        return;
-    };
-    ensure_database_once(&target);
 
     let (_driver, _database, mut connection) = ffi_connect(&cdylib, &target);
-    let mut statement = ffi_streaming_statement(&mut connection, 600, 50);
+    let mut statement = streaming_statement(&mut connection, 600, 50);
     let mut first_reader = statement.execute().expect("first execute");
     let batch = first_reader
         .next()
@@ -337,12 +300,9 @@ fn ffi_execute_twice_with_first_stream_still_open() {
         .expect("first batch ok");
     assert_eq!(batch.num_rows(), 50);
 
-    // Re-execute with the first stream still open, and consume the new stream to completion.
     let second_reader = statement.execute().expect("second execute");
     assert_eq!(drain_rows(second_reader), 600);
 
-    // Draining the invalidation candidate may yield rows or an error; crashing is the only
-    // unacceptable outcome.
     for item in first_reader {
         if item.is_err() {
             break;
@@ -350,29 +310,19 @@ fn ffi_execute_twice_with_first_stream_still_open() {
     }
 }
 
-/// Cross-thread release race: a second thread releases a
-/// live result stream while the main thread starts and consumes a new query on the same
-/// connection. ~50 iterations to give the race room to bite.
+/// One thread releases a live stream while another runs a new query on the same connection.
 #[test]
 fn ffi_stream_release_races_new_query() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping ffi_stream_release_races_new_query");
+    let Some((target, cdylib)) = ffi_setup("ffi_stream_release_races_new_query") else {
         return;
     };
-    let Some(cdylib) = required_cdylib_path() else {
-        eprintln!("cdylib not built — skipping FFI lifecycle test (run `cargo build` first)");
-        return;
-    };
-    ensure_database_once(&target);
 
     let (_driver, _database, mut connection) = ffi_connect(&cdylib, &target);
     for _ in 0..50 {
-        let mut statement = ffi_streaming_statement(&mut connection, 500, 50);
+        let mut statement = streaming_statement(&mut connection, 500, 50);
         let reader = statement.execute().expect("execute racing stream");
-        // Release the stream (its drop runs the C release callback, which tears down the
-        // driver-side reader and its prefetch task) from another thread…
+        // Dropping the reader runs the C release callback, which stops the prefetch task.
         let releaser = std::thread::spawn(move || drop(reader));
-        // …while this thread runs a fresh query on the same connection.
         let mut probe = connection.new_statement().expect("new statement");
         probe.set_sql_query("SELECT 1 AS one").unwrap();
         assert_eq!(drain_rows(probe.execute().expect("racing query")), 1);
@@ -382,22 +332,13 @@ fn ffi_stream_release_races_new_query() {
     }
 }
 
-/// Unhappy paths must surface specific errors — not crashes — through the C ABI: executing
-/// with no SQL set (query and update paths), deriving a parameter schema with nothing to derive
-/// it from, and preparing an empty statement. The statement must stay usable afterwards.
-/// (Cancel-after-release, the remaining InvalidState-class path, needs raw FFI calls and lives in
-/// `ffi_double_release_and_error_struct_reuse`.)
+/// Calls on a statement without SQL report `InvalidState` and leave it usable. Cancel after
+/// release is covered by `ffi_double_release_and_error_struct_reuse`.
 #[test]
 fn ffi_unhappy_paths_error_instead_of_crash() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping ffi_unhappy_paths_… test");
+    let Some((target, cdylib)) = ffi_setup("ffi_unhappy_paths_error_instead_of_crash") else {
         return;
     };
-    let Some(cdylib) = required_cdylib_path() else {
-        eprintln!("cdylib not built — skipping FFI lifecycle test (run `cargo build` first)");
-        return;
-    };
-    ensure_database_once(&target);
 
     let (_driver, _database, mut connection) = ffi_connect(&cdylib, &target);
     let mut statement = connection.new_statement().expect("new statement");
@@ -419,8 +360,7 @@ fn ffi_unhappy_paths_error_instead_of_crash() {
         .expect_err("prepare without SQL must fail");
     assert_eq!(error.status, Status::InvalidState, "{error:?}");
 
-    // With SQL set but *before* `prepare`, the parameter schema is well-defined for this driver
-    // (Spanner plans server-side; prepare is a no-op) — it must succeed rather than crash.
+    // The parameter schema needs no `prepare`, which is a no-op for this driver.
     statement.set_sql_query("SELECT @p AS v").unwrap();
     let schema = statement
         .get_parameter_schema()
@@ -428,7 +368,6 @@ fn ffi_unhappy_paths_error_instead_of_crash() {
     assert_eq!(schema.fields().len(), 1);
     assert_eq!(schema.field(0).name(), "p");
 
-    // The failed calls must not have wedged the statement: it still executes.
     statement.set_sql_query("SELECT 1 AS one").unwrap();
     assert_eq!(
         drain_rows(statement.execute().expect("execute after failures")),
@@ -436,50 +375,37 @@ fn ffi_unhappy_paths_error_instead_of_crash() {
     );
 }
 
-/// Abandoning a half-consumed stream, through the C ABI: read one batch of a large result,
-/// release the stream mid-flight (which must also clean up the driver's background prefetch task
-/// — `spawn_prefetch` in `src/runtime.rs`; its `JoinHandle` is aborted on reader drop), and
-/// verify the statement and connection keep working. Repeated a few times so leaked tasks or a
-/// wedged runtime would compound and surface.
+/// Releasing a half-consumed stream also aborts its prefetch task (`spawn_prefetch` in
+/// `src/runtime.rs`); the statement and connection keep working. Repeated so leaked tasks would
+/// accumulate.
 #[test]
 fn ffi_drop_half_consumed_stream_then_connection_still_works() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping ffi_drop_half_consumed_… test");
+    let test = "ffi_drop_half_consumed_stream_then_connection_still_works";
+    let Some((target, cdylib)) = ffi_setup(test) else {
         return;
     };
-    let Some(cdylib) = required_cdylib_path() else {
-        eprintln!("cdylib not built — skipping FFI lifecycle test (run `cargo build` first)");
-        return;
-    };
-    ensure_database_once(&target);
 
     let (_driver, _database, mut connection) = ffi_connect(&cdylib, &target);
     for _ in 0..5 {
-        // 10k rows / 500-row batches: 20 chunks, of which only the first is consumed.
-        // (GENERATE_ARRAY caps at 16000 elements, so this cannot grow past that.)
-        let mut statement = ffi_streaming_statement(&mut connection, 10_000, 500);
+        // 20 chunks, of which only the first is read. GENERATE_ARRAY allows at most 16000 rows.
+        let mut statement = streaming_statement(&mut connection, 10_000, 500);
         let mut reader = statement.execute().expect("execute large query");
         let first = reader.next().expect("first batch").expect("first batch ok");
         assert_eq!(first.num_rows(), 500);
-        // Abandon the stream mid-flight, prefetch task and all.
         drop(reader);
-        // The same statement handle must remain usable after its stream was abandoned.
         statement.set_sql_query("SELECT 1 AS one").unwrap();
         assert_eq!(drain_rows(statement.execute().expect("re-execute")), 1);
     }
-    // And the connection as a whole still streams a fresh result to completion.
-    let mut probe = ffi_streaming_statement(&mut connection, 1000, 100);
+    let mut probe = streaming_statement(&mut connection, 1000, 100);
     assert_eq!(drain_rows(probe.execute().expect("fresh query")), 1000);
 }
 
-/// Pure-Rust (non-FFI) variant of [`ffi_drop_half_consumed_stream_then_connection_still_works`].
+/// The native Rust variant of [`ffi_drop_half_consumed_stream_then_connection_still_works`].
 #[test]
 fn drop_half_consumed_reader_then_connection_still_works() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping drop_half_consumed_… test");
+    let Some(target) = setup("drop_half_consumed_reader_then_connection_still_works") else {
         return;
     };
-    ensure_database_once(&target);
 
     let mut driver = SpannerDriver::try_new().expect("create driver");
     let database = driver
@@ -491,19 +417,11 @@ fn drop_half_consumed_reader_then_connection_still_works() {
     let mut connection = connect_with_retry(&database);
 
     for _ in 0..5 {
-        let mut statement = connection.new_statement().expect("new statement");
-        statement
-            .set_option(
-                OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
-                OptionValue::Int(500),
-            )
-            .expect("set rows_per_batch");
-        // 10k rows / 500-row batches — see the FFI variant for the sizing rationale.
-        statement.set_sql_query(rows_sql(10_000)).unwrap();
+        let mut statement = streaming_statement(&mut connection, 10_000, 500);
         let mut reader = statement.execute().expect("execute large query");
         let first = reader.next().expect("first batch").expect("first batch ok");
         assert_eq!(first.num_rows(), 500);
-        drop(reader); // abandons the stream with the prefetch task mid-flight
+        drop(reader);
     }
 
     let mut probe = connection.new_statement().expect("new statement");
@@ -511,12 +429,9 @@ fn drop_half_consumed_reader_then_connection_still_works() {
     assert_eq!(drain_rows(probe.execute().expect("fresh query")), 1000);
 }
 
-/// Double-release and error-struct reuse at the raw C ABI — paths the managed Rust wrappers
-/// never exercise, because their `Drop` impls release exactly once. Releasing a statement /
-/// connection / database / driver twice must yield a clean `INVALID_STATE` error, not a crash or
-/// double-free; one `FFI_AdbcError` struct is reused across every call with its embedded
-/// `release` callback invoked (deliberately twice — it must be idempotent) between uses, the
-/// standard C consumer idiom. Also covers cancellation after releasing the handle.
+/// Releasing each object twice reports `INVALID_STATE`, as does cancelling a released statement.
+/// One `FFI_AdbcError` is reused throughout, released twice between uses to check idempotency.
+/// The managed wrappers cannot do this: their `Drop` releases once.
 #[cfg(feature = "ffi")]
 #[test]
 fn ffi_double_release_and_error_struct_reuse() {
@@ -529,18 +444,11 @@ fn ffi_double_release_and_error_struct_reuse() {
         FFI_AdbcError, FFI_AdbcStatement,
     };
 
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set — skipping ffi_double_release_… test");
+    let Some((target, cdylib)) = ffi_setup("ffi_double_release_and_error_struct_reuse") else {
         return;
     };
-    let Some(cdylib) = required_cdylib_path() else {
-        eprintln!("cdylib not built — skipping raw FFI test (run `cargo build` first)");
-        return;
-    };
-    ensure_database_once(&target);
 
-    /// Release `error`'s contents through its embedded callback, twice: the second call is the
-    /// idempotency check for the message and private data cleanup.
+    /// Release `error` twice; the second call checks idempotency.
     fn release_error_twice(error: &mut FFI_AdbcError) {
         assert!(
             error.release.is_some(),
@@ -554,7 +462,6 @@ fn ffi_double_release_and_error_struct_reuse() {
         assert!(error.message.is_null(), "release must null the message");
     }
 
-    /// The error message currently held by `error`, for asserting on specific errors.
     fn error_message(error: &FFI_AdbcError) -> String {
         if error.message.is_null() {
             return String::new();
@@ -564,15 +471,12 @@ fn ffi_double_release_and_error_struct_reuse() {
             .into_owned()
     }
 
-    // Load the shared library directly (as a C driver manager would), so the raw entrypoints can
-    // be driven in ways the managed wrappers never do. Declared before every FFI object below so
-    // it is dropped last: the driver's function pointers and the error's release callback point
-    // into this library's code.
+    // Load the library directly, as a C driver manager would. Declared first so it is dropped
+    // last: the driver's function pointers and the error's release callback point into it.
     let library = unsafe { libloading::Library::new(&cdylib) }.expect("load cdylib");
     let init: libloading::Symbol<FFI_AdbcDriverInitFunc> =
         unsafe { library.get(b"AdbcSpannerInit") }.expect("resolve AdbcSpannerInit");
 
-    // The single error struct reused across every call below.
     let mut error = FFI_AdbcError::default();
 
     let mut driver = FFI_AdbcDriver::default();
@@ -585,7 +489,6 @@ fn ffi_double_release_and_error_struct_reuse() {
     };
     assert_eq!(status, ADBC_STATUS_OK);
 
-    // Database: new → set uri → init.
     let mut database = FFI_AdbcDatabase::default();
     let status = unsafe { driver.DatabaseNew.unwrap()(&mut database, &mut error) };
     assert_eq!(status, ADBC_STATUS_OK);
@@ -598,11 +501,10 @@ fn ffi_double_release_and_error_struct_reuse() {
     let status = unsafe { driver.DatabaseInit.unwrap()(&mut database, &mut error) };
     assert_eq!(status, ADBC_STATUS_OK);
 
-    // Connection: new → init, retrying briefly (a fresh emulator database can lag). Each failed
-    // attempt also exercises the release-and-reuse cycle on the shared error struct.
     let mut connection = FFI_AdbcConnection::default();
     let status = unsafe { driver.ConnectionNew.unwrap()(&mut connection, &mut error) };
     assert_eq!(status, ADBC_STATUS_OK);
+    // Retry, as in `connect_with_retry`.
     let mut status = ADBC_STATUS_OK;
     for _ in 0..20 {
         status =
@@ -620,7 +522,6 @@ fn ffi_double_release_and_error_struct_reuse() {
         unsafe { driver.StatementNew.unwrap()(&mut connection, &mut statement, &mut error) };
     assert_eq!(status, ADBC_STATUS_OK);
 
-    // --- Statement: release, release again, then cancel-after-release. ---
     let statement_release = driver.StatementRelease.unwrap();
     let status = unsafe { statement_release(&mut statement, &mut error) };
     assert_eq!(status, ADBC_STATUS_OK);
@@ -635,7 +536,6 @@ fn ffi_double_release_and_error_struct_reuse() {
         error_message(&error)
     );
     release_error_twice(&mut error);
-    // Cancel on a released statement returns InvalidState.
     let status = unsafe { driver.StatementCancel.unwrap()(&mut statement, &mut error) };
     assert_eq!(
         status, ADBC_STATUS_INVALID_STATE,
@@ -643,7 +543,6 @@ fn ffi_double_release_and_error_struct_reuse() {
     );
     release_error_twice(&mut error);
 
-    // --- Connection released twice, reusing the same error struct. ---
     let connection_release = driver.ConnectionRelease.unwrap();
     let status = unsafe { connection_release(&mut connection, &mut error) };
     assert_eq!(status, ADBC_STATUS_OK);
@@ -654,7 +553,6 @@ fn ffi_double_release_and_error_struct_reuse() {
     );
     release_error_twice(&mut error);
 
-    // --- Database released twice. ---
     let database_release = driver.DatabaseRelease.unwrap();
     let status = unsafe { database_release(&mut database, &mut error) };
     assert_eq!(status, ADBC_STATUS_OK);
@@ -665,8 +563,8 @@ fn ffi_double_release_and_error_struct_reuse() {
     );
     release_error_twice(&mut error);
 
-    // --- Driver released twice (through a saved callback: the first release clears the field,
-    // which is also what makes the struct's eventual `Drop` a safe no-op). ---
+    // Through a saved callback: the first release clears the field, which also makes the
+    // struct's `Drop` a no-op.
     let driver_release = driver.release.unwrap();
     let status = unsafe { driver_release(&mut driver, &mut error) };
     assert_eq!(status, ADBC_STATUS_OK);

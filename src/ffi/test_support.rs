@@ -1,9 +1,8 @@
-//! Helpers shared by the test modules across this export layer.
+//! Helpers shared by the C ABI unit tests.
 
 use super::abi::{ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA, AdbcError};
 
-/// An `AdbcError` as a 1.1.0 caller hands it in: zeroed, with the vendor-code sentinel that
-/// advertises the larger layout.
+/// A zeroed `AdbcError` as a 1.1.0 caller passes it, with the sentinel `vendor_code`.
 pub(super) fn zeroed_error() -> AdbcError {
     AdbcError {
         message: std::ptr::null_mut(),
@@ -15,14 +14,14 @@ pub(super) fn zeroed_error() -> AdbcError {
     }
 }
 
-/// Run the driver's release callback on an out parameter, when one was set.
+/// Run the error's release callback, if set.
 pub(super) fn release_error(error: &mut AdbcError) {
     if let Some(release) = error.release {
         unsafe { release(&raw mut *error) };
     }
 }
 
-/// The message the driver exported into an out parameter, or `None` when it set none.
+/// The error's message, if set.
 pub(super) fn error_message(error: &AdbcError) -> Option<String> {
     if error.message.is_null() {
         return None;
@@ -34,14 +33,12 @@ pub(super) fn error_message(error: &AdbcError) -> Option<String> {
     )
 }
 
-/// A typed null for whichever pointer parameter a call leaves unset.
-///
-/// `*mut T` coerces to `*const T` at a call site, so this spells both.
+/// Null for any pointer argument; `*mut T` coerces to `*const T`.
 pub(super) fn null<T>() -> *mut T {
     std::ptr::null_mut()
 }
 
-/// Every attempted cleanup panics with another payload of the same kind.
+/// A panic payload whose destructor panics with another `PanicOnDrop`.
 pub(super) struct PanicOnDrop;
 
 impl Drop for PanicOnDrop {

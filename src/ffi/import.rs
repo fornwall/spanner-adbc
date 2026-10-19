@@ -1,4 +1,4 @@
-//! Importing bound C streams, including producers that return an error without a description.
+//! Import of the Arrow C streams passed to `AdbcStatementBindStream`.
 
 use std::ffi::{CStr, c_int};
 use std::sync::Arc;
@@ -21,8 +21,8 @@ pub(super) struct BoundStreamReader {
 
 impl BoundStreamReader {
     /// # Safety
-    /// `stream` must be null or point to a valid Arrow C stream. Validated streams are moved
-    /// into this reader; malformed callback tables retain caller ownership.
+    /// `stream` must be null or point to a valid Arrow C stream. The reader takes ownership once
+    /// the callbacks are validated; a stream with missing callbacks stays with the caller.
     pub(super) unsafe fn from_raw(stream: *mut FFI_ArrowArrayStream) -> Result<Self> {
         let Some(stream_ref) = (unsafe { stream.as_ref() }) else {
             return Err(invalid_argument("stream must not be null"));
@@ -113,7 +113,9 @@ impl Iterator for BoundStreamReader {
             })?;
             if data.null_count() != 0 {
                 return Err(ArrowError::CDataInterface(
-                    "bound stream must not contain top-level null rows; put null values in the individual columns instead".to_owned(),
+                    "bound stream must not contain top-level null rows; put null values in the \
+                     individual columns instead"
+                        .to_owned(),
                 ));
             }
             let row_count = data.len();
@@ -134,19 +136,17 @@ impl RecordBatchReader for BoundStreamReader {
     }
 }
 
-/// Validate imported buffers once, reporting the offending column. Arrow's C importer uses
-/// `ArrayData::new_unchecked`; offsets, view indices, UTF-8 and null counts must be checked before
-/// safe Arrow accessors can rely on them. Native Rust batches already satisfy these invariants.
+/// Validate imported data, naming the offending column. Arrow's C importer uses
+/// `ArrayData::new_unchecked`, so offsets, view indices, UTF-8 and null counts must be checked
+/// before safe accessors rely on them.
 ///
-/// This does not validate pointer ownership: the C interface supplies pointers without allocation
-/// lengths, and the importer infers some buffer lengths from offsets. Producers must still uphold
-/// `from_ffi`'s unsafe contract so importing and validating the buffers stays within allocated memory.
+/// Buffer bounds cannot be checked: the C interface passes pointers without allocation lengths,
+/// so producers must still uphold `from_ffi`'s safety contract.
 pub(super) fn validate_imported(
     data: &ArrayData,
     fields: &Fields,
 ) -> std::result::Result<(), String> {
-    // The struct itself carries no values, so only its own layout and null buffer are checked
-    // here; `validate_full` then covers each column and everything nested inside it.
+    // The struct has no values of its own; `validate_full` checks each column recursively.
     data.validate_data()
         .map_err(|failure| format!("the top-level struct is invalid: {failure}"))?;
     for (field, column) in fields.iter().zip(data.child_data()) {

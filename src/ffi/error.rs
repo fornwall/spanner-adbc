@@ -1,9 +1,8 @@
-//! Writing a driver [`Error`] back through a caller-owned `AdbcError`.
+//! Writing a driver [`Error`] into a caller-owned `AdbcError`.
 //!
-//! The caller allocates the struct, so its size depends on the ADBC revision it was built against.
-//! A 1.1.0 caller signals the larger layout by presetting [`ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA`]
-//! in `vendor_code`; anything else must be treated as the 1.0.0 prefix, where the trailing two
-//! fields do not exist and writing them would run off the end of the caller's allocation.
+//! The caller allocates the struct, so its size depends on the ADBC revision it was built
+//! against. A 1.1.0 caller presets `vendor_code` to [`ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA`].
+//! Otherwise only the 1.0.0 prefix exists, and the two trailing fields must not be touched.
 
 use std::ffi::{CString, c_int, c_void};
 
@@ -12,21 +11,16 @@ use adbc_core::error::Error;
 use super::abi::{ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA, AdbcError, AdbcErrorDetail, AdbcErrorV100};
 use super::guard::sanitized_cstring;
 
-/// Owned backing store for the key/value pairs handed out by [`error_get_detail`]. The header
-/// promises the caller these borrow from the error and stay valid until it is released, so they
-/// live here and are freed by [`release_error`].
+/// Backing store for [`error_get_detail`], whose pointers must stay valid until the error is
+/// released.
 type ErrorDetails = Vec<(CString, Vec<u8>)>;
 
-/// Detail key carrying the numeric gRPC code that the 1.1.0 layout's `vendor_code` sentinel
-/// displaces (see [`export_error`]).
-///
-/// The driver-specific namespace distinguishes this from forwarded `google.rpc.*` details.
-pub(crate) const VENDOR_CODE_DETAIL_KEY: &str = "adbc.spanner.vendor_code";
+/// Detail key for the gRPC code that the 1.1.0 sentinel displaces from `vendor_code`.
+const VENDOR_CODE_DETAIL_KEY: &str = "adbc.spanner.vendor_code";
 
 /// # Safety
 /// `error` must be a pointer this driver previously wrote a 1.1.0 error into.
-// Guard-exempt: must not unwind and cannot — freeing a `CString` and a details box does not
-// panic, and the rest is plain pointer writes.
+// Guard-exempt: freeing a `CString` and the details box cannot panic.
 unsafe extern "C" fn release_error(error: *mut AdbcError) {
     let Some(error) = (unsafe { error.as_mut() }) else {
         return;
@@ -39,14 +33,13 @@ unsafe extern "C" fn release_error(error: *mut AdbcError) {
         drop(unsafe { Box::from_raw(error.private_data.cast::<ErrorDetails>()) });
         error.private_data = std::ptr::null_mut();
     }
-    // Clearing this makes the callback idempotent, which the header requires.
+    // adbc.h requires release to be idempotent.
     error.release = None;
 }
 
 /// # Safety
 /// `error` must be a pointer this driver previously wrote a 1.0.0 error into.
-// Guard-exempt: must not unwind and cannot — freeing a `CString` does not panic, and the rest is
-// plain pointer writes.
+// Guard-exempt: freeing a `CString` cannot panic.
 unsafe extern "C" fn release_error_v100(error: *mut AdbcErrorV100) {
     let Some(error) = (unsafe { error.as_mut() }) else {
         return;
@@ -77,7 +70,7 @@ pub(crate) unsafe fn export_error(out: *mut AdbcError, error: Error) {
         std::ptr::null()
     };
 
-    // Reusing an out parameter that still holds an error is legal; release it so it does not leak.
+    // The out parameter may still hold an earlier error.
     if let Some(release) = unsafe { (*out).release } {
         unsafe { release(out) };
     }
@@ -100,7 +93,6 @@ pub(crate) unsafe fn export_error(out: *mut AdbcError, error: Error) {
         }
         let value = AdbcError {
             message: sanitized_cstring(&error.message).into_raw(),
-            // The sentinel enables consumers to read the 1.1 fields.
             vendor_code: ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA,
             sqlstate: error.sqlstate,
             release: Some(release_error),
@@ -120,18 +112,16 @@ pub(crate) unsafe fn export_error(out: *mut AdbcError, error: Error) {
             sqlstate: error.sqlstate,
             release: Some(release_error_v100),
         };
-        // Only the 1.0.0 prefix exists in the caller's allocation; the tail must stay untouched.
+        // The caller allocated only the 1.0.0 prefix.
         unsafe { std::ptr::write_unaligned(out.cast::<AdbcErrorV100>(), value) };
     }
 }
 
-/// Borrow the detail box behind `error`, if the caller's struct is one that has the field at all.
+/// The detail box behind `error`, if it is a 1.1.0 error.
 ///
-/// The mirror image of the guard in [`export_error`]: adbc.h says `private_data` "may not be used
-/// unless vendor_code is ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA", because a 1.0.0 caller allocated
-/// only `ADBC_ERROR_1_0_0_SIZE` bytes and the field is past the end of it. So the sentinel decides
-/// whether the pointer may even be read, and the read goes through the field's own address rather
-/// than a reference to the whole struct.
+/// adbc.h forbids reading `private_data` unless `vendor_code` holds the sentinel, since a 1.0.0
+/// allocation ends before it. For the same reason, reads go through field addresses rather than
+/// a reference to the whole struct.
 ///
 /// # Safety
 /// `error` must be null or point to at least the 1.0.0 prefix of a valid `AdbcError`.
@@ -150,8 +140,7 @@ unsafe fn details<'a>(error: *const AdbcError) -> Option<&'a ErrorDetails> {
 
 /// # Safety
 /// `error` must be null or point to a valid `AdbcError`.
-// Guard-exempt: pure reads of driver-owned allocations; the fallible conversion is saturating,
-// so nothing here can panic.
+// Guard-exempt: reads only, with a saturating conversion.
 pub(crate) unsafe extern "C" fn error_get_detail_count(error: *const AdbcError) -> c_int {
     let Some(details) = (unsafe { details(error) }) else {
         return 0;
@@ -161,8 +150,7 @@ pub(crate) unsafe extern "C" fn error_get_detail_count(error: *const AdbcError) 
 
 /// # Safety
 /// `error` must be null or point to a valid `AdbcError`.
-// Guard-exempt: pure reads of driver-owned allocations through checked lookups; nothing here can
-// panic.
+// Guard-exempt: reads only, through checked lookups.
 pub(crate) unsafe extern "C" fn error_get_detail(
     error: *const AdbcError,
     index: c_int,

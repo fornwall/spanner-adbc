@@ -1,9 +1,5 @@
-//! The entry points every exported object repeats, written once.
-//!
-//! A database, a connection and a statement all expose the same handle prologues (`New`,
-//! `Release`) and the same eight option entry points (string/bytes/int/double setters and
-//! getters). They live here as generic `extern "C"` functions, over [`FfiHandle`] and
-//! [`OptionTarget`]; the vtable names the instantiation each slot needs.
+//! `New`, `Release` and the eight option entry points, shared by all three objects as generic
+//! `extern "C"` functions over [`FfiHandle`] and [`OptionTarget`].
 
 use std::ffi::{c_char, c_void};
 use std::sync::MutexGuard;
@@ -16,13 +12,10 @@ use super::abi::{ADBC_STATUS_OK, AdbcDriver, AdbcError, AdbcStatusCode};
 use super::guard::{
     byte_slice, missing_argument, required_str, write_bytes, write_out, write_string,
 };
-use super::handle::{Exported, Staged, dispatch};
+use super::handle::{Exported, Staged, dispatch, finish};
 use crate::error::{invalid_state, not_found};
 
-/// How an entry point reaches the driver object behind one of the three exported ABI structs.
-///
-/// Implemented by `AdbcDatabase`, `AdbcConnection` and `AdbcStatement`, whose first field is the
-/// `private_data` slot in every case.
+/// An ABI handle struct: `AdbcDatabase`, `AdbcConnection` or `AdbcStatement`.
 pub(super) trait FfiHandle {
     /// What lives behind `private_data`.
     type State: OptionTarget + Send;
@@ -30,20 +23,19 @@ pub(super) trait FfiHandle {
     const KIND: &'static str;
     fn private_data(&self) -> *mut c_void;
     fn private_data_mut(&mut self) -> &mut *mut c_void;
-    /// The driver vtable the caller's handle carries, which the driver manager populates and
-    /// routes `AdbcErrorGetDetail*` back through.
+    /// The vtable the driver manager stored in the handle; see [`driver_of`].
     fn private_driver(&self) -> *const AdbcDriver;
 }
 
-/// How options reach the state behind a handle. A [`Staged`] object buffers sets until `Init` and
-/// refuses gets before it; a statement is live from the moment it exists and does neither.
+/// How options reach the state behind a handle. A [`Staged`] object buffers sets and refuses gets
+/// until `Init`; a statement has no `Init` and does neither.
 pub(super) trait OptionTarget {
     /// The typed option key, parsed from the caller's C string.
     type Key: for<'a> From<&'a str>;
     /// The live object the typed getters read from.
     type Options: Optionable<Option = Self::Key>;
 
-    /// Apply an option, buffering it when the object has a pre-init phase it is still in.
+    /// Apply an option, or buffer it before `Init`.
     fn set(&mut self, key: Self::Key, value: OptionValue) -> Result<()>;
 
     /// The initialized object, or `NOT_FOUND` when the option cannot be read yet.
@@ -58,8 +50,6 @@ where
     type Key = K;
     type Options = S;
 
-    /// Buffer pre-init options for validation by the constructor, retaining each key's last
-    /// value and position so failed initialization can be corrected without changing precedence.
     fn set(&mut self, key: K, value: OptionValue) -> Result<()> {
         match self {
             Self::Pending(options) => {
@@ -70,8 +60,7 @@ where
         }
     }
 
-    /// Pending options have not been validated. Report `NOT_FOUND` until initialization rather
-    /// than returning buffered values as though the driver had accepted them.
+    /// Buffered options are unvalidated, so they read as `NOT_FOUND` until `Init`.
     fn options(&mut self, kind: &str, key: &K) -> Result<&mut S> {
         match self {
             Self::Ready(state) => Ok(state),
@@ -86,8 +75,7 @@ where
 
 type KeyOf<H> = <<H as FfiHandle>::State as OptionTarget>::Key;
 
-/// The `private_data` slot behind a caller-supplied handle, with null standing in for a null or
-/// never-populated handle.
+/// The handle's `private_data`, or null for a null handle.
 ///
 /// # Safety
 /// `handle` must be null or point to a valid ABI struct.
@@ -95,12 +83,11 @@ pub(super) unsafe fn slot_of<H: FfiHandle>(handle: *mut H) -> *mut c_void {
     unsafe { handle.as_ref() }.map_or(std::ptr::null_mut(), FfiHandle::private_data)
 }
 
-/// The driver vtable behind a caller-supplied handle, or null when the caller populated none.
+/// The handle's `private_driver`, or null.
 ///
-/// It is carried into every exported Arrow stream, because `AdbcErrorFromArrayStream` hands the
-/// caller an `AdbcError` in driver-owned storage and the driver manager reaches that error's
-/// details through this field. A directly linked caller leaves it null and reads the details
-/// through the driver's own `ErrorGetDetail*` instead.
+/// Exported streams carry it: `AdbcErrorFromArrayStream` returns an `AdbcError` in driver-owned
+/// storage, and the driver manager finds that error's detail getters through this field. A
+/// directly linked caller leaves it null.
 ///
 /// # Safety
 /// `handle` must be null or point to a valid ABI struct.
@@ -108,9 +95,8 @@ pub(super) unsafe fn driver_of<H: FfiHandle>(handle: *mut H) -> *const AdbcDrive
     unsafe { handle.as_ref() }.map_or(std::ptr::null(), FfiHandle::private_driver)
 }
 
-/// Reject a null handle struct before anything behind it is touched. Distinct from a null
-/// `private_data`: a null struct pointer is a bad argument, an unpopulated slot is an object used
-/// out of order.
+/// Reject a null handle pointer as a bad argument. A null `private_data` is instead an object
+/// used out of order.
 ///
 /// # Safety
 /// `handle` must be null or point to a valid ABI struct.
@@ -118,8 +104,7 @@ unsafe fn checked<'a, H: FfiHandle>(handle: *mut H) -> Result<&'a mut H> {
     unsafe { handle.as_mut() }.ok_or_else(|| missing_argument(H::KIND))
 }
 
-/// Run `f` against the state behind a caller-supplied handle, dispatching through
-/// [`super::handle::dispatch`] for panic containment and the poison/lock discipline.
+/// Run `f` on the state behind `handle` through [`dispatch`].
 ///
 /// # Safety
 /// `handle` must be null or point to a valid ABI struct.
@@ -131,8 +116,8 @@ where
     unsafe { dispatch::<H::State, _>(slot_of(handle), H::KIND, error, f) }
 }
 
-/// Reject `*New` on a populated handle to avoid leaking the existing object. ADBC requires
-/// callers to pass a zero-initialized struct.
+/// Refuse `*New` on a populated handle, which would leak its object. ADBC requires a
+/// zero-initialized struct.
 pub(super) fn already_populated(kind: &str) -> adbc_core::error::Error {
     invalid_state(format!(
         "{kind} already holds a driver object; release it before creating another, and pass a \
@@ -140,14 +125,13 @@ pub(super) fn already_populated(kind: &str) -> adbc_core::error::Error {
     ))
 }
 
-/// `AdbcDatabaseNew`/`AdbcConnectionNew`: populate the caller's handle with a freshly built
-/// pre-init state. A statement has no pre-`Init` phase, so it is built from its connection by
+/// `AdbcDatabaseNew`/`AdbcConnectionNew`. Statements have no `Init` and are built by
 /// [`super::statement::statement_new`] instead.
 ///
 /// # Safety
 /// `handle` must be null or point to a valid ABI struct.
-// Guard-exempt: the database and connection defaults allocate nothing; allocating `Exported`
-// aborts on allocation failure. This exemption depends on those Default implementations.
+// Guard-exempt: relies on the `Staged` default allocating nothing; allocation failure for
+// `Exported` aborts rather than panics.
 pub(super) unsafe extern "C" fn new_handle<H: FfiHandle>(
     handle: *mut H,
     error: *mut AdbcError,
@@ -157,18 +141,17 @@ where
 {
     match unsafe { checked(handle) } {
         Ok(handle) if !handle.private_data().is_null() => {
-            super::handle::finish(Err(already_populated(H::KIND)), error)
+            finish(Err(already_populated(H::KIND)), error)
         }
         Ok(handle) => {
             *handle.private_data_mut() = Exported::into_private_data(H::State::default());
             ADBC_STATUS_OK
         }
-        Err(failure) => super::handle::finish(Err(failure), error),
+        Err(failure) => finish(Err(failure), error),
     }
 }
 
-/// Every `*Release`: drop the state and null the slot, so a second release is an error rather
-/// than a double free.
+/// Every `*Release`.
 ///
 /// # Safety
 /// `handle` must be null or point to a valid ABI struct, and no other call on the object may be
@@ -181,13 +164,12 @@ pub(super) unsafe extern "C" fn release_handle<H: FfiHandle>(
         Ok(handle) => unsafe {
             super::handle::release::<H::State>(handle.private_data_mut(), H::KIND, error)
         },
-        Err(failure) => super::handle::finish(Err(failure), error),
+        Err(failure) => finish(Err(failure), error),
     }
 }
 
-/// Lock the state behind a caller-supplied handle without dispatching a call on it, for the entry
-/// points that need a second object beyond the one they dispatch on. The caller still has to
-/// check readiness before using it.
+/// Lock the state behind a second handle that an entry point needs besides the one it dispatches
+/// on. The caller must still check that the state is ready.
 ///
 /// # Safety
 /// `handle` must be null or point to a valid ABI struct, and the guard must not outlive it.
@@ -227,11 +209,10 @@ pub(super) unsafe extern "C" fn set_option_string<H: FfiHandle>(
     value: *const c_char,
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
-    // The value is validated before the handle is even consulted, so a null value is a bad
-    // argument on any handle.
+    // Checked before the handle, so a null value is a bad argument even on a released handle.
     let value = match unsafe { required_str(value, "value") } {
         Ok(value) => OptionValue::String(value.to_string()),
-        Err(failure) => return super::handle::finish(Err(failure), error),
+        Err(failure) => return finish(Err(failure), error),
     };
     unsafe { set_option(handle, key, value, error) }
 }
@@ -248,7 +229,7 @@ pub(super) unsafe extern "C" fn set_option_bytes<H: FfiHandle>(
 ) -> AdbcStatusCode {
     let value = match unsafe { byte_slice(value, length, "value") } {
         Ok(value) => OptionValue::Bytes(value.to_vec()),
-        Err(failure) => return super::handle::finish(Err(failure), error),
+        Err(failure) => return finish(Err(failure), error),
     };
     unsafe { set_option(handle, key, value, error) }
 }

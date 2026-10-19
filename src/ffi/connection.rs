@@ -52,7 +52,6 @@ pub(super) unsafe extern "C" fn connection_init(
     unsafe {
         with_state(connection, error, |state| {
             let options = state.pending(KIND)?;
-            // Lock the database while constructing the connection from it.
             let mut database = super::options::borrow(database)?;
             let database = database.ready(super::database::KIND)?;
             let ready = database.new_connection_with_opts(options.entries.clone())?;
@@ -64,11 +63,8 @@ pub(super) unsafe extern "C" fn connection_init(
     }
 }
 
-/// Hand a driver-produced reader to the caller as an Arrow C stream.
-///
-/// The connection's `private_driver` travels with it: `AdbcErrorFromArrayStream` returns an
-/// `AdbcError` in driver-owned storage, and the driver manager reads that error's details only
-/// through the vtable this field names.
+/// Export `reader` as an Arrow C stream carrying the connection's `private_driver` (see
+/// [`driver_of`]).
 ///
 /// # Safety
 /// `connection` must be null or point to a valid `AdbcConnection`, and `out` must be null or
@@ -79,8 +75,7 @@ unsafe fn export_stream(
     out: *mut FFI_ArrowArrayStream,
 ) -> Result<()> {
     let stream = super::stream::export_reader(reader, unsafe { driver_of(connection) });
-    // On a null `out` the stream is dropped here rather than leaked: it has not been handed over,
-    // so this side still owns it.
+    // On a null `out`, ownership never transferred and the stream is dropped here.
     unsafe { write_out(out, stream, "out") }
 }
 
@@ -108,9 +103,8 @@ pub(super) unsafe extern "C" fn connection_cancel(
     connection: *mut AdbcConnection,
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
-    // Dispatch-free on purpose, through the handle installed at init; see `handle::cancel`.
-    // `InvalidState` is reported only before init (no handle yet) — a cancel with no operation in
-    // flight returns OK, a documented deviation (see `SlotCancelHandle`).
+    // Bypasses `dispatch` so it can interrupt a running call. Before `Init` there is no cancel
+    // handle (`InvalidState`); with nothing in flight it returns OK (see `SlotCancelHandle`).
     unsafe { super::handle::cancel::<State>(slot_of(connection), KIND, error) }
 }
 
@@ -166,7 +160,7 @@ pub(super) unsafe extern "C" fn connection_get_objects(
     unsafe {
         with_state(connection, error, |state| {
             required_output(out, "out")?;
-            // An unknown depth is a caller error; `ObjectDepth::try_from` uses `InvalidData`.
+            // An unknown depth is a caller error, not `try_from`'s `InvalidData`.
             // ADBC_OBJECT_DEPTH_COLUMNS aliases ALL (0), so 4 is not a valid depth.
             let depth = ObjectDepth::try_from(depth).map_err(|_| {
                 invalid_argument(format!(
@@ -209,8 +203,7 @@ pub(super) unsafe extern "C" fn connection_get_table_schema(
             required_output(schema, "schema")?;
             let catalog = optional_str(catalog, "catalog")?;
             let db_schema = optional_str(db_schema, "db_schema")?;
-            // Unlike GetObjects, this looks up one specific table, so the name is not a filter and
-            // cannot be omitted.
+            // Not a filter as in GetObjects: this names one table.
             let table_name = required_str(table_name, "table_name")?;
 
             let found = state

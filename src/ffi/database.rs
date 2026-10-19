@@ -33,17 +33,16 @@ impl FfiHandle for AdbcDatabase {
     }
 }
 
-/// One driver, and therefore one Tokio runtime, shared by every database in the process.
-///
-/// Runtime creation is fallible; a failure leaves the cell empty so a later init can retry.
+/// One driver, and so one Tokio runtime, shared by every database in the process. A failure to
+/// create it leaves the cell empty, so a later `Init` can retry.
 fn shared_driver() -> Result<&'static Mutex<SpannerDriver>> {
     static DRIVER: OnceLock<Mutex<SpannerDriver>> = OnceLock::new();
 
     if let Some(driver) = DRIVER.get() {
         return Ok(driver);
     }
-    // Construct outside `get_or_init` so failures can be returned. Concurrent first callers may
-    // build extra runtimes, which are dropped after one wins initialization.
+    // Built outside `get_or_init` so errors can be returned. Racing first callers may build extra
+    // runtimes, which are dropped.
     let driver = SpannerDriver::try_new()?;
     Ok(DRIVER.get_or_init(|| Mutex::new(driver)))
 }
@@ -64,8 +63,6 @@ pub(super) unsafe extern "C" fn database_init(
                     Status::Internal,
                 )
             })?;
-            // Preserve setter order: a URI expands into options that later setters can override.
-            // Clone the buffer so failed initialization can be retried.
             let database = driver.new_database_with_opts(options.entries.clone())?;
             *state = State::Ready(database);
             Ok(())

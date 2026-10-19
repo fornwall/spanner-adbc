@@ -36,8 +36,7 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
  public:
   AdbcStatusCode SetupDatabase(struct AdbcDatabase* database,
                                struct AdbcError* error) const override {
-    // Load our cdylib through the driver manager and point it at the target
-    // database. The driver auto-detects SPANNER_EMULATOR_HOST from the env.
+    // The driver itself reads SPANNER_EMULATOR_HOST.
     RAISE_ADBC(AdbcDatabaseSetOption(database, "driver",
                                      EnvOr("ADBC_SPANNER_LIBRARY", "").c_str(), error));
     RAISE_ADBC(AdbcDatabaseSetOption(database, "entrypoint", "AdbcSpannerInit", error));
@@ -69,11 +68,8 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
                              error);
   }
 
-  // The suite's fixed two-column sample table (int64s INT64, strings STRING),
-  // seeded with the canonical {42, -42, NULL} / {"foo", NULL, ""} rows. No
-  // `PRIMARY KEY` clause: Spanner keys a keyless table on a hidden `rowid` of
-  // its own, so the table's visible columns are exactly the two the suite
-  // expects.
+  // No `PRIMARY KEY` clause: Spanner keys such a table on a hidden `rowid`, so
+  // its visible columns are just the two the suite expects.
   AdbcStatusCode CreateSampleTable(struct AdbcConnection* connection,
                                    const std::string& name,
                                    struct AdbcError* error) const override {
@@ -154,9 +150,8 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
          {"SELECT CAST(1.5 AS FLOAT)", "SELECT CAST(1.5 AS FLOAT64)"}},
         {"StatementTest::TestSqlSchemaFloats::cast-1.5-as-float",
          {"SELECT CAST(1.5 AS FLOAT)", "SELECT CAST(1.5 AS FLOAT64)"}},
-        // Ingest readbacks: only the NULLS FIRST/LAST has to go — the expected
-        // NULL-first ascending / NULL-last descending order is GoogleSQL's own
-        // default for ASC / DESC.
+        // Ingest readbacks: drop NULLS FIRST/LAST, which are GoogleSQL's
+        // defaults for ASC and DESC.
         {"StatementTest::TestSqlIngestTemporalType::select-bulk-ingest",
          {"SELECT * FROM `bulk_ingest` ORDER BY `col` ASC NULLS FIRST",
           "SELECT * FROM `bulk_ingest` ORDER BY `col` ASC"}},
@@ -187,9 +182,8 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
         {"StatementTest::TestSqlPrepareUpdateStream::select-bulk-ingest",
          {"SELECT * FROM `bulk_ingest` ORDER BY `ints` ASC NULLS FIRST",
           "SELECT * FROM `bulk_ingest` ORDER BY `ints` ASC"}},
-        // Suite-internal DDL/DML in Spanner-valid form. The DDL needs only the
-        // native type names: a `CREATE TABLE` with no `PRIMARY KEY` clause is
-        // legal Spanner, keyed on the implicit hidden `rowid`.
+        // Suite-internal DDL/DML: native type names and explicit INSERT column
+        // lists. A table without a `PRIMARY KEY` clause is valid Spanner.
         {"StatementTest::TestSqlBind::create-table-bindtest",
          {"CREATE TABLE bindtest (col1 INTEGER, col2 TEXT)",
           "CREATE TABLE bindtest (col1 INT64, col2 STRING(MAX))"}},
@@ -212,11 +206,9 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
           "CREATE TABLE `delete_test` (foo INT64)"}},
     };
 
-    // The whole TestSqlIngestType family shares one call site whose query id is
-    // suffixed with the ingested Arrow type. All scalar types take the plain
-    // rewrite; a list column cannot be ORDER BY'd in GoogleSQL, so order by its
-    // first element instead (NULL rows order first, matching the expected
-    // NULL-then-ascending data of both list cases).
+    // TestSqlIngestType query ids end with the ingested Arrow type. GoogleSQL
+    // cannot ORDER BY an array, so list columns order by their first element,
+    // which matches the expected NULL-first ascending data.
     constexpr std::string_view kIngestTypePrefix =
         "StatementTest::TestSqlIngestType::select-bulk-ingest::";
     if (query_id.substr(0, kIngestTypePrefix.size()) == kIngestTypePrefix) {
@@ -235,13 +227,10 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
     return std::string(it->second.sql);
   }
 
-  // What the driver hands back when a column of ingested Arrow data is
-  // selected: Spanner's integer type is INT64, its narrowest float is FLOAT32
-  // (so a half-float widens into it), strings are STRING(MAX) and binary is
-  // BYTES(MAX), so the narrower/alternate Arrow layouts widen to the canonical
-  // Arrow type of the Spanner column (`bind::spanner_column_type` on the ingest
-  // side, `src/conversion.rs` on the readback side). Nested types recurse through the
-  // base class's SchemaField overload, mapping e.g. List<Int32> to List<Int64>.
+  // Ingested Arrow types read back as the canonical type of their Spanner
+  // column: INT64, FLOAT32 (for half floats), STRING(MAX) or BYTES(MAX). See
+  // `bind::spanner_column_type` for ingest and `src/conversion.rs` for reads.
+  // The base class's SchemaField overload applies this to nested types.
   ArrowType IngestSelectRoundTripType(ArrowType ingest_type) const override {
     switch (ingest_type) {
       case NANOARROW_TYPE_INT8:
@@ -266,10 +255,8 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
     }
   }
 
-  // The driver supports all four ingest modes; for the create modes it builds
-  // the table from the ingest data's Arrow schema, with no `PRIMARY KEY` clause
-  // (Spanner keys such a table on a hidden `rowid` of its own), so the created
-  // table's columns are exactly the ingested ones.
+  // Created tables have no `PRIMARY KEY` clause, so their columns are just the
+  // ingested ones.
   bool supports_bulk_ingest(const char* mode) const override {
     return std::strcmp(mode, "adbc.ingest.mode.append") == 0 ||
            std::strcmp(mode, "adbc.ingest.mode.create") == 0 ||
@@ -361,14 +348,10 @@ class SpannerStatementTest : public ::testing::Test,
   void TearDown() override { ASSERT_NO_FATAL_FAILURE(TearDownTest()); }
 
  protected:
-  // Value check for the temporal ingest cases (the base class deliberately
-  // FAILs). Only TIMESTAMP ingest reaches this: Duration ingest is unsupported
-  // (its case is excluded), so no other temporal type gets to the readback.
-  // The driver stores Arrow timestamps of any unit as Spanner TIMESTAMP and
-  // reads them back as Timestamp(Nanosecond, "UTC"), so the suite's raw
-  // {NULL, -42, 0, 42} inputs come back scaled from the source unit to
-  // nanoseconds (the timezone changes nothing — Arrow timestamps are
-  // epoch-anchored and the tz is metadata).
+  // The base class fails this check by default. Only TIMESTAMP ingest gets
+  // here, since Duration ingest is unsupported. Timestamps of any unit read
+  // back as Timestamp(Nanosecond, "UTC"), so the suite's {NULL, -42, 0, 42}
+  // come back scaled to nanoseconds; the timezone is only metadata.
   void ValidateIngestedTemporalData(struct ArrowArrayView* values, ArrowType type,
                                     enum ArrowTimeUnit unit,
                                     const char* /*timezone*/) override {

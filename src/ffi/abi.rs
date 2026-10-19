@@ -1,11 +1,7 @@
 //! The ADBC C ABI, transcribed from `arrow-adbc/c/include/arrow-adbc/adbc.h`.
 //!
-//! This module is declarations only: `#[repr(C)]` layouts, type aliases and constants. It holds no
-//! logic, so it can be diffed against the upstream header line by line. Everything that decides
-//! *what* to do lives in the sibling modules; this file only says what the wire format is.
-//!
-//! Field order in [`AdbcDriver`] is load-bearing: it is the vtable the driver manager indexes into.
-//! Do not reorder, and append only at the end, mirroring the header.
+//! Declarations only, so the file can be compared with the header. Field order in [`AdbcDriver`]
+//! is the vtable layout: never reorder it, and append only at the end, as upstream does.
 
 #![allow(
     non_snake_case,
@@ -29,8 +25,8 @@ use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 pub(crate) const ADBC_VERSION_1_0_0: c_int = 1_000_000;
 pub(crate) const ADBC_VERSION_1_1_0: c_int = 1_001_000;
 
-/// Sentinel in [`AdbcError::vendor_code`] marking the struct as 1.1.0-sized, so the 1.1.0 fields
-/// may be read and written. Callers that predate 1.1.0 leave a real vendor code (or zero) here.
+/// [`AdbcError::vendor_code`] value marking the struct as 1.1.0-sized. Only then do the 1.1.0
+/// fields exist.
 pub(crate) const ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA: i32 = i32::MIN;
 
 #[repr(C)]
@@ -96,8 +92,7 @@ pub(crate) struct AdbcPartitions {
     pub(crate) release: Option<unsafe extern "C" fn(*mut Self)>,
 }
 
-/// The driver vtable. Fields up to (excluding) `ErrorGetDetailCount` are ADBC 1.0.0; the remainder
-/// were added in 1.1.0. A `None` slot is a legal way to say "not implemented".
+/// The driver vtable. A `None` slot means "not implemented".
 #[repr(C)]
 pub(crate) struct AdbcDriver {
     pub(crate) private_data: *mut c_void,
@@ -475,16 +470,15 @@ pub(crate) struct AdbcDriver {
     >,
 }
 
-/// `offsetof(struct AdbcDriver, ErrorGetDetailCount)` — the number of bytes a 1.0.0 caller
-/// allocated, and therefore the most we may write when it asks for 1.0.0.
+/// `offsetof(struct AdbcDriver, ErrorGetDetailCount)`: the size of a 1.0.0 caller's allocation.
 pub(crate) const ADBC_DRIVER_1_0_0_SIZE: usize =
     std::mem::offset_of!(AdbcDriver, ErrorGetDetailCount);
 
-/// `offsetof(struct AdbcError, private_data)` — likewise for the error struct.
+/// `offsetof(struct AdbcError, private_data)`: the size of a 1.0.0 caller's allocation.
 pub(crate) const ADBC_ERROR_1_0_0_SIZE: usize = std::mem::offset_of!(AdbcError, private_data);
 
-/// `error.rs` writes the 1.0.0 prefix by casting to [`AdbcErrorV100`], which is only sound while
-/// that struct is exactly the prefix. Enforce it at compile time rather than trusting the reader.
+// `error.rs` writes 1.0.0 errors through `AdbcErrorV100`, which is sound only while it matches
+// the 1.0.0 prefix of `AdbcError`.
 const _: () = assert!(ADBC_ERROR_1_0_0_SIZE == size_of::<AdbcErrorV100>());
 
 #[cfg(test)]
@@ -493,8 +487,7 @@ mod tests {
 
     use super::*;
 
-    /// Check the exported `adbc_core` status constants against the C header so an incompatible
-    /// dependency change cannot silently alter this driver's ABI.
+    /// The status codes come from `adbc_core`; pin them to the header's values.
     #[test]
     fn status_codes_match_the_c_header() {
         assert_eq!(size_of::<AdbcStatusCode>(), 1);
@@ -542,17 +535,8 @@ mod tests {
         );
     }
 
-    /// Layout drift against the C header is silent memory corruption, so these are pinned to the
-    /// values the header itself produces on a 64-bit target, obtained by compiling
-    /// `arrow-adbc/c/include/arrow-adbc/adbc.h` and printing the macros and offsets:
-    ///
-    /// ```text
-    /// ADBC_DRIVER_1_0_0_SIZE=232   ADBC_DRIVER_1_1_0_SIZE=464
-    /// ADBC_ERROR_1_0_0_SIZE=32     ADBC_ERROR_1_1_0_SIZE=48
-    /// ```
-    ///
-    /// Sizes alone would not catch a pair of same-shaped fields being swapped, so interior offsets
-    /// are pinned too: one early in the 1.0.0 block, the last 1.0.0 slot, and the last slot of all.
+    /// Sizes and offsets printed by compiling adbc.h for a 64-bit target. The interior offsets
+    /// catch swapped fields of the same size, which the sizes alone would miss.
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn driver_vtable_matches_the_c_header() {

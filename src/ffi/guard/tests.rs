@@ -7,8 +7,6 @@ fn catches_a_panic_as_an_internal_error() {
     assert!(error.message.contains("kaboom"), "{}", error.message);
 }
 
-/// Both panic payload shapes `panic!` produces are rendered; anything else says so rather
-/// than reporting an empty message.
 #[test]
 fn renders_both_panic_payload_shapes() {
     assert_eq!(panic_message(&"borrowed"), "borrowed");
@@ -16,7 +14,6 @@ fn renders_both_panic_payload_shapes() {
     assert_eq!(panic_message(&7_u8), "unknown panic payload");
 }
 
-/// An interior NUL becomes a visible `?` rather than truncating what follows it.
 #[test]
 fn sanitized_cstring_replaces_interior_nuls_instead_of_truncating() {
     assert_eq!(
@@ -41,7 +38,7 @@ fn write_string_and_bytes_report_the_required_size_without_writing() {
     let mut buffer = [0_i8; 2];
     let mut length = buffer.len();
     unsafe { write_string("hello", buffer.as_mut_ptr(), &raw mut length) }.unwrap();
-    // "hello" plus NUL; nothing written because the buffer is too small.
+    // Too small: only the required size is reported.
     assert_eq!(length, 6);
     assert_eq!(buffer, [0, 0]);
 
@@ -54,7 +51,6 @@ fn write_string_and_bytes_report_the_required_size_without_writing() {
         "hello"
     );
 
-    // `write_bytes` follows the same protocol, without the trailing NUL.
     let mut buffer = [0_u8; 1];
     let mut length = buffer.len();
     unsafe { write_bytes(b"abc", buffer.as_mut_ptr(), &raw mut length) }.unwrap();
@@ -87,9 +83,8 @@ fn write_string_preserves_utf8_and_terminates_empty_values() {
     assert_eq!(buffer, [sentinel; 16]);
 }
 
-/// adbc.h promises that a reported length no larger than the one passed in means the value
-/// was written, so a null buffer claiming room has to be refused rather than answered `OK`.
-/// A null buffer of length zero is the size probe, and stays legal.
+/// Per adbc.h, a reported length within the caller's means the value was written, so a null
+/// buffer claiming room must be refused.
 #[test]
 fn a_null_buffer_is_a_size_probe_only_when_it_says_it_holds_nothing() {
     let mut length = 64;
@@ -108,7 +103,7 @@ fn a_null_buffer_is_a_size_probe_only_when_it_says_it_holds_nothing() {
     assert_eq!(length, 3);
     assert!(
         unsafe { write_bytes(b"", std::ptr::null_mut(), &raw mut length) }.is_err(),
-        "the length is now 3, so the null buffer claims room it does not have"
+        "the length is now 3"
     );
 }
 

@@ -1,8 +1,7 @@
 use super::*;
 use crate::ffi::test_support::{null, zeroed_error};
 
-/// Every operation slot in header order. This driver installs callbacks for unsupported
-/// operations too, so callers receive `NOT_IMPLEMENTED` from a populated slot.
+/// Every operation slot in header order, and whether it is populated.
 fn slots(table: &AdbcDriver) -> Vec<(&'static str, bool)> {
     macro_rules! slots {
         ($($field:ident),+ $(,)?) => {
@@ -88,9 +87,8 @@ fn populates_a_1_1_0_vtable() {
     assert_eq!(status, ADBC_STATUS_OK);
     let table = unsafe { table.assume_init() };
     let slots = slots(&table);
-    // The list above must cover the struct, or a field added to `AdbcDriver` and forgotten in
-    // `vtable()` would be swept by a test that never looks at it. Everything in the struct but
-    // `private_data`, `private_manager` and `release` is a slot.
+    // Catch a field added to `AdbcDriver` but not to `slots`. All but the first three fields are
+    // slots.
     assert_eq!(
         slots.len(),
         size_of::<AdbcDriver>() / size_of::<*const c_void>() - 3,
@@ -101,12 +99,9 @@ fn populates_a_1_1_0_vtable() {
     }
 }
 
-/// The 1.0.0 prefix must be as complete as the 1.1.0 table within its own bounds: a caller
-/// that asked for 1.0.0 gets every slot it knows about, and the tail is left alone (see
-/// `writes_only_the_prefix_for_a_1_0_0_caller`).
 #[test]
 fn populates_every_slot_a_1_0_0_caller_can_see() {
-    // Allocated at the 1.1.0 size so the tail can be inspected, but declared as 1.0.0.
+    // Allocated at the 1.1.0 size so the tail can be inspected.
     let mut table = std::mem::MaybeUninit::<AdbcDriver>::zeroed();
     let mut error = zeroed_error();
     assert_eq!(
@@ -123,22 +118,14 @@ fn populates_every_slot_a_1_0_0_caller_can_see() {
     for (name, populated) in slots(&table).into_iter().take(PREFIX_SLOTS) {
         assert!(populated, "{name} is missing from the 1.0.0 prefix");
     }
-    // Everything past the prefix stays as the caller left it, which here is zeroed.
     for (name, populated) in slots(&table).into_iter().skip(PREFIX_SLOTS) {
         assert!(!populated, "{name} was written past the 1.0.0 prefix");
     }
 }
 
-/// Populated slots are not necessarily the *right* slots: `vtable()` is a struct literal, and
-/// two entry points of the same signature can be transposed in it without the compiler or an
-/// `is_some()` sweep noticing. The database and connection lifecycle and option slots are
-/// therefore driven through the table and checked by what they do.
-///
-/// `DatabaseNew`/`DatabaseInit`/`DatabaseRelease` are the transposable database trio (all
-/// `(handle, error)`); the eight option slots are type-distinct in Rust, so this covers them
-/// as a working-through-the-table check rather than an anti-transposition one. The
-/// connection's `Commit`/`Rollback`/`Cancel` share a signature too, but on a pre-init
-/// connection all three report the same refusal, so nothing here can tell them apart.
+/// Entry points with the same signature could be transposed in `vtable()` without the compiler
+/// noticing, so drive the database and connection lifecycle and option slots through the table
+/// and check their effects. (`Commit`, `Rollback` and `Cancel` behave identically before `Init`.)
 #[test]
 fn the_vtable_slots_do_what_their_names_say() {
     use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
@@ -169,10 +156,8 @@ fn the_vtable_slots_do_what_their_names_say() {
     );
     assert!(!database.private_data.is_null());
 
-    // The four typed setters, each with its own key, checked by the payload each one buffered: a
-    // slot wired to the wrong decoder would record the wrong variant. The values are deliberately
-    // mistyped for their keys, which pre-`Init` is fine — the buffer records what it was handed
-    // and the replay at `Init` is what validates it.
+    // Each typed setter buffers its own variant, so a miswired slot shows up as the wrong
+    // payload. Values need not suit their keys: nothing is validated before `Init`.
     let uri = name(adbc_core::constants::ADBC_OPTION_URI);
     let endpoint = name(crate::OPTION_ENDPOINT);
     let emulator = name(crate::OPTION_EMULATOR);
@@ -239,7 +224,7 @@ fn the_vtable_slots_do_what_their_names_say() {
     );
     assert!(database.private_data.is_null());
 
-    // The same sweep for the connection's four typed setters.
+    // The same for the connection.
     let mut connection = abi::AdbcConnection {
         private_data: null(),
         private_driver: null(),
@@ -310,9 +295,8 @@ fn the_vtable_slots_do_what_their_names_say() {
     assert!(matches!(buffered[2].1, OptionValue::Double(v) if v == 1.5));
     assert!(matches!(&buffered[3].1, OptionValue::Bytes(v) if v == b"z"));
 
-    // The four connection getters all refuse a pre-init connection -- as `NOT_FOUND`, the
-    // one failure adbc.h documents for them -- which is the most a handle without a
-    // reachable service can show.
+    // Before `Init` all four getters report NOT_FOUND, which is as far as they get without a
+    // backend.
     let mut length = 0_usize;
     let mut integer = 0_i64;
     let mut double = 0_f64;
@@ -361,8 +345,6 @@ fn the_vtable_slots_do_what_their_names_say() {
     assert!(connection.private_data.is_null());
 }
 
-/// A 1.0.0 caller allocates only the prefix. Writing past it would corrupt whatever follows,
-/// so the bytes after the prefix must be left exactly as they were.
 #[test]
 fn writes_only_the_prefix_for_a_1_0_0_caller() {
     let mut buffer = [0xAA_u8; size_of::<AdbcDriver>()];

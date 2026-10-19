@@ -7,8 +7,7 @@ use super::*;
 use crate::ffi::test_support::null;
 use adbc_core::options::OptionDatabase;
 
-/// A cancel handle that records whether it fired, standing in for the driver's
-/// `OperationCancelHandle`.
+/// A cancel handle that records whether it fired.
 struct RecordingCancel(Arc<AtomicBool>);
 
 impl CancelHandle for RecordingCancel {
@@ -56,7 +55,6 @@ fn a_panicking_call_poisons_only_that_object() {
         unsafe { dispatch::<u32, _>(first, "statement", null(), |_| panic!("inside the driver")) };
     assert_eq!(status, AdbcStatusCode::from(Status::Internal));
 
-    // The panicking object refuses further work.
     let status = unsafe {
         dispatch::<u32, _>(first, "statement", null(), |state| {
             *state = 1;
@@ -65,7 +63,7 @@ fn a_panicking_call_poisons_only_that_object() {
     };
     assert_eq!(status, AdbcStatusCode::from(Status::Internal));
 
-    // An unrelated object remains usable.
+    // Another object is unaffected.
     let status = unsafe {
         dispatch::<u32, _>(second, "statement", null(), |state| {
             *state = 1;
@@ -120,8 +118,7 @@ fn a_panicking_call_also_poisons_borrowed_handles() {
     }
 }
 
-/// A cancel handle that parks inside `try_cancel` until the test releases it, so a `Release` can
-/// provably land while a cancel is still running.
+/// A cancel handle that blocks in `try_cancel` until the test resumes it.
 struct BlockingCancel {
     entered: Sender<()>,
     resume: StdMutex<Receiver<()>>,
@@ -139,8 +136,7 @@ impl CancelHandle for BlockingCancel {
     }
 }
 
-/// Once cancellation has acquired an owned reference, releasing the handle must not free the
-/// mutex it holds. Callers must still synchronize initial acquisition with release.
+/// Once cancellation holds an owned reference, `Release` must not free the object under it.
 #[test]
 fn a_release_during_a_cancel_does_not_free_the_object_under_it() {
     let (entered_sender, entered_receiver) = channel::<()>();
@@ -157,7 +153,7 @@ fn a_release_during_a_cancel_does_not_free_the_object_under_it() {
     let canceller = std::thread::spawn(move || unsafe {
         cancel::<u32>(address as *mut c_void, "statement", null())
     });
-    // The cancel is provably inside `try_cancel`, holding a guard on the object's cancel mutex.
+    // The cancel is now inside `try_cancel`, holding the cancel mutex.
     entered_receiver.recv().expect("test channel");
 
     let mut slot = slot;
@@ -167,12 +163,10 @@ fn a_release_during_a_cancel_does_not_free_the_object_under_it() {
     );
     assert!(slot.is_null());
 
-    // The in-flight cancel still owns a live object, and finishing it is what frees it.
+    // Finishing the cancel frees the object.
     resume_sender.send(()).expect("test channel");
     assert_eq!(canceller.join().expect("cancel thread"), ADBC_STATUS_OK);
 
-    // The handle is spent either way: the slot is null, so a later call reports rather than
-    // reaching the object the cancel has since dropped.
     assert_eq!(
         unsafe { cancel::<u32>(slot, "statement", null()) },
         AdbcStatusCode::from(Status::InvalidState)
@@ -209,7 +203,6 @@ fn dispatching_on_a_released_handle_is_an_invalid_state() {
         ADBC_STATUS_OK
     );
     assert!(slot.is_null());
-    // A second release must report, not double free.
     assert_eq!(
         unsafe { release::<u32>(&mut slot, "database", null()) },
         AdbcStatusCode::from(Status::InvalidState)
@@ -220,9 +213,7 @@ fn dispatching_on_a_released_handle_is_an_invalid_state() {
     );
 }
 
-/// The primary Cancel scenario from adbc.h: one thread is blocked inside an operation, and
-/// another thread cancels it. Cancel must neither wait for the dispatch turn nor misreport the
-/// busy object.
+/// The main `Cancel` use case in adbc.h: one thread blocks in a call while another cancels it.
 #[test]
 fn cancel_does_not_wait_for_a_held_dispatch_turn() {
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -243,7 +234,7 @@ fn cancel_does_not_wait_for_a_held_dispatch_turn() {
     });
     started_receiver.recv().unwrap();
 
-    // The dispatch turn is provably held; cancel must still complete immediately.
+    // The state lock is held; cancel must not wait for it.
     let status = unsafe { cancel::<u32>(slot, "statement", null()) };
     assert_eq!(status, ADBC_STATUS_OK);
     assert!(cancelled.load(Ordering::SeqCst));
@@ -255,7 +246,7 @@ fn cancel_does_not_wait_for_a_held_dispatch_turn() {
     unsafe { release::<u32>(&mut slot, "statement", null()) };
 }
 
-/// A call arriving while another holds the dispatch turn waits for it and then succeeds.
+/// A call made while another holds the state lock waits for it, then succeeds.
 #[test]
 fn a_call_blocked_behind_a_dispatch_turn_completes_instead_of_failing() {
     let slot = Exported::into_private_data(7_u32);
@@ -272,7 +263,7 @@ fn a_call_blocked_behind_a_dispatch_turn_completes_instead_of_failing() {
     });
     started_receiver.recv().unwrap();
 
-    // Issued while the turn is definitely held, mimicking GetOption during a slow query.
+    // Like a GetOption during a slow query.
     let second = std::thread::spawn(move || unsafe {
         dispatch::<u32, _>(address as *mut c_void, "statement", null(), |state| {
             assert_eq!(*state, 7);
@@ -288,7 +279,6 @@ fn a_call_blocked_behind_a_dispatch_turn_completes_instead_of_failing() {
     unsafe { release::<u32>(&mut slot, "statement", null()) };
 }
 
-/// Ordinary calls on one handle must serialize access to its state.
 #[test]
 fn concurrent_dispatches_serialize_instead_of_racing() {
     const THREADS: usize = 8;
@@ -333,7 +323,6 @@ fn cancel_still_works_after_a_panic_poisoned_the_object() {
         unsafe { dispatch::<u32, _>(slot, "statement", null(), |_| panic!("inside the driver")) };
     assert_eq!(status, AdbcStatusCode::from(Status::Internal));
 
-    // Dispatches are refused, but cancelling what the panicked call left behind still works.
     let status = unsafe { cancel::<u32>(slot, "statement", null()) };
     assert_eq!(status, ADBC_STATUS_OK);
     assert!(cancelled.load(Ordering::SeqCst));
@@ -344,12 +333,11 @@ fn cancel_still_works_after_a_panic_poisoned_the_object() {
 
 #[test]
 fn cancel_without_an_installed_handle_is_an_invalid_state() {
-    // Null and released slots report as uninitialized...
     assert_eq!(
         unsafe { cancel::<u32>(null(), "connection", null()) },
         AdbcStatusCode::from(Status::InvalidState)
     );
-    // ...and a live object whose init has not installed a handle yet reports likewise.
+    // A live object whose `Init` has not installed a handle yet.
     let slot = Exported::into_private_data(0_u32);
     assert_eq!(
         unsafe { cancel::<u32>(slot, "connection", null()) },

@@ -1,12 +1,12 @@
-//! How an exported object is represented behind `private_data`, and how entry points reach it.
+//! The object behind each handle's `private_data`, and how entry points reach it.
 //!
-//! Each handle owns an [`Arc<Exported<S>>`]. Calls serialize through its state mutex, and a panic
-//! poisons every state locked by that call. [`cancel`] uses a separate lock so it can interrupt a
-//! blocked operation.
+//! Each handle owns an [`Arc<Exported<S>>`]. Calls serialize on its state mutex, and a panic
+//! poisons every state the panicking call locked. [`cancel`] uses a separate lock so it can
+//! interrupt a blocked call.
 //!
-//! Callers must exclude `Release` from all other calls, including `Cancel`: reading the caller's
-//! `private_data` and acquiring an owned reference are not atomic. Once acquired, the cancel
-//! reference keeps the state alive until cancellation completes.
+//! Callers must not overlap `Release` with any other call, including `Cancel`: reading
+//! `private_data` and taking a reference are not atomic. Once taken, the cancel reference keeps
+//! the state alive until cancellation returns.
 
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
@@ -20,13 +20,12 @@ use super::abi::{ADBC_STATUS_OK, AdbcError, AdbcStatusCode};
 use super::error::export_error;
 use super::guard::catch;
 
-/// Options accumulated before init, retaining each key's last value and position.
+/// Options set before `Init`, ordered by each key's latest set.
 ///
-/// Position matters because a URI can also set individual options: an explicit endpoint set
-/// after a URI must be applied after it, even if that endpoint was set earlier too.
+/// Order matters because a URI expands into individual options: an endpoint set after the URI
+/// must override it, even if the endpoint was also set before.
 pub(crate) struct OptionBuffer<K> {
-    /// Cloned rather than taken by the fallible constructors, so a failed `Init` keeps the
-    /// options and the handle can be initialized again.
+    /// Cloned, not taken, by `Init`, so a failed `Init` can be retried.
     pub(super) entries: Vec<(K, OptionValue)>,
 }
 
@@ -43,15 +42,14 @@ impl<K: PartialEq> OptionBuffer<K> {
     }
 }
 
-/// An exported object is either still collecting options or fully initialized. ADBC splits
-/// construction across `New`/`SetOption`/`Init`, and the driver's own constructors want all the
-/// options at once, so the pre-init options are buffered until `Init`.
+/// A database or connection before or after `Init`. ADBC splits construction across
+/// `New`/`SetOption`/`Init`, while the driver's constructors take all options at once.
 pub(crate) enum Staged<K, S> {
     Pending(OptionBuffer<K>),
     Ready(S),
 }
 
-/// A fresh handle is pending with an empty option buffer, which is what `New` installs.
+/// The state `New` installs.
 impl<K: PartialEq, S> Default for Staged<K, S> {
     fn default() -> Self {
         Self::Pending(OptionBuffer {
@@ -61,7 +59,7 @@ impl<K: PartialEq, S> Default for Staged<K, S> {
 }
 
 impl<K: PartialEq, S> Staged<K, S> {
-    /// The initialized state, or the uniform refusal for an object that has none.
+    /// The initialized state, or `InvalidState` before `Init`.
     pub(crate) fn ready(&mut self, kind: &str) -> Result<&mut S> {
         match self {
             Self::Ready(state) => Ok(state),
@@ -69,8 +67,7 @@ impl<K: PartialEq, S> Staged<K, S> {
         }
     }
 
-    /// The mirror of [`Self::ready`]: the options buffered before `Init`, for the entry point
-    /// that performs it.
+    /// The buffered options, or `InvalidState` after `Init`.
     pub(crate) fn pending(&mut self, kind: &str) -> Result<&mut OptionBuffer<K>> {
         match self {
             Self::Pending(options) => Ok(options),
@@ -82,30 +79,27 @@ impl<K: PartialEq, S> Staged<K, S> {
     }
 }
 
-/// The contents of an exported handle's `private_data`.
+/// What a handle's `private_data` points to.
 ///
-/// The raw pointer the caller holds is shared freely between its threads, so everything here is
-/// reached through `&Exported<S>` and interior mutability; forming a `&mut` to the whole struct
-/// would alias when two calls overlap, which adbc.h explicitly permits for `Cancel` and the
-/// option getters.
+/// The caller may share the handle between threads, so everything is reached through
+/// `&Exported<S>` and interior mutability. A `&mut` to the whole struct would alias when calls
+/// overlap, which adbc.h permits for `Cancel` and the option getters.
 pub(crate) struct Exported<S> {
-    /// The object's cancel handle, populated once the state is initialized. Kept beside — not
-    /// inside — the state so [`cancel`] can reach the driver's thread-safe cancellation machinery
-    /// while another call holds the state lock.
+    /// Set once the state is initialized. Kept outside `state` so [`cancel`] works while another
+    /// call holds the state lock.
     cancel: Mutex<Option<Box<dyn CancelHandle>>>,
-    /// The driver object itself. Every call that touches it takes this lock, so overlapping calls
-    /// serialize instead of racing; [`cancel`] bypasses it.
+    /// Taken by every call except [`cancel`].
     state: Mutex<S>,
 }
 
-// Raw FFI pointers bypass these trait checks at call sites. Keep a compile-time assertion that
-// adding a field cannot make sharing a handle between caller threads unsound.
+// Raw pointers bypass `Send`/`Sync` checks at call sites. Fail to compile if a new field makes
+// sharing a handle between threads unsound.
 fn _exported_is_shareable<S: Send>(exported: &Exported<S>) -> &(dyn Send + Sync) {
     exported
 }
 
-// `S: Send` because the caller may create the object on one thread and use it from another; the
-// mutex already prevents concurrent access, so `Sync` is not required of the state itself.
+// `S: Send` because the caller may use the object from several threads; the mutex prevents
+// concurrent access, so `S: Sync` is not needed.
 impl<S: Send> Exported<S> {
     pub(crate) fn into_private_data(state: S) -> *mut c_void {
         Self::into_private_data_with_cancel(state, None)
@@ -127,15 +121,14 @@ impl<S: Send> Exported<S> {
 }
 
 impl<S> Exported<S> {
-    /// Take the state lock, refusing a poisoned object.
-    ///
-    /// This also rejects a state borrowed by another handle's call when that call panicked.
+    /// Take the state lock, refusing a state poisoned by a panic, including one in another
+    /// handle's call that borrowed it.
     fn lock_state(&self, kind: &str) -> Result<MutexGuard<'_, S>> {
         self.state.lock().map_err(|_| poisoned(kind))
     }
 }
 
-/// A null slot, pending state or missing cancel handle is not usable yet, or has been released.
+/// For a null slot, a pending state or a missing cancel handle.
 #[cold]
 #[inline(never)]
 fn uninitialized(kind: &str) -> Error {
@@ -154,9 +147,7 @@ fn poisoned(kind: &str) -> Error {
     )
 }
 
-/// Borrow the object behind `slot` without taking a reference of one's own.
-///
-/// The caller must prevent `Release` from overlapping the borrow.
+/// Borrow the object behind `slot` without taking a reference count.
 ///
 /// # Safety
 /// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
@@ -165,10 +156,8 @@ unsafe fn borrowed<'a, S>(slot: *mut c_void, kind: &str) -> Result<&'a Exported<
     unsafe { slot.cast::<Exported<S>>().as_ref() }.ok_or_else(|| uninitialized(kind))
 }
 
-/// Take a reference of one's own to the object behind `slot`, keeping it alive independently of
-/// the handle.
-///
-/// Used by [`cancel`] to retain the state for the duration of cancellation.
+/// Take an owned reference to the object behind `slot`, which keeps it alive through a later
+/// `Release`.
 ///
 /// # Safety
 /// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
@@ -208,10 +197,8 @@ where
     finish(outcome, error)
 }
 
-/// Cancel the object's in-flight operation without taking its state lock.
-///
-/// Uses the separate cancel lock, including after the state has been poisoned, so a blocked or
-/// panicked operation can still be cancelled.
+/// Cancel the object's in-flight operation without taking its state lock, so a blocked call can
+/// be cancelled, even after a panic poisoned the state.
 ///
 /// # Safety
 /// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
@@ -222,7 +209,7 @@ pub(crate) unsafe fn cancel<S>(
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
     let outcome = catch(|| {
-        // A reference of this call's own, not the handle's: see [`strong`].
+        // Owned, so a `Release` after this point cannot free the object mid-cancel.
         let exported = unsafe { strong::<S>(slot, kind) }?;
         let handle = exported
             .cancel
@@ -236,8 +223,8 @@ pub(crate) unsafe fn cancel<S>(
     finish(outcome, error)
 }
 
-/// Install cancellation before publishing an initialized state. Statements supply the cancel
-/// handle at construction through [`Exported::into_private_data_with_cancel`] instead.
+/// Install the cancel handle of a newly initialized state. Statements pass theirs to
+/// [`Exported::into_private_data_with_cancel`] instead.
 ///
 /// # Safety
 /// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
@@ -253,8 +240,8 @@ pub(crate) unsafe fn install_cancel_handle<S>(slot: *mut c_void, handle: Box<dyn
 
 /// Lock the state behind `slot` without dispatching a call on it.
 ///
-/// `AdbcConnectionInit` borrows its database and `AdbcStatementNew` borrows its connection.
-/// Both must serialize with calls on the borrowed object and propagate mutex poisoning.
+/// `AdbcConnectionInit` borrows its database and `AdbcStatementNew` its connection; both must
+/// serialize with calls on the borrowed object and respect its poisoning.
 ///
 /// # Safety
 /// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
@@ -263,10 +250,8 @@ pub(crate) unsafe fn lock_state<'a, S>(slot: *mut c_void, kind: &str) -> Result<
     unsafe { borrowed::<S>(slot, kind) }?.lock_state(kind)
 }
 
-/// Drop the handle's reference to the object and null the slot out, so a second release is an
-/// error rather than a double free.
-///
-/// An already acquired cancel reference can defer destruction until cancellation finishes.
+/// Drop the handle's reference and null the slot, so a second release is an error instead of a
+/// double free. An in-flight [`cancel`] can defer destruction until it returns.
 ///
 /// # Safety
 /// `slot` must point to a handle field holding null or a pointer produced by
@@ -280,8 +265,7 @@ pub(crate) unsafe fn release<S>(
     if taken.is_null() {
         return finish(Err(uninitialized(kind)), error);
     }
-    // Dropping driver state can run arbitrary code (closing clients, joining tasks), so it is
-    // contained like any other call.
+    // Dropping driver state runs arbitrary code, such as closing clients.
     let outcome = catch(|| {
         drop(unsafe { Arc::from_raw(taken.cast_const().cast::<Exported<S>>()) });
         Ok(())
@@ -295,8 +279,8 @@ pub(crate) fn finish(result: Result<()>, error: *mut AdbcError) -> AdbcStatusCod
         Ok(()) => ADBC_STATUS_OK,
         Err(failure) => {
             let status = AdbcStatusCode::from(failure.status);
-            // Exporting can run the caller's previous release callback. Contain panics while
-            // preserving the original status; error details may be unavailable on failure.
+            // Exporting can run the caller's previous release callback. If that panics, the
+            // status still reports the original failure.
             let contained = catch(|| {
                 unsafe { export_error(error, failure) };
                 Ok(())

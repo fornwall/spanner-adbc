@@ -1,10 +1,6 @@
-//! Tests for the statement entry points.
-//!
-//! A statement is live from the moment `AdbcStatementNew` builds it, and building one means
-//! building a Spanner `DatabaseClient` — which opens a session with a real `CreateSession` RPC.
-//! There is therefore no offline stand-in for a live statement, so what is exercised here is
-//! everything that comes *before* one: argument validation, the released-handle refusals, the
-//! partition export, and the Arrow C stream/array import a bound stream goes through.
+//! Creating a statement requires a connection, which opens a session with a real RPC. These
+//! tests cover what needs no live statement: argument validation, released handles, partition
+//! export and bound stream import.
 
 use std::ffi::{CString, c_int};
 use std::sync::Arc;
@@ -23,8 +19,7 @@ use crate::ffi::test_support::null;
 
 const TARGET_TABLE: &str = "adbc.ingest.target_table";
 
-/// The shape a caller sees after `AdbcStatementRelease`, and the shape of a zeroed struct that
-/// was never passed to `AdbcStatementNew`.
+/// A statement after `AdbcStatementRelease`, or one never passed to `AdbcStatementNew`.
 fn released_handle() -> AdbcStatement {
     AdbcStatement {
         private_data: null(),
@@ -40,14 +35,14 @@ type GetSchema = unsafe extern "C" fn(*mut FFI_ArrowArrayStream, *mut FFI_ArrowS
 type GetNext = unsafe extern "C" fn(*mut FFI_ArrowArrayStream, *mut FFI_ArrowArray) -> c_int;
 type GetLastError = unsafe extern "C" fn(*mut FFI_ArrowArrayStream) -> *const c_char;
 
-/// Rebuilds `stream` with the given callbacks swapped in, keeping its private data and release.
+/// Rebuild `stream` with the given callbacks swapped in, keeping its private data and release.
 fn replace_callbacks(
     stream: FFI_ArrowArrayStream,
     get_schema: Option<GetSchema>,
     get_next: Option<GetNext>,
     get_last_error: Option<GetLastError>,
 ) -> FFI_ArrowArrayStream {
-    // Ownership of the private data moves to the rebuilt stream, so the original must not drop.
+    // The rebuilt stream takes over the private data.
     let stream = std::mem::ManuallyDrop::new(stream);
     // SAFETY: the replacements only ignore or write their outputs; the retained release still
     // matches the retained private data.
@@ -72,8 +67,7 @@ fn rejects_a_null_statement_handle() {
         unsafe { release_handle::<AdbcStatement>(null(), null()) },
         AdbcStatusCode::from(Status::InvalidArguments)
     );
-    // Everything that goes through `with_state` treats a null handle as an uninitialized one,
-    // because that is exactly what it is.
+    // Entry points using `with_state` treat a null handle as uninitialized.
     assert_eq!(
         unsafe { statement_prepare(null(), null()) },
         AdbcStatusCode::from(Status::InvalidState)
@@ -286,8 +280,7 @@ fn imported_streams_reject_null_rows_and_mismatched_column_counts() {
     }
 }
 
-/// A value long enough to live in a data buffer rather than inline in its view, holding bytes no
-/// `str` may hold.
+/// A struct with one non-UTF-8 value, long enough to be stored out of line from its view.
 fn out_of_line_non_utf8_struct() -> arrow_data::ArrayData {
     use arrow_array::BinaryViewArray;
     use arrow_schema::{DataType, Field};
@@ -301,17 +294,12 @@ fn out_of_line_non_utf8_struct() -> arrow_data::ArrayData {
     .to_data()
 }
 
-/// Arrow's C data interface importer ends in `ArrayData::new_unchecked`, so a producer's offsets,
-/// view headers and UTF-8 are its own word until the driver checks them. Consumers cannot check
-/// them for it: `GenericByteViewArray::value` resolves a view through `buffers.get_unchecked`, and
-/// the byte-array families build a `&str` through `from_bytes_unchecked`, so a malformed array is
-/// undefined behavior downstream rather than a panic that could be reported.
+/// Arrow's C importer skips validation, while safe accessors such as `StringViewArray::value`
+/// assume valid data, so a malformed import would be undefined behavior downstream.
 ///
-/// A view whose buffer index or offset addresses bytes the array never held cannot be built
-/// through any safe arrow API, and `build_unchecked` would state a safety contract the data
-/// breaks. Delivering a `BinaryView` array under a declared `Utf8View` schema reaches the same
-/// guard safely: the two layouts are byte-identical, every buffer is genuinely present and
-/// correctly sized, and only the one invariant `from_bytes_unchecked` rests on is false.
+/// An out-of-bounds view cannot be built through a safe API, so this sends `BinaryView` data
+/// under a `Utf8View` schema instead: the layouts are identical and only the UTF-8 invariant is
+/// broken.
 #[test]
 fn imported_arrays_are_validated_and_name_the_column_that_fails() {
     use arrow_schema::{DataType, Field};
@@ -327,7 +315,6 @@ fn imported_arrays_are_validated_and_name_the_column_that_fails() {
 
     let declared = vec![Field::new("payload", DataType::Utf8View, false)];
 
-    // The bound-stream path: every batch the producer yields is checked, not just the first.
     let stream = FFI_ArrowArrayStream::new(Box::new(RecordBatchIterator::new(
         std::iter::empty(),
         Arc::new(Schema::new(declared)),
@@ -355,8 +342,7 @@ fn exported_partitions_expose_their_payloads_and_release_idempotently() {
         let pointer = unsafe { *exported.partitions.add(index) };
         let length = unsafe { *exported.partition_lengths.add(index) };
         assert_eq!(length, expected.len(), "partition {index}");
-        // An empty `Vec` yields a dangling pointer that must not be dereferenced; the zero
-        // length already says everything the caller needs.
+        // An empty payload's pointer is unspecified.
         if expected.is_empty() {
             continue;
         }
@@ -375,13 +361,11 @@ fn exported_partitions_expose_their_payloads_and_release_idempotently() {
     assert_eq!(exported.num_partitions, 0);
     assert!(exported.release.is_none());
 
-    // The header lets a caller release twice; the second call must be a no-op, not a
-    // double free of the payload box.
+    // adbc.h allows a second release, which must be a no-op.
     unsafe { release(&raw mut exported) };
     assert!(exported.private_data.is_null());
     assert_eq!(exported.num_partitions, 0);
 
-    // A null argument is likewise tolerated.
     unsafe { release(null()) };
 }
 
@@ -390,8 +374,7 @@ fn exporting_no_partitions_still_releases_cleanly() {
     let mut exported = export_partitions(Vec::new());
     assert_eq!(exported.num_partitions, 0);
     assert!(!exported.private_data.is_null());
-    // An empty `Vec`'s `as_mut_ptr` is a dangling non-null address, which a defensive or
-    // sanitizer-instrumented driver manager reads as a real array of length zero.
+    // Not an empty `Vec`'s dangling pointer.
     assert!(exported.partitions.is_null());
     assert!(exported.partition_lengths.is_null());
     let release = exported.release.unwrap();
@@ -399,8 +382,7 @@ fn exporting_no_partitions_still_releases_cleanly() {
     assert!(exported.private_data.is_null());
 }
 
-/// The pointer array must describe the payloads the box owns, not copies that were dropped on
-/// the way out of `export_partitions`.
+/// The exported pointers must point into the payloads the box owns, not dropped copies.
 #[test]
 fn exported_partitions_point_into_the_owned_payloads() {
     let payloads = vec![vec![9_u8; 4096]];
