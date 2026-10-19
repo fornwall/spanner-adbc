@@ -274,6 +274,14 @@ impl SpannerDatabase {
                 )));
             }
         }
+        // Emulator mode has no default address. Without one the client dials production
+        // anonymously and fails with a confusing authentication error.
+        if emulator && endpoint.is_none() {
+            return Err(invalid_state(
+                "spanner.emulator=true needs an endpoint: set spanner.endpoint, a host:port in \
+                 the URI, or SPANNER_EMULATOR_HOST",
+            ));
+        }
 
         // Without a credential option, Omni and plaintext endpoints connect anonymously instead
         // of through ADC. Building ADC just to carry a quota project would send Google tokens to

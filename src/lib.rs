@@ -414,8 +414,8 @@ pub const OPTION_ENDPOINT: &str = "spanner.endpoint";
 
 /// Database option: when `true`, connect with anonymous credentials, as the Spanner emulator
 /// expects. Enabled automatically when `SPANNER_EMULATOR_HOST` is set. Combining it with an
-/// explicit credential option or [`OPTION_QUOTA_PROJECT`] fails at connect time instead of
-/// silently ignoring them.
+/// explicit credential option or [`OPTION_QUOTA_PROJECT`], or using it without an endpoint,
+/// fails at connect time.
 pub const OPTION_EMULATOR: &str = "spanner.emulator";
 
 /// Database option: `cloud` (default) or `omni`. Omni requires an explicit [`OPTION_ENDPOINT`],

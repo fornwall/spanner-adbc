@@ -369,3 +369,31 @@ fn a_blank_endpoint_unsets_it() {
         assert_eq!(db.resolve_target(None).unwrap().endpoint, None);
     }
 }
+
+#[test]
+fn emulator_mode_without_an_endpoint_is_rejected() {
+    let mut db = new_database();
+    db.set_option(
+        OptionDatabase::Uri,
+        OptionValue::String(
+            "spanner:///projects/p/instances/i/databases/d?spanner.emulator=true".into(),
+        ),
+    )
+    .unwrap();
+    let error = db.resolve_target(None).unwrap_err();
+    assert_eq!(error.status, Status::InvalidState);
+    assert!(
+        error.message.contains("needs an endpoint"),
+        "{}",
+        error.message
+    );
+
+    let target = db.resolve_target(Some("localhost:9010")).unwrap();
+    assert_eq!(target.endpoint.as_deref(), Some("http://localhost:9010"));
+    db.set_option(
+        OptionDatabase::Other(OPTION_ENDPOINT.into()),
+        "localhost:9010".into(),
+    )
+    .unwrap();
+    assert!(db.resolve_target(None).unwrap().emulator);
+}

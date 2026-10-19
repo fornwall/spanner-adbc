@@ -55,7 +55,7 @@ connections keep theirs. Getters don't show values taken from the environment.
 | --- | --- | --- | --- | --- |
 | `uri` | `spanner://` URI | required | set, verbatim | Database path plus optional endpoint and options; see [connection URIs](#connection-uris). Without it, creating a connection fails with `InvalidState`. |
 | `spanner.endpoint` | gRPC endpoint URL; `""` unsets | production endpoint | set | Overrides the endpoint from `SPANNER_EMULATOR_HOST`. A bare `host:port` uses `http://`. Only `https://` uses TLS; other schemes are plaintext. |
-| `spanner.emulator` | boolean | `false` | always | Uses anonymous credentials. The emulator's address still comes from `spanner.endpoint` or `SPANNER_EMULATOR_HOST`. A non-empty `SPANNER_EMULATOR_HOST` also enables this mode. |
+| `spanner.emulator` | boolean | `false` | always | Uses anonymous credentials. The emulator's address still comes from `spanner.endpoint` or `SPANNER_EMULATOR_HOST`; with neither, connecting fails with `InvalidState`. A non-empty `SPANNER_EMULATOR_HOST` also enables this mode. |
 | `spanner.instance_type` | `cloud`, `omni` | `cloud` | always | Selects Cloud Spanner or Spanner Omni. Omni needs an explicit endpoint, ignores `SPANNER_EMULATOR_HOST` and can't be combined with `spanner.emulator=true`. Without explicit credentials, Omni connects anonymously; see [anonymous connections](#anonymous-connections). |
 | `spanner.auth.keyfile` | credential JSON file path | ADC | set | Supports `service_account`, `authorized_user`, `impersonated_service_account` and `external_account` JSON. |
 | `spanner.auth.keyfile_json` | inline credential JSON | ADC | write-only | Same formats as `keyfile`, and takes precedence over it. Not allowed in URIs. |
