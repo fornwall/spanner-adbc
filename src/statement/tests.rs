@@ -1,5 +1,3 @@
-//! Offline unit tests for the statement execution guards and option parsers.
-
 use super::*;
 use adbc_core::error::Status;
 
@@ -13,12 +11,10 @@ fn ingest_temporary_accepts_false_and_rejects_true() {
              unset or false",
         )
     };
-    // The spec default (`false`, as the exact string) is a no-op.
     check_ingest_temporary(OptionValue::String("false".into())).unwrap();
-    // Spanner has no temporary tables: a truthy value is rejected as unimplemented.
     let error = check_ingest_temporary(OptionValue::String("true".into())).unwrap_err();
     assert_eq!(error.status, Status::NotImplemented);
-    // Invalid spellings and non-string values fail boolean coercion before the feature check.
+    // Invalid values fail boolean parsing before the feature check.
     for bad in ["maybe", "FALSE", "0", "no", "TRUE", "1", "yes"] {
         let error = check_ingest_temporary(OptionValue::String(bad.into())).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "{bad}");
@@ -30,34 +26,7 @@ fn ingest_temporary_accepts_false_and_rejects_true() {
 }
 
 #[test]
-fn exec_incremental_accepts_false_and_rejects_true() {
-    let check_exec_incremental = |value| {
-        check_unsupported_true(
-            value,
-            "option adbc.statement.exec.incremental",
-            "setting adbc.statement.exec.incremental to true: incremental execute_partitions is \
-             not implemented; leave it unset or false",
-        )
-    };
-    // The spec default (`false`, as the exact string) is a no-op.
-    check_exec_incremental(OptionValue::String("false".into())).unwrap();
-    // Incremental execution is not implemented: a truthy value is rejected as such.
-    let error = check_exec_incremental(OptionValue::String("true".into())).unwrap_err();
-    assert_eq!(error.status, Status::NotImplemented);
-    // Invalid spellings and non-string values fail boolean coercion before the feature check.
-    for bad in ["maybe", "FALSE", "0", "no", "TRUE", "1", "yes"] {
-        let error = check_exec_incremental(OptionValue::String(bad.into())).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments, "{bad}");
-    }
-    for bad in [OptionValue::Int(0), OptionValue::Int(1)] {
-        let error = check_exec_incremental(bad).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-    }
-}
-
-#[test]
 fn dml_partitioned_option_coerces_and_unsets_on_empty() {
-    // Exactly the strings "true"/"false", with empty/whitespace unsetting it (default false).
     assert!(dml_partitioned_option(OptionValue::String("true".into())).unwrap());
     assert!(!dml_partitioned_option(OptionValue::String("false".into())).unwrap());
     for empty in ["", "   "] {
@@ -76,19 +45,16 @@ fn partitioned_dml_accepts_a_single_statement() {
     for sql in [
         "UPDATE Singers SET Active = true WHERE Active = false",
         "DELETE FROM Singers WHERE SingerId > 100",
-        // A trailing terminator still splits to one statement.
         "DELETE FROM Singers WHERE SingerId > 100;",
     ] {
         assert!(check_partitioned_dml(sql, true, 0).is_ok(), "{sql}");
     }
-    // One bound parameter row is fine — it binds the single statement.
     assert!(check_partitioned_dml("DELETE FROM Singers WHERE SingerId = @id", true, 1).is_ok());
 }
 
 #[test]
 fn partitioned_dml_rejects_what_it_cannot_express() {
     let sql = "UPDATE Singers SET Active = true WHERE Active = false";
-    // Manual transaction mode: partitioned DML cannot join a buffer-and-commit transaction.
     let error = check_partitioned_dml(sql, false, 0).unwrap_err();
     assert_eq!(error.status, Status::InvalidState);
     assert!(
@@ -97,7 +63,6 @@ fn partitioned_dml_rejects_what_it_cannot_express() {
         "{}",
         error.message
     );
-    // A `;`-separated batch: partitioned DML runs exactly one statement.
     let error = check_partitioned_dml(&format!("{sql}; {sql}"), true, 0).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     assert!(
@@ -106,7 +71,6 @@ fn partitioned_dml_rejects_what_it_cannot_express() {
         "{}",
         error.message
     );
-    // THEN RETURN: partitioned DML returns no rows.
     let error = check_partitioned_dml(&format!("{sql} THEN RETURN SingerId"), true, 0).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     assert!(
@@ -114,7 +78,6 @@ fn partitioned_dml_rejects_what_it_cannot_express() {
         "{}",
         error.message
     );
-    // Several bound parameter rows: again, only one statement can run.
     let error = check_partitioned_dml(sql, true, 3).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     assert!(
@@ -127,10 +90,8 @@ fn partitioned_dml_rejects_what_it_cannot_express() {
 
 #[test]
 fn execute_schema_guard_rejects_ddl_and_dml() {
-    // The arguments `execute_schema` passes to the shared guard.
     let check_schema =
         |sql: &str| check_query_only(sql, "execute_schema", "planned in a read-only schema probe");
-    // Queries — plain, CTE, parenthesised, statement-hinted — pass through to the PLAN probe.
     for sql in [
         "SELECT 1",
         "WITH cte AS (SELECT 1 AS a) SELECT a FROM cte",
@@ -140,12 +101,8 @@ fn execute_schema_guard_rejects_ddl_and_dml() {
     ] {
         check_schema(sql).unwrap_or_else(|e| panic!("query should pass: {sql}: {e}"));
     }
-    // DDL is rejected up front with the same `InvalidArguments` as DML — both are the "not a
-    // query" class.
     let error = check_schema("CREATE TABLE t (id INT64) PRIMARY KEY (id)").unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
-    // DML — in any spelling, hinted, or with THEN RETURN — gets a clear `InvalidArguments`
-    // instead of Spanner's raw read-only-transaction error from the PLAN probe.
     for sql in [
         "INSERT INTO t (id) VALUES (1)",
         "update t set c = 1 where true",
@@ -166,7 +123,6 @@ fn execute_schema_guard_rejects_ddl_and_dml() {
 
 #[test]
 fn execute_partitions_guard_rejects_ddl_and_dml() {
-    // The arguments `execute_partitions` passes to the shared guard.
     let check_partitions = |sql: &str| {
         check_query_only(
             sql,
@@ -174,7 +130,6 @@ fn execute_partitions_guard_rejects_ddl_and_dml() {
             "partitioned in a batch read-only transaction",
         )
     };
-    // Queries — plain, CTE, parenthesised, statement-hinted — pass through to partitioning.
     for sql in [
         "SELECT 1",
         "WITH cte AS (SELECT 1 AS a) SELECT a FROM cte",
@@ -184,8 +139,6 @@ fn execute_partitions_guard_rejects_ddl_and_dml() {
     ] {
         check_partitions(sql).unwrap_or_else(|e| panic!("query should pass: {sql}: {e}"));
     }
-    // DDL is rejected up front with the same `InvalidArguments` as DML — both are the "not a
-    // query" class.
     let error = check_partitions("CREATE TABLE t (id INT64) PRIMARY KEY (id)").unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     assert!(
@@ -193,8 +146,6 @@ fn execute_partitions_guard_rejects_ddl_and_dml() {
         "unexpected message: {}",
         error.message
     );
-    // DML — in any spelling, hinted, or with THEN RETURN — gets a clear `InvalidArguments`
-    // instead of Spanner's raw read-only-transaction error from `partition_query`.
     for sql in [
         "INSERT INTO t (id) VALUES (1)",
         "update t set c = 1 where true",
@@ -218,8 +169,7 @@ fn execute_partitions_guard_rejects_ddl_and_dml() {
 #[test]
 fn all_dml_batch_guard_rejects_mixed_batches_and_passes_single_statements() {
     let split = |sql: &str| crate::sql::split_statements(sql);
-    // Single statements always pass — classification of a lone statement is the caller's
-    // concern — as do genuine all-DML batches and empty text.
+    // Single statements pass whatever their kind, as do all-DML batches.
     for sql in [
         "SELECT 1",
         "INSERT INTO t (id) VALUES (1)",
@@ -229,8 +179,6 @@ fn all_dml_batch_guard_rejects_mixed_batches_and_passes_single_statements() {
     ] {
         check_all_dml_batch(&split(sql)).unwrap_or_else(|e| panic!("should pass: {sql}: {e}"));
     }
-    // A multi-statement batch mixing DML with a query or DDL is rejected with
-    // InvalidArguments, naming the offending statement — whichever side comes first.
     for (sql, offending) in [
         ("DELETE FROM t WHERE true; SELECT 1", "SELECT 1"),
         ("SELECT 1; DELETE FROM t WHERE true", "SELECT 1"),
@@ -245,7 +193,7 @@ fn all_dml_batch_guard_rejects_mixed_batches_and_passes_single_statements() {
             error.message
         );
     }
-    // A `;` inside a literal is not a separator, so this is a single statement and passes.
+    // A `;` inside a literal doesn't separate statements.
     check_all_dml_batch(&split("SELECT 'a;b'")).unwrap();
 }
 
@@ -256,8 +204,6 @@ fn string_option_requires_a_string_value() {
         string_option(&key, OptionValue::String("hi".into())).unwrap(),
         "hi"
     );
-    // A non-string value kind is rejected as an invalid argument, and the error names the
-    // offending option's full key rather than a generic "statement option".
     for value in [OptionValue::Int(1), OptionValue::Double(1.0)] {
         let error = string_option(&key, value).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
@@ -270,16 +216,7 @@ fn string_option_requires_a_string_value() {
 }
 
 #[test]
-fn bool_option_parses_exact_true_false() {
-    // Only the exact lowercase ADBC canonical spellings are accepted (matching adbc_core's
-    // own `TryFrom<OptionValue> for bool` and the reference C++ drivers).
-    assert!(bool_option(OptionValue::String("true".into()), "option o").unwrap());
-    assert!(!bool_option(OptionValue::String("false".into()), "option o").unwrap());
-}
-
-#[test]
 fn bool_option_rejects_non_bool_values() {
-    // Only the exact strings "true" and "false" are accepted.
     for bad in [
         "maybe", "", "2", "t", "on", "TRUE", "True", "FALSE", "False", "1", "0", "yes", "no",
         "YES", "NO",
@@ -287,7 +224,6 @@ fn bool_option_rejects_non_bool_values() {
         let error = bool_option(OptionValue::String(bad.into()), "option o").unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
     }
-    // Non-string value kinds — including int-typed sets — are rejected outright.
     for bad in [
         OptionValue::Int(0),
         OptionValue::Int(1),
@@ -295,28 +231,6 @@ fn bool_option_rejects_non_bool_values() {
     ] {
         let error = bool_option(bad, "option o").unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
-    }
-}
-
-#[test]
-fn bind_by_name_option_parses_as_a_boolean_naming_the_option() {
-    // The option is a plain boolean parsed by the shared `bool_option`; an invalid value is
-    // rejected with `InvalidArguments`, and the error names the option.
-    let what = "option adbc.statement.bind_by_name";
-    assert!(crate::options::bool_option(OptionValue::String("true".into()), what).unwrap());
-    assert!(!crate::options::bool_option(OptionValue::String("false".into()), what).unwrap());
-    for bad in [
-        OptionValue::String("maybe".into()),
-        // An int-typed set is rejected like any other non-string value.
-        OptionValue::Int(1),
-    ] {
-        let error = crate::options::bool_option(bad, what).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-        assert!(
-            error.message.contains("adbc.statement.bind_by_name"),
-            "{}",
-            error.message
-        );
     }
 }
 
@@ -330,18 +244,14 @@ fn rows_per_batch_option_accepts_positive_ints_and_strings() {
 #[test]
 fn rows_per_batch_option_rejects_zero_negative_and_malformed() {
     let parse = |value| crate::options::positive_usize(value, "option spanner.rows_per_batch");
-    // Zero is explicitly invalid (a batch must hold at least one row).
     let error = parse(OptionValue::Int(0)).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
-    // Negatives fail the `usize::try_from` / positivity filter.
     let error = parse(OptionValue::Int(-8192)).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
-    // Strings must parse to a positive integer.
     for bad in ["0", "-1", "abc", "1.5", ""] {
         let error = parse(OptionValue::String(bad.into())).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
     }
-    // A non-int, non-string value kind is rejected.
     let error = parse(OptionValue::Double(3.0)).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
 }

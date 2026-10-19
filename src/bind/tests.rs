@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use adbc_core::error::Status;
 use arrow_array::{
     Date32Array, Decimal128Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
     ListArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
@@ -10,30 +11,29 @@ use google_cloud_spanner::statement::Statement;
 
 use super::*;
 
-/// Bind every column of `batch` at `row` as a synthetic positional parameter (`@p0`, `@p1`, …)
-/// — a thin test driver over [`bind_params`] so the shared Arrow→Spanner conversion can be
-/// exercised (and its wire encoding asserted via the built statement's `Debug` rendering)
-/// without inventing per-test parameter names.
-fn bind_row(
-    builder: StatementBuilder,
-    batch: &RecordBatch,
-    row: usize,
-) -> Result<StatementBuilder> {
+/// Bind every column of `batch` at `row` as `@p0`, `@p1`, ...
+fn bind_row(batch: &RecordBatch, row: usize) -> Result<StatementBuilder> {
     let names: Vec<String> = (0..batch.num_columns()).map(|i| format!("p{i}")).collect();
-    bind_params(builder, &names, batch, row)
+    let sql = format!(
+        "SELECT {}",
+        names
+            .iter()
+            .map(|name| format!("@{name}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    bind_params(Statement::builder(sql), &names, batch, row)
 }
 
-/// The wire encoding of every parameter bound from `batch` at `row`, as the built statement's
-/// `Debug` rendering carries it: `INT64` binds as `StringValue("<digits>")`, `FLOAT64` as
-/// `NumberValue`, `BOOL` as `BoolValue`, `BYTES` as base64 inside a `StringValue`, and a SQL NULL
-/// as `NullValue`.
-fn bound(builder: StatementBuilder, batch: &RecordBatch, row: usize) -> String {
-    format!("{:?}", bind_row(builder, batch, row).unwrap().build())
+/// Debug rendering of the statement [`bind_row`] builds, the only external view of its
+/// parameters. INT64 renders as `StringValue("<digits>")`, FLOAT64 as `NumberValue`, BYTES as
+/// base64 in a `StringValue`, and NULL as `NullValue`.
+fn bound(batch: &RecordBatch, row: usize) -> String {
+    format!("{:?}", bind_row(batch, row).unwrap().build())
 }
 
 #[test]
 fn binds_narrow_integers_as_int64() {
-    // Int16 / Int32 widen to Spanner INT64 (its only integer type).
     let b = batch(
         vec![
             Field::new("a", DataType::Int16, true),
@@ -44,21 +44,17 @@ fn binds_narrow_integers_as_int64() {
             Arc::new(Int32Array::from(vec![Some(9i32), None])),
         ],
     );
-    let row0 = bound(Statement::builder("SELECT @a, @b"), &b, 0);
+    let row0 = bound(&b, 0);
     assert!(row0.contains(r#"StringValue("7")"#), "Int16 7: {row0}");
     assert!(row0.contains(r#"StringValue("9")"#), "Int32 9: {row0}");
-    // Widened, not passed through in a narrower numeric encoding.
     assert!(!row0.contains("NumberValue"), "{row0}");
-    // The null row binds both columns as typed NULLs, with no value left over.
-    let row1 = bound(Statement::builder("SELECT @a, @b"), &b, 1);
+    let row1 = bound(&b, 1);
     assert_eq!(row1.matches("NullValue(NullValue)").count(), 2, "{row1}");
     assert!(!row1.contains("StringValue"), "{row1}");
 }
 
 #[test]
 fn binds_unsigned_integers_as_int64() {
-    // UInt8 / UInt16 / UInt32 widen losslessly to Spanner INT64; the boundary values (each
-    // width's max) must bind as their exact decimal encoding, not overflow or wrap.
     let b = batch(
         vec![
             Field::new("a", DataType::UInt8, true),
@@ -71,27 +67,17 @@ fn binds_unsigned_integers_as_int64() {
             Arc::new(arrow_array::UInt32Array::from(vec![Some(u32::MAX), None])),
         ],
     );
-    let stmt = bind_row(Statement::builder("SELECT @p0, @p1, @p2"), &b, 0)
-        .unwrap()
-        .build();
-    let dbg = format!("{stmt:?}");
-    // u32::MAX = 4_294_967_295 round-trips as its exact decimal string (INT64 holds it).
-    assert!(
-        dbg.contains(r#"StringValue("4294967295")"#),
-        "u32::MAX must widen to INT64 4294967295: {dbg}"
-    );
-    assert!(dbg.contains(r#"StringValue("255")"#), "u8::MAX: {dbg}");
-    assert!(dbg.contains(r#"StringValue("65535")"#), "u16::MAX: {dbg}");
-    // The null row binds all three columns as typed nulls.
-    let row1 = bound(Statement::builder("SELECT @p0, @p1, @p2"), &b, 1);
+    let row0 = bound(&b, 0);
+    assert!(row0.contains(r#"StringValue("4294967295")"#), "{row0}");
+    assert!(row0.contains(r#"StringValue("255")"#), "{row0}");
+    assert!(row0.contains(r#"StringValue("65535")"#), "{row0}");
+    let row1 = bound(&b, 1);
     assert_eq!(row1.matches("NullValue(NullValue)").count(), 3, "{row1}");
 }
 
 #[test]
 fn binds_half_floats_as_doubles() {
-    // Float16 has no Spanner counterpart; it widens into the FLOAT32 column
-    // `spanner_column_type` creates. The widening is exact — every `f16` is
-    // representable in `f32`/`f64` — so the bound value carries no rounding artefacts.
+    // Every f16 converts to f64 without rounding.
     let b = batch(
         vec![Field::new("v", DataType::Float16, true)],
         vec![Arc::new(arrow_array::Float16Array::from(vec![
@@ -99,22 +85,14 @@ fn binds_half_floats_as_doubles() {
             None,
         ]))],
     );
-    let stmt = bind_row(Statement::builder("SELECT @v"), &b, 0)
-        .unwrap()
-        .build();
-    let dbg = format!("{stmt:?}");
-    assert!(
-        dbg.contains("-1.5"),
-        "f16 -1.5 must widen exactly to -1.5: {dbg}"
-    );
-    // The null row binds as a typed null.
-    let row1 = bound(Statement::builder("SELECT @v"), &b, 1);
+    let row0 = bound(&b, 0);
+    assert!(row0.contains("-1.5"), "{row0}");
+    let row1 = bound(&b, 1);
     assert!(row1.contains("NullValue(NullValue)"), "{row1}");
 }
 
 #[test]
 fn binds_fixed_size_binary_as_bytes() {
-    // FixedSizeBinary(n) binds as Spanner BYTES, exactly like variable-width Binary.
     let values: Vec<Option<&[u8]>> = vec![Some(b"abcd"), None];
     let arr =
         arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 4)
@@ -123,19 +101,18 @@ fn binds_fixed_size_binary_as_bytes() {
         vec![Field::new("v", DataType::FixedSizeBinary(4), true)],
         vec![Arc::new(arr)],
     );
-    // Ingested as an insert mutation, a 4-byte fixed cell lands as its raw BYTES value.
     let dbg = format!("{:?}", insert_mutation("t", &b, 0).unwrap());
+    // "abcd" in base64.
     assert!(
         dbg.contains("StringValue") && dbg.contains("YWJjZA=="),
-        "FixedSizeBinary cell must ship as base64 BYTES (\"abcd\" = YWJjZA==): {dbg}"
+        "{dbg}"
     );
-    // A null fixed cell stays NULL.
     let dbg = format!("{:?}", insert_mutation("t", &b, 1).unwrap());
     assert!(dbg.contains("NullValue"), "null fixed cell: {dbg}");
 }
 
-/// A nullable string-family field tagged with the canonical `arrow.json` extension, as the
-/// driver's own read path produces for Spanner `JSON` columns.
+/// A nullable field tagged with the `arrow.json` extension, as the read path produces for JSON
+/// columns.
 fn json_field(name: &str, data_type: DataType) -> Field {
     Field::new(name, data_type, true).with_metadata(std::collections::HashMap::from([(
         "ARROW:extension:name".to_string(),
@@ -155,28 +132,12 @@ fn binds_json_tagged_strings_as_json_params() {
             Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#), None])),
         ],
     );
-    // Identical storage values have distinct logical types: JSON versus STRING.
-    let stmt = bind_row(Statement::builder("SELECT @p0, @p1"), &b, 0)
-        .unwrap()
-        .build();
-    let dbg = format!("{stmt:?}");
-    assert!(
-        dbg.contains(r#""p0": Type(Type { code: Json"#),
-        "no JSON param type for p0 in: {dbg}"
-    );
-    assert!(
-        dbg.contains(r#""p1": Type(Type { code: String"#),
-        "untagged p1 must bind as STRING: {dbg}"
-    );
-    // Null row: the JSON type annotation must survive a typed null.
-    let stmt = bind_row(Statement::builder("SELECT @p0, @p1"), &b, 1)
-        .unwrap()
-        .build();
-    let dbg = format!("{stmt:?}");
-    assert!(
-        dbg.contains(r#""p0": Type(Type { code: Json"#),
-        "typed null lost JSON type: {dbg}"
-    );
+    let dbg = bound(&b, 0);
+    assert!(dbg.contains(r#""p0": Type(Type { code: Json"#), "{dbg}");
+    assert!(dbg.contains(r#""p1": Type(Type { code: String"#), "{dbg}");
+    // A null keeps the JSON type.
+    let dbg = bound(&b, 1);
+    assert!(dbg.contains(r#""p0": Type(Type { code: Json"#), "{dbg}");
 }
 
 #[test]
@@ -222,17 +183,18 @@ fn null_parameters_keep_their_arrow_logical_types() {
     ] {
         let null = arrow_array::new_null_array(&data_type, 1);
         let b = batch(vec![Field::new("p", data_type.clone(), true)], vec![null]);
-        let actual = bound(Statement::builder("SELECT @p0"), &b, 0);
+        let actual = bound(&b, 0);
         assert!(
             actual.contains(&format!("\"p0\": {expected:?}")),
             "{data_type}: {actual}"
         );
     }
+    // Arrow Null leaves the type to the SQL.
     let b = batch(
         vec![Field::new("p", DataType::Null, true)],
         vec![Arc::new(arrow_array::NullArray::new(1))],
     );
-    let actual = bound(Statement::builder("SELECT CAST(@p0 AS STRING)"), &b, 0);
+    let actual = bound(&b, 0);
     assert!(!actual.contains("\"p0\": Type"), "{actual}");
 }
 
@@ -253,10 +215,7 @@ fn binds_json_tagged_list_elements_as_json_arrays() {
         true,
     );
     let b = batch(vec![field], vec![Arc::new(docs)]);
-    let stmt = bind_row(Statement::builder("SELECT @p0"), &b, 0)
-        .unwrap()
-        .build();
-    let dbg = format!("{stmt:?}");
+    let dbg = bound(&b, 0);
     assert!(
         dbg.contains(r#""p0": Type(Type { code: Array"#)
             && dbg.contains("array_element_type: Some(Type { code: Json"),
@@ -266,19 +225,13 @@ fn binds_json_tagged_list_elements_as_json_arrays() {
 
 #[test]
 fn json_tag_is_ignored_on_non_string_storage() {
-    // `arrow.json` is only defined over string storage; a tag on Int64 must bind as INT64.
+    // `arrow.json` is only defined over string storage.
     let b = batch(
         vec![json_field("n", DataType::Int64)],
         vec![Arc::new(Int64Array::from(vec![Some(7)]))],
     );
-    let stmt = bind_row(Statement::builder("SELECT @p0"), &b, 0)
-        .unwrap()
-        .build();
-    let dbg = format!("{stmt:?}");
-    assert!(
-        !dbg.contains("Json"),
-        "tagged Int64 mis-bound as JSON: {dbg}"
-    );
+    let dbg = bound(&b, 0);
+    assert!(!dbg.contains("Json"), "{dbg}");
 }
 
 #[test]
@@ -290,8 +243,6 @@ fn creates_json_columns_for_tagged_ingest_fields() {
             DataType::List(Arc::new(json_field("item", DataType::Utf8))),
             true,
         ),
-        // The tag is honoured through dictionary encoding too (see `cell_value`), so a
-        // dictionary-encoded JSON column creates JSON, not the value type's STRING(MAX).
         json_field(
             "cat",
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
@@ -310,7 +261,6 @@ fn maps_arrow_to_spanner_column_types() {
     assert_eq!(spanner_column_type(&DataType::Int32).unwrap(), "INT64");
     assert_eq!(spanner_column_type(&DataType::Int64).unwrap(), "INT64");
     assert_eq!(spanner_column_type(&DataType::Float32).unwrap(), "FLOAT32");
-    // `Float16` has no Spanner type of its own; it widens losslessly into FLOAT32.
     assert_eq!(spanner_column_type(&DataType::Float16).unwrap(), "FLOAT32");
     assert_eq!(spanner_column_type(&DataType::Utf8).unwrap(), "STRING(MAX)");
     assert_eq!(
@@ -323,16 +273,14 @@ fn maps_arrow_to_spanner_column_types() {
     );
     let list = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
     assert_eq!(spanner_column_type(&list).unwrap(), "ARRAY<INT64>");
-    // The unsigned widths that fit i64 losslessly widen to INT64.
     assert_eq!(spanner_column_type(&DataType::UInt8).unwrap(), "INT64");
     assert_eq!(spanner_column_type(&DataType::UInt16).unwrap(), "INT64");
     assert_eq!(spanner_column_type(&DataType::UInt32).unwrap(), "INT64");
-    // FixedSizeBinary maps to BYTES like the variable-width binary kinds.
     assert_eq!(
         spanner_column_type(&DataType::FixedSizeBinary(4)).unwrap(),
         "BYTES(MAX)"
     );
-    // UInt64 has no lossless INT64 mapping (u64::MAX > i64::MAX), so it is rejected.
+    // u64::MAX doesn't fit INT64.
     assert!(spanner_column_type(&DataType::UInt64).is_err());
 }
 
@@ -358,12 +306,7 @@ fn dictionary_json_arrays_keep_their_type_when_creating_ingest_tables() {
             "CREATE TABLE `events` (`docs` ARRAY<JSON>)"
         );
         for row in 0..2 {
-            let statement = bind_row(Statement::builder("SELECT @p0"), &b, row)
-                .unwrap()
-                .build();
-            assert!(
-                format!("{statement:?}").contains("array_element_type: Some(Type { code: Json")
-            );
+            assert!(bound(&b, row).contains("array_element_type: Some(Type { code: Json"));
         }
     }
     check::<i32>();
@@ -376,8 +319,7 @@ fn builds_create_table_sql() {
         Field::new("idx", DataType::Int64, true),
         Field::new("name", DataType::Utf8, true),
     ]);
-    // No PRIMARY KEY clause and no extra column — Spanner adds its own hidden `rowid` key,
-    // so the created table is exactly the ingest schema.
+    // No PRIMARY KEY: Spanner adds a hidden rowid key.
     assert_eq!(
         create_table_sql("my_table", None, &schema, false).unwrap(),
         "CREATE TABLE `my_table` (`idx` INT64, `name` STRING(MAX))"
@@ -387,7 +329,6 @@ fn builds_create_table_sql() {
             .unwrap()
             .starts_with("CREATE TABLE IF NOT EXISTS `t`")
     );
-    // A named target schema (`adbc.ingest.target_db_schema`) qualifies the created table.
     assert!(
         create_table_sql("t", Some("app"), &schema, false)
             .unwrap()
@@ -395,8 +336,6 @@ fn builds_create_table_sql() {
     );
 }
 
-/// A wide ingest schema with one unmappable column must say *which* column: the Arrow type alone
-/// leaves the caller to guess among the rest.
 #[test]
 fn create_table_sql_names_the_column_it_cannot_map() {
     let schema = Schema::new(vec![
@@ -404,7 +343,7 @@ fn create_table_sql_names_the_column_it_cannot_map() {
         Field::new("weird", DataType::UInt64, true),
     ]);
     let err = create_table_sql("t", None, &schema, false).unwrap_err();
-    assert_eq!(err.status, adbc_core::error::Status::InvalidArguments);
+    assert_eq!(err.status, Status::InvalidArguments);
     assert!(
         err.message.starts_with("ingest column \"weird\": "),
         "{}",
@@ -428,7 +367,7 @@ fn ingest_ddl_rejects_types_the_value_encoder_cannot_bind() {
     ] {
         let schema = Schema::new(vec![Field::new("bad", data_type.clone(), true)]);
         let error = create_table_sql("t", None, &schema, false).unwrap_err();
-        assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+        assert_eq!(error.status, Status::InvalidArguments);
         assert!(
             error.message.starts_with("ingest column \"bad\": "),
             "{data_type}: {error}"
@@ -438,9 +377,6 @@ fn ingest_ddl_rejects_types_the_value_encoder_cannot_bind() {
 
 #[test]
 fn builds_insert_mutations() {
-    // A two-column row becomes one insert mutation carrying the raw column names and the same
-    // wire values parameter binding produces (INT64 as a decimal string, STRING as-is, NULL as
-    // a null value) — asserted via the mutation's Debug rendering, its only external view.
     let b = batch(
         vec![
             Field::new("Id", DataType::Int64, false),
@@ -462,11 +398,9 @@ fn builds_insert_mutations() {
     ] {
         assert!(dbg.contains(needle), "missing {needle} in: {dbg}");
     }
-    // A null cell stays a null value in the mutation.
     let dbg = format!("{:?}", insert_mutation("Users", &b, 1).unwrap());
     assert!(dbg.contains("NullValue"), "no NULL for row 1: {dbg}");
-    // Reserved words and odd characters need no quoting: mutations carry raw proto names,
-    // not SQL.
+    // Mutations carry raw names, so reserved words need no quoting.
     let odd = batch(
         vec![Field::new("index", DataType::Int64, false)],
         vec![Arc::new(Int64Array::from(vec![42]))],
@@ -474,9 +408,8 @@ fn builds_insert_mutations() {
     let dbg = format!("{:?}", insert_mutation("create", &odd, 0).unwrap());
     assert!(
         dbg.contains("\"create\"") && dbg.contains("\"index\""),
-        "reserved-word names must pass through untouched: {dbg}"
+        "{dbg}"
     );
-    // An unsupported Arrow type is rejected, same as parameter binding.
     let bad = batch(
         vec![Field::new("x", DataType::UInt64, false)],
         vec![Arc::new(arrow_array::UInt64Array::from(vec![1u64]))],
@@ -486,18 +419,13 @@ fn builds_insert_mutations() {
 
 #[test]
 fn json_tagged_strings_ingest_as_plain_strings_in_mutations() {
-    // Mutation values carry no per-value type: Spanner types them from the target column, so
-    // an `arrow.json`-tagged string must land as its plain string encoding (a JSON column
-    // accepts it), not some typed wrapper.
+    // Spanner types mutation values from the target column, so JSON travels as a plain string.
     let b = batch(
         vec![json_field("doc", DataType::Utf8)],
         vec![Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#)]))],
     );
     let dbg = format!("{:?}", insert_mutation("t", &b, 0).unwrap());
-    assert!(
-        dbg.contains(r#"StringValue("{\"a\":1}")"#),
-        "JSON-tagged cell must be its plain string: {dbg}"
-    );
+    assert!(dbg.contains(r#"StringValue("{\"a\":1}")"#), "{dbg}");
 }
 
 #[test]
@@ -526,8 +454,6 @@ fn int_batch(names: &[&str]) -> RecordBatch {
 
 #[test]
 fn resolves_parameters_by_name_when_columns_match() {
-    // bind_by_name=true: every bound column names a query parameter -> bind by name,
-    // order-independent.
     let b = int_batch(&["b", "a"]);
     assert_eq!(
         resolve_parameter_names("SELECT @a, @b", &b, true).unwrap(),
@@ -537,14 +463,11 @@ fn resolves_parameters_by_name_when_columns_match() {
 
 #[test]
 fn resolves_parameters_positionally_by_default() {
-    // The default (bind_by_name=false): i-th column binds to the i-th parameter in query
-    // order, column names ignored — what positional clients / the validation suite produce.
     let b = int_batch(&["res", "other"]);
     assert_eq!(
         resolve_parameter_names("INSERT INTO t VALUES (@p1, @p2)", &b, false).unwrap(),
         vec!["p1", "p2"],
     );
-    // A single column still binds to the single parameter.
     let one = int_batch(&["res"]);
     assert_eq!(
         resolve_parameter_names("INSERT INTO t VALUES (@p1)", &one, false).unwrap(),
@@ -554,8 +477,7 @@ fn resolves_parameters_positionally_by_default() {
 
 #[test]
 fn by_name_mode_binds_by_name_and_leaves_extra_params_unbound() {
-    // By-name binding ignores column order. A parameter with no matching column (@c) stays
-    // unbound; Spanner rejects it at execution time.
+    // @c stays unbound; Spanner rejects it at execution time.
     let b = int_batch(&["b", "a"]);
     assert_eq!(
         resolve_parameter_names("SELECT @a, @b, @c", &b, true).unwrap(),
@@ -565,37 +487,24 @@ fn by_name_mode_binds_by_name_and_leaves_extra_params_unbound() {
 
 #[test]
 fn by_name_mode_rejects_an_unmatched_column_naming_the_column() {
-    // bind_by_name=true: a bound column with no matching query parameter is a hard
-    // InvalidArguments error naming that *column* (it is a column name, not a parameter) and the
-    // parameters the query does declare — never a silent positional fallback (which is what the
-    // default bind_by_name=false does with this input).
     let b = int_batch(&["a", "x"]);
     let err = resolve_parameter_names("SELECT @a, @b", &b, true).unwrap_err();
-    assert_eq!(err.status, adbc_core::error::Status::InvalidArguments);
+    assert_eq!(err.status, Status::InvalidArguments);
     assert!(
         err.message.contains("cannot bind column \"x\""),
-        "error must name the offending column: {}",
+        "{}",
         err.message
     );
-    assert!(
-        err.message.contains("[\"a\", \"b\"]"),
-        "error must name the query's parameters: {}",
-        err.message
-    );
+    assert!(err.message.contains("[\"a\", \"b\"]"), "{}", err.message);
 }
 
 #[test]
 fn positional_binding_ignores_coincidental_name_matches() {
-    // Every column name matches a query parameter, so by-name binding would reorder the values
-    // (column "b" -> @b). The default positional binding must ignore the names entirely:
-    // column 0 binds @a, column 1 binds @b.
     let b = int_batch(&["b", "a"]);
     assert_eq!(
         resolve_parameter_names("SELECT @a, @b", &b, false).unwrap(),
         vec!["a", "b"],
     );
-    // Contrast: by-name binding name-matches the very same input (see
-    // resolves_parameters_by_name_when_columns_match).
     assert_eq!(
         resolve_parameter_names("SELECT @a, @b", &b, true).unwrap(),
         vec!["b", "a"],
@@ -604,8 +513,7 @@ fn positional_binding_ignores_coincidental_name_matches() {
 
 #[test]
 fn positional_mode_still_requires_matching_counts() {
-    // Even a column that names a parameter cannot save a count mismatch under the default
-    // positional binding.
+    // A column named after a parameter doesn't excuse a count mismatch.
     let b = int_batch(&["a"]);
     let err = resolve_parameter_names("SELECT @a, @b", &b, false).unwrap_err();
     assert!(
@@ -617,8 +525,6 @@ fn positional_mode_still_requires_matching_counts() {
 
 #[test]
 fn bind_params_reuses_resolved_names_across_rows() {
-    // The mapping is resolved once (lexing the SQL), then reused to bind every row — no
-    // re-lexing per row. Both rows of a two-row batch bind against the same `names`.
     let b = batch(
         vec![
             Field::new("a", DataType::Int64, false),
@@ -635,17 +541,13 @@ fn bind_params_reuses_resolved_names_across_rows() {
         let built = bind_params(Statement::builder("SELECT @a, @b"), &names, &b, row).unwrap();
         format!("{:?}", built.build())
     };
-    // Each row binds its own cells through the one resolved mapping.
     let row0 = bind(0);
     assert!(row0.contains(r#"StringValue("1")"#), "{row0}");
     assert!(row0.contains(r#"StringValue("2")"#), "{row0}");
     let row1 = bind(1);
     assert!(row1.contains(r#"StringValue("3")"#), "{row1}");
     assert!(row1.contains(r#"StringValue("4")"#), "{row1}");
-    assert!(
-        !row1.contains(r#"StringValue("1")"#),
-        "row 1 kept row 0 values: {row1}"
-    );
+    assert!(!row1.contains(r#"StringValue("1")"#), "{row1}");
 }
 
 #[test]
@@ -661,7 +563,6 @@ fn positional_binding_rejects_count_mismatch() {
 
 #[test]
 fn binds_date_timestamp_and_numeric() {
-    // DATE, TIMESTAMP(µs) and a NUMERIC within range all bind without error.
     let b = batch(
         vec![
             Field::new("d", DataType::Date32, false),
@@ -678,11 +579,11 @@ fn binds_date_timestamp_and_numeric() {
             ),
         ],
     );
-    let row0 = bound(Statement::builder("SELECT @d, @t, @n"), &b, 0);
+    let row0 = bound(&b, 0);
     for needle in [
         r#"StringValue("2024-01-15")"#,
         r#"StringValue("2024-01-15T12:34:56.789012Z")"#,
-        // NUMERIC keeps its full scale rather than collapsing to "1.5".
+        // NUMERIC keeps its full scale.
         r#"StringValue("1.500000000")"#,
     ] {
         assert!(row0.contains(needle), "missing {needle} in: {row0}");
@@ -691,19 +592,15 @@ fn binds_date_timestamp_and_numeric() {
 
 #[test]
 fn timestamp_string_preserves_full_precision() {
-    // Microsecond formats six fractional digits: 2024-01-15T12:34:56.789012Z.
     let micros = 1_705_322_096_789_012i64;
     assert_eq!(
         timestamp_string("t", &TimeUnit::Microsecond, micros).unwrap(),
         "2024-01-15T12:34:56.789012Z"
     );
-    // Nanosecond keeps all nine fractional digits — the sub-microsecond …012_999 ns is
-    // preserved (Spanner TIMESTAMP has nanosecond precision), not truncated to micros.
     assert_eq!(
         timestamp_string("t", &TimeUnit::Nanosecond, micros * 1_000 + 999).unwrap(),
         "2024-01-15T12:34:56.789012999Z"
     );
-    // Millisecond formats three fractional digits, Second none — each unit's own precision.
     assert_eq!(
         timestamp_string("t", &TimeUnit::Millisecond, 1_705_322_096_789).unwrap(),
         "2024-01-15T12:34:56.789Z"
@@ -712,8 +609,7 @@ fn timestamp_string_preserves_full_precision() {
         timestamp_string("t", &TimeUnit::Second, 1_705_322_096).unwrap(),
         "2024-01-15T12:34:56Z"
     );
-    // A negative nanosecond value renders as its exact instant (one ns before the epoch), with
-    // full nanosecond digits — not rounded/truncated toward zero.
+    // One nanosecond before the epoch, not truncated toward zero.
     assert_eq!(
         timestamp_string("t", &TimeUnit::Nanosecond, -1).unwrap(),
         "1969-12-31T23:59:59.999999999Z"
@@ -751,7 +647,6 @@ fn temporal_binding_accepts_spanner_range_boundaries() {
 
 #[test]
 fn temporal_binding_rejects_values_outside_spanner_range() {
-    use adbc_core::error::Status;
     use arrow_array::{ArrayRef, Date64Array};
 
     let mut arrays: Vec<ArrayRef> = vec![
@@ -806,7 +701,6 @@ fn temporal_binding_rejects_values_outside_spanner_range() {
 
 #[test]
 fn binds_timestamp_at_every_unit() {
-    // Every Arrow TimestampArray unit binds without error.
     let ns = 1_705_322_096_789_012_999i64;
     let b = batch(
         vec![
@@ -824,9 +718,8 @@ fn binds_timestamp_at_every_unit() {
             Arc::new(TimestampNanosecondArray::from(vec![ns]).with_timezone("UTC")),
         ],
     );
-    // Each unit formats to exactly its own precision — the second-resolution column gains no
-    // spurious fractional digits, and the nanosecond one keeps all nine.
-    let row0 = bound(Statement::builder("SELECT @s, @m, @n"), &b, 0);
+    // Each unit formats at its own precision.
+    let row0 = bound(&b, 0);
     for needle in [
         r#"StringValue("2024-01-15T12:34:56Z")"#,
         r#"StringValue("2024-01-15T12:34:56.789Z")"#,
@@ -838,7 +731,6 @@ fn binds_timestamp_at_every_unit() {
 
 #[test]
 fn binds_null_nanosecond_timestamp() {
-    // A null nanosecond timestamp binds as a typed NULL, like the other temporal types.
     let b = batch(
         vec![Field::new(
             "n",
@@ -847,7 +739,7 @@ fn binds_null_nanosecond_timestamp() {
         )],
         vec![Arc::new(TimestampNanosecondArray::from(vec![None::<i64>]))],
     );
-    let row0 = bound(Statement::builder("SELECT @n"), &b, 0);
+    let row0 = bound(&b, 0);
     assert!(row0.contains("NullValue(NullValue)"), "{row0}");
 }
 
@@ -867,7 +759,7 @@ fn null_temporal_and_numeric_bind() {
             ),
         ],
     );
-    let row0 = bound(Statement::builder("SELECT @d, @n"), &b, 0);
+    let row0 = bound(&b, 0);
     assert_eq!(row0.matches("NullValue(NullValue)").count(), 2, "{row0}");
 }
 
@@ -879,8 +771,7 @@ fn numeric_string_formats_full_i128_range() {
     assert_eq!(numeric_string(-1, 9), "-0.000000001");
     assert_eq!(numeric_string(150, 2), "1.50");
     assert_eq!(numeric_string(-7, 0), "-7");
-    // 10^30 overflows a 96-bit decimal mantissa but is a valid Spanner NUMERIC; it must format
-    // exactly, which is the whole point of formatting the i128 rather than a narrower type.
+    // 10^30 overflows a 96-bit decimal mantissa but is a valid NUMERIC.
     assert_eq!(
         numeric_string(10i128.pow(30), 9),
         "1000000000000000000000.000000000"
@@ -901,7 +792,6 @@ fn numeric_string_preserves_negative_scale_without_integer_overflow() {
 
 #[test]
 fn binds_numeric_beyond_a_96_bit_decimal() {
-    // 10^30 (unscaled) overflows a 96-bit decimal but binds fine: we format the i128 directly.
     let b = batch(
         vec![Field::new("n", DataType::Decimal128(38, 9), false)],
         vec![Arc::new(
@@ -910,17 +800,15 @@ fn binds_numeric_beyond_a_96_bit_decimal() {
                 .unwrap(),
         )],
     );
-    let row0 = bound(Statement::builder("SELECT @n"), &b, 0);
+    let row0 = bound(&b, 0);
     assert!(
         row0.contains(r#"StringValue("1000000000000000000000.000000000")"#),
-        "10^30 at scale 9 must format exactly: {row0}"
+        "{row0}"
     );
 }
 
 #[test]
 fn binds_large_string_and_binary() {
-    // LargeUtf8 / LargeBinary (what pyarrow.Table.from_pandas emits) bind like their 32-bit
-    // offset counterparts, including typed nulls.
     let b = batch(
         vec![
             Field::new("s", DataType::LargeUtf8, true),
@@ -931,18 +819,16 @@ fn binds_large_string_and_binary() {
             Arc::new(LargeBinaryArray::from(vec![Some(b"bytes".as_ref()), None])),
         ],
     );
-    let row0 = bound(Statement::builder("SELECT @s, @b"), &b, 0);
+    let row0 = bound(&b, 0);
     assert!(row0.contains(r#"StringValue("hello")"#), "{row0}");
-    // BYTES travel base64-encoded inside a StringValue: b"bytes" is "Ynl0ZXM=".
+    // b"bytes" in base64.
     assert!(row0.contains(r#"StringValue("Ynl0ZXM=")"#), "{row0}");
-    let row1 = bound(Statement::builder("SELECT @s, @b"), &b, 1);
+    let row1 = bound(&b, 1);
     assert_eq!(row1.matches("NullValue(NullValue)").count(), 2, "{row1}");
 }
 
 #[test]
 fn binds_view_strings_and_binaries() {
-    // Utf8View / BinaryView (the German-string layouts polars and newer pyarrow emit) bind
-    // like their offset-based counterparts, including typed nulls.
     let b = batch(
         vec![
             Field::new("s", DataType::Utf8View, true),
@@ -959,20 +845,19 @@ fn binds_view_strings_and_binaries() {
             ])),
         ],
     );
-    let row0 = bound(Statement::builder("SELECT @s, @b"), &b, 0);
+    let row0 = bound(&b, 0);
     assert!(row0.contains(r#"StringValue("hello view")"#), "{row0}");
+    // b"view bytes" in base64.
     assert!(
         row0.contains(r#"StringValue("dmlldyBieXRlcw==")"#),
-        "b\"view bytes\" base64: {row0}"
+        "{row0}"
     );
-    let row1 = bound(Statement::builder("SELECT @s, @b"), &b, 1);
+    let row1 = bound(&b, 1);
     assert_eq!(row1.matches("NullValue(NullValue)").count(), 2, "{row1}");
 }
 
 #[test]
 fn binds_int8_and_date64() {
-    // Int8 widens to INT64 like the other narrow ints; Date64 (ms at day boundaries) binds as
-    // a DATE string.
     let b = batch(
         vec![
             Field::new("i", DataType::Int8, true),
@@ -980,23 +865,17 @@ fn binds_int8_and_date64() {
         ],
         vec![
             Arc::new(arrow_array::Int8Array::from(vec![Some(7i8), None])),
-            // 19737 days = 2024-01-15, at the exact millisecond day boundary.
+            // 2024-01-15
             Arc::new(arrow_array::Date64Array::from(vec![
                 Some(19_737i64 * 86_400_000),
                 None,
             ])),
         ],
     );
-    let row0 = bound(Statement::builder("SELECT @i, @d"), &b, 0);
-    assert!(
-        row0.contains(r#"StringValue("7")"#),
-        "Int8 widens to INT64: {row0}"
-    );
-    assert!(
-        row0.contains(r#"StringValue("2024-01-15")"#),
-        "Date64 milliseconds become a DATE string: {row0}"
-    );
-    let row1 = bound(Statement::builder("SELECT @i, @d"), &b, 1);
+    let row0 = bound(&b, 0);
+    assert!(row0.contains(r#"StringValue("7")"#), "{row0}");
+    assert!(row0.contains(r#"StringValue("2024-01-15")"#), "{row0}");
+    let row1 = bound(&b, 1);
     assert_eq!(row1.matches("NullValue(NullValue)").count(), 2, "{row1}");
 }
 
@@ -1035,7 +914,7 @@ fn date64_binding_rejects_time_of_day_in_scalars_and_lists() {
                 .unwrap_err(),
                 insert_mutation("events", &b, row).unwrap_err(),
             ] {
-                assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+                assert_eq!(error.status, Status::InvalidArguments);
                 assert!(error.message.contains("created_at"), "{error}");
                 assert!(error.message.contains("whole number of days"), "{error}");
             }
@@ -1068,15 +947,14 @@ fn binds_view_arrays_as_list_elements() {
         ],
         vec![Arc::new(strings.finish()), Arc::new(bytes.finish())],
     );
-    let row0 = bound(Statement::builder("SELECT @s, @b"), &b, 0);
-    // The string list keeps its null element in place rather than dropping it.
+    let row0 = bound(&b, 0);
     assert!(
         row0.contains(
             r#"ListValue { values: [Value { kind: Some(StringValue("a")) }, Value { kind: Some(NullValue(NullValue)) }] }"#
         ),
         "{row0}"
     );
-    // b"b" is "Yg==" base64.
+    // b"b" in base64.
     assert!(
         row0.contains(r#"ListValue { values: [Value { kind: Some(StringValue("Yg==")) }] }"#),
         "{row0}"
@@ -1085,23 +963,18 @@ fn binds_view_arrays_as_list_elements() {
 
 #[test]
 fn rejects_unsupported_arrow_type() {
-    // A type with no Spanner mapping (UInt64 — Spanner has no unsigned integer) is rejected.
     let b = batch(
         vec![Field::new("x", DataType::UInt64, false)],
         vec![Arc::new(arrow_array::UInt64Array::from(vec![1u64]))],
     );
-    assert!(bind_row(Statement::builder("SELECT @x"), &b, 0).is_err());
+    assert!(bind_row(&b, 0).is_err());
 }
 
-// ------------------------------------------------------------------------------------------
-// Dictionary-encoded columns (pandas categoricals over the C data interface).
-// ------------------------------------------------------------------------------------------
+// Dictionary-encoded columns, such as pandas categoricals.
 
 #[test]
 fn binds_dictionary_encoded_columns_as_their_values() {
-    // A dictionary-encoded column binds its decoded values: the key at each row selects the
-    // dictionary value, which runs through the same mapping as its plain form — strings bind
-    // as STRING, Int32 values still widen to INT64, and a null cell binds NULL.
+    // Decoded values bind like their plain type; Int32 still widens to INT64.
     let strings: arrow_array::DictionaryArray<Int32Type> =
         vec![Some("a"), None, Some("b"), Some("a")]
             .into_iter()
@@ -1117,31 +990,23 @@ fn binds_dictionary_encoded_columns_as_their_values() {
         ],
         vec![Arc::new(strings), Arc::new(ints)],
     );
-    let row0 = bound_params_debug(&b, 0);
+    let row0 = bound(&b, 0);
     assert!(
         row0.contains(r#"StringValue("a")"#) && row0.contains(r#"StringValue("9")"#),
-        "row 0 must bind the decoded values: {row0}"
+        "{row0}"
     );
-    assert!(
-        !row0.contains("NumberValue"),
-        "dictionary Int32 values must widen to INT64: {row0}"
-    );
-    let row1 = bound_params_debug(&b, 1);
-    assert!(
-        row1.contains("NullValue"),
-        "null cells must bind NULL: {row1}"
-    );
-    let row2 = bound_params_debug(&b, 2);
+    assert!(!row0.contains("NumberValue"), "{row0}");
+    let row1 = bound(&b, 1);
+    assert!(row1.contains("NullValue"), "{row1}");
+    let row2 = bound(&b, 2);
     assert!(
         row2.contains(r#"StringValue("b")"#) && row2.contains(r#"StringValue("7")"#),
-        "row 2 must bind the decoded values: {row2}"
+        "{row2}"
     );
 }
 
 #[test]
 fn binds_dictionary_encoded_array_cells() {
-    // The dictionary value type re-enters the full cell mapping, so an ARRAY<...> value type
-    // is accepted encoded too: key 0 selects the [1, NULL] cell.
     let lists = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
         Some(vec![Some(1i64), None]),
         Some(vec![Some(2)]),
@@ -1154,23 +1019,21 @@ fn binds_dictionary_encoded_array_cells() {
         vec![Field::new("tags", dict.data_type().clone(), true)],
         vec![Arc::new(dict)],
     );
-    let row0 = bound_params_debug(&b, 0);
+    let row0 = bound(&b, 0);
     assert!(
         row0.contains(r#"StringValue("1")"#) && row0.contains("NullValue"),
-        "row 0 must bind the decoded array cell: {row0}"
+        "{row0}"
     );
-    // A null cell of a List-valued dictionary is a null array (a bare NullValue).
-    let row1 = bound_params_debug(&b, 1);
+    // A null key binds a null array.
+    let row1 = bound(&b, 1);
     assert!(
         row1.contains("NullValue") && !row1.contains("ListValue"),
-        "null cell must bind as a null array: {row1}"
+        "{row1}"
     );
 }
 
 #[test]
 fn binds_dictionary_cells_of_a_sliced_batch_at_their_offset() {
-    // A sliced dictionary column reads its keys through the sliced view: slice row 0 is
-    // parent row 1 ("beta"), not the buffer-start "alpha".
     let dict: arrow_array::DictionaryArray<Int32Type> = vec![Some("alpha"), Some("beta"), None]
         .into_iter()
         .collect();
@@ -1179,52 +1042,42 @@ fn binds_dictionary_cells_of_a_sliced_batch_at_their_offset() {
         vec![Arc::new(dict)],
     );
     let sliced = b.slice(1, 2);
-    let row0 = bound_params_debug(&sliced, 0);
+    let row0 = bound(&sliced, 0);
     assert!(
         row0.contains(r#"StringValue("beta")"#) && !row0.contains("alpha"),
-        "row 0 was read from the unsliced buffer: {row0}"
+        "{row0}"
     );
-    let row1 = bound_params_debug(&sliced, 1);
+    let row1 = bound(&sliced, 1);
     assert!(
         row1.contains("NullValue") && !row1.contains("beta"),
-        "row 1 was read from the unsliced buffer: {row1}"
+        "{row1}"
     );
 }
 
 #[test]
 fn binds_non_null_key_pointing_at_null_dictionary_value_as_null() {
-    // The second way a dictionary cell can be null: the key is valid but selects a null entry
-    // *inside the values array* (the null-key form is covered above). The delegated scalar
-    // binder's own null check must fire on the values array — this exact case stayed latent
-    // for years in the ADBC postgres driver's already-supported string dictionaries
-    // (apache/arrow-adbc, "insufficient data left in message"), so lock it in.
+    // A valid key can select a null value. The ADBC PostgreSQL driver once mishandled this
+    // ("insufficient data left in message").
     let dict = arrow_array::DictionaryArray::new(
-        arrow_array::Int8Array::from(vec![Some(0i8), Some(1)]), // both keys valid
-        Arc::new(StringArray::from(vec![None, Some("a")])),     // values[0] is null
+        arrow_array::Int8Array::from(vec![Some(0i8), Some(1)]),
+        Arc::new(StringArray::from(vec![None, Some("a")])),
     );
     let b = batch(
         vec![Field::new("s", dict.data_type().clone(), true)],
         vec![Arc::new(dict)],
     );
-    let row0 = bound_params_debug(&b, 0);
+    let row0 = bound(&b, 0);
     assert!(
         row0.contains("NullValue") && !row0.contains("StringValue"),
-        "key 0 selects a null dictionary value and must bind NULL: {row0}"
+        "{row0}"
     );
-    let row1 = bound_params_debug(&b, 1);
-    assert!(
-        row1.contains(r#"StringValue("a")"#),
-        "key 1 selects a present value: {row1}"
-    );
+    let row1 = bound(&b, 1);
+    assert!(row1.contains(r#"StringValue("a")"#), "{row1}");
 }
 
 #[test]
 fn binds_json_tagged_dictionary_strings_as_json_params() {
-    // The `arrow.json` tag is honoured through dictionary encoding (the Arrow spec allows an
-    // extension array to be dictionary-encoded, so its storage type is
-    // `dictionary<indices, utf8>`): a present cell binds with the explicit JSON param type via
-    // the plain-path delegation, and a null cell keeps it — the typed-null rule of the plain
-    // path (`binds_json_tagged_strings_as_json_params`).
+    // Arrow allows extension arrays to be dictionary-encoded. Null cells keep the JSON type too.
     let dict = arrow_array::DictionaryArray::new(
         arrow_array::Int8Array::from(vec![Some(0i8), None]),
         Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#)])),
@@ -1234,18 +1087,16 @@ fn binds_json_tagged_dictionary_strings_as_json_params() {
         vec![Arc::new(dict)],
     );
     for row in 0..2 {
-        let dbg = bound_params_debug(&b, row);
+        let dbg = bound(&b, row);
         assert!(
             dbg.contains(r#""p0": Type(Type { code: Json"#),
-            "row {row} lost the JSON param type: {dbg}"
+            "row {row}: {dbg}"
         );
     }
 }
 
 #[test]
 fn json_tag_is_ignored_on_non_string_dictionary_values() {
-    // `json_tag_is_ignored_on_non_string_storage`, through the encoding: `arrow.json` is only
-    // defined over string storage, so a tagged Dictionary(_, Int64) still binds as INT64.
     let dict = arrow_array::DictionaryArray::new(
         arrow_array::Int8Array::from(vec![Some(0i8)]),
         Arc::new(Int64Array::from(vec![7i64])),
@@ -1254,17 +1105,13 @@ fn json_tag_is_ignored_on_non_string_dictionary_values() {
         vec![json_field("n", dict.data_type().clone())],
         vec![Arc::new(dict)],
     );
-    let dbg = bound_params_debug(&b, 0);
-    assert!(
-        !dbg.contains("Json"),
-        "tagged Int64 dictionary mis-bound as JSON: {dbg}"
-    );
+    let dbg = bound(&b, 0);
+    assert!(!dbg.contains("Json"), "{dbg}");
 }
 
 #[test]
 fn rejects_unsupported_dictionary_value_type() {
-    // An unsupported *value* type is rejected with the same error as its plain form — on a
-    // null cell too (the value type is validated on every row, like the other arms).
+    // Rejected on null cells too.
     let dict = arrow_array::DictionaryArray::new(
         arrow_array::Int32Array::from(vec![Some(0), None]),
         Arc::new(arrow_array::UInt64Array::from(vec![1u64])),
@@ -1274,7 +1121,7 @@ fn rejects_unsupported_dictionary_value_type() {
         vec![Arc::new(dict)],
     );
     for row in 0..2 {
-        let err = bind_row(Statement::builder("SELECT @x"), &b, row).unwrap_err();
+        let err = bind_row(&b, row).unwrap_err();
         assert!(
             err.message.contains("unsupported Arrow type UInt64"),
             "row {row}: unexpected error: {}",
@@ -1285,8 +1132,6 @@ fn rejects_unsupported_dictionary_value_type() {
 
 #[test]
 fn ingests_dictionary_encoded_columns_decoded() {
-    // Mutation-based ingest shares `cell_value`, so a dictionary cell lands decoded; the
-    // create-mode DDL mapping likewise sees through the encoding to the value type.
     let dict: arrow_array::DictionaryArray<Int32Type> =
         vec![Some("Alice"), None].into_iter().collect();
     let data_type = dict.data_type().clone();
@@ -1295,26 +1140,16 @@ fn ingests_dictionary_encoded_columns_decoded() {
         vec![Arc::new(dict)],
     );
     let dbg = format!("{:?}", insert_mutation("Users", &b, 0).unwrap());
-    assert!(
-        dbg.contains(r#"StringValue("Alice")"#),
-        "mutation must carry the decoded value: {dbg}"
-    );
+    assert!(dbg.contains(r#"StringValue("Alice")"#), "{dbg}");
     let dbg = format!("{:?}", insert_mutation("Users", &b, 1).unwrap());
     assert!(dbg.contains("NullValue"), "no NULL for row 1: {dbg}");
     assert_eq!(spanner_column_type(&data_type).unwrap(), "STRING(MAX)");
 }
 
-// ------------------------------------------------------------------------------------------
 // ARRAY (List / LargeList) binding.
-// ------------------------------------------------------------------------------------------
 
 #[test]
 fn array_elements_widen_and_keep_nulls_through_scalar_binder() {
-    // The array path routes every element through the same `scalar_binder` as a scalar bind:
-    // Int32 elements widen to Spanner INT64 (`StringValue("<digits>")`), a middle element null
-    // stays `NullValue`, and a whole-cell null becomes a `NullValue` (a Spanner null array).
-    // Asserted on the built statement's wire rendering, since a bound array's per-element wire
-    // encoding is its only external view.
     let arr = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
         Some(vec![Some(1i32), None, Some(3)]),
         None,
@@ -1323,30 +1158,23 @@ fn array_elements_widen_and_keep_nulls_through_scalar_binder() {
         vec![Field::new("tags", arr.data_type().clone(), true)],
         vec![Arc::new(arr)],
     );
-    let populated = bound_params_debug(&b, 0);
+    let populated = bound(&b, 0);
     for needle in [r#"StringValue("1")"#, "NullValue", r#"StringValue("3")"#] {
         assert!(
             populated.contains(needle),
             "row 0 missing {needle}: {populated}"
         );
     }
-    // Widening really happened — no i32-specific `NumberValue` slipped through.
-    assert!(
-        !populated.contains("NumberValue"),
-        "Int32 array element must widen to INT64: {populated}"
-    );
-    // A null array cell is a bare NullValue (no ListValue wrapper).
-    let null_array = bound_params_debug(&b, 1);
+    assert!(!populated.contains("NumberValue"), "{populated}");
+    let null_array = bound(&b, 1);
     assert!(
         null_array.contains("NullValue") && !null_array.contains("ListValue"),
-        "null array cell must be a NullValue: {null_array}"
+        "{null_array}"
     );
 }
 
 #[test]
 fn binds_int64_array_including_null_array_and_null_element() {
-    // A row with a populated array (incl. a null element), a fully-null array, and an empty
-    // array all bind without error.
     let arr = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
         Some(vec![Some(1i64), None, Some(3)]),
         None,
@@ -1356,35 +1184,20 @@ fn binds_int64_array_including_null_array_and_null_element() {
         vec![Field::new("tags", arr.data_type().clone(), true)],
         vec![Arc::new(arr)],
     );
-    let bind = |row| {
-        bound(
-            Statement::builder("INSERT INTO t (tags) VALUES (@tags)"),
-            &b,
-            row,
-        )
-    };
-    // A populated array keeps its null element in place.
-    let row0 = bind(0);
+    let row0 = bound(&b, 0);
     assert!(
         row0.contains(
             r#"ListValue { values: [Value { kind: Some(StringValue("1")) }, Value { kind: Some(NullValue(NullValue)) }, Value { kind: Some(StringValue("3")) }] }"#
         ),
         "{row0}"
     );
-    // A null array cell is a bare NullValue, not an empty list...
-    let row1 = bind(1);
+    // A null array and an empty array stay distinct.
+    let row1 = bound(&b, 1);
     assert!(row1.contains("NullValue(NullValue)"), "{row1}");
-    assert!(
-        !row1.contains("ListValue"),
-        "a null array must not be []: {row1}"
-    );
-    // ...and an empty array really is an empty list, not a NULL.
-    let row2 = bind(2);
+    assert!(!row1.contains("ListValue"), "{row1}");
+    let row2 = bound(&b, 2);
     assert!(row2.contains("ListValue { values: [] }"), "{row2}");
-    assert!(
-        !row2.contains("NullValue"),
-        "an empty array must not be NULL: {row2}"
-    );
+    assert!(!row2.contains("NullValue"), "{row2}");
 }
 
 #[test]
@@ -1447,10 +1260,8 @@ fn binds_arrays_of_each_supported_element_type() {
             Arc::new(nums),
         ],
     );
-    // Each element type keeps its own Spanner encoding inside the ListValue.
-    let row0 = bound(Statement::builder("SELECT @f, @bo, @s, @d, @t, @n"), &b, 0);
+    let row0 = bound(&b, 0);
     for needle in [
-        // FLOAT64 stays a number; the null element survives in place.
         r#"ListValue { values: [Value { kind: Some(NumberValue(1.5)) }, Value { kind: Some(NullValue(NullValue)) }] }"#,
         r#"ListValue { values: [Value { kind: Some(BoolValue(true)) }] }"#,
         r#"ListValue { values: [Value { kind: Some(StringValue("hi")) }] }"#,
@@ -1466,7 +1277,6 @@ fn binds_arrays_of_each_supported_element_type() {
 fn rejects_nested_array_element_type() {
     use arrow_array::builder::{Int64Builder, ListBuilder};
 
-    // ARRAY<ARRAY<INT64>> has no Spanner representation and must be rejected clearly.
     let mut lb = ListBuilder::new(ListBuilder::new(Int64Builder::new()));
     lb.values().values().append_value(1);
     lb.values().append(true);
@@ -1476,7 +1286,7 @@ fn rejects_nested_array_element_type() {
         vec![Field::new("x", arr.data_type().clone(), true)],
         vec![Arc::new(arr)],
     );
-    let err = bind_row(Statement::builder("SELECT @x"), &b, 0).unwrap_err();
+    let err = bind_row(&b, 0).unwrap_err();
     assert!(
         err.message.contains("unsupported Arrow type"),
         "unexpected error: {}",
@@ -1486,7 +1296,6 @@ fn rejects_nested_array_element_type() {
 
 #[test]
 fn spanner_column_type_maps_array_element_types() {
-    // The write-path DDL mapping already recurses into the element type.
     let list = |dt: DataType| DataType::List(Arc::new(Field::new("item", dt, true)));
     assert_eq!(
         spanner_column_type(&list(DataType::Utf8)).unwrap(),
@@ -1498,38 +1307,12 @@ fn spanner_column_type_maps_array_element_types() {
     );
 }
 
-// ------------------------------------------------------------------------------------------
-// Sliced batches / arrays (non-zero Arrow offsets).
-//
-// A caller can legitimately bind a sliced `RecordBatch` (e.g. `pyarrow.Table.slice`, or a
-// consumer splitting bound data into chunks), whose arrays are views at a non-zero offset
-// into shared buffers. Row `i` must then be read from the *sliced view*, not from position
-// `i` of the underlying buffers — the upstream PostgreSQL ADBC driver had exactly that bug
-// for sliced list arrays (apache/arrow-adbc#4320). These tests pin the behaviour down by
-// asserting the actual bound values, via the built statement's `Debug` rendering — the only
-// view of its parameters outside the client crate (`Statement.params` is `pub(crate)`
-// there). The needles are exact wire encodings: `INT64` binds as `StringValue("<digits>")`,
-// strings as `StringValue(..)`, and SQL nulls as `NullValue`.
-// ------------------------------------------------------------------------------------------
-
-/// Bind row `row` of `batch` as `@p0…@pN` (via [`bind_row`]) and render the built statement,
-/// parameters included, for substring assertions on the bound values.
-fn bound_params_debug(batch: &RecordBatch, row: usize) -> String {
-    let params = (0..batch.num_columns())
-        .map(|i| format!("@p{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let stmt = bind_row(Statement::builder(format!("SELECT {params}")), batch, row)
-        .unwrap()
-        .build();
-    format!("{stmt:?}")
-}
+// Sliced batches: arrays are views at a nonzero offset into shared buffers, so row `i` must be
+// read through the view. The ADBC PostgreSQL driver had this bug for sliced lists
+// (apache/arrow-adbc#4320).
 
 #[test]
 fn binds_rows_of_a_sliced_batch_at_their_offset() {
-    // Three-row parent; the bound batch is `slice(1, 2)`, so slice row 0 is parent row 1 and
-    // slice row 1 is parent row 2 (all null). Reading from position 0 of the underlying
-    // buffers instead would bind 10 / "alpha".
     let parent = batch(
         vec![
             Field::new("id", DataType::Int64, true),
@@ -1547,7 +1330,7 @@ fn binds_rows_of_a_sliced_batch_at_their_offset() {
     let sliced = parent.slice(1, 2);
     assert_eq!(sliced.num_rows(), 2);
 
-    let row0 = bound_params_debug(&sliced, 0);
+    let row0 = bound(&sliced, 0);
     assert!(row0.contains(r#"StringValue("20")"#), "row 0: {row0}");
     assert!(row0.contains(r#"StringValue("beta")"#), "row 0: {row0}");
     assert!(
@@ -1555,8 +1338,7 @@ fn binds_rows_of_a_sliced_batch_at_their_offset() {
         "row 0 was read from the unsliced buffer: {row0}"
     );
 
-    // Slice row 1 (parent row 2) is null in both columns; nothing from earlier rows leaks in.
-    let row1 = bound_params_debug(&sliced, 1);
+    let row1 = bound(&sliced, 1);
     assert!(row1.contains("NullValue"), "row 1: {row1}");
     assert!(
         !row1.contains("beta") && !row1.contains(r#"StringValue("20")"#),
@@ -1566,8 +1348,6 @@ fn binds_rows_of_a_sliced_batch_at_their_offset() {
 
 #[test]
 fn binds_list_cells_of_a_sliced_batch_at_their_offset() {
-    // The apache/arrow-adbc#4320 shape: a list column in a sliced batch. Slice row 0 must
-    // bind parent row 1's cell [3, NULL, 5] — not the buffer-start cell [1, 2].
     let arr = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
         Some(vec![Some(1i64), Some(2)]),
         Some(vec![Some(3), None, Some(5)]),
@@ -1579,7 +1359,7 @@ fn binds_list_cells_of_a_sliced_batch_at_their_offset() {
     );
     let sliced = b.slice(1, 2);
 
-    let row0 = bound_params_debug(&sliced, 0);
+    let row0 = bound(&sliced, 0);
     for needle in [r#"StringValue("3")"#, "NullValue", r#"StringValue("5")"#] {
         assert!(row0.contains(needle), "row 0 missing {needle}: {row0}");
     }
@@ -1588,7 +1368,7 @@ fn binds_list_cells_of_a_sliced_batch_at_their_offset() {
         "row 0 was read from the unsliced buffer: {row0}"
     );
 
-    let row1 = bound_params_debug(&sliced, 1);
+    let row1 = bound(&sliced, 1);
     assert!(row1.contains(r#"StringValue("6")"#), "row 1: {row1}");
     assert!(
         !row1.contains(r#"StringValue("3")"#),
@@ -1600,8 +1380,7 @@ fn binds_list_cells_of_a_sliced_batch_at_their_offset() {
 fn binds_string_list_cells_of_a_sliced_batch_at_their_offset() {
     use arrow_array::builder::{ListBuilder, StringBuilder};
 
-    // Same shape with variable-width elements: both the list offsets and the child string
-    // offsets are shared with the sliced-away row.
+    // Both the list offsets and the child string offsets are shared with the sliced-away row.
     let mut sb = ListBuilder::new(StringBuilder::new());
     sb.values().append_value("skip");
     sb.append(true);
@@ -1615,7 +1394,7 @@ fn binds_string_list_cells_of_a_sliced_batch_at_their_offset() {
     );
     let sliced = b.slice(1, 1);
 
-    let row0 = bound_params_debug(&sliced, 0);
+    let row0 = bound(&sliced, 0);
     assert!(row0.contains(r#"StringValue("keep")"#), "row 0: {row0}");
     assert!(row0.contains("NullValue"), "row 0: {row0}");
     assert!(
@@ -1642,16 +1421,16 @@ fn binds_sliced_large_lists_with_sliced_child_values() {
         vec![Arc::new(lists)],
     )
     .slice(1, 3);
-    let row = bound_params_debug(&batch, 0);
+    let row = bound(&batch, 0);
     for value in [r#"StringValue("2")"#, "NullValue", r#"StringValue("4")"#] {
         assert!(row.contains(value), "{row}");
     }
     assert!(!row.contains(r#"StringValue("1")"#), "{row}");
     assert!(!row.contains(r#"StringValue("99")"#), "{row}");
-    let empty = bound_params_debug(&batch, 1);
+    let empty = bound(&batch, 1);
     assert!(empty.contains("ListValue"), "{empty}");
     assert!(!empty.contains("NullValue"), "{empty}");
-    let null = bound_params_debug(&batch, 2);
+    let null = bound(&batch, 2);
     assert!(null.contains("NullValue"), "{null}");
     assert!(!null.contains("ListValue"), "{null}");
 }
@@ -1669,7 +1448,7 @@ fn by_name_binding_rejects_case_insensitive_duplicate_columns() {
         ],
     );
     let error = resolve_parameter_names("SELECT @NaMe", &batch, true).unwrap_err();
-    assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+    assert_eq!(error.status, Status::InvalidArguments);
     assert!(error.message.contains("same query parameter"), "{error}");
 }
 
@@ -1759,7 +1538,7 @@ fn decimal_scale_above_arrow_limit_is_rejected() {
         scalar_binder("amount", &data_type).unwrap_err(),
         spanner_column_type(&data_type).unwrap_err(),
     ] {
-        assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+        assert_eq!(error.status, Status::InvalidArguments);
         assert!(error.message.contains("unsupported scale 39"), "{error}");
     }
 }

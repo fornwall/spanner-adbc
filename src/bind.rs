@@ -36,12 +36,11 @@ use crate::sql::{named_parameters, qualified_table, quote_ident};
 
 /// Bind one row using parameter names resolved once for the SQL and batch schema.
 pub(crate) fn bind_params(
-    builder: StatementBuilder,
+    mut builder: StatementBuilder,
     names: &[String],
     batch: &RecordBatch,
     row: usize,
 ) -> Result<StatementBuilder> {
-    let mut builder = builder;
     let schema = batch.schema();
     for (i, name) in names.iter().enumerate() {
         builder = bind_one(
@@ -70,7 +69,7 @@ pub(crate) fn resolve_parameter_names(
 
     // Spanner matches case-insensitively; send each name using the query's spelling.
     if bind_by_name {
-        let param_set: std::collections::HashMap<String, &str> = params
+        let by_name: std::collections::HashMap<String, &str> = params
             .iter()
             .map(|p| (p.to_ascii_lowercase(), p.as_str()))
             .collect();
@@ -78,7 +77,7 @@ pub(crate) fn resolve_parameter_names(
         let mut bound = std::collections::HashSet::with_capacity(batch.num_columns());
         for field in schema.fields() {
             let column = field.name();
-            let Some(param) = param_set.get(&column.to_ascii_lowercase()) else {
+            let Some(param) = by_name.get(&column.to_ascii_lowercase()) else {
                 return Err(invalid_argument(format!(
                     "cannot bind column {column:?}: adbc.statement.bind_by_name is true, so every \
                      bound column must be named after one of the query's parameters, which are \

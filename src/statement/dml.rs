@@ -1,4 +1,4 @@
-//! DML binding and execution: buffered/manual writes, autocommit, returned rows and partitioned DML.
+//! DML execution: manual-transaction buffering, autocommit, `THEN RETURN` and partitioned DML.
 
 use std::sync::Arc;
 
@@ -29,8 +29,8 @@ pub(super) enum DmlOutcome {
 }
 
 impl SpannerStatement {
-    /// Bind each row to one normalized DML statement. Reuse its configured builder and resolve
-    /// parameter names once per batch; directed-read options apply only to read-only queries.
+    /// Bind each row to the single DML statement in `sql`. Directed reads apply only to read-only
+    /// queries, so this uses `sql_builder`.
     fn build_bound_statements(&self, sql: &str) -> Result<Vec<SpannerSql>> {
         let parts = crate::sql::split_statements(sql);
         check_all_dml_batch(&parts)?;
@@ -48,8 +48,7 @@ impl SpannerStatement {
             if batch.num_rows() == 0 {
                 continue;
             }
-            // Resolve the column→parameter mapping once per batch (it lexes `sql`), then reuse it
-            // for every row instead of re-lexing the SQL per bound row.
+            // Resolving names lexes the SQL, so do it once per batch.
             let names = bind::resolve_parameter_names(sql, batch, self.bind_by_name)?;
             for row in 0..batch.num_rows() {
                 statements.push(bind::bind_params(builder.clone(), &names, batch, row)?.build());
@@ -64,8 +63,6 @@ impl SpannerStatement {
             return self.build_bound_statements(sql);
         }
         let statements = crate::sql::split_statements(sql);
-        // `ExecuteBatchDml` accepts only DML. Validate the entire batch before buffering any
-        // statements in a manual transaction.
         check_all_dml_batch(&statements)?;
         Ok(statements
             .into_iter()
@@ -105,7 +102,7 @@ impl SpannerStatement {
         let isolation = self.config.isolation.clone();
         let request = self.config.request.clone();
         let retry = self.config.retry;
-        // DML with THEN RETURN is a write path: the update timeout bounds the whole transaction.
+        // The update timeout covers the whole transaction.
         let update_timeout = self.config.timeouts.update_timeout();
         let transaction = async move {
             let mut runner = runner_builder(&client, isolation, &request, retry);
@@ -221,7 +218,7 @@ impl SpannerStatement {
         let bound_rows = self.bound.iter().map(RecordBatch::num_rows).sum();
         check_partitioned_dml(sql, lock_txn(&self.txn).autocommit(), bound_rows)?;
         let mut statements = self.build_dml_statements(sql)?;
-        // A bound stream of zero rows has nothing to execute, exactly as on the batch-DML path.
+        // Zero bound rows leave nothing to execute, as on the batch DML path.
         let Some(statement) = statements.pop() else {
             return Ok(0);
         };
