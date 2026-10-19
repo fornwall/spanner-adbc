@@ -1,5 +1,5 @@
-//! Offline tests for isolation levels, the fixed current catalog/schema and partition
-//! descriptors.
+//! Offline tests for isolation levels, the fixed current catalog/schema, partition descriptors,
+//! and metadata reads against a mock server.
 
 use adbc_core::error::Status;
 use adbc_core::options::OptionValue;
@@ -315,8 +315,8 @@ mod table_schema_probe {
 
     use crate::{SpannerConnection, SpannerDriver};
 
-    type Requests = Arc<Mutex<Vec<v1::ExecuteSqlRequest>>>;
-    type Sender = tokio::sync::mpsc::Sender<tonic::Result<v1::PartialResultSet>>;
+    pub(super) type Requests = Arc<Mutex<Vec<v1::ExecuteSqlRequest>>>;
+    pub(super) type Sender = tokio::sync::mpsc::Sender<tonic::Result<v1::PartialResultSet>>;
 
     /// What the mock answers to the `SELECT * ... LIMIT 0` schema query.
     enum SchemaQuery {
@@ -325,9 +325,9 @@ mod table_schema_probe {
         Silent,
     }
 
-    struct MockServer {
+    pub(super) struct MockServer {
         endpoint: String,
-        requests: Requests,
+        pub(super) requests: Requests,
         server: tokio::task::JoinHandle<()>,
         _runtime: tokio::runtime::Runtime,
     }
@@ -344,13 +344,6 @@ mod table_schema_probe {
         let requests = Requests::default();
         let silent: Arc<Mutex<Vec<Sender>>> = Arc::default();
         let mut mock = MockSpanner::new();
-        mock.expect_create_session().returning(|request| {
-            Ok(tonic::Response::new(v1::Session {
-                name: format!("{}/sessions/mock", request.into_inner().database),
-                multiplexed: true,
-                ..Default::default()
-            }))
-        });
         let record = requests.clone();
         mock.expect_execute_streaming_sql()
             .returning(move |request| {
@@ -386,6 +379,19 @@ mod table_schema_probe {
                     }
                 }
             });
+        serve(mock, requests)
+    }
+
+    /// Serves sessions plus `mock`'s expectations on an ephemeral port. `requests` is what the
+    /// expectations record.
+    pub(super) fn serve(mut mock: MockSpanner, requests: Requests) -> MockServer {
+        mock.expect_create_session().returning(|request| {
+            Ok(tonic::Response::new(v1::Session {
+                name: format!("{}/sessions/mock", request.into_inner().database),
+                multiplexed: true,
+                ..Default::default()
+            }))
+        });
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -402,7 +408,7 @@ mod table_schema_probe {
         }
     }
 
-    fn connect(server: &MockServer) -> SpannerConnection {
+    pub(super) fn connect(server: &MockServer) -> SpannerConnection {
         let mut driver = SpannerDriver::try_new().unwrap();
         driver
             .new_database_with_opts([
@@ -470,6 +476,35 @@ mod table_schema_probe {
         assert_eq!(single_use_bound(&requests[1]), expected);
     }
 
+    /// Spanner resolves names case-insensitively, but `INFORMATION_SCHEMA` keeps the declared
+    /// case, so the probe must lowercase both sides; otherwise it would report `singers` missing
+    /// while `Singers` exists. The mock can't evaluate SQL, so check the probe's text.
+    #[test]
+    fn probe_compares_names_case_insensitively() {
+        let server = start(SchemaQuery::Fails(tonic::Code::InvalidArgument));
+        let error = connect(&server)
+            .get_table_schema(None, Some("App"), "singers")
+            .unwrap_err();
+        assert_eq!(error.status, Status::NotFound, "{}", error.message);
+
+        let requests = server.requests.lock().unwrap();
+        let probe = &requests[1];
+        for comparison in [
+            "LOWER(TABLE_SCHEMA) = LOWER(@schema)",
+            "LOWER(TABLE_NAME) = LOWER(@table)",
+        ] {
+            assert!(probe.sql.contains(comparison), "{}", probe.sql);
+        }
+        let params = &probe.params.as_ref().expect("bound names").fields;
+        for (name, value) in [("schema", "App"), ("table", "singers")] {
+            assert_eq!(
+                params[name].kind,
+                Some(prost_types::value::Kind::StringValue(value.into())),
+                "{name}"
+            );
+        }
+    }
+
     /// Only a missing-table status is refined. Probing after a timeout would add a second query
     /// deadline, and after a permission error the probe cannot see the table.
     #[test]
@@ -492,5 +527,121 @@ mod table_schema_probe {
         let error = connection.get_table_schema(None, None, "Slow").unwrap_err();
         assert_eq!(error.status, Status::Timeout, "{}", error.message);
         assert_eq!(server.requests.lock().unwrap().len(), 1, "no probe");
+    }
+}
+
+/// `get_statistics` against a mock server whose every query answers after a delay.
+mod statistics_deadline {
+    use std::time::Duration;
+
+    use adbc_core::error::Status;
+    use adbc_core::options::{OptionConnection, OptionValue};
+    use adbc_core::{Connection, Optionable};
+    use spanner_grpc_mock::MockSpanner;
+    use spanner_grpc_mock::google::spanner::v1;
+
+    use super::table_schema_probe::{Requests, connect, serve};
+
+    const DELAY: Duration = Duration::from_millis(200);
+
+    fn wire_type(code: v1::TypeCode) -> Option<v1::Type> {
+        Some(v1::Type {
+            code: code as i32,
+            ..Default::default()
+        })
+    }
+
+    /// One table `t` with no visible columns, so the only scan is `COUNT(*)`.
+    fn delayed_response(request: &v1::ExecuteSqlRequest) -> v1::PartialResultSet {
+        use v1::TypeCode::{Int64, String};
+        let (fields, values): (Vec<(&str, v1::TypeCode)>, Vec<&str>) =
+            if request.sql.contains("INFORMATION_SCHEMA.TABLES") {
+                (
+                    vec![("TABLE_SCHEMA", String), ("TABLE_NAME", String)],
+                    vec!["", "t"],
+                )
+            } else if request.sql.contains("INFORMATION_SCHEMA.COLUMNS") {
+                let names = ["TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "SPANNER_TYPE"];
+                (names.map(|name| (name, String)).to_vec(), Vec::new())
+            } else {
+                (vec![("n", Int64)], vec!["3"])
+            };
+        let inline_begin = matches!(
+            request
+                .transaction
+                .as_ref()
+                .and_then(|t| t.selector.as_ref()),
+            Some(v1::transaction_selector::Selector::Begin(_))
+        );
+        v1::PartialResultSet {
+            metadata: Some(v1::ResultSetMetadata {
+                row_type: Some(v1::StructType {
+                    fields: fields
+                        .into_iter()
+                        .map(|(name, code)| v1::struct_type::Field {
+                            name: name.into(),
+                            r#type: wire_type(code),
+                        })
+                        .collect(),
+                }),
+                // The client needs the id of a transaction begun inline.
+                transaction: inline_begin.then(|| v1::Transaction {
+                    id: b"stats-txn".to_vec(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            values: values
+                .into_iter()
+                .map(|value| prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue(value.into())),
+                })
+                .collect(),
+            last: true,
+            ..Default::default()
+        }
+    }
+
+    /// The query timeout is one deadline for the whole call. Discovery (two sequential queries)
+    /// and the scan each fit in it, but together they don't.
+    #[test]
+    fn one_query_deadline_covers_discovery_and_scans() {
+        let requests = Requests::default();
+        let mut mock = MockSpanner::new();
+        let record = requests.clone();
+        mock.expect_execute_streaming_sql()
+            .returning(move |request| {
+                let request = request.into_inner();
+                let response = delayed_response(&request);
+                record.lock().unwrap().push(request);
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tokio::spawn(async move {
+                    tokio::time::sleep(DELAY).await;
+                    let _ = tx.send(Ok(response)).await;
+                });
+                Ok(tonic::Response::new(rx))
+            });
+        let server = serve(mock, requests);
+        let mut connection = connect(&server);
+
+        let statistics = connection.get_statistics(None, None, None, false);
+        assert!(statistics.is_ok(), "no deadline: {:?}", statistics.err());
+        assert_eq!(
+            server.requests.lock().unwrap().len(),
+            3,
+            "TABLES, COLUMNS, one scan"
+        );
+
+        connection
+            .set_option(
+                OptionConnection::Other(crate::OPTION_RPC_TIMEOUT_QUERY.into()),
+                OptionValue::Double(2.5 * DELAY.as_secs_f64()),
+            )
+            .unwrap();
+        let error = connection
+            .get_statistics(None, None, None, false)
+            .err()
+            .expect("three sequential delays exceed one deadline");
+        assert_eq!(error.status, Status::Timeout, "{}", error.message);
     }
 }

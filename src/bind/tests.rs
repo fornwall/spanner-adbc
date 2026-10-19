@@ -428,6 +428,48 @@ fn json_tagged_strings_ingest_as_plain_strings_in_mutations() {
     assert!(dbg.contains(r#"StringValue("{\"a\":1}")"#), "{dbg}");
 }
 
+/// The pre-DDL check must fail exactly where building the mutations would, including on a later
+/// row and inside dictionaries and lists.
+#[test]
+fn ingest_value_check_fails_where_mutation_building_would() {
+    use arrow_array::{ArrayRef, Date64Array, DictionaryArray};
+
+    let date_dictionary = DictionaryArray::new(
+        Int32Array::from(vec![0, 1]),
+        Arc::new(Date32Array::from(vec![0, i32::MAX])) as ArrayRef,
+    );
+    let bad_second_rows: Vec<ArrayRef> = vec![
+        Arc::new(Date32Array::from(vec![0, i32::MAX])),
+        Arc::new(Date64Array::from(vec![0, 1])),
+        Arc::new(TimestampSecondArray::from(vec![0, i64::MAX])),
+        Arc::new(date_dictionary),
+        Arc::new(ListArray::from_iter_primitive::<Date32Type, _, _>([
+            Some(vec![Some(0)]),
+            Some(vec![Some(i32::MAX)]),
+        ])),
+    ];
+    for array in bad_second_rows {
+        let b = batch(
+            vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("d", array.data_type().clone(), false),
+            ],
+            vec![Arc::new(Int64Array::from(vec![1, 2])), array],
+        );
+        assert!(insert_mutation("t", &b, 0).is_ok());
+        let expected = insert_mutation("t", &b, 1).unwrap_err();
+        let error = check_ingest_values(&b).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(error.message, expected.message);
+        assert!(check_ingest_values(&b.slice(0, 1)).is_ok());
+    }
+    let unsupported = batch(
+        vec![Field::new("x", DataType::UInt64, false)],
+        vec![Arc::new(arrow_array::UInt64Array::from(vec![1u64]))],
+    );
+    assert!(check_ingest_values(&unsupported).is_err());
+}
+
 #[test]
 fn mutation_table_joins_schema_with_a_dot() {
     assert_eq!(mutation_table(None, "Users"), "Users");

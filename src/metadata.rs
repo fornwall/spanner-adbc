@@ -35,6 +35,11 @@ pub(crate) fn check_lookup_catalog(catalog: Option<&str>, reported: &str) -> Res
     }
 }
 
+/// The [`table_exists_at`] probe. Spanner resolves schema and table names case-insensitively, but
+/// `INFORMATION_SCHEMA` keeps their declared case.
+const TABLE_EXISTS_SQL: &str = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
+     WHERE LOWER(TABLE_SCHEMA) = LOWER(@schema) AND LOWER(TABLE_NAME) = LOWER(@table)";
+
 /// Whether a table exists now, read strongly as writes see it. The default schema is `""` in
 /// Spanner.
 ///
@@ -73,14 +78,10 @@ pub(crate) fn table_exists_at(
             config.timeouts.query_timeout(),
             crate::OPTION_RPC_TIMEOUT_QUERY,
             async move {
-                let statement = metadata_sql_builder(
-                    config,
-                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
-                 WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table",
-                )
-                .add_param("schema", &schema)
-                .add_param("table", &table)
-                .build();
+                let statement = metadata_sql_builder(config, TABLE_EXISTS_SQL)
+                    .add_param("schema", &schema)
+                    .add_param("table", &table)
+                    .build();
                 let transaction = crate::staleness::single_use(&client, bound);
                 let result_set = transaction
                     .execute_query(statement)

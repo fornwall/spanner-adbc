@@ -69,23 +69,20 @@ pub(crate) fn collect_statistics(
     db_schema: Option<&str>,
     table_name: Option<&str>,
 ) -> Result<Vec<SchemaStatistics>> {
-    let timeout = config.timeouts.query_timeout();
-    // Discovery and aggregate scans share one snapshot, including for stale reads.
     let bound = config.read_staleness.multi_use_timestamp_bound()?;
-    let txn = {
-        let client = client.clone();
-        Arc::new(block_on_cancellable(runtime, cancel, async move {
-            crate::staleness::multi_use(&client, bound).await
-        })?)
-    };
-
-    // Discovery and aggregate scans each get the connection's query timeout.
-    let (table_batch, column_batch) = {
-        let txn = txn.clone();
-        block_on_cancellable(
-            runtime,
-            cancel,
-            with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
+    let client = client.clone();
+    let db_schema_matcher = db_schema.map(LikeMatcher::new);
+    let table_name_matcher = table_name.map(LikeMatcher::new);
+    // One cancel signal and query deadline cover discovery and every scan, as for `get_objects`.
+    let (prepared, batches) = block_on_cancellable(
+        runtime,
+        cancel,
+        with_timeout(
+            config.timeouts.query_timeout(),
+            crate::OPTION_RPC_TIMEOUT_QUERY,
+            async move {
+                // Discovery and aggregate scans share one snapshot, including for stale reads.
+                let txn = crate::staleness::multi_use(&client, bound).await?;
                 let tables = query_txn(
                     &txn,
                     metadata_sql_builder(
@@ -107,75 +104,24 @@ pub(crate) fn collect_statistics(
                     ),
                 )
                 .await?;
-                Ok::<_, Error>((tables, columns))
-            }),
-        )?
-    };
-
-    let (ts, tn) = (
-        str_col(&table_batch, tables_col::TABLE_SCHEMA)?,
-        str_col(&table_batch, tables_col::TABLE_NAME)?,
-    );
-    let (cts, ctn, ccn, ctype) = (
-        str_col(&column_batch, columns_col::TABLE_SCHEMA)?,
-        str_col(&column_batch, columns_col::TABLE_NAME)?,
-        str_col(&column_batch, columns_col::COLUMN_NAME)?,
-        str_col(&column_batch, columns_col::SPANNER_TYPE)?,
-    );
-
-    // Group columns once, preserving ordinal order within each table.
-    let mut columns_by_table: HashMap<(&str, &str), Vec<(String, bool)>> = HashMap::new();
-    for c in 0..column_batch.num_rows() {
-        columns_by_table
-            .entry((cts.value(c), ctn.value(c)))
-            .or_default()
-            .push((ccn.value(c).to_string(), is_groupable(ctype.value(c))));
-    }
-
-    let db_schema_matcher = db_schema.map(LikeMatcher::new);
-    let table_name_matcher = table_name.map(LikeMatcher::new);
-    let mut prepared: Vec<PreparedTable> = Vec::new();
-    for r in 0..table_batch.num_rows() {
-        let schema = ts.value(r);
-        let table = tn.value(r);
-        if db_schema_matcher
-            .as_ref()
-            .is_some_and(|m| !m.matches(schema))
-        {
-            continue;
-        }
-        if table_name_matcher
-            .as_ref()
-            .is_some_and(|m| !m.matches(table))
-        {
-            continue;
-        }
-        let columns = columns_by_table
-            .remove(&(schema, table))
-            .unwrap_or_default();
-        let (sql, plan) = build_table_query(schema, table, &columns)?;
-        prepared.push(PreparedTable {
-            schema: schema.to_string(),
-            table: table.to_string(),
-            sql,
-            plan,
-        });
-    }
-
-    // `buffered` keeps input order. One cancel signal and deadline cover all scans.
-    let batches: Vec<RecordBatch> = block_on_cancellable(
-        runtime,
-        cancel,
-        with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async {
-            stream::iter(prepared.iter().map(|p| {
-                let txn = txn.clone();
-                let statement = metadata_sql_builder(config, p.sql.as_str());
-                async move { query_txn(&txn, statement).await }
-            }))
-            .buffered(STATISTICS_SCAN_CONCURRENCY)
-            .try_collect()
-            .await
-        }),
+                let prepared = prepare_tables(
+                    &tables,
+                    &columns,
+                    db_schema_matcher.as_ref(),
+                    table_name_matcher.as_ref(),
+                )?;
+                // `buffered` keeps input order.
+                let batches: Vec<RecordBatch> = stream::iter(
+                    prepared
+                        .iter()
+                        .map(|p| query_txn(&txn, metadata_sql_builder(config, p.sql.as_str()))),
+                )
+                .buffered(STATISTICS_SCAN_CONCURRENCY)
+                .try_collect()
+                .await?;
+                Ok::<_, Error>((prepared, batches))
+            },
+        ),
     )?;
 
     // Group by schema in first-seen order without repeatedly scanning the output.
@@ -195,6 +141,58 @@ pub(crate) fn collect_statistics(
         }
     }
     Ok(schemas)
+}
+
+/// Build the aggregate query of each discovered base table that matches the filters, from the
+/// `INFORMATION_SCHEMA.TABLES` and `COLUMNS` discovery batches.
+fn prepare_tables(
+    table_batch: &RecordBatch,
+    column_batch: &RecordBatch,
+    db_schema_matcher: Option<&LikeMatcher>,
+    table_name_matcher: Option<&LikeMatcher>,
+) -> Result<Vec<PreparedTable>> {
+    let (ts, tn) = (
+        str_col(table_batch, tables_col::TABLE_SCHEMA)?,
+        str_col(table_batch, tables_col::TABLE_NAME)?,
+    );
+    let (cts, ctn, ccn, ctype) = (
+        str_col(column_batch, columns_col::TABLE_SCHEMA)?,
+        str_col(column_batch, columns_col::TABLE_NAME)?,
+        str_col(column_batch, columns_col::COLUMN_NAME)?,
+        str_col(column_batch, columns_col::SPANNER_TYPE)?,
+    );
+
+    // Group columns once, preserving ordinal order within each table.
+    let mut columns_by_table: HashMap<(&str, &str), Vec<(String, bool)>> = HashMap::new();
+    for c in 0..column_batch.num_rows() {
+        columns_by_table
+            .entry((cts.value(c), ctn.value(c)))
+            .or_default()
+            .push((ccn.value(c).to_string(), is_groupable(ctype.value(c))));
+    }
+
+    let mut prepared: Vec<PreparedTable> = Vec::new();
+    for r in 0..table_batch.num_rows() {
+        let schema = ts.value(r);
+        let table = tn.value(r);
+        if db_schema_matcher.is_some_and(|m| !m.matches(schema)) {
+            continue;
+        }
+        if table_name_matcher.is_some_and(|m| !m.matches(table)) {
+            continue;
+        }
+        let columns = columns_by_table
+            .remove(&(schema, table))
+            .unwrap_or_default();
+        let (sql, plan) = build_table_query(schema, table, &columns)?;
+        prepared.push(PreparedTable {
+            schema: schema.to_string(),
+            table: table.to_string(),
+            sql,
+            plan,
+        });
+    }
+    Ok(prepared)
 }
 
 /// A per-table aggregate statistics query, prepared but not yet run.

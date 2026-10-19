@@ -168,6 +168,55 @@ pub(crate) fn insert_mutation(table: &str, batch: &RecordBatch, row: usize) -> R
     Ok(builder.build())
 }
 
+/// Run the mutation value conversion over `batch` and discard the values, so an ingest can reject
+/// a bad value before its DDL runs. A column whose values always convert once its type is accepted
+/// is checked on its first row only.
+pub(crate) fn check_ingest_values(batch: &RecordBatch) -> Result<()> {
+    let schema = batch.schema();
+    for (i, field) in schema.fields().iter().enumerate() {
+        let column = batch.column(i).as_ref();
+        let rows = if values_always_convert(column.data_type()) {
+            batch.num_rows().min(1)
+        } else {
+            batch.num_rows()
+        };
+        for row in 0..rows {
+            cell_value(field.name(), field, column, row)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether [`scalar_binder`] accepts every value of `data_type` once it accepts the type. Types
+/// not listed here, such as dates and timestamps, are checked value by value.
+fn values_always_convert(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Null
+        | DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_)
+        | DataType::Decimal128(_, _) => true,
+        DataType::Dictionary(_, value) => values_always_convert(value),
+        DataType::List(item) | DataType::LargeList(item) => values_always_convert(item.data_type()),
+        _ => false,
+    }
+}
+
 /// Qualify a mutation table with its schema, without SQL identifier quoting.
 pub(crate) fn mutation_table(db_schema: Option<&str>, table_name: &str) -> String {
     match db_schema.filter(|s| !s.is_empty()) {

@@ -286,15 +286,16 @@ fn split_batches_caps_rows_per_batch() {
     assert_eq!(last.unwrap().values(), &[4]);
 }
 
-/// Statements on an in-process mock server that only serves sessions and records queries, which
-/// it rejects with a non-retryable status.
+/// Statements on an in-process mock server that only serves sessions. It records queries and
+/// counts transaction RPCs, rejecting both with a non-retryable status.
 mod mock {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use adbc_core::error::Status;
     use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
     use adbc_core::{Connection, Database, Driver, Optionable, Statement};
-    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_array::{Date32Array, Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use spanner_grpc_mock::MockSpanner;
     use spanner_grpc_mock::google::spanner::v1;
@@ -306,6 +307,8 @@ mod mock {
     struct MockServer {
         endpoint: String,
         requests: Requests,
+        /// Transaction and DML RPCs, which the mock rejects without recording their content.
+        other_rpcs: Arc<AtomicUsize>,
         server: tokio::task::JoinHandle<()>,
         _runtime: tokio::runtime::Runtime,
     }
@@ -332,6 +335,26 @@ mod mock {
                 record.lock().unwrap().push(request.into_inner());
                 Err(tonic::Status::unimplemented("mock spanner server"))
             });
+        // An unexpected call would panic the server task, which the client retries forever.
+        let other_rpcs = Arc::new(AtomicUsize::new(0));
+        macro_rules! reject_and_count {
+            ($($method:ident),+) => {
+                $(
+                    let count = other_rpcs.clone();
+                    mock.$method().returning(move |_| {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Err(tonic::Status::unimplemented("mock spanner server"))
+                    });
+                )+
+            };
+        }
+        reject_and_count!(
+            expect_begin_transaction,
+            expect_commit,
+            expect_rollback,
+            expect_execute_batch_dml,
+            expect_batch_write
+        );
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -343,9 +366,14 @@ mod mock {
         MockServer {
             endpoint,
             requests,
+            other_rpcs,
             server,
             _runtime: runtime,
         }
+    }
+
+    fn rpc_count(server: &MockServer) -> usize {
+        server.requests.lock().unwrap().len() + server.other_rpcs.load(Ordering::SeqCst)
     }
 
     fn connect(server: &MockServer) -> SpannerConnection {
@@ -536,5 +564,123 @@ mod mock {
                 nanos: 0,
             }))
         );
+    }
+
+    fn ingest_statement(
+        connection: &mut SpannerConnection,
+        db_schema: Option<&str>,
+        table: &str,
+        mode: &str,
+    ) -> SpannerStatement {
+        let mut statement = connection.new_statement().unwrap();
+        if let Some(db_schema) = db_schema {
+            statement
+                .set_option(
+                    OptionStatement::TargetDbSchema,
+                    OptionValue::String(db_schema.into()),
+                )
+                .unwrap();
+        }
+        for (key, value) in [
+            (OptionStatement::TargetTable, table),
+            (OptionStatement::IngestMode, mode),
+            // Bounds the admin RPC if the DDL runs anyway; the mock serves no admin API.
+            (
+                OptionStatement::Other(crate::OPTION_RPC_TIMEOUT_UPDATE.into()),
+                "5",
+            ),
+        ] {
+            statement
+                .set_option(key, OptionValue::String(value.into()))
+                .unwrap();
+        }
+        statement
+    }
+
+    /// DDL can't be rolled back, and `replace` drops the existing table, so a value that fails
+    /// to convert must fail the ingest before any DDL runs.
+    #[test]
+    fn ingest_value_errors_fail_before_the_table_ddl() {
+        let server = start();
+        let mut connection = connect(&server);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("d", DataType::Date32, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(Date32Array::from(vec![0, i32::MAX])),
+            ],
+        )
+        .unwrap();
+        for mode in ["replace", "create", "create_append"] {
+            let mut statement = ingest_statement(&mut connection, None, "t", mode);
+            statement.bind(batch.clone()).unwrap();
+            let error = statement.execute_update().unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{mode}: {error}");
+            assert!(error.message.contains("out of range"), "{mode}: {error}");
+        }
+        assert_eq!(rpc_count(&server), 0);
+    }
+
+    /// Every mode rejects names Spanner can never accept, before any RPC. Append builds no DDL,
+    /// so without the check it would send them in mutations and report `NotFound`.
+    #[test]
+    fn ingest_rejects_invalid_names_in_every_mode() {
+        let server = start();
+        let mut connection = connect(&server);
+        let named = |column: &str| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    column,
+                    DataType::Int64,
+                    false,
+                )])),
+                vec![Arc::new(Int64Array::from(vec![1_i64]))],
+            )
+            .unwrap()
+        };
+        for mode in ["append", "create", "create_append", "replace"] {
+            for (db_schema, table, column) in [
+                (None, "", "c"),
+                (None, "t`x", "c"),
+                (None, "t\\x", "c"),
+                (Some("s`"), "t", "c"),
+                (None, "t", ""),
+                (None, "t", "c`d"),
+            ] {
+                let mut statement = ingest_statement(&mut connection, db_schema, table, mode);
+                statement.bind(named(column)).unwrap();
+                let error = statement.execute_update().unwrap_err();
+                assert_eq!(
+                    error.status,
+                    Status::InvalidArguments,
+                    "{mode} {db_schema:?}.{table:?} column {column:?}: {error}"
+                );
+            }
+        }
+        assert_eq!(rpc_count(&server), 0);
+    }
+
+    /// Zero bound rows execute nothing, as plain DML does; the runner would otherwise begin and
+    /// commit an empty read/write transaction.
+    #[test]
+    fn returning_dml_with_zero_bound_rows_sends_nothing() {
+        let server = start();
+        let mut connection = connect(&server);
+        let sql = "UPDATE t SET c = 1 WHERE c = @p THEN RETURN c";
+        for update in [true, false] {
+            let mut statement = connection.new_statement().unwrap();
+            statement.set_sql_query(sql).unwrap();
+            statement.bind(one_row().slice(0, 0)).unwrap();
+            if update {
+                assert_eq!(statement.execute_update().unwrap(), Some(0));
+            } else {
+                let reader = statement.execute().unwrap();
+                assert_eq!(reader.count(), 0);
+            }
+        }
+        assert_eq!(rpc_count(&server), 0);
     }
 }

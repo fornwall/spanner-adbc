@@ -205,6 +205,15 @@ impl SpannerStatement {
         } else {
             self.build_bound_statements(sql)?
         };
+        // Zero bound rows leave nothing to execute, as on the batch DML path; the runner would
+        // still begin and commit an empty transaction.
+        if statements.is_empty() {
+            return Ok(DmlOutcome::Returning {
+                batches: Vec::new(),
+                schema: Arc::new(Schema::empty()),
+                affected: 0,
+            });
+        }
         let (batches, schema, affected) = self.execute_returning_dml(statements)?;
         Ok(DmlOutcome::Returning {
             batches,

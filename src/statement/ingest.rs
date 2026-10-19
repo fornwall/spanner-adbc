@@ -148,13 +148,34 @@ impl SpannerStatement {
                 txn.check_kind_allowed(TxnKind::Dml)?;
             }
         }
+        self.check_ingest_names(table)?;
         let ingest_ddl = self.build_ingest_table_ddl(table, self.ingest_mode)?;
         if let Some(ddl) = ingest_ddl {
+            // DDL can't be rolled back, and `replace` has already dropped the old table when the
+            // mutations are built, so a bad value must fail first.
+            for batch in &self.bound {
+                bind::check_ingest_values(batch)?;
+            }
             self.run_ddl(ddl)
                 .map_err(|error| self.remap_ingest_create_error(table, error))?;
         }
         self.run_ingest_mutations(table)
             .map_err(|error| self.remap_ingest_append_error(table, error))
+    }
+
+    /// Reject names Spanner can never accept with `InvalidArguments` in every mode. The create
+    /// modes would catch them while building DDL; `append` would send them in mutations and get
+    /// back a missing-table or missing-column error.
+    fn check_ingest_names(&self, table: &str) -> Result<()> {
+        crate::sql::qualified_table(self.target_db_schema.as_deref(), table)?;
+        if let Some(schema) = self.bound_ingest_schema() {
+            for field in schema.fields() {
+                crate::sql::quote_ident(field.name()).map_err(|e| {
+                    annotate(e, |m| format!("ingest column {:?}: {m}", field.name()))
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// Map a failed `create`-mode DDL onto `AlreadyExists`, as ADBC requires, when the table
@@ -472,7 +493,7 @@ fn note_rows_already_committed(error: Error, committed: i64) -> Error {
             note.push_str("; ");
         }
         note.push_str(
-            "this chunk's own commit outcome is unknown — it may still have landed server-side, so \
+            "this chunk's own commit outcome is unknown: it may still have landed server-side, so \
              retrying could duplicate rows",
         );
     }
