@@ -1,6 +1,6 @@
-//! Creating a statement requires a connection, which opens a session with a real RPC. These
-//! tests cover what needs no live statement: argument validation, released handles, partition
-//! export and bound stream import.
+//! Creating a statement requires a connection, which opens a session with an RPC. Most of these
+//! tests need no live statement: argument validation, released handles, partition export and
+//! bound stream import. [`MockStatement`] serves the rest from a mock Spanner server.
 
 use std::ffi::{CString, c_int};
 use std::sync::Arc;
@@ -11,6 +11,7 @@ use arrow_array::ffi::to_ffi;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatchIterator};
 
 use super::*;
+use crate::ffi::abi::AdbcDatabase;
 use crate::ffi::options::{
     get_option_bytes, get_option_double, get_option_int, get_option_string, release_handle,
     set_option_bytes, set_option_double, set_option_int, set_option_string,
@@ -397,4 +398,206 @@ fn exported_partitions_point_into_the_owned_payloads() {
     assert_eq!(unsafe { *exported.partition_lengths }, 4096);
     let release = exported.release.unwrap();
     unsafe { release(&raw mut exported) };
+}
+
+/// Arrow's importer asserts that a struct's children match its fields, at every nesting level.
+/// The top-level count is checked before import, but a nested mismatch reaches the importer.
+#[test]
+fn a_nested_column_that_disagrees_with_the_bound_schema_is_an_error_not_a_panic() {
+    use arrow_array::RecordBatchReader;
+    use arrow_schema::{DataType, Field, Fields};
+
+    let x = Field::new("x", DataType::Int64, false);
+    let y = Field::new("y", DataType::Int64, false);
+    let declared = Arc::new(Schema::new(vec![Field::new(
+        "a",
+        DataType::Struct(Fields::from(vec![x.clone()])),
+        false,
+    )]));
+    let wider = StructArray::new(
+        Fields::from(vec![x, y]),
+        vec![
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+        ],
+        None,
+    );
+    let actual = Arc::new(Schema::new(vec![Field::new(
+        "a",
+        wider.data_type().clone(),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(actual, vec![Arc::new(wider) as ArrayRef]).unwrap();
+    // `RecordBatchIterator` does not check its batches against the schema it reports.
+    let mut stream = FFI_ArrowArrayStream::new(Box::new(RecordBatchIterator::new(
+        [Ok(batch)],
+        declared.clone(),
+    )));
+    let mut reader = unsafe { BoundStreamReader::from_raw(&raw mut stream) }.unwrap();
+    assert_eq!(reader.schema(), declared);
+    let failure = reader.next().unwrap().unwrap_err().to_string();
+    assert!(failure.contains("invalid Arrow array"), "{failure}");
+    assert!(reader.next().is_none());
+}
+
+/// A live statement over a mock Spanner server, created through the C ABI without a backend.
+struct MockStatement {
+    statement: AdbcStatement,
+    connection: AdbcConnection,
+    database: AdbcDatabase,
+    server: tokio::task::JoinHandle<()>,
+    _runtime: tokio::runtime::Runtime,
+}
+
+impl MockStatement {
+    fn start() -> Self {
+        use spanner_grpc_mock::MockSpanner;
+        use spanner_grpc_mock::google::spanner::v1;
+
+        use crate::ffi::database::database_init;
+        use crate::ffi::options::new_handle;
+
+        let mut mock = MockSpanner::new();
+        mock.expect_create_session().returning(|request| {
+            Ok(tonic::Response::new(v1::Session {
+                name: format!("{}/sessions/mock", request.into_inner().database),
+                multiplexed: true,
+                ..Default::default()
+            }))
+        });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (endpoint, server) = runtime
+            .block_on(spanner_grpc_mock::start("127.0.0.1:0", mock))
+            .unwrap();
+
+        let mut database = AdbcDatabase {
+            private_data: null(),
+            private_driver: null(),
+        };
+        assert_eq!(
+            unsafe { new_handle(&raw mut database, null()) },
+            ADBC_STATUS_OK
+        );
+        for (name, value) in [
+            ("uri", "spanner:///projects/p/instances/i/databases/d"),
+            (crate::OPTION_ENDPOINT, endpoint.as_str()),
+            (crate::OPTION_EMULATOR, "true"),
+        ] {
+            let (name, value) = (key(name), key(value));
+            assert_eq!(
+                unsafe {
+                    set_option_string(&raw mut database, name.as_ptr(), value.as_ptr(), null())
+                },
+                ADBC_STATUS_OK
+            );
+        }
+        assert_eq!(
+            unsafe { database_init(&raw mut database, null()) },
+            ADBC_STATUS_OK
+        );
+
+        let mut connection = AdbcConnection {
+            private_data: null(),
+            private_driver: null(),
+        };
+        assert_eq!(
+            unsafe { new_handle(&raw mut connection, null()) },
+            ADBC_STATUS_OK
+        );
+        assert_eq!(
+            unsafe {
+                crate::ffi::connection::connection_init(
+                    &raw mut connection,
+                    &raw mut database,
+                    null(),
+                )
+            },
+            ADBC_STATUS_OK
+        );
+
+        let mut statement = released_handle();
+        assert_eq!(
+            unsafe { statement_new(&raw mut connection, &raw mut statement, null()) },
+            ADBC_STATUS_OK
+        );
+        Self {
+            statement,
+            connection,
+            database,
+            server,
+            _runtime: runtime,
+        }
+    }
+}
+
+impl Drop for MockStatement {
+    fn drop(&mut self) {
+        unsafe {
+            release_handle(&raw mut self.statement, null());
+            release_handle(&raw mut self.connection, null());
+            release_handle(&raw mut self.database, null());
+        }
+        self.server.abort();
+    }
+}
+
+/// A struct array and a schema that disagree are a caller mistake: Arrow's importer asserts on
+/// them, and that panic must not poison the statement.
+#[test]
+fn binding_an_array_that_disagrees_with_its_schema_keeps_the_statement_usable() {
+    use arrow_schema::{DataType, Field, Fields};
+
+    use crate::ffi::test_support::{error_message, release_error, zeroed_error};
+
+    let mut mock = MockStatement::start();
+    let s = &raw mut mock.statement;
+    let one = Fields::from(vec![Field::new("p", DataType::Int64, false)]);
+    let two = StructArray::new(
+        Fields::from(vec![
+            Field::new("p", DataType::Int64, false),
+            Field::new("q", DataType::Int64, false),
+        ]),
+        vec![
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+        ],
+        None,
+    );
+    let (mut values, _) = to_ffi(&two.to_data()).unwrap();
+    let mut schema = FFI_ArrowSchema::try_from(&DataType::Struct(one.clone())).unwrap();
+    let mut error = zeroed_error();
+    assert_eq!(
+        unsafe { statement_bind(s, &raw mut values, &raw mut schema, &raw mut error) },
+        AdbcStatusCode::from(Status::InvalidArguments),
+        "{:?}",
+        error_message(&error)
+    );
+    let message = error_message(&error).unwrap();
+    assert!(message.contains("not a valid Arrow array"), "{message}");
+    release_error(&mut error);
+    // Ownership transferred: both inputs are released.
+    assert!(values.release().is_none());
+    assert!(schema.release().is_none());
+
+    let valid = StructArray::new(
+        one,
+        vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        None,
+    );
+    let (mut values, mut schema) = to_ffi(&valid.to_data()).unwrap();
+    assert_eq!(
+        unsafe { statement_bind(s, &raw mut values, &raw mut schema, &raw mut error) },
+        ADBC_STATUS_OK,
+        "{:?}",
+        error_message(&error)
+    );
+    let query = key("SELECT @p");
+    assert_eq!(
+        unsafe { statement_set_sql_query(s, query.as_ptr(), null()) },
+        ADBC_STATUS_OK
+    );
 }

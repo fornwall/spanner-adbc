@@ -215,6 +215,10 @@ pub(super) unsafe extern "C" fn error_from_array_stream(
     })
 }
 
+// `inline(never)` keeps one copy of this function, so its address identifies our streams in
+// `error_from_array_stream`. An inlinable function may be duplicated per codegen unit, and Miri
+// gives each reification of one a distinct address.
+#[inline(never)]
 unsafe extern "C" fn release(stream: *mut FFI_ArrowArrayStream) {
     if stream.is_null() {
         return;

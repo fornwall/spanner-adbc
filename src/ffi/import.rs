@@ -1,6 +1,7 @@
 //! Import of the Arrow C streams passed to `AdbcStatementBindStream`.
 
 use std::ffi::{CStr, c_int};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use adbc_core::error::Result;
@@ -10,6 +11,7 @@ use arrow_array::{RecordBatch, RecordBatchOptions, RecordBatchReader, StructArra
 use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType, Fields, Schema, SchemaRef};
 
+use super::guard::{drop_panic_payload, panic_message};
 use crate::error::invalid_argument;
 
 #[derive(Debug)]
@@ -56,7 +58,7 @@ impl BoundStreamReader {
                 "bound stream get_schema returned a released schema",
             ));
         }
-        let schema = Schema::try_from(&schema).map_err(|failure| {
+        let schema = contain_import(|| Schema::try_from(&schema)).map_err(|failure| {
             invalid_argument(format!(
                 "bound stream returned an invalid schema: {failure}"
             ))
@@ -102,9 +104,9 @@ impl Iterator for BoundStreamReader {
                 self.schema.fields().len(),
             ))));
         }
-        let result = unsafe {
+        let result = contain_import(|| unsafe {
             from_ffi_and_data_type(array, DataType::Struct(self.schema.fields().clone()))
-        }
+        })
         .and_then(|data| {
             validate_imported(&data, self.schema.fields()).map_err(|failure| {
                 ArrowError::CDataInterface(format!(
@@ -134,6 +136,23 @@ impl RecordBatchReader for BoundStreamReader {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
+}
+
+/// Run an Arrow C data import. Arrow's importer asserts instead of returning an error on some
+/// malformed input, such as a struct whose children disagree with its fields at any depth.
+/// Catching the panic here keeps a caller's mistake from poisoning the statement in `dispatch`.
+/// Unwinding drops the imported structs, which runs their release callbacks.
+pub(super) fn contain_import<T>(
+    import: impl FnOnce() -> std::result::Result<T, ArrowError>,
+) -> std::result::Result<T, ArrowError> {
+    std::panic::catch_unwind(AssertUnwindSafe(import)).unwrap_or_else(|cause| {
+        let message = format!(
+            "invalid Arrow array or schema: {}",
+            panic_message(cause.as_ref())
+        );
+        drop_panic_payload(cause);
+        Err(ArrowError::CDataInterface(message))
+    })
 }
 
 /// Validate imported data, naming the offending column. Arrow's C importer uses

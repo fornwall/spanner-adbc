@@ -19,7 +19,7 @@ use super::abi::{
 };
 use super::guard::{byte_slice, catch, required_output, required_str, write_out};
 use super::handle::{Exported, finish};
-use super::import::{BoundStreamReader, validate_imported};
+use super::import::{BoundStreamReader, contain_import, validate_imported};
 use super::options::{FfiHandle, already_populated, driver_of, slot_of, with_state};
 use crate::error::invalid_argument;
 use crate::statement::SpannerStatement;
@@ -152,7 +152,7 @@ pub(super) unsafe extern "C" fn statement_bind(
     unsafe {
         with_state(statement, error, |state| {
             // Arrow's importer can panic on released inputs. Reject them before taking ownership,
-            // so a caller mistake neither consumes the other input nor poisons the statement.
+            // so a caller mistake does not consume the other input.
             let Some(values_ref) = values.as_ref() else {
                 return Err(invalid_argument("values must not be null"));
             };
@@ -168,7 +168,9 @@ pub(super) unsafe extern "C" fn statement_bind(
             // ADBC transfers ownership of both inputs.
             let values = FFI_ArrowArray::from_raw(values);
             let schema = FFI_ArrowSchema::from_raw(schema);
-            let data = from_ffi(values, &schema).map_err(|failure| {
+            // The importer also asserts on other malformed input; `contain_import` reports that
+            // as an error instead of a panic that would poison the statement.
+            let data = contain_import(|| from_ffi(values, &schema)).map_err(|failure| {
                 invalid_argument(format!(
                     "bind values are not a valid Arrow array: {failure}"
                 ))

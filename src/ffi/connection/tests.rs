@@ -266,7 +266,6 @@ fn metadata_outputs_are_checked_before_initialization_or_network_work() {
     let mut connection = pending();
     let mut error = zeroed_error();
     let connection_ptr = &raw mut connection;
-    let error_ptr = &raw mut error;
     let calls: [(&str, MetadataCall); 7] = [
         ("out", |connection, error| unsafe {
             connection_get_info(connection, null(), 0, null(), error)
@@ -309,7 +308,8 @@ fn metadata_outputs_are_checked_before_initialization_or_network_work() {
     ];
     for (output, call) in calls {
         assert_eq!(
-            call(connection_ptr, error_ptr),
+            // A fresh pointer each time: `release_error` reborrows `error` uniquely.
+            call(connection_ptr, &raw mut error),
             ADBC_STATUS_INVALID_ARGUMENT
         );
         assert_eq!(
