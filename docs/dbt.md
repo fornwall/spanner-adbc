@@ -24,29 +24,7 @@ as bugs. They are independent of a local Spanner prototype.
 
 ### Correctness candidates
 
-1. **Include the selected driver library in the loaded-driver cache key.**
-   [`AdbcDriverKey`][driver-cache] stores the discriminant of `LoadStrategy`, discarding the
-   string inside `System(Some(...))`. Two loads with the same backend/ABI but different library
-   names or paths therefore share a cache key; cached failures also affect later loads.
-   Preserve the strategy's relevant payload. Test loading two distinguishable libraries in one
-   process, plus a failed first path followed by a valid second path. This helps development and
-   alternative drivers for existing adapters as well as a Spanner prototype.
-
-2. **Release cloned managed statements only when ownership ends.**
-   [`ManagedStatement`][statement-owner] derives `Clone` around an `Arc`, but its outer
-   [`Drop` implementation][statement-drop] calls `StatementRelease` for each clone. Investigate
-   moving release to the shared inner owner, consistent with connection/database ownership.
-   First add a fake-driver test: clone, drop one handle, execute through the survivor, then
-   verify exactly one release after the final owner. This is a source-level lifetime concern;
-   establish actual call paths before claiming a user-visible crash.
-
-3. **Return the intended error for private `dbt.*` statement options.**
-   [`get_option_string`][statement-options] constructs a `NotFound` error without returning it,
-   then queries the underlying driver. Return the error and review the typed getters for the
-   same namespace policy. A fake driver should observe no calls for private options, while
-   ordinary string, integer, double and byte options still pass through unchanged.
-
-4. **Make option debug formatting consistently redact credentials.**
+1. **Make option debug formatting consistently redact credentials.**
    The [database builder][database-debug] masks only a few option-name patterns; existing
    BigQuery/Databricks credential keys such as `auth_credentials`, `auth.access_token` and
    `oauth.client_secret` do not all match. The [connection builder][connection-debug] prints
@@ -55,13 +33,13 @@ as bugs. They are independent of a local Spanner prototype.
    not evidence that production logs have exposed credentials. Cover Spanner's inline JSON
    and token options when adding the adapter.
 
-5. **Canonicalize each relation component using its own quote policy.**
+2. **Canonicalize each relation component using its own quote policy.**
    [`get_canonical_fqn`][canonical-fqn] checks `quote_policy().database` when normalizing the
    database, schema and identifier. Schema and identifier should use their own flags. Test
    all combinations with mixed-case Snowflake/Postgres names and relation-cache lookup, then
    keep Spanner's namespace/case rules explicit when introducing it.
 
-6. **Fix SQL literal escaping and make binding substitution SQL-aware.**
+3. **Fix SQL literal escaping and make binding substitution SQL-aware.**
    [`SqlLiteralFormatter`][formatter] escapes quotes but not existing backslashes for
    BigQuery/Databricks; its tests currently accept a trailing-backslash literal that needs
    closer validation. Separately, `format_sql_with_bindings` splits raw text on `%s` or `?`,
@@ -72,7 +50,7 @@ as bugs. They are independent of a local Spanner prototype.
    parsing in `dbt-adapter-sql`. Do not copy textual
    substitution into Spanner's native `@name` parameter path.
 
-7. **Preserve update counts and error identity in record/replay.**
+4. **Preserve update counts and error identity in record/replay.**
    [`RecordingStatement::execute_update`][record-update] returns a live affected-row count but
    does not record it, while [replay][replay-update] returns `None`. Update errors are reduced
    to `Internal` errors in these paths. Record optional counts and structured error identity,
@@ -80,13 +58,13 @@ as bugs. They are independent of a local Spanner prototype.
    for zero/unknown counts, invalid SQL, authorization failures and cancellation. This benefits
    existing update paths and makes future Spanner fixtures meaningful.
 
-The cache, statement ownership, private-option, builder-formatting and update-replay patterns
-above were also checked in the v2.0.8 source. The relation/formatter findings are pinned to
-reviewed `main`; their release impact still needs a reproducer.
+The builder-formatting and update-replay patterns above were also checked in
+the v2.0.8 source. The relation/formatter findings are pinned to reviewed `main`; their release
+impact still needs a reproducer.
 
 ### Shared adapter features
 
-8. **Make execution completion and affected-row reporting explicit at the adapter layer.**
+5. **Make execution completion and affected-row reporting explicit at the adapter layer.**
    The [engine][engine-execute] uses `execute_update()` for selected backends, but usually calls
    `execute()` and can drop the reader when `fetch=false`. The [driver manager][execute-rows]
    discards the standard affected-row output on that query path. Establish when a non-fetching
@@ -97,7 +75,7 @@ reviewed `main`; their release impact still needs a reproducer.
    [#16159][skip-drain] deliberately avoids unnecessary BigQuery DML draining. Do not replace
    this with unconditional draining or unconditional `execute_update()` for every adapter.
 
-9. **Use ADBC schema-only execution where supported, including record/replay.**
+6. **Use ADBC schema-only execution where supported, including record/replay.**
    [`dbt-adbc::Statement`][statement-api] already exposes `execute_schema()`; a new low-level API
    is unnecessary. [Adapter schema inference][schema-inference] currently obtains schemas through
    query execution or backend-specific SQL such as DESCRIBE, and
@@ -107,25 +85,25 @@ reviewed `main`; their release impact still needs a reproducer.
    types and permission errors without scanning model data. This prepares table construction
    on databases without CTAS, including Spanner.
 
-10. **Generalize the existing Arrow seed path where it is useful.**
-    [DuckDB seed ingestion][duckdb-seed] already provides an Arrow-based implementation;
-    [#16560][seed-pr] is related ongoing work. Discuss extracting reusable batch/type/ingest
-    handling instead of adding another SQL-literal seed loader. Keep target-schema selection,
-    column overrides, explicit keys and staging publication adapter-owned. Test decimals,
-    empty/all-null CSVs, large files, duplicate keys and a failure after a committed batch.
-    Spanner's `bind_stream()` currently buffers its input, so the adapter must submit bounded
-    batches if it promises bounded seed memory.
+7. **Generalize the existing Arrow seed path where it is useful.**
+   [DuckDB seed ingestion][duckdb-seed] already provides an Arrow-based implementation;
+   [#16560][seed-pr] is related ongoing work. Discuss extracting reusable batch/type/ingest
+   handling instead of adding another SQL-literal seed loader. Keep target-schema selection,
+   column overrides, explicit keys and staging publication adapter-owned. Test decimals,
+   empty/all-null CSVs, large files, duplicate keys and a failure after a committed batch.
+   Spanner's `bind_stream()` currently buffers its input, so the adapter must submit bounded
+   batches if it promises bounded seed memory.
 
-11. **Document and test the route for a community ADBC-backed adapter.**
-    [Generic/system driver loading][driver-backend] exists, but it does not register a dbt
-    adapter, profile or dialect. Document the required integration points, local development
-    loading, experimental gating, supported platforms and eventual distribution/checksums.
-    The [GizmoSQL adapter proposal][gizmosql-pr] is related work to coordinate with, not evidence
-    that arbitrary drivers can already be selected in a released profile. Include a small
-    fake-driver conformance suite for options, schema discovery, errors and cancellation.
+8. **Document and test the route for a community ADBC-backed adapter.**
+   [Generic/system driver loading][driver-backend] exists, but it does not register a dbt
+   adapter, profile or dialect. Document the required integration points, local development
+   loading, experimental gating, supported platforms and eventual distribution/checksums.
+   The [GizmoSQL adapter proposal][gizmosql-pr] is related work to coordinate with, not evidence
+   that arbitrary drivers can already be selected in a released profile. Include a small
+   fake-driver conformance suite for options, schema discovery, errors and cancellation.
 
 The adapter should follow dbt's [architecture rules][architecture]: keep backend behavior above
-`dbt-adbc` and use its existing primitives/options. Items 8–11 identify shared features to agree
+`dbt-adbc` and use its existing primitives/options. Items 5–8 identify shared features to agree
 with maintainers while prototyping; a general plugin-system redesign is outside this proposal.
 
 ## Integration boundary and driver behavior
@@ -323,10 +301,6 @@ unless their implementation and tests are included.
 [dbt-release]: https://github.com/dbt-labs/dbt/releases/tag/v2.0.8
 [dbt-main]: https://github.com/dbt-labs/dbt/commit/00e5d9ef340bd07476f8f02e4e6d048fa8749993
 [architecture]: https://github.com/dbt-labs/dbt/blob/00e5d9ef340bd07476f8f02e4e6d048fa8749993/.agents/adapters.md
-[driver-cache]: https://github.com/dbt-labs/dbt/blob/00e5d9ef340bd07476f8f02e4e6d048fa8749993/crates/dbt-adbc/src/driver.rs#L170-L182
-[statement-owner]: https://github.com/dbt-labs/dbt/blob/00e5d9ef340bd07476f8f02e4e6d048fa8749993/crates/dbt-adbc/src/driver_manager.rs#L997-L1005
-[statement-drop]: https://github.com/dbt-labs/dbt/blob/00e5d9ef340bd07476f8f02e4e6d048fa8749993/crates/dbt-adbc/src/driver_manager.rs#L1255-L1264
-[statement-options]: https://github.com/dbt-labs/dbt/blob/00e5d9ef340bd07476f8f02e4e6d048fa8749993/crates/dbt-adbc/src/statement.rs#L201-L235
 [database-debug]: https://github.com/dbt-labs/dbt/blob/00e5d9ef340bd07476f8f02e4e6d048fa8749993/crates/dbt-adbc/src/database/builder.rs#L163-L177
 [connection-debug]: https://github.com/dbt-labs/dbt/blob/00e5d9ef340bd07476f8f02e4e6d048fa8749993/crates/dbt-adbc/src/connection/builder.rs#L25-L32
 [canonical-fqn]: https://github.com/dbt-labs/dbt/blob/00e5d9ef340bd07476f8f02e4e6d048fa8749993/crates/dbt-adapter/src/relation/relation_impl.rs#L311-L346
