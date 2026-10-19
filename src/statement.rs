@@ -260,11 +260,12 @@ impl SpannerStatement {
             };
             let statement = bind::bind_params(base_builder, names, batch, 0)?.build();
             let bound = self.config.read_staleness.timestamp_bound()?;
+            let txn = manual_txn.clone();
             let reader = block_on_cancellable(
                 &self.runtime,
                 &self.cancel.current(),
                 with_timeout(query_timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
-                    let result_set = match manual_txn {
+                    let result_set = match txn {
                         Some(txn) => txn.execute_query(statement).await.map_err(from_spanner)?,
                         None => crate::staleness::single_use(&client, bound)
                             .execute_query(statement)
@@ -282,7 +283,8 @@ impl SpannerStatement {
                     )
                     .await
                 }),
-            )?;
+            )
+            .inspect_err(|error| self.discard_unbegun_read_txn(manual_txn.as_ref(), error))?;
             return Ok(Box::new(reader));
         }
         let bound = self.config.read_staleness.multi_use_timestamp_bound()?;
@@ -292,11 +294,12 @@ impl SpannerStatement {
             group: 0,
             row: 0,
         });
+        let txn = manual_txn.clone();
         let reader = block_on_cancellable(
             &self.runtime,
             &self.cancel.current(),
             with_timeout(query_timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
-                let transaction = match manual_txn {
+                let transaction = match txn {
                     Some(txn) => txn,
                     None => Arc::new(crate::staleness::multi_use(&client, bound).await?),
                 };
@@ -311,7 +314,8 @@ impl SpannerStatement {
                 )
                 .await
             }),
-        )?;
+        )
+        .inspect_err(|error| self.discard_unbegun_read_txn(manual_txn.as_ref(), error))?;
         Ok(Box::new(reader))
     }
 
@@ -338,6 +342,7 @@ impl SpannerStatement {
         let bound = self.config.read_staleness.timestamp_bound()?;
         let statement = self.read_sql_builder(&sql).build();
         let fetch_timeout = self.config.timeouts.fetch_timeout();
+        let txn = manual_txn.clone();
         // `stream_query` fetches the first chunk to settle the schema; the reader converts the
         // rest one chunk at a time.
         let reader = block_on_cancellable(
@@ -347,7 +352,7 @@ impl SpannerStatement {
                 self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
-                    let result_set = match manual_txn {
+                    let result_set = match txn {
                         Some(txn) => txn.execute_query(statement).await.map_err(from_spanner)?,
                         None => crate::staleness::single_use(&client, bound)
                             .execute_query(statement)
@@ -366,8 +371,27 @@ impl SpannerStatement {
                     .await
                 },
             ),
-        )?;
+        )
+        .inspect_err(|error| self.discard_unbegun_read_txn(manual_txn.as_ref(), error))?;
         Ok(Box::new(reader))
+    }
+
+    /// After a failed query, forget the manual read transaction it used if that never began.
+    ///
+    /// A driver cancel or timeout drops the query instead, and the client then keeps an unbegun
+    /// transaction usable, so leave it in place: a concurrent query may be beginning it.
+    fn discard_unbegun_read_txn(
+        &self,
+        txn: Option<&Arc<MultiUseReadOnlyTransaction>>,
+        error: &Error,
+    ) {
+        let dropped =
+            error.vendor_code == 0 && matches!(error.status, Status::Cancelled | Status::Timeout);
+        if let Some(txn) = txn
+            && !dropped
+        {
+            lock_txn(&self.txn).discard_unbegun_read_txn(txn);
+        }
     }
 
     /// Submit DDL through `UpdateDatabaseDdl`. Statements in a batch are not transactional.
@@ -688,7 +712,7 @@ impl SpannerStatement {
     /// The first query of a manual transaction creates it at this statement's read bound, fixing
     /// the transaction's kind to queries; later queries reuse it and their staleness settings are
     /// ignored. Building issues no RPC (the begin is inlined into the first query), so a failed
-    /// query never leaves a transaction begun.
+    /// query never leaves a transaction begun; the caller then discards the unbegun transaction.
     fn manual_read_transaction(&self) -> Result<Option<Arc<MultiUseReadOnlyTransaction>>> {
         {
             let st = lock_txn(&self.txn);

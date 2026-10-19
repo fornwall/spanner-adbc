@@ -152,6 +152,20 @@ impl TxnState {
         }
     }
 
+    /// Forget the shared read-only transaction if it is still `txn` and never began. With an
+    /// inline begin, the client marks a transaction whose first query failed as permanently
+    /// failed, so every later query would fail until commit or rollback. Nothing began, so no
+    /// snapshot is lost and the next query starts a fresh transaction.
+    pub(crate) fn discard_unbegun_read_txn(&mut self, txn: &Arc<MultiUseReadOnlyTransaction>) {
+        // Spanner returns the read timestamp when the transaction begins.
+        if txn.read_timestamp().is_some() {
+            return;
+        }
+        if matches!(&self.txn, ManualTxn::Read(current) if Arc::ptr_eq(current, txn)) {
+            self.txn = ManualTxn::Unset;
+        }
+    }
+
     /// Buffer DML for the next commit.
     pub(crate) fn buffer_dml(&mut self, new: Vec<SpannerSql>) -> Result<()> {
         self.check_kind_allowed(TxnKind::Dml)?;

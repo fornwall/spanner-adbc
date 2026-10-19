@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use adbc_core::error::{Result, Status};
+use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
 use adbc_core::{CancelHandle, Connection, Optionable};
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
@@ -19,7 +19,8 @@ use google_cloud_spanner::model::StructType;
 use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
 use crate::driver::{Connected, SharedDatabaseAdmin};
 use crate::error::{
-    err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option, unsupported,
+    annotate, err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option,
+    unsupported,
 };
 use crate::options::{SharedConfig, impl_typed_option_getters};
 use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable};
@@ -120,7 +121,8 @@ impl SpannerConnection {
                 &self.cancel.current(),
                 &self.config,
                 mutations.clone(),
-            );
+            )
+            .map_err(note_commit_outcome_unknown);
         }
         run_batch_txn(
             &self.runtime,
@@ -131,7 +133,8 @@ impl SpannerConnection {
             mutations,
             // Not the transaction's last request: Spanner applies the mutations at commit.
             false,
-        )?;
+        )
+        .map_err(note_commit_outcome_unknown)?;
         Ok(())
     }
 }
@@ -584,6 +587,20 @@ pub(crate) fn decode_partition(descriptor: &[u8]) -> Result<PartitionDescriptor>
     Ok(PartitionDescriptor {
         partition,
         row_type,
+    })
+}
+
+/// A timeout or cancel drops an in-flight commit, which may still land. The buffer is kept, so
+/// warn that committing it again could apply the work twice.
+fn note_commit_outcome_unknown(error: Error) -> Error {
+    if !matches!(error.status, Status::Timeout | Status::Cancelled) {
+        return error;
+    }
+    annotate(error, |message| {
+        format!(
+            "{message} (the commit may still have been applied; the buffered work is kept, so \
+             committing again could apply it twice; roll back to discard it)"
+        )
     })
 }
 

@@ -684,3 +684,424 @@ mod mock {
         assert_eq!(rpc_count(&server), 0);
     }
 }
+
+/// Manual-transaction behavior against a mock that serves queries, batch DML and commits.
+mod manual_txn {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use adbc_core::error::Status;
+    use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
+    use adbc_core::{Connection, Database, Driver, Optionable, Statement};
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use spanner_grpc_mock::MockSpanner;
+    use spanner_grpc_mock::google::spanner::v1;
+
+    use crate::{SpannerConnection, SpannerDriver, SpannerStatement};
+
+    type Selectors = Arc<Mutex<Vec<(String, Option<v1::transaction_selector::Selector>)>>>;
+
+    /// What the mock does with each `Commit`, by zero-based call index.
+    type CommitScript = Box<dyn Fn(usize) -> CommitAction + Send + Sync>;
+
+    enum CommitAction {
+        Ok,
+        Fail(tonic::Code),
+        /// Block until the test releases the gate, then fail with `UNAVAILABLE`.
+        Hang,
+    }
+
+    #[derive(Default)]
+    struct Recorded {
+        batch_dml: Mutex<Vec<v1::ExecuteBatchDmlRequest>>,
+        commits: Mutex<Vec<v1::CommitRequest>>,
+    }
+
+    struct MockServer {
+        endpoint: String,
+        recorded: Arc<Recorded>,
+        selectors: Selectors,
+        /// Releases hung commits, so dropping the server does not wait on them.
+        gate: Arc<AtomicBool>,
+        server: tokio::task::JoinHandle<()>,
+        _runtime: tokio::runtime::Runtime,
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.gate.store(true, Ordering::SeqCst);
+            self.server.abort();
+        }
+    }
+
+    fn result(inline_begin: bool, txn_id: &[u8]) -> v1::PartialResultSet {
+        v1::PartialResultSet {
+            metadata: Some(v1::ResultSetMetadata {
+                row_type: Some(v1::StructType {
+                    fields: vec![v1::struct_type::Field {
+                        name: "c".into(),
+                        r#type: Some(v1::Type {
+                            code: v1::TypeCode::String as i32,
+                            ..Default::default()
+                        }),
+                    }],
+                }),
+                // Spanner returns the read timestamp of a read-only transaction it begins.
+                transaction: inline_begin.then(|| v1::Transaction {
+                    id: txn_id.to_vec(),
+                    read_timestamp: Some(prost_types::Timestamp {
+                        seconds: 1_800_000_000,
+                        nanos: 0,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            values: vec![prost_types::Value {
+                kind: Some(prost_types::value::Kind::StringValue("v".into())),
+            }],
+            last: true,
+            ..Default::default()
+        }
+    }
+
+    fn start() -> MockServer {
+        start_with(Box::new(|_| CommitAction::Ok))
+    }
+
+    /// Queries on `Missing` fail with `INVALID_ARGUMENT`, as Spanner reports an unknown table.
+    /// Other queries return one row, and the transaction id when they begin inline. Batch DML
+    /// reports one row per statement; commits follow `commits`.
+    fn start_with(commits: CommitScript) -> MockServer {
+        let recorded = Arc::new(Recorded::default());
+        let selectors = Selectors::default();
+        let gate = Arc::new(AtomicBool::new(false));
+        let mut mock = MockSpanner::new();
+        mock.expect_create_session().returning(|request| {
+            Ok(tonic::Response::new(v1::Session {
+                name: format!("{}/sessions/mock", request.into_inner().database),
+                multiplexed: true,
+                ..Default::default()
+            }))
+        });
+        let record = selectors.clone();
+        let begun = Arc::new(Mutex::new(0_u32));
+        mock.expect_execute_streaming_sql()
+            .returning(move |request| {
+                let request = request.into_inner();
+                let selector = request.transaction.and_then(|t| t.selector);
+                let inline_begin =
+                    matches!(selector, Some(v1::transaction_selector::Selector::Begin(_)));
+                record.lock().unwrap().push((request.sql.clone(), selector));
+                if request.sql.contains("Missing") {
+                    return Err(tonic::Status::invalid_argument("Table not found: Missing"));
+                }
+                let id = {
+                    let mut begun = begun.lock().unwrap();
+                    *begun += u32::from(inline_begin);
+                    format!("ro-{begun}")
+                };
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tx.try_send(Ok(result(inline_begin, id.as_bytes())))
+                    .unwrap();
+                Ok(tonic::Response::new(rx))
+            });
+        let record = recorded.clone();
+        mock.expect_execute_batch_dml().returning(move |request| {
+            let request = request.into_inner();
+            let inline_begin = matches!(
+                request
+                    .transaction
+                    .as_ref()
+                    .and_then(|t| t.selector.as_ref()),
+                Some(v1::transaction_selector::Selector::Begin(_))
+            );
+            let result_sets = (0..request.statements.len())
+                .map(|i| v1::ResultSet {
+                    metadata: Some(v1::ResultSetMetadata {
+                        transaction: (i == 0 && inline_begin).then(|| v1::Transaction {
+                            id: b"rw-txn".to_vec(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    stats: Some(v1::ResultSetStats {
+                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect();
+            record.batch_dml.lock().unwrap().push(request);
+            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
+                result_sets,
+                ..Default::default()
+            }))
+        });
+        mock.expect_begin_transaction().returning(|_| {
+            Ok(tonic::Response::new(v1::Transaction {
+                id: b"wo-txn".to_vec(),
+                ..Default::default()
+            }))
+        });
+        mock.expect_rollback()
+            .returning(|_| Ok(tonic::Response::new(())));
+        let record = recorded.clone();
+        let hung = gate.clone();
+        mock.expect_commit().returning(move |request| {
+            let index = {
+                let mut commits = record.commits.lock().unwrap();
+                commits.push(request.into_inner());
+                commits.len() - 1
+            };
+            match commits(index) {
+                CommitAction::Ok => Ok(tonic::Response::new(v1::CommitResponse::default())),
+                CommitAction::Fail(code) => Err(tonic::Status::new(code, "mock commit failure")),
+                CommitAction::Hang => {
+                    tokio::task::block_in_place(|| {
+                        let deadline = Instant::now() + Duration::from_secs(30);
+                        while !hung.load(Ordering::SeqCst) && Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    });
+                    Err(tonic::Status::unavailable("released hung commit"))
+                }
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (endpoint, server) = runtime
+            .block_on(spanner_grpc_mock::start("127.0.0.1:0", mock))
+            .unwrap();
+        MockServer {
+            endpoint,
+            recorded,
+            selectors,
+            gate,
+            server,
+            _runtime: runtime,
+        }
+    }
+
+    fn connect(server: &MockServer) -> SpannerConnection {
+        let mut driver = SpannerDriver::try_new().unwrap();
+        driver
+            .new_database_with_opts([
+                (
+                    OptionDatabase::Uri,
+                    OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
+                ),
+                (
+                    OptionDatabase::Other(crate::OPTION_ENDPOINT.into()),
+                    OptionValue::String(server.endpoint.clone()),
+                ),
+                (
+                    OptionDatabase::Other(crate::OPTION_EMULATOR.into()),
+                    OptionValue::String("true".into()),
+                ),
+            ])
+            .unwrap()
+            .new_connection()
+            .unwrap()
+    }
+
+    fn manual(server: &MockServer) -> SpannerConnection {
+        let mut connection = connect(server);
+        connection
+            .set_option(OptionConnection::AutoCommit, OptionValue::from("false"))
+            .unwrap();
+        connection
+    }
+
+    fn query(connection: &mut SpannerConnection, sql: &str) -> adbc_core::error::Result<usize> {
+        let mut statement = connection.new_statement()?;
+        statement.set_sql_query(sql)?;
+        let reader = statement.execute()?;
+        let mut rows = 0;
+        for batch in reader {
+            rows += batch
+                .map_err(|e| crate::error::err(e.to_string(), Status::Internal))?
+                .num_rows();
+        }
+        Ok(rows)
+    }
+
+    fn update(connection: &mut SpannerConnection, sql: &str) -> Option<i64> {
+        let mut statement = connection.new_statement().unwrap();
+        statement.set_sql_query(sql).unwrap();
+        statement.execute_update().unwrap()
+    }
+
+    /// An `append` ingest of `rows` rows into `t`, which needs no admin RPC.
+    fn ingest(connection: &mut SpannerConnection, rows: usize) -> SpannerStatement {
+        let mut statement = connection.new_statement().unwrap();
+        for (key, value) in [
+            (OptionStatement::TargetTable, "t"),
+            (OptionStatement::IngestMode, "append"),
+        ] {
+            statement
+                .set_option(key, OptionValue::String(value.into()))
+                .unwrap();
+        }
+        let values = StringArray::from((0..rows).map(|i| format!("v{i}")).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, false)])),
+            vec![Arc::new(values)],
+        )
+        .unwrap();
+        statement.bind(batch).unwrap();
+        statement
+    }
+
+    /// A failed first query begins nothing, so it must not poison the manual transaction: with
+    /// an inline begin the client marks the unstarted transaction permanently failed.
+    #[test]
+    fn failed_first_query_does_not_poison_the_manual_read_transaction() {
+        let server = start();
+        let mut connection = manual(&server);
+
+        let error = query(&mut connection, "SELECT c FROM Missing").unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments, "{error}");
+        assert_eq!(
+            query(&mut connection, "SELECT c FROM t").expect("the next query runs"),
+            1
+        );
+        // A begun transaction keeps its snapshot after a failed query.
+        let error = query(&mut connection, "SELECT c FROM Missing").unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments, "{error}");
+        assert_eq!(query(&mut connection, "SELECT c FROM t").unwrap(), 1);
+
+        let selectors = server.selectors.lock().unwrap();
+        assert_eq!(selectors.len(), 4, "{selectors:?}");
+        for (index, (_, selector)) in selectors.iter().take(2).enumerate() {
+            assert!(
+                matches!(selector, Some(v1::transaction_selector::Selector::Begin(_))),
+                "query {index} begins inline: {selector:?}"
+            );
+        }
+        for (sql, selector) in &selectors[2..] {
+            assert_eq!(
+                selector,
+                &Some(v1::transaction_selector::Selector::Id(b"ro-1".to_vec())),
+                "{sql}: later queries share the transaction the first successful query began"
+            );
+        }
+    }
+
+    /// An `ABORTED` commit reruns the whole transaction: the batch DML and the buffered
+    /// mutations go out again, the commit succeeds once, and the buffer is cleared.
+    #[test]
+    fn aborted_commit_replays_buffered_dml_and_mutations() {
+        let server = start_with(Box::new(|index| {
+            if index == 0 {
+                CommitAction::Fail(tonic::Code::Aborted)
+            } else {
+                CommitAction::Ok
+            }
+        }));
+        let mut connection = manual(&server);
+        assert_eq!(
+            update(&mut connection, "UPDATE t SET c = 'x' WHERE TRUE"),
+            None
+        );
+        assert_eq!(ingest(&mut connection, 2).execute_update().unwrap(), None);
+        connection.commit().expect("the rerun commits");
+
+        let batch_dml = server.recorded.batch_dml.lock().unwrap().clone();
+        let commits = server.recorded.commits.lock().unwrap().clone();
+        assert_eq!(batch_dml.len(), 2, "one batch per attempt");
+        assert_eq!(commits.len(), 2, "one commit per attempt");
+        for (request, commit) in batch_dml.iter().zip(&commits) {
+            assert_eq!(request.statements.len(), 1);
+            assert_eq!(commit.mutations.len(), 2, "{commit:?}");
+        }
+
+        // The applied work is gone: committing again sends nothing.
+        connection.commit().unwrap();
+        assert_eq!(server.recorded.commits.lock().unwrap().len(), 2);
+        assert_eq!(query(&mut connection, "SELECT c FROM t").unwrap(), 1);
+    }
+
+    /// A failed commit keeps the buffer, as documented. Rollback discards it, and the next
+    /// transaction starts empty.
+    #[test]
+    fn rollback_after_a_failed_commit_discards_the_buffer() {
+        let server = start_with(Box::new(|index| {
+            if index == 0 {
+                CommitAction::Fail(tonic::Code::FailedPrecondition)
+            } else {
+                CommitAction::Ok
+            }
+        }));
+        let mut connection = manual(&server);
+        update(&mut connection, "UPDATE t SET c = 'a' WHERE TRUE");
+        let error = connection.commit().unwrap_err();
+        assert_eq!(error.status, Status::InvalidState, "{error}");
+        let error = query(&mut connection, "SELECT c FROM t").unwrap_err();
+        assert_eq!(
+            error.status,
+            Status::InvalidState,
+            "the buffer is kept: {error}"
+        );
+        connection.rollback().unwrap();
+
+        update(&mut connection, "UPDATE t SET c = 'b' WHERE TRUE");
+        connection.commit().unwrap();
+        let batch_dml = server.recorded.batch_dml.lock().unwrap();
+        let sqls: Vec<_> = batch_dml
+            .iter()
+            .flat_map(|request| request.statements.iter().map(|s| s.sql.as_str()))
+            .collect();
+        assert_eq!(
+            sqls,
+            [
+                "UPDATE t SET c = 'a' WHERE TRUE",
+                "UPDATE t SET c = 'b' WHERE TRUE"
+            ]
+        );
+    }
+
+    /// Cancelling a commit blocked in the RPC returns promptly and leaves the connection usable;
+    /// the stale cancel does not reach the next commit.
+    #[test]
+    fn cancel_during_commit_leaves_the_connection_usable() {
+        let server = start_with(Box::new(|index| {
+            if index == 0 {
+                CommitAction::Hang
+            } else {
+                CommitAction::Ok
+            }
+        }));
+        let mut connection = manual(&server);
+        update(&mut connection, "UPDATE t SET c = 'a' WHERE TRUE");
+        let cancel = connection.get_cancel_handle();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            cancel.try_cancel().unwrap();
+        });
+        let started = Instant::now();
+        let error = connection.commit().unwrap_err();
+        canceller.join().unwrap();
+        assert_eq!(error.status, Status::Cancelled, "{error}");
+        assert!(
+            error.message.contains("may still have been applied"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+
+        // Mockall serializes calls to one expectation, so free the hung handler.
+        server.gate.store(true, Ordering::SeqCst);
+
+        connection.rollback().unwrap();
+        update(&mut connection, "UPDATE t SET c = 'b' WHERE TRUE");
+        connection
+            .commit()
+            .expect("the next commit starts uncancelled");
+        assert_eq!(server.recorded.commits.lock().unwrap().len(), 2);
+    }
+}
