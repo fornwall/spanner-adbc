@@ -5,7 +5,6 @@ on:
     branches: [main]
   pull_request:
 
-# Cancel superseded PR runs; let main-branch runs complete.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -142,7 +141,6 @@ jobs:
       - name: Test backend wrappers and setup
         run: python3 -m unittest discover -s scripts/tests -v
 
-  # Check dependency advisories, licenses and sources (deny.toml), plus unused dependencies.
   supply-chain:
     name: cargo-deny + machete
     runs-on: ubuntu-latest

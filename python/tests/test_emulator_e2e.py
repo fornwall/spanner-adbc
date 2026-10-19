@@ -20,7 +20,7 @@ def _connect(database, *, autocommit):
 
 
 def test_driver_library_is_bundled():
-    # The wheel under test must ship the native library; a bare source tree wouldn't.
+    # Integration runs must test an installed library, not a bare source tree.
     assert spanner_adbc._driver_path()
 
 
@@ -92,7 +92,6 @@ def test_bulk_ingest_append(spanner_database):
                     "Name": pa.array(["x", "y", "z"], type=pa.string()),
                 }
             )
-            # Preserve the table's explicitly declared primary key.
             count = cur.adbc_ingest("AdbcPyIngest", data, mode="append")
             assert count == 3
 
@@ -105,7 +104,6 @@ def test_bulk_ingest_append(spanner_database):
 
 
 def test_execute_partitions_round_trip(spanner_database):
-    # The union of partitions must contain every row once, with the full schema.
     conn = _connect(spanner_database, autocommit=True)
     try:
         with conn.cursor() as cur:
@@ -117,12 +115,8 @@ def test_execute_partitions_round_trip(spanner_database):
             )
 
         with conn.cursor() as cur:
-            cur.adbc_statement.set_options(
-                **{
-                    StatementOptions.DATA_BOOST.value: "true",
-                }
-            )
-            # A single-table scan is partitionable (no ORDER BY: not partitionable).
+            cur.adbc_statement.set_options(**{StatementOptions.DATA_BOOST.value: "true"})
+            # ORDER BY would make the query non-partitionable.
             partitions, schema = cur.adbc_execute_partitions(
                 "SELECT Id FROM AdbcPyPartition"
             )
@@ -140,7 +134,6 @@ def test_execute_partitions_round_trip(spanner_database):
             assert partitions
             assert schema.names == ["Id"]
 
-        # Read every partition back — a fresh cursor per descriptor — and union ids.
         seen: set[int] = set()
         for token in partitions:
             with conn.cursor() as cur:
@@ -148,7 +141,6 @@ def test_execute_partitions_round_trip(spanner_database):
                 table = cur.fetch_arrow_table()
             assert table.schema == schema
             ids = table.column("Id").to_pylist()
-            # No id may appear in more than one partition.
             assert seen.isdisjoint(ids)
             seen.update(ids)
 
@@ -158,22 +150,17 @@ def test_execute_partitions_round_trip(spanner_database):
 
 
 def test_manual_commit_and_rollback(spanner_database):
-    # autocommit off => statements group into manual transactions, each one kind of work
-    # (queries or DML) fixed by its first statement. DDL is not transaction-aware: it
-    # applies immediately, regardless of the transaction.
     conn = _connect(spanner_database, autocommit=False)
     try:
+        # DDL applies immediately, outside the manual transaction.
         with conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS AdbcPyTxn")  # DDL runs immediately
+            cur.execute("DROP TABLE IF EXISTS AdbcPyTxn")
             cur.execute("CREATE TABLE AdbcPyTxn (Id INT64 NOT NULL) PRIMARY KEY (Id)")
 
         with conn.cursor() as cur:
             cur.execute("INSERT INTO AdbcPyTxn (Id) VALUES (1)")
-            # Buffered, not yet committed. A query issued while DML is buffered would
-            # not observe the pending write (no read-your-writes), so rather than
-            # silently returning a stale snapshot the driver rejects it with
-            # InvalidState (surfaced as DBAPI ProgrammingError). The buffered INSERT is
-            # left intact and still applies on the commit below.
+            # A query could not see the buffered write, so the driver rejects it.
+            # The INSERT stays buffered and is committed below.
             with pytest.raises(ProgrammingError):
                 cur.execute("SELECT COUNT(*) AS n FROM AdbcPyTxn")
 
@@ -181,11 +168,9 @@ def test_manual_commit_and_rollback(spanner_database):
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS n FROM AdbcPyTxn")
             assert cur.fetch_arrow_table().column("n").to_pylist() == [1]
-        # The count opened a query transaction (a pinned read-only snapshot); end it so the
-        # write below starts a fresh transaction.
+        # End the read-only transaction opened by the count.
         conn.rollback()
 
-        # A rolled-back insert must leave the table unchanged.
         with conn.cursor() as cur:
             cur.execute("INSERT INTO AdbcPyTxn (Id) VALUES (2)")
         conn.rollback()

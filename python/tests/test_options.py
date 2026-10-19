@@ -85,9 +85,7 @@ def test_every_driver_option_key_is_documented_at_some_level():
 def test_every_driver_option_key_has_a_typed_enum_member(heading, enum_cls):
     """Every driver option documented at a level has a member in that level's enum."""
     _require_sources()
-    # Intersecting with the OPTION_* keys drops the standard ADBC keys (`uri`,
-    # `adbc.*`) that the docs also list: those are defined by adbc_driver_manager,
-    # not by this crate, so the enums include them only for convenience.
+    # Standard ADBC keys (`uri`, `adbc.*`) are documented but not OPTION_* constants.
     expected = (
         _documented_keys_by_level()[heading] & _driver_option_keys()
     ) - _EXPECTED_MISSING
@@ -95,20 +93,20 @@ def test_every_driver_option_key_has_a_typed_enum_member(heading, enum_cls):
     missing = expected - present
     assert not missing, (
         f"{enum_cls.__name__} has no member for driver option(s) {sorted(missing)}. "
-        "Add one to python/spanner_adbc/_options.py, or — if the omission is "
-        "deliberate — record it with a reason in _EXPECTED_MISSING."
+        "Add one to python/spanner_adbc/_options.py, or list it with a reason in "
+        "_EXPECTED_MISSING."
     )
 
 
 @pytest.mark.parametrize("heading,enum_cls", _LEVELS, ids=lambda v: getattr(v, "__name__", v))
 def test_typed_enum_members_are_real_keys_at_their_level(heading, enum_cls):
-    """The reverse direction: no typos, and no member filed under the wrong level."""
+    """Catch typos and members filed under the wrong level."""
     _require_sources()
     documented = _documented_keys_by_level()[heading]
     bogus = {member.value for member in enum_cls} - documented
     assert not bogus, (
         f"{enum_cls.__name__} member(s) {sorted(bogus)} are not documented as "
-        f"{heading.lower()} in docs/options.md — typo, or filed at the wrong level?"
+        f"{heading.lower()} in docs/options.md"
     )
 
 
@@ -167,20 +165,16 @@ def test_dbapi_connect_forwards_options(monkeypatch, autocommit):
 
 
 def test_connection_option_round_trips_through_kwargs(spanner_database):
-    """A ``spanner.*`` vendor option passed via ``conn_kwargs`` takes effect
-    end-to-end: it round-trips through ``get_option`` and a query runs under it."""
     conn = spanner.connect(
         db_kwargs=database_options(spanner_database),
         conn_kwargs={ConnectionOptions.REQUEST_TAG: "adbc-py-e2e"},
         autocommit=True,
     )
     try:
-        # The value the driver received round-trips back through get_option.
         assert (
             conn.adbc_connection.get_option(ConnectionOptions.REQUEST_TAG.value)
             == "adbc-py-e2e"
         )
-        # And a query still runs with the option in effect.
         with conn.cursor(adbc_stmt_kwargs={StatementOptions.ROWS_PER_BATCH: "1024"}) as cur:
             cur.execute("SELECT 1 AS one")
             assert cur.fetchone()[0] == 1

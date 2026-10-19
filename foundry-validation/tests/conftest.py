@@ -29,8 +29,6 @@ def pytest_addoption(parser):
     parser.addoption("--vendor-version", action="store", default=None)
 
 
-# The committed skip-inventory baseline (see _skip_baseline_guard below and the
-# "Skip-inventory baseline guard" section of foundry-validation/README.md).
 SKIP_BASELINE_PATH = Path(__file__).resolve().parents[1] / "skip_baseline.txt"
 
 _SKIP_BASELINE_HEADER = """\
@@ -39,7 +37,7 @@ _SKIP_BASELINE_HEADER = """\
 # Reasons are maintained in the .txtcase files.
 #
 # CI sets FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE to reject new or stale skips.
-# Regenerate after an intentional change to the skip set:
+# Regenerate after changing the skip set:
 #   FOUNDRY_UPDATE_SKIP_BASELINE=1 scripts/run-foundry-validation.sh
 """
 
@@ -61,9 +59,7 @@ def _require_passes_guard(session: pytest.Session, exitstatus: int) -> None:
     if session.testscollected > 0 and passed == 0:
         message = (
             f"FOUNDRY_VALIDATION_REQUIRE_PASSES: collected {session.testscollected} "
-            "case(s) but none passed — every case skipped or errored. This usually "
-            "means the harness itself is broken (driver failed to load, connection "
-            "setup failed), not an expected Spanner SQL-dialect skip."
+            "case(s) but none passed. The driver or connection setup is probably broken."
         )
         if reporter is not None:
             reporter.write_line(message, red=True)
@@ -85,8 +81,7 @@ def _skip_reason(report: pytest.TestReport) -> str:
 
 
 def _collect_skipped(session: pytest.Session) -> dict[str, str]:
-    # Map each skipped nodeid to its (last-seen) reason. Keyed by nodeid so a case
-    # reported skipped in more than one phase collapses to a single entry.
+    # Keyed by nodeid so a case skipped in several phases appears once.
     reporter = session.config.pluginmanager.get_plugin("terminalreporter")
     skipped: dict[str, str] = {}
     if reporter is None:  # pragma: no cover - terminal reporter is a default plugin
@@ -99,8 +94,7 @@ def _collect_skipped(session: pytest.Session) -> dict[str, str]:
 
 
 def _load_baseline(path: Path) -> set[str]:
-    # One nodeid per line. Blank lines and `#` comment lines are ignored; a trailing
-    # "  # <reason>" annotation is stripped so only the nodeid is compared.
+    # One nodeid per line, optionally followed by "  # <reason>".
     nodeids: set[str] = set()
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
@@ -151,7 +145,7 @@ def _skip_baseline_guard(session: pytest.Session) -> None:
     if not SKIP_BASELINE_PATH.exists():
         emit(
             "FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE: no baseline at "
-            f"{SKIP_BASELINE_PATH} — regenerate with "
+            f"{SKIP_BASELINE_PATH}; regenerate with "
             "FOUNDRY_UPDATE_SKIP_BASELINE=1 scripts/run-foundry-validation.sh"
         )
         session.exitstatus = int(pytest.ExitCode.TESTS_FAILED)
@@ -167,20 +161,17 @@ def _skip_baseline_guard(session: pytest.Session) -> None:
     if unlisted:
         emit(
             "FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE: "
-            f"{len(unlisted)} case(s) skipped but NOT in the baseline (unlisted "
-            "skip) — a new or regressed case is skipping without being acknowledged. "
-            "Triage it (fix it, or add it to the baseline with a reason via "
-            "FOUNDRY_UPDATE_SKIP_BASELINE=1):"
+            f"{len(unlisted)} case(s) skipped but not in the baseline. Fix them, or "
+            "add them with FOUNDRY_UPDATE_SKIP_BASELINE=1:"
         )
         for nodeid in unlisted:
             emit(f"  + {nodeid}")
     if stale:
         emit(
             "FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE: "
-            f"{len(stale)} baseline entr(y/ies) did NOT skip this run (stale entry) "
-            "— the case no longer skips. If it now passes, remove its .txtcase skip "
-            "and regenerate the baseline to enable the coverage; if it now fails or "
-            "was renamed upstream, investigate:"
+            f"{len(stale)} baseline entr(y/ies) did not skip. If a case now passes, "
+            "remove its .txtcase skip and regenerate the baseline; if it fails or was "
+            "renamed upstream, investigate:"
         )
         for nodeid in stale:
             emit(f"  - {nodeid}")

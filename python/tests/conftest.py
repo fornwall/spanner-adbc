@@ -17,11 +17,7 @@ DATABASE = "adbc-test"
 
 
 def _rest_base():
-    """Base URL of the emulator's REST admin API.
-
-    ``SPANNER_EMULATOR_HOST`` is the gRPC endpoint (``host:9010``); the REST admin
-    API lives on ``host:9020`` (override the port with ``SPANNER_EMULATOR_REST_PORT``).
-    """
+    """REST admin API on the gRPC host, port ``SPANNER_EMULATOR_REST_PORT`` (9020)."""
     grpc = os.environ["SPANNER_EMULATOR_HOST"]
     host = grpc.rsplit(":", 1)[0] or "localhost"
     port = os.environ.get("SPANNER_EMULATOR_REST_PORT", "9020")
@@ -44,7 +40,7 @@ def _post(url, body):
 
 
 def _await_operation(op):
-    """Poll a long-running operation to completion (emulator ops are near-instant)."""
+    """Poll a long-running operation to completion."""
     if op is None:  # Resource already exists (HTTP 409).
         return
     name = op.get("name")
@@ -66,7 +62,6 @@ def _await_operation(op):
 
 
 def _require_target():
-    """CI requires a configured target instead of silently skipping integration tests."""
     return os.environ.get("ADBC_TEST_REQUIRE_TARGET", "").lower() in ("1", "true", "yes")
 
 
@@ -98,7 +93,7 @@ def official_client(project):
 
 @pytest.fixture(scope="session")
 def spanner_database():
-    """Ensure the instance + database exist and return the database path."""
+    """Create the test instance and database if needed and return the database path."""
     if os.environ.get("SPANNER_OMNI_ENDPOINT"):
         if os.environ.get("SPANNER_EMULATOR_HOST"):
             pytest.fail("Configure only one of SPANNER_OMNI_ENDPOINT and SPANNER_EMULATOR_HOST")

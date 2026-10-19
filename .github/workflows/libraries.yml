@@ -1,15 +1,13 @@
 name: Shared libraries
 
-# Build the loadable ADBC driver shared library for every supported platform.
-# Artifacts are attached to each run (downloadable from the run's summary page),
-# and, for tag pushes, also uploaded as assets on the corresponding GitHub Release.
+# Build the driver library and Python wheels for each platform. Tag pushes also
+# publish them to the GitHub Release and PyPI.
 on:
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
 
-# Cancel superseded PR runs; let branch and release builds complete.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -75,7 +73,6 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
         run: cargo build --release --target ${{ matrix.target }}
 
-      # Reject libraries requiring a newer glibc than the manylinux wheel tag allows.
       - name: Verify glibc requirement matches the manylinux_2_35 wheel tag
         if: contains(matrix.target, 'linux-gnu')
         run: |
@@ -89,7 +86,6 @@ jobs:
             exit 1
           fi
 
-      # Reject libraries requiring a newer macOS than the wheel tag allows.
       - name: Verify the minimum macOS matches the wheel tag
         if: contains(matrix.target, 'apple-darwin')
         run: |
@@ -171,8 +167,7 @@ jobs:
               cargo build --release
             '
 
-      # Verify musllinux compatibility and the exported driver entrypoint.
-      - name: Verify the library is a musl (not glibc) shared object
+      - name: Verify musl linkage and the exported entrypoint
         run: |
           set -euo pipefail
           lib="target/release/libspanner_adbc.so"
@@ -185,7 +180,7 @@ jobs:
           strong="$(readelf -W --dyn-syms "$lib" \
             | awk '$8 ~ /@GLIBC_/ && $7 == "UND" && $5 != "WEAK" { print $8 }' || true)"
           if [ -n "$strong" ]; then
-            echo "::error::$lib requires glibc symbols — not a musl build" >&2
+            echo "::error::$lib requires glibc symbols" >&2
             printf '%s\n' "$strong" >&2
             exit 1
           fi
@@ -236,7 +231,6 @@ jobs:
           set -euo pipefail
           sha="${{ github.sha }}"
           repo="${{ github.repository }}"
-          # Each required workflow must run on the main-branch push accompanying the tag.
           required=(ci.yml adbc-validation.yml foundry-validation.yml)
           # Allow 30 minutes for runs to register and complete; missing runs block publishing.
           deadline=$(( SECONDS + 1800 ))
@@ -269,7 +263,6 @@ jobs:
             sleep 20
           done
 
-  # Require the tag to match Cargo.toml before publishing libraries or wheels.
   version-gate:
     name: Tag matches crate version
     if: startsWith(github.ref, 'refs/tags/')
@@ -310,14 +303,12 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # Stamp the release version into the driver-discovery manifest.
       # Users set Driver.shared to the extracted library path before installing it.
       - name: Stamp the release version into the driver manifest
         shell: bash
         run: |
           set -euo pipefail
           version="${GITHUB_REF#refs/tags/v}"
-          # Add the release version to the source manifest.
           awk -v ver="$version" '
             { print }
             !done && /^name = / { printf "version = '\''%s'\''\n", ver; done = 1 }
@@ -331,7 +322,6 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          # Include every published archive and the manifest in SHA256SUMS.
           sha256sum spanner-adbc-* spanner.toml > SHA256SUMS
           echo "Published checksums:"
           cat SHA256SUMS
@@ -404,7 +394,7 @@ jobs:
             else
               unzip -q "../artifacts/${staging}.zip" -d "$work"
             fi
-            # Exactly one platform's library must be present per wheel build.
+            # setup.py refuses to build with more than one staged library.
             rm -f spanner_adbc/*.so spanner_adbc/*.dylib spanner_adbc/*.dll
             cp "$work/${staging}/${lib}" spanner_adbc/
             python setup.py bdist_wheel --plat-name "$plat"
@@ -442,8 +432,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Smoke-test the installed manylinux x86_64 wheel on this glibc runner.
-          # The other platform wheels are inspected above.
+          # Only the manylinux x86_64 wheel can be installed on this runner.
           whl="$(ls python/wheelhouse/*manylinux_2_35_x86_64.whl)"
           python -m pip install "$whl"
           # Avoid importing the source tree instead of the installed wheel.
@@ -492,7 +481,6 @@ jobs:
   # repository, libraries.yml and the pypi environment; see CONTRIBUTING.md.
   python-publish:
     name: Publish wheels to PyPI
-    # Publish to PyPI after matching-version GitHub Release assets are attached.
     needs: [python-wheels, ci-gate, version-gate, release]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest

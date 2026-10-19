@@ -1,11 +1,8 @@
-# Monitor GitHub Actions and registry Cargo dependencies. Coordinate git-pinned
-# dependency updates across Cargo and validation harnesses; see CONTRIBUTING.md.
+# Git-pinned dependencies are updated by hand; see CONTRIBUTING.md.
 version: 2
 updates:
   - package-ecosystem: github-actions
-    # "/" scans the workflow files; the composite action's action.yml lives outside
-    # .github/workflows, so list its directory explicitly to keep its SHA-pinned
-    # dtolnay/rust-toolchain monitored too.
+    # "/" covers only .github/workflows, so list the composite action too.
     directories:
       - "/"
       - "/.github/actions/setup-rust"

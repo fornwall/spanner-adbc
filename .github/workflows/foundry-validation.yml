@@ -8,7 +8,6 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Cancel superseded PR runs; let main-branch runs complete.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -32,7 +31,7 @@ jobs:
       # Require at least one passing case; pytest otherwise accepts an all-skip run.
       FOUNDRY_VALIDATION_REQUIRE_PASSES: "1"
       # Require skips to match foundry-validation/skip_baseline.txt.
-      # Regenerate deliberately with FOUNDRY_UPDATE_SKIP_BASELINE=1.
+      # Regenerate it with FOUNDRY_UPDATE_SKIP_BASELINE=1.
       FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE: "1"
 
     steps:
@@ -45,7 +44,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          # Run the suite on the latest stable Python (it requires >= 3.13).
+          # The suite requires Python 3.13 or newer.
           python-version: "3.x"
           check-latest: true
           cache: pip

@@ -44,7 +44,7 @@ def main() -> int:
         print(f">> {LOOPS} read loops of {N} rows (profile window)", flush=True)
         t0 = time.perf_counter()
         total = 0
-        for i in range(LOOPS):
+        for _ in range(LOOPS):
             with conn.cursor() as cur:
                 cur.execute(f"SELECT {bp.COLUMNS} FROM {bp.TABLE}")
                 table = cur.fetch_arrow_table()

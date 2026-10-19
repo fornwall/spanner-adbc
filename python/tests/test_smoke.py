@@ -42,7 +42,6 @@ def test_dbapi_errors_can_be_caught_through_the_driver_module(monkeypatch):
 
 
 def test_missing_library_raises_clearly():
-    """When no bundled lib is present (source checkout), the error is actionable."""
     import pathlib
 
     here = pathlib.Path(spanner_adbc.__file__).parent
@@ -51,10 +50,7 @@ def test_missing_library_raises_clearly():
         for n in ("libspanner_adbc.so", "libspanner_adbc.dylib", "spanner_adbc.dll")
     )
     if has_lib:
-        # A real wheel is installed; just confirm the path resolves.
         assert spanner_adbc._driver_path()
     else:
-        import pytest
-
         with pytest.raises(RuntimeError, match="no bundled Spanner driver library"):
             spanner_adbc._driver_path()

@@ -7,7 +7,6 @@ on:
     branches: [main]
   pull_request:
 
-# Cancel superseded PR runs; let main-branch runs complete.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -24,9 +23,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
-    # Exercise both backends with plain, C++ ASan/UBSan, and Rust ASan builds.
-    # Rust ASan also instruments std and runs a cross-boundary overflow canary.
-    # Its C++ harness uses clang so both sides share LLVM's ASan runtime.
     strategy:
       fail-fast: false
       matrix:
@@ -47,9 +43,7 @@ jobs:
             toolchain: nightly
 
     env:
-      # Instrument the C++ harness and its dependencies.
       ADBC_VALIDATION_SANITIZE: ${{ matrix.sanitize }}
-      # Instrument the Rust cdylib and std; the runner selects clang for a shared ASan runtime.
       ADBC_VALIDATION_RUST_SANITIZE: ${{ matrix.rust-sanitize }}
       ADBC_VALIDATION_BUILD_DIR: ${{ github.workspace }}/.adbc-validation-build-${{ matrix.name }}
 

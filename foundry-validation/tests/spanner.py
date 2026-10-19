@@ -8,10 +8,10 @@ from adbc_drivers_validation import model, quirks
 class SpannerQuirks(model.DriverQuirks):
     name = "spanner"
     driver = "spanner_adbc"
-    # These must match what the driver reports via get_info (see src/lib.rs, src/info.rs).
+    # Must match the driver's get_info values (src/info.rs).
     driver_name = "spanner-adbc"
     vendor_name = "Google Cloud Spanner"
-    vendor_version = None  # the driver reports VendorVersion as a null value (no Spanner server version)
+    vendor_version = None  # Spanner exposes no server version
     short_version = "emulator"
 
     features = model.DriverFeatures(
@@ -50,9 +50,7 @@ class SpannerQuirks(model.DriverQuirks):
         return (Path(__file__).parent.parent / "queries" / "spanner",)
 
     def bind_parameter(self, index: int) -> str:
-        # Spanner uses named parameters (@name); the driver binds a batch column
-        # to the @<column-name> of the same name. The suite substitutes $N via
-        # this hook, so we emit @pN and pair it with a pN-named bind column.
+        # Spanner has only named parameters; the driver binds column pN to @pN.
         return f"@p{index}"
 
     def query_override(self, context: str, default: str) -> str:
@@ -64,10 +62,8 @@ class SpannerQuirks(model.DriverQuirks):
         if context == "TestStatement.sample_table":
             return "CREATE TABLE `sample_table` (id INT64, value STRING(MAX)) PRIMARY KEY (id)"
         if context == "TestStatement.test_rows_affected.create_table":
-            # The suite's default is `CREATE TABLE <quoted_name> (id INT)`; Spanner just
-            # needs the native type name. No PRIMARY KEY clause: the test runs
-            # `UPDATE ... SET id = id + 1`, which Spanner rejects on a key column, and a
-            # keyless table is keyed on a hidden `rowid` instead.
+            # No PRIMARY KEY: the test runs `UPDATE ... SET id = id + 1`, which Spanner
+            # rejects on a key column. A keyless table is keyed on a hidden `rowid`.
             return default.replace("(id INT)", "(id INT64)")
         return super().query_override(context, default)
 
@@ -76,15 +72,9 @@ class SpannerQuirks(model.DriverQuirks):
 
     @property
     def sample_ddl_constraints(self) -> list[str]:
-        # Spanner DDL: INT64, PRIMARY KEY clause after the column list, table-level
-        # FOREIGN KEY constraints. Parents are created before children. Only the
-        # tables needed by the enabled tests are created; Spanner has no UNIQUE
-        # table constraint (only unique indexes).
-        #
-        # The two FK children declare no primary key of their own — the suite asserts
-        # each reports exactly one constraint, and a declared key would be a second.
-        # Spanner keys them on a hidden `rowid`, which get_objects omits (along with
-        # its implicit PK and NOT NULL check constraints).
+        # Parents precede children. Spanner has no UNIQUE table constraint.
+        # The FK children declare no primary key because the suite expects exactly
+        # one constraint per table; get_objects omits their hidden `rowid` key.
         return [
             "CREATE TABLE constraint_check (a INT64, b INT64,"
             " CONSTRAINT check_positive CHECK (a > 0),"
@@ -109,7 +99,7 @@ class SpannerQuirks(model.DriverQuirks):
 
     def is_table_not_found(self, table_name, error: Exception) -> bool:
         text = str(error).lower()
-        if "table not found" in text or "not found" in text:
+        if "not found" in text:
             return table_name is None or table_name.lower() in text
         return False
 

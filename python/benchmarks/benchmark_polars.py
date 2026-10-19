@@ -12,11 +12,6 @@ Run from the repository root after following the benchmark README's setup:
 
 Options: ``--rows N`` (default 100000), ``--repeat K`` (default 5),
 ``--batch B`` (ingest batch size for setup, default 20000).
-
-Requires ``SPANNER_EMULATOR_HOST`` (set by ``with-emulator.sh``) and the
-bundled driver library next to ``spanner_adbc`` (see the benchmark
-README). The script creates the instance and database through the emulator's
-REST admin API.
 """
 
 from __future__ import annotations
@@ -36,7 +31,6 @@ INSTANCE = "test-instance"
 DATABASE = "adbc-test"
 TABLE = "BenchPolars"
 
-# Include numeric, string and boolean columns; aggregate the FLOAT64 value column.
 COLUMNS = "id, value, quantity, category, active"
 DDL = (
     f"CREATE TABLE {TABLE} ("
@@ -65,7 +59,7 @@ def _post(url: str, body: dict):
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as exc:
-        if exc.code == 409:  # already exists -> idempotent
+        if exc.code == 409:  # already exists
             return None
         raise
 
@@ -88,7 +82,7 @@ def _await_operation(op) -> None:
 
 
 def ensure_database() -> str:
-    """Create the instance + database if absent; return the database path."""
+    """Create the instance and database if absent; return the database path."""
     base = _rest_base()
     _await_operation(
         _post(
@@ -116,7 +110,6 @@ def build_data(n: int):
     import pyarrow as pa
 
     ids = list(range(n))
-    # Deterministic values let both clients read identical data.
     value = [((i * 7) % 10_000) / 100.0 for i in ids]
     quantity = [i % 500 for i in ids]
     category = [f"cat-{i % 20}" for i in ids]
@@ -148,8 +141,7 @@ def setup_table(database: str, n: int, batch: int) -> None:
         with conn.cursor() as cur:
             cur.execute(f"DROP TABLE IF EXISTS {TABLE}")
             cur.execute(DDL)
-        # Ingest in slices purely for progress reporting; the driver chunks and
-        # commits internally under the emulator's per-commit mutation cap.
+        # Slices are only for progress output; the driver splits commits itself.
         loaded = 0
         for start in range(0, n, batch):
             slice_ = data.slice(start, min(batch, n - start))
@@ -187,7 +179,7 @@ def run_adbc(database: str):
 
 
 def run_official(database: str):
-    """Official client: per-row Python lists -> Polars (row-wise) -> mean."""
+    """Read rows through google-cloud-spanner and return the Polars mean and row count."""
     import polars as pl
     from google.cloud import spanner
 
@@ -198,15 +190,14 @@ def run_official(database: str):
         "category": pl.Utf8,
         "active": pl.Boolean,
     }
-    # With SPANNER_EMULATOR_HOST set the client auto-uses anonymous credentials
-    # and plaintext gRPC against the emulator.
+    # SPANNER_EMULATOR_HOST makes the client use anonymous plaintext gRPC.
     _, project, _, instance_id, _, database_id = database.split("/")
     client = spanner.Client(project=project)
     instance = client.instance(instance_id)
     db = instance.database(database_id)
     with db.snapshot() as snapshot:
         result = snapshot.execute_sql(f"SELECT {COLUMNS} FROM {TABLE}")
-        rows = list(result)  # each row materialized as a Python list
+        rows = list(result)
     df = pl.DataFrame(rows, schema=schema, orient="row")
     return df["value"].mean(), df.height
 
@@ -256,14 +247,13 @@ def main() -> int:
     print(f">> setup: creating {TABLE} and loading {args.rows} rows")
     setup_table(database, args.rows, args.batch)
 
-    print(f">> benchmarking (repeat={args.repeat}) — download whole table, Polars mean(value)")
+    print(f">> benchmarking (repeat={args.repeat}): download whole table, Polars mean(value)")
     results = []
     for name, fn in (("adbc", run_adbc), ("official", run_official)):
         print(f"    running: {name} ...", flush=True)
         (mean, rows), times = timeit(lambda fn=fn: fn(database), args.repeat)
         results.append((summarize(name, times, rows), mean, rows))
 
-    # Correctness: both engines must agree on the mean and the row count.
     (_, mean_a, rows_a), (_, mean_b, rows_b) = results
     assert rows_a == rows_b == args.rows, (rows_a, rows_b, args.rows)
     assert abs(mean_a - mean_b) < 1e-9, (mean_a, mean_b)

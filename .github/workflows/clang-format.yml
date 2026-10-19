@@ -1,6 +1,5 @@
 name: clang-format
 
-# Path filters apply only to formatting; ADBC validation runs on every change.
 # Keep the push and pull_request path lists in sync.
 on:
   push:
@@ -15,7 +14,6 @@ on:
       - 'adbc-validation/.clang-format'
       - '.github/workflows/clang-format.yml'
 
-# Cancel superseded PR runs; let main-branch runs complete.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

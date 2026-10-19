@@ -119,7 +119,6 @@ jobs:
           set -euo pipefail
           label="nightly-fuzz-failure"
           title="Nightly fuzz run failed"
-          # Reuse the open tracking issue across nightly failures.
           gh label create "$label" --color B60205 \
             --description "Automated: a scheduled fuzz run failed" 2>/dev/null || true
           body="A scheduled [fuzz run]($RUN_URL) failed (commit ${GITHUB_SHA})."

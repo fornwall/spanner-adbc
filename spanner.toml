@@ -1,36 +1,17 @@
-# ADBC driver manifest for the Google Cloud Spanner driver.
-#
-# Load by name with an ADBC driver manager that supports manifests:
+# ADBC driver manifest for the Google Cloud Spanner driver. With a driver manager
+# that supports manifests, select it by name or by URI scheme alone:
 #
 #     driver = "spanner"
 #     uri    = "spanner:///projects/p/instances/i/databases/d"
 #
-# Without `driver`, the URI scheme selects the driver name.
-# Specification: https://arrow.apache.org/adbc/current/format/driver_manifests.html
+# Install as `spanner.toml` in a directory on `ADBC_DRIVER_PATH` or in a user or
+# system config directory; see
+# https://arrow.apache.org/adbc/current/format/driver_manifests.html
 #
-# Install as `spanner.toml` in a driver discovery directory. Search order:
+# Edit `Driver.shared` to point at the installed library. Paths must be absolute or
+# resolvable by the dynamic loader; they are not relative to this file.
 #
-#   1. every directory in the `ADBC_DRIVER_PATH` environment variable
-#      (`:`-separated on Unix, `;`-separated on Windows)
-#   2. additional search paths supplied by the caller — notably, the Python
-#      driver manager adds `$VIRTUAL_ENV/etc/adbc/drivers` inside a venv
-#   3. the user config directory
-#        Linux:   `$XDG_CONFIG_HOME/adbc/drivers`, else `~/.config/adbc/drivers`
-#        macOS:   `~/Library/Application Support/ADBC/Drivers`
-#        Windows: `HKEY_CURRENT_USER\SOFTWARE\ADBC\Drivers\spanner`, else
-#                 `%LOCALAPPDATA%\ADBC\Drivers`
-#   4. the system config directory
-#        Linux:   `/etc/adbc/drivers`
-#        macOS:   `/Library/Application Support/ADBC/Drivers`
-#        Windows: `HKEY_LOCAL_MACHINE\SOFTWARE\ADBC\Drivers\spanner`
-#
-# Edit `Driver.shared` below to match the installed library. Paths must be absolute
-# or resolvable by the platform's dynamic loader; they are not relative to this file.
-# The defaults assume a system-wide installation of a GitHub release library.
-#
-# For the Python package, generate a manifest pointing at its bundled library:
-#
-#     python -m spanner_adbc.manifest install
+# The Python package generates its own manifest: `python -m spanner_adbc.manifest install`.
 
 manifest_version = 1
 

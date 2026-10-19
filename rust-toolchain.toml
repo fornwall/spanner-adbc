@@ -1,5 +1,4 @@
-# Shared development/CI toolchain; keep aligned with Cargo.toml’s rust-version.
-# Fuzzing uses nightly separately.
+# Keep aligned with rust-version in Cargo.toml. Fuzzing uses nightly.
 [toolchain]
 channel = "1.99.1"
 components = ["rustfmt", "clippy"]

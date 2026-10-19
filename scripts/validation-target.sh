@@ -36,7 +36,7 @@ elif [ -n "${SPANNER_EMULATOR_HOST:-}" ]; then
     esac
   done
 
-  # GET the exact resource: a database with a similar name is not sufficient.
+  # Poll the database resource itself; creation can return before it is readable.
   ready=0
   for ((deadline=SECONDS+10; SECONDS<deadline; )); do
     if [ "$(curl --noproxy '*' --max-time 1 -s -o /dev/null -w '%{http_code}' \

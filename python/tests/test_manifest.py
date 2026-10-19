@@ -30,9 +30,7 @@ needs_library = pytest.mark.skipif(
 def test_manifest_parses_and_has_the_required_keys():
     doc = tomllib.loads(manifest_mod.manifest_text())
 
-    # `manifest_version`, if present, must be 1; managers reject anything higher.
     assert doc["manifest_version"] == 1
-    # The only *required* key per the spec.
     shared = doc["Driver"]["shared"]
     assert isinstance(shared, str)
     assert os.path.isabs(shared), shared
@@ -47,13 +45,11 @@ def test_manifest_parses_and_has_the_required_keys():
 @needs_library
 def test_install_writes_a_manifest_named_for_the_driver(tmp_path):
     written = manifest_mod.install(tmp_path)
-    # The base name is what the driver manager matches against the driver name
-    # and against a connection URI's scheme, so it must be exactly this.
+    # The driver manager matches this name against driver="spanner" and the URI scheme.
     assert written.name == "spanner.toml"
     assert written.parent == tmp_path
     assert tomllib.loads(written.read_text())["Driver"]["shared"]
 
-    # Re-running overwrites rather than failing: that is the upgrade path.
     again = manifest_mod.install(tmp_path)
     assert again == written
 
@@ -175,8 +171,7 @@ def test_user_manifest_uses_platform_config_directory(tmp_path, monkeypatch, pla
 def test_manifest_makes_the_driver_discoverable_by_name(
     spanner_database, tmp_path, monkeypatch
 ):
-    """End-to-end: resolve the driver through a manifest, not a library path."""
-    pytest.importorskip("pyarrow")  # dbapi result fetching needs it
+    pytest.importorskip("pyarrow")
     import adbc_driver_manager.dbapi
 
     manifest_mod.install(tmp_path)
@@ -185,7 +180,6 @@ def test_manifest_makes_the_driver_discoverable_by_name(
     db_kwargs = database_options(spanner_database)
     uri = db_kwargs.pop("uri")
 
-    # (1) By driver name.
     with adbc_driver_manager.dbapi.connect(
         driver="spanner", uri=uri, db_kwargs=db_kwargs, autocommit=True
     ) as conn:
@@ -193,8 +187,7 @@ def test_manifest_makes_the_driver_discoverable_by_name(
             cur.execute("SELECT 1")
             assert cur.fetchone() == (1,)
 
-    # (2) By URI scheme alone — no `driver` option at all. This is what the
-    # manifest buys over the bundled-path `spanner_adbc.connect()`.
+    # Without a driver option, the URI scheme selects the manifest.
     with adbc_driver_manager.dbapi.connect(
         uri=uri, db_kwargs=db_kwargs, autocommit=True
     ) as conn:

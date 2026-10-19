@@ -2,18 +2,14 @@ name: Resilience (fault injection)
 
 # Exercise cancellation and recovery through a Toxiproxy transport-fault proxy.
 # Spanner status-code faults such as ABORTED are covered separately; see tests/RESILIENCE.md.
-# To require this workflow before merging, add "Resilience harness (emulator + Toxiproxy)"
-# to the repository branch-protection checks.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
   schedule:
-    # Nightly at 04:30 UTC; scheduled failures also create a tracking issue.
-    - cron: "30 4 * * *"
+    - cron: "30 4 * * *" # daily at 04:30 UTC
 
-# Cancel superseded PR runs; let main-branch runs complete.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -66,7 +62,6 @@ jobs:
           set -euo pipefail
           label="nightly-resilience-failure"
           title="Nightly resilience run failed"
-          # Reuse the open tracking issue across nightly failures.
           gh label create "$label" --color B60205 \
             --description "Automated: a scheduled resilience run failed" 2>/dev/null || true
           body="A scheduled [resilience run]($RUN_URL) failed (commit ${GITHUB_SHA})."

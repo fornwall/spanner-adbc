@@ -3,7 +3,7 @@
 # Reasons are maintained in the .txtcase files.
 #
 # CI sets FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE to reject new or stale skips.
-# Regenerate after an intentional change to the skip set:
+# Regenerate after changing the skip set:
 #   FOUNDRY_UPDATE_SKIP_BASELINE=1 scripts/run-foundry-validation.sh
 
 tests/test_connection.py::TestConnection::test_get_objects_constraints_unique[spanner:emulator]  # not implemented

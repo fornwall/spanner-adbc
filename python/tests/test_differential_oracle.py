@@ -1,9 +1,4 @@
-"""Compare Arrow values with the official Python client on the same Spanner target.
-
-The corpus covers numeric boundaries, non-finite floats, Unicode, bytes, dates,
-nanosecond timestamps, NUMERIC, JSON, arrays and nulls. Both clients use either
-the emulator or Omni selected by conftest.
-"""
+"""Compare Arrow values with the official Python client on the same Spanner target."""
 
 import base64
 import datetime
@@ -21,8 +16,7 @@ from conftest import database_options, official_client
 
 TABLE = "AdbcOracle"
 
-# Column name + logical kind, in the order the SELECT returns them. The kind
-# drives normalization/comparison below.
+# (name, kind) in SELECT order; kind selects normalization and comparison.
 COLUMNS = [
     ("Id", "int"),
     ("IntCol", "int"),
@@ -38,9 +32,8 @@ COLUMNS = [
     ("StrArr", "array_str"),
 ]
 
-# One INSERT per row so the type-sensitive literals stay readable. Min int64 is
-# written as ``-9223372036854775807 - 1`` because ``9223372036854775808`` on its
-# own overflows an INT64 literal (the unary minus is applied afterwards).
+# Min INT64 is written as ``-9223372036854775807 - 1`` because the literal
+# ``9223372036854775808`` overflows before the unary minus applies.
 SEED_ROWS = [
     # Typical values.
     "(1, 42, 3.14, TRUE, 'hello', b'\\x00\\x01\\xff', DATE '2024-01-15', "
@@ -95,17 +88,11 @@ def _create_and_seed(cur):
         cur.execute(f"INSERT INTO {TABLE} ({cols}) VALUES {values}")
 
 
-# --- normalization helpers ------------------------------------------------
-
-
 def _to_jsonable(value):
     """Parse a JSON cell into plain Python for structural comparison.
 
-    Our driver returns JSON as its raw text (a ``str``). The official client
-    returns ``JsonObject`` (a ``dict`` subclass) whose ``str()`` is unreliable
-    (Python ``repr`` for objects, and a ``dict`` that misleadingly reprs as
-    ``[]`` for JSON arrays), so canonicalize it through ``.serialize()`` when
-    available.
+    The driver returns JSON text. The official client returns ``JsonObject``,
+    whose ``str()`` is not JSON, so use ``serialize()`` when available.
     """
     if value is None:
         return None
@@ -120,13 +107,7 @@ def _to_jsonable(value):
 
 
 def _official_ts_to_nanos(dt):
-    """Total nanoseconds since the Unix epoch for an official-client timestamp.
-
-    The client returns ``DatetimeWithNanoseconds`` (a ``datetime`` subclass with
-    a full ``nanosecond`` field); Python ``datetime`` itself only reaches
-    microseconds, so we rebuild the whole-second instant from calendar fields and
-    add the sub-second nanoseconds explicitly.
-    """
+    """Epoch nanoseconds for a ``DatetimeWithNanoseconds``, keeping the ``nanosecond`` field."""
     plain = datetime.datetime(
         dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second,
         tzinfo=datetime.timezone.utc,
@@ -146,8 +127,7 @@ def _normalize_official(kind, value):
     if kind == "json":
         return _to_jsonable(value)
     if kind == "bytes":
-        # The official client hands back BYTES still base64-encoded (as bytes);
-        # decode so it lines up with the raw bytes our driver already decodes to.
+        # The official client returns BYTES base64-encoded.
         return base64.b64decode(value)
     return value
 
@@ -163,8 +143,7 @@ def _normalize_adbc(kind, value):
 def _floats_equal(a, b):
     if math.isnan(a) or math.isnan(b):
         return math.isnan(a) and math.isnan(b)
-    # Distinguish +0.0 from -0.0 (== treats them equal) so a sign-dropping bug
-    # would surface here.
+    # == treats -0.0 and +0.0 as equal.
     if a == 0.0 and b == 0.0:
         return math.copysign(1.0, a) == math.copysign(1.0, b)
     return a == b
@@ -182,12 +161,8 @@ def _values_equal(kind, a, b):
     return a == b
 
 
-# --- the fixture(s) -------------------------------------------------------
-
-
 @pytest.fixture(scope="module")
 def official_database(spanner_database):
-    """The official client's handle for the same target as the ADBC connection."""
     _, project, _, instance, _, database = spanner_database.split("/")
     return official_client(project).instance(instance).database(database)
 
@@ -195,9 +170,6 @@ def official_database(spanner_database):
 def _official_query(database, sql):
     with database.snapshot() as snapshot:
         return [list(row) for row in snapshot.execute_sql(sql)]
-
-
-# --- tests ----------------------------------------------------------------
 
 
 def test_scalar_and_array_types_match_oracle(spanner_database, official_database):
@@ -224,9 +196,7 @@ def test_scalar_and_array_types_match_oracle(spanner_database, official_database
         f"row count mismatch: adbc={table.num_rows} official={len(official)}"
     )
 
-    # Materialize each ADBC column as a normalized Python list. Timestamps are
-    # read as raw int64 epoch-nanoseconds (pyarrow .to_pylist() would truncate the
-    # nanosecond tail to microseconds), matching the official-side normalization.
+    # Read timestamps as int64 epoch nanoseconds: to_pylist() truncates to microseconds.
     adbc_cols = {}
     for name, kind in COLUMNS:
         if kind == "ts":
@@ -249,10 +219,8 @@ def test_scalar_and_array_types_match_oracle(spanner_database, official_database
 
 
 def test_array_of_struct_matches_oracle(spanner_database, official_database):
-    # Spanner only returns a STRUCT wrapped in an ARRAY (a top-level STRUCT is
-    # UNIMPLEMENTED on real Spanner), so probe ARRAY<STRUCT<a,b,c>> via
-    # ARRAY(SELECT AS STRUCT ...). Our driver maps it to List<Struct>; the
-    # official client returns a list of structs, each a positional list.
+    # Spanner rejects top-level STRUCT columns, so query ARRAY<STRUCT<...>>.
+    # The official client returns each struct as a positional list.
     sql = (
         "SELECT ARRAY("
         "  SELECT AS STRUCT a, b, c FROM ("
@@ -273,13 +241,12 @@ def test_array_of_struct_matches_oracle(spanner_database, official_database):
     finally:
         conn.close()
 
-    adbc_arr = table.column("arr").to_pylist()[0]  # list of dicts
-    # Field order from the Arrow schema, so we can flatten each struct to a list.
+    adbc_arr = table.column("arr").to_pylist()[0]
     struct_type = table.schema.field("arr").type.value_type
     field_names = [struct_type.field(i).name for i in range(struct_type.num_fields)]
     adbc_structs = [[s[fn] for fn in field_names] for s in adbc_arr]
 
-    official = _official_query(official_database, sql)[0][0]  # list of structs (lists)
+    official = _official_query(official_database, sql)[0][0]
 
     assert len(adbc_structs) == len(official), (
         f"struct-array length mismatch: adbc={len(adbc_structs)} official={len(official)}"

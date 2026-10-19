@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -53,8 +54,6 @@ print("200", end="")
 ''')
 
     def tool(self, name, source):
-        import sys
-
         executable = self.root / name
         executable.write_text(f"#!{sys.executable}\n{source}")
         executable.chmod(0o755)

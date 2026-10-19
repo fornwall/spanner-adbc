@@ -1,5 +1,4 @@
-# cargo-deny configuration — supply-chain checks (advisories, licenses, bans, sources).
-# Run locally with `cargo deny check`; enforced in CI.
+# Supply-chain checks for `cargo deny check`, also run in CI.
 
 [graph]
 all-features = true

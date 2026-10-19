@@ -1,8 +1,6 @@
-"""Typed option-key constants for the Spanner ADBC driver.
+"""Option keys for ``db_kwargs``, ``conn_kwargs`` and ``adbc_stmt_kwargs``.
 
-Use members directly as dictionary keys in ``db_kwargs`` / ``conn_kwargs`` on
-``connect()``, or ``adbc_stmt_kwargs`` on ``cursor()``. Their string representation
-is the wire key. See ``docs/options.md`` for types, defaults and accepted values.
+See ``docs/options.md`` for types, defaults and accepted values.
 """
 
 import enum
@@ -13,25 +11,22 @@ __all__ = ["DatabaseOptions", "ConnectionOptions", "StatementOptions"]
 class DatabaseOptions(enum.StrEnum):
     """Database-level options (set before connecting, via ``db_kwargs``)."""
 
-    #: **Standard ADBC.** A ``spanner://`` connection URI whose path is the fully-qualified
-    #: database path, ``spanner:///projects/<p>/instances/<i>/databases/<d>``. The scheme is
-    #: required; a bare path is rejected. Pass it through ``db_kwargs`` on ``connect``.
+    #: Standard ADBC. Connection URI of the form
+    #: ``spanner:///projects/<p>/instances/<i>/databases/<d>``; the scheme is required.
     URI = "uri"
-    #: Override the Spanner gRPC endpoint (e.g. an emulator ``host:port``).
+    #: Spanner gRPC endpoint override, e.g. an emulator ``host:port``.
     ENDPOINT = "spanner.endpoint"
     #: Backend type: ``"cloud"`` (default) or ``"omni"`` for a self-hosted endpoint.
     INSTANCE_TYPE = "spanner.instance_type"
     #: ``"true"`` to connect with anonymous credentials (emulator mode).
     EMULATOR = "spanner.emulator"
-    #: Path to a service-account / credential JSON file.
+    #: Path to a credential JSON file.
     KEYFILE = "spanner.auth.keyfile"
-    #: The same credential JSON passed inline as a string. Write-only: never
-    #: readable back via ``get_option``, and not accepted as a ``URI`` query
-    #: parameter (URIs get logged) — pass it here instead.
+    #: Credential JSON passed inline. Write-only, and rejected as a URI query
+    #: parameter because URIs get logged.
     KEYFILE_JSON = "spanner.auth.keyfile_json"
-    #: A caller-supplied OAuth 2.0 bearer token, sent verbatim (no refresh).
-    #: Write-only: never readable back via ``get_option``, and not accepted as a
-    #: ``URI`` query parameter (URIs get logged) — pass it here instead.
+    #: OAuth 2.0 bearer token, sent as is and never refreshed. Write-only, and
+    #: rejected as a URI query parameter because URIs get logged.
     ACCESS_TOKEN = "spanner.auth.access_token"
     #: Service account to impersonate; setting it enables impersonation.
     IMPERSONATE_TARGET_PRINCIPAL = "spanner.auth.impersonate.target_principal"
@@ -41,8 +36,7 @@ class DatabaseOptions(enum.StrEnum):
     IMPERSONATE_SCOPES = "spanner.auth.impersonate.scopes"
     #: Optional impersonated-token lifetime, in seconds (default ``3600``).
     IMPERSONATE_LIFETIME = "spanner.auth.impersonate.lifetime"
-    #: The GCP project charged for API quota (the ``x-goog-user-project`` header),
-    #: decoupled from the project owning the data. ``""`` unsets.
+    #: Project billed for API quota (``x-goog-user-project``). ``""`` unsets.
     QUOTA_PROJECT = "spanner.auth.quota_project"
 
 
@@ -97,11 +91,7 @@ class ConnectionOptions(enum.StrEnum):
 
 
 class StatementOptions(enum.StrEnum):
-    """Statement-level options (set via ``conn.cursor(adbc_stmt_kwargs=...)``).
-
-    The options shared with :class:`ConnectionOptions` are per-statement overrides
-    of the value inherited from the connection.
-    """
+    """Statement-level options (set via ``conn.cursor(adbc_stmt_kwargs=...)``)."""
 
     #: Rows converted into each streamed Arrow ``RecordBatch`` (default ``8192``).
     ROWS_PER_BATCH = "spanner.rows_per_batch"
@@ -146,9 +136,8 @@ class StatementOptions(enum.StrEnum):
     RETRY_BACKOFF_MULTIPLIER = "spanner.retry.backoff.multiplier"
     #: How bound Arrow columns pair with ``@name`` parameters (``"true"`` = by name).
     BIND_BY_NAME = "adbc.statement.bind_by_name"
-    #: ``"true"`` routes an autocommit bulk ingest's chunks through Spanner's
-    #: non-atomic **BatchWrite** RPC instead of a write-only transaction.
-    #: Ignored in manual-transaction mode.
+    #: ``"true"`` sends autocommit bulk ingest through the non-atomic BatchWrite
+    #: RPC instead of a write-only transaction. Ignored in manual-transaction mode.
     INGEST_BATCH_WRITE = "spanner.ingest.batch_write"
     #: ``"true"`` partitions an idempotent ``UPDATE`` or ``DELETE`` across
     #: independent commits. Non-atomic; ``rowcount`` is a lower bound.

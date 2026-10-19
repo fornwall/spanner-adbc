@@ -1,50 +1,36 @@
 #!/usr/bin/env bash
 #
-# Build the spanner-adbc cdylib and the canonical Apache Arrow ADBC C++
-# validation suite (see adbc-validation/), then run the suite against the driver
-# loaded through the ADBC driver manager.
+# Build the driver and the Arrow ADBC C++ validation suite (adbc-validation/),
+# then run the suite against the driver through the ADBC driver manager.
+# Without a configured target, rerun under scripts/with-emulator.sh.
 #
-# With no Spanner target configured it starts a throwaway emulator (via
-# scripts/with-emulator.sh) and creates the test instance/database itself, so:
-#
-#   scripts/run-adbc-validation.sh            # emulator, CI checks (gate + guards)
-#   scripts/run-adbc-validation.sh --full     # emulator, every test (exploration)
-#   scripts/run-adbc-validation.sh --check-drift  # build + stale guard only (no DB)
+#   scripts/run-adbc-validation.sh                # gate and guards (CI)
+#   scripts/run-adbc-validation.sh --full         # every case, isolated; expect failures
+#   scripts/run-adbc-validation.sh --check-drift  # build and stale guard only, no database
 #   SPANNER_EMULATOR_HOST=localhost:9010 scripts/run-adbc-validation.sh
 #   SPANNER_GCP_DATABASE=proj.inst.db scripts/run-adbc-validation.sh
 #
-# Two sanitizer knobs (see the SANITIZE / RUST_SANITIZE block below):
-#   ADBC_VALIDATION_SANITIZE=address,undefined scripts/run-adbc-validation.sh  # C++ side only
-#   ADBC_VALIDATION_SANITIZE=address ADBC_VALIDATION_RUST_SANITIZE=address \
-#     scripts/run-adbc-validation.sh   # + the Rust cdylib itself (nightly -Zsanitizer=address,
-#                                      #   C++ side auto-built with clang to match the runtime)
+# Sanitizers:
+#   ADBC_VALIDATION_SANITIZE=address,undefined    # C++ harness and libraries
+#   ADBC_VALIDATION_SANITIZE=address ADBC_VALIDATION_RUST_SANITIZE=address
+#                                                 # also the cdylib (nightly, clang)
 #
-# The default (CI) path is driven by the single EXCLUDED list below (cases known
-# not to pass on Spanner; see adbc-validation/README.md) and runs three checks:
-#
-#   1. Gate            — everything EXCEPT the excluded cases must pass or skip;
-#                        new upstream cases auto-enroll here.
-#   2. Expected-failure guard — no excluded case may actually pass.
-#   3. Stale guard     — every EXCLUDED entry must still exist upstream.
-#
-# `--full` runs the whole suite (per-test isolation) for local exploration;
-# expect Spanner-specific failures/skips there.
+# The default run checks the EXCLUDED list below (see adbc-validation/README.md):
+#   gate: every other case passes or skips, including new upstream cases;
+#   expected-failure guard: no excluded case passes;
+#   stale guard: every excluded case still exists upstream.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Instrument the C++ harness, driver manager and validation libraries.
 SANITIZE="${ADBC_VALIDATION_SANITIZE:-}"
-
-# Instrument Rust and std with nightly ASan. Requires address sanitization on
-# the C++ side and clang so both sides share the compiler-rt runtime.
 RUST_SANITIZE="${ADBC_VALIDATION_RUST_SANITIZE:-}"
 
 # -Zbuild-std needs an explicit --target, placing the cdylib in target/<triple>/debug/.
 RUST_TARGET="$(rustc -vV | sed -n 's/host: //p')"
 
-# Default to clang for runtime compatibility; respect explicit compiler choices.
+# Rust ASan uses compiler-rt; GCC's libasan in the same process aborts at startup.
 if [ -n "$RUST_SANITIZE" ]; then
   export CC="${CC:-clang}"
   export CXX="${CXX:-clang++}"
@@ -77,8 +63,7 @@ for arg in "$@"; do
   esac
 done
 
-# Excluded cases must still exist and fail or skip. All other cases run in the gate.
-# Adapt dialect-specific SQL in SpannerQuirks::RewriteSql when possible.
+# Prefer adapting dialect-specific SQL in SpannerQuirks::RewriteSql to excluding a case.
 EXCLUDED=(
   # Duration and Interval have no supported column mapping; the emulator also
   # rejects INTERVAL columns. UInt64 cannot fit losslessly in INT64, and the
@@ -86,14 +71,12 @@ EXCLUDED=(
   'SpannerStatementTest.SqlIngestDuration'
   'SpannerStatementTest.SqlIngestInterval'
   'SpannerStatementTest.SqlIngestUInt64'
-
 )
 
 # A leading '-' excludes these cases from gtest; without it, only these cases run.
 EXCLUDED_FILTER="$(IFS=:; printf '%s' "${EXCLUDED[*]}")"
 
-# Verify Rust instrumentation by writing past a C++-allocated buffer.
-# The test-only canary must trigger an ASan heap-buffer-overflow report.
+# The test-only canary writes past a C++-allocated buffer from Rust; ASan must report it.
 run_rust_asan_canary() {
   local lib="$REPO_ROOT/target/$RUST_TARGET/debug/libspanner_adbc.so"
   local src="$REPO_ROOT/adbc-validation/asan_canary.cc"
@@ -128,12 +111,9 @@ run_rust_asan_canary() {
 
 build_harness() {
   if [ -n "$RUST_SANITIZE" ]; then
-    # Instrument Rust and std, and include the test-only overflow canary.
-    # The explicit target places the library in target/<triple>/debug/.
     echo ">> building the spanner-adbc cdylib with -Zsanitizer=$RUST_SANITIZE (nightly, -Zbuild-std, --target $RUST_TARGET, --cfg asan_canary)"
     RUSTFLAGS="-Zsanitizer=$RUST_SANITIZE --cfg asan_canary ${RUSTFLAGS:-}" \
       cargo +nightly build -Zbuild-std --target "$RUST_TARGET"
-    # Verify instrumentation before running the full suite.
     run_rust_asan_canary
   else
     echo ">> building the spanner-adbc cdylib"
@@ -186,7 +166,7 @@ run_stale_guard() {
 
   if [ "${#stale[@]}" -ne 0 ]; then
     echo "!! ${#stale[@]} EXCLUDED entr(y/ies) no longer exposed by the harness" >&2
-    echo "   (renamed/removed upstream? bumped ARROW_ADBC_TAG? — clean up EXCLUDED):" >&2
+    echo "   (renamed or removed upstream after an ARROW_ADBC_TAG bump?):" >&2
     printf '     %s\n' "${stale[@]}" >&2
     return 1
   fi
@@ -233,8 +213,8 @@ run_xfail_guard() {
   ' "$xml")
 
   if [ "${#xpass[@]}" -ne 0 ]; then
-    echo "!! ${#xpass[@]} EXCLUDED test(s) now PASS — remove them from EXCLUDED so the" >&2
-    echo "   gate enforces them (an expected-failure that started passing):" >&2
+    echo "!! ${#xpass[@]} EXCLUDED test(s) now pass; remove them from EXCLUDED so the" >&2
+    echo "   gate enforces them:" >&2
     printf '     %s\n' "${xpass[@]}" >&2
     return 1
   fi
@@ -243,8 +223,7 @@ run_xfail_guard() {
   return 0
 }
 
-# --check-drift: build the harness and run only the stale guard. This needs no
-# emulator/database, so it runs before the emulator gate below and exits.
+# --check-drift needs no database, so handle it before starting an emulator.
 if [ "$CHECK_DRIFT_ONLY" -eq 1 ]; then
   build_harness
   run_stale_guard
@@ -258,16 +237,13 @@ fi
 
 build_harness
 
-# The stale guard needs no database, so run it before the emulator DB creation.
-# Skip it under --full (which is exploratory and runs every case anyway).
+# Run the stale guard before creating the database; --full is exploratory and skips it.
 if [ "$FULL" -eq 0 ]; then
   run_stale_guard
 fi
 
 source "$REPO_ROOT/scripts/validation-target.sh"
 
-# The instrumented leg builds with an explicit --target, so its artifact lives under
-# target/<triple>/debug/ rather than target/debug/.
 if [ -n "$RUST_SANITIZE" ]; then
   export ADBC_SPANNER_LIBRARY="$REPO_ROOT/target/$RUST_TARGET/debug/libspanner_adbc.so"
 else
@@ -283,7 +259,6 @@ if [ "$FULL" -eq 1 ]; then
   # Isolate each case so an abort cannot prevent the remaining cases from running.
   ctest --test-dir "$BUILD_DIR" --output-on-failure || true
 else
-  # Gate first (must pass), then assert the excluded set still all fails/skips.
   run_gate
   run_xfail_guard
 fi

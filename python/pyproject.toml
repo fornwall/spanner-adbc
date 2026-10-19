@@ -10,7 +10,6 @@ description = "ADBC (Arrow Database Connectivity) driver for Google Cloud Spanne
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
-# Include the license for the bundled native driver.
 license-files = ["LICENSE"]
 authors = [{ name = "Fredrik Fornwall", email = "fredrik@fornwall.net" }]
 keywords = ["adbc", "arrow", "spanner", "database", "gcp"]
@@ -25,15 +24,12 @@ classifiers = [
     "Programming Language :: Rust",
     "Topic :: Database",
 ]
-# Minimum driver manager version supported by the wrapper.
 dependencies = ["adbc-driver-manager>=1.0"]
 
 [project.optional-dependencies]
-# Use the driver manager’s Arrow/pandas extra and state the minimum Arrow version.
 dbapi = ["adbc-driver-manager[dbapi]>=1.0", "pyarrow>=14.0.1"]
 
 [project.scripts]
-# Write a manifest using the installed library’s absolute path.
 spanner-adbc-install-manifest = "spanner_adbc.manifest:main"
 
 [project.urls]

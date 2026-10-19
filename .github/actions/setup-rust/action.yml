@@ -19,7 +19,6 @@ runs:
       id: version
       shell: bash
       run: |
-        # Pass the pinned version explicitly; sed also works on macOS runners.
         channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)
         if [ -z "$channel" ]; then
           echo "::error::could not read 'channel' from rust-toolchain.toml" >&2

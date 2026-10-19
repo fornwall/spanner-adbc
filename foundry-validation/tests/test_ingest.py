@@ -3,7 +3,7 @@ import pytest
 
 from . import spanner
 
-# Exercise 1–128 KiB values in all supported variable-length string/binary layouts.
+# Exercise 1-128 KiB values in each variable-length string and binary layout.
 LONG_VALUE_QUERIES = {
     "ingest/string",
     "ingest/large_string",

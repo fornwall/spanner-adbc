@@ -1,13 +1,9 @@
 """Register the bundled library for ADBC discovery by name or URI scheme.
 
-Run after installing, upgrading, or moving the Python environment::
+The manifest stores an absolute library path, so rerun after installing,
+upgrading or moving the Python environment::
 
-    python -m spanner_adbc.manifest install
-    # Equivalent console command:
-    spanner-adbc-install-manifest
-
-The manifest uses an absolute library path and is installed in a directory the
-driver manager searches; see :func:`default_install_dir`.
+    python -m spanner_adbc.manifest install  # or: spanner-adbc-install-manifest
 """
 
 from __future__ import annotations
@@ -34,22 +30,13 @@ MANIFEST_NAME = "spanner.toml"
 
 
 def _toml_string(value: str) -> str:
-    """Escape paths, including control characters, as TOML basic strings."""
-    # Keep non-BMP Unicode intact: JSON surrogate escapes are invalid in TOML.
+    # TOML rejects JSON's surrogate-pair escapes, so keep non-ASCII characters
+    # literal. JSON leaves DEL unescaped, but TOML forbids it raw.
     return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
 def manifest_text(library: str | os.PathLike[str] | None = None) -> str:
-    """Render a driver manifest for this installation.
-
-    Parameters
-    ----------
-    library:
-        Absolute path to the driver shared library. Defaults to the library
-        bundled in this wheel.
-
-    ``Driver.shared`` uses an absolute path to the library in this installation.
-    """
+    """Render a driver manifest pointing at *library*, by default the bundled one."""
     path = pathlib.Path(library) if library is not None else pathlib.Path(_driver_path())
     path = path.resolve()
     return f"""\
@@ -112,16 +99,15 @@ def install(
 ) -> pathlib.Path:
     """Write ``spanner.toml`` into *directory* and return the path written.
 
-    *directory* defaults to :func:`default_install_dir` and is created if it
-    does not exist. An existing manifest is overwritten, so re-running this
-    after an upgrade is the supported way to refresh a stale path.
+    *directory* defaults to :func:`default_install_dir` and is created if
+    missing. An existing manifest is overwritten.
     """
     text = manifest_text(library)
     target_dir = pathlib.Path(directory) if directory is not None else default_install_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / MANIFEST_NAME
-    # Replace only after writing succeeds, so a failed upgrade leaves the old
-    # manifest usable and concurrent readers never see a partial TOML file.
+    # Write then rename, so a failed write keeps the old manifest and readers
+    # never see a partial file.
     with tempfile.TemporaryDirectory(dir=target_dir, prefix=".spanner-") as temporary:
         temporary_path = pathlib.Path(temporary) / MANIFEST_NAME
         temporary_path.write_text(text, encoding="utf-8")
