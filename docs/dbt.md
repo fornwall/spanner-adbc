@@ -159,7 +159,7 @@ Agree on a proposed `type: spanner` profile contract; these fields are not accep
 | `uri` | Database option `uri`, e.g. `spanner:///projects/p/instances/i/databases/d`; derive logical database ID `d`. |
 | `schema` | Explicit `""` for the default schema or a named schema; SQL qualification and `adbc.ingest.target_db_schema`, not a mutable current-schema option. |
 | Credentials | ADC by default; map explicit sources to documented `spanner.auth.*` database options with dbt redaction. Let the driver refresh supported credential sources; fixed `spanner.auth.access_token` values require caller-managed validity. |
-| Emulator / Omni | Map endpoint and mode explicitly. Emulator uses `spanner.emulator`; Omni uses `spanner.instance_type=omni` plus an endpoint. |
+| Emulator / Omni | Map endpoint and mode explicitly. Emulator uses `spanner.emulator`; Omni uses `spanner.instance_type=omni` plus an endpoint. Omni and plaintext endpoints connect anonymously unless explicit credentials are set. |
 | Threads and execution settings | dbt worker count plus correctly scoped driver priority, timeout, retry and request/transaction tag options. |
 | Timestamp precision | Expose `spanner.max_timestamp_precision`; document and test the default. Microseconds cover years 1–9999 but truncate finer precision; nanoseconds have a narrower range. |
 

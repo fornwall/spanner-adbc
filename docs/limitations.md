@@ -26,6 +26,14 @@ The fix belongs upstream: the loops in `src/spanner/src/result_set.rs` and
 `retry_max_*` and `batch_write_honors_retry_attempt_limit` tests in
 [tests/mock_spanner.rs](../tests/mock_spanner.rs) cover the current behavior.
 
+## Interrupted writes can hold locks
+
+When a cancel or the `update` timeout interrupts DML, the driver drops the client's transaction.
+The client then sends `Rollback` in the background if it knows the transaction ID. During the
+first request, which begins the transaction inline, it doesn't know the ID yet, so nothing rolls
+the transaction back. Its locks stay held until Spanner aborts it as idle, normally after about
+10 seconds. Other transactions touching the same rows can wait until then.
+
 ## Synchronous calls from Tokio
 
 The ADBC Rust traits are synchronous. The driver runs them on its own Tokio runtime with

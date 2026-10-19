@@ -96,7 +96,7 @@ install into a directory on `ADBC_DRIVER_PATH`. For a standalone shared library,
 
 ## Authentication
 
-Without credential options, the driver uses
+Without credential options, the driver connects to Cloud Spanner with
 [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials):
 run `gcloud auth application-default login` locally, set `GOOGLE_APPLICATION_CREDENTIALS`, or
 use an attached service account on Google Cloud.
@@ -110,8 +110,8 @@ To pass credentials explicitly, add one of these to `db_kwargs`:
 | `DatabaseOptions.ACCESS_TOKEN` | OAuth bearer token, never refreshed |
 | `DatabaseOptions.IMPERSONATE_TARGET_PRINCIPAL` | Service account to impersonate, using ADC or the explicit credentials |
 
-`ACCESS_TOKEN` can't be combined with a keyfile or impersonation. The [option reference][options]
-lists scopes and the other authentication settings.
+`ACCESS_TOKEN` can't be combined with `KEYFILE`, `KEYFILE_JSON` or impersonation. The
+[option reference][options] lists scopes and the other authentication settings.
 
 For the [Spanner emulator](https://cloud.google.com/spanner/docs/emulator), connect anonymously:
 
@@ -127,12 +127,15 @@ with spanner.connect(db_kwargs={
     ...
 ```
 
-In emulator mode the driver ignores ambient ADC and rejects explicit credential options.
+In emulator mode the driver ignores ambient ADC and rejects explicit credential options and
+`DatabaseOptions.QUOTA_PROJECT`.
 
 For Spanner Omni, set `DatabaseOptions.INSTANCE_TYPE` to `"omni"` and `DatabaseOptions.ENDPOINT`
 to the server, such as `"http://localhost:15000"`, and use
 `spanner:///projects/default/instances/default/databases/<database>` as the URI. Leave
-`DatabaseOptions.EMULATOR` unset.
+`DatabaseOptions.EMULATOR` unset. Omni and plaintext endpoints (any scheme but `https://`, or a
+bare `host:port`) connect anonymously unless you pass explicit credentials, and reject
+`QUOTA_PROJECT` without them. Explicit credentials sent to a plaintext endpoint are unencrypted.
 
 ## Options
 
@@ -144,9 +147,10 @@ to the server, such as `"http://localhost:15000"`, and use
 
 Option keys are available as the `DatabaseOptions`, `ConnectionOptions` and `StatementOptions`
 enums, or you can use the raw strings. The enums are `StrEnum`s, so members work as dictionary
-keys. Pass `.value` to driver manager getters such as `get_option`, which need a plain `str`.
-The [option reference][options] lists types, defaults and accepted values. Set cursor options
-with `conn.cursor(adbc_stmt_kwargs={...})` or `cur.adbc_statement.set_options(**{...})`.
+keys. Pass `.value` to the typed driver manager getters, such as `get_option_int`, which need
+a plain `str`. The [option reference][options] lists types, defaults and accepted values. Set
+cursor options with `conn.cursor(adbc_stmt_kwargs={...})` or
+`cur.adbc_statement.set_options(**{...})`.
 
 [options]: https://github.com/fornwall/spanner-adbc/blob/main/docs/options.md
 
@@ -171,10 +175,10 @@ DML, DDL and ingest; rollback still works.
 
 ## Transactions
 
-DBAPI defaults to `autocommit=False`. The first statement of a manual transaction decides
-whether it runs queries or writes. Mixing the two raises `spanner.ProgrammingError` until you
-commit or roll back. Queries share a snapshot. DML is buffered until `conn.commit()`, so queries
-can't see buffered writes.
+DBAPI defaults to `autocommit=False`. A manual transaction runs either queries or writes,
+whichever comes first. Mixing the two raises `spanner.ProgrammingError` until you commit or
+roll back. Queries share a snapshot. DML is buffered until `conn.commit()`, so queries can't see
+buffered writes.
 
 Leaving a `with spanner.connect(...)` block closes the connection without committing. Call
 `conn.commit()` before the end of the block to keep buffered writes.

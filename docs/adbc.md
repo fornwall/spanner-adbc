@@ -96,14 +96,15 @@ runs the statement once per row, and a query's runs share one snapshot.
 For ingest, `adbc.ingest.target_table` selects the table and `adbc.ingest.mode` decides whether
 to create or replace it. Each row becomes an insert mutation. Autocommit ingest commits in
 chunks, so a large ingest is not atomic; in a manual transaction all mutations wait for one
-commit. Creating or replacing the table is DDL and happens immediately.
+commit. Creating or replacing the table is DDL and happens immediately. The driver converts every
+bound value first, so a bad value fails before the DDL runs.
 
 The driver checks table, schema and column names before sending anything. It rejects names
 containing a backtick, a backslash or a control character, because Spanner's DDL parser doesn't
 honour escapes inside backtick-quoted identifiers.
 
-Setting SQL clears the ingest target and vice versa. `prepare()` only checks that one of them is
-set; Spanner plans the SQL when it runs.
+Setting SQL clears the ingest target table, schema and catalog, and setting a target table clears
+the SQL. `prepare()` only checks that one of them is set; Spanner plans the SQL when it runs.
 
 ### Bound types
 
@@ -131,9 +132,9 @@ bytes with your own descriptors.
 
 | Method | Result |
 | --- | --- |
-| `get_info` | Driver and vendor metadata. Unsupported info codes are omitted. |
+| `get_info` | Driver and vendor metadata. Codes without a value, such as the vendor version, are null; unknown codes are omitted. |
 | `get_objects` | Catalogs, schemas, tables, columns and constraints from `INFORMATION_SCHEMA`. |
-| `get_table_schema` | A table's columns as Arrow fields. |
+| `get_table_schema` | A table's columns as Arrow fields. A missing table returns `NotFound`. |
 | `get_table_types` | `BASE TABLE` and `VIEW`. |
 | `get_statistics` | Exact row, distinct and null counts from one aggregate scan per table, even when approximate statistics are requested. |
 | `get_statistic_names` | An empty, typed result: the driver defines no statistics of its own. |

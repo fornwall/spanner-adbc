@@ -317,7 +317,7 @@ pub mod fuzzing {
     mod tests {
         /// Keep fuzz harnesses, manifest entries and CI discovery in sync.
         #[test]
-        fn every_fuzz_target_is_wired_and_documented() {
+        fn every_fuzz_target_is_wired() {
             let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
 
             // Each `[[bin]]` is immediately followed by `name = "..."`, the shape that
@@ -407,8 +407,9 @@ pub mod bench_support {
 }
 
 /// Database option: an explicit gRPC endpoint, such as an emulator's `http://localhost:9010`.
-/// A bare `host:port` connects over plaintext. When unset or `""`, the client connects to the
-/// production service.
+/// A bare `host:port` gets `http://`, and every scheme but `https://` connects over plaintext.
+/// When unset or `""`, the driver uses `SPANNER_EMULATOR_HOST` if set, else the production
+/// service.
 pub const OPTION_ENDPOINT: &str = "spanner.endpoint";
 
 /// Database option: when `true`, connect with anonymous credentials, as the Spanner emulator
@@ -428,8 +429,8 @@ pub const OPTION_INSTANCE_TYPE: &str = "spanner.instance_type";
 pub const OPTION_KEYFILE: &str = "spanner.auth.keyfile";
 
 /// Database option: an inline JSON credential such as a service-account key (dbt's
-/// `keyfile_json`). Without this or [`OPTION_KEYFILE`], and outside emulator mode, the driver uses
-/// Application Default Credentials.
+/// `keyfile_json`). Without a credential option, the driver uses Application Default Credentials,
+/// except in emulator mode and on Omni or plaintext endpoints, which connect anonymously.
 ///
 /// Write-only: the value is a private key, so `get_option` always fails with
 /// [`Status::NotFound`](adbc_core::error::Status::NotFound), and a `spanner://` URI carrying it is
@@ -471,9 +472,11 @@ pub const OPTION_ACCESS_TOKEN: &str = "spanner.auth.access_token";
 /// library.
 pub const OPTION_QUOTA_PROJECT: &str = "spanner.auth.quota_project";
 
-/// Statement option: the number of rows in each Arrow [`RecordBatch`](arrow_array::RecordBatch)
-/// streamed by [`Statement::execute`](adbc_core::Statement::execute). Larger batches use more
-/// memory; smaller ones return the first batch sooner. A positive integer; defaults to 8192.
+/// Statement option: the maximum number of rows in each Arrow
+/// [`RecordBatch`](arrow_array::RecordBatch) returned by
+/// [`Statement::execute`](adbc_core::Statement::execute), including `THEN RETURN` rows. Streamed
+/// query batches are also capped by size. Larger batches use more memory; smaller ones return the
+/// first batch sooner. A positive integer; defaults to 8192.
 pub const OPTION_ROWS_PER_BATCH: &str = "spanner.rows_per_batch";
 
 /// Statement option: run the partitions of
@@ -665,15 +668,16 @@ pub const OPTION_RETRY_BACKOFF_MAX_SECONDS: &str = "spanner.retry.backoff.max_se
 /// delay. Otherwise handled as [`OPTION_RETRY_BACKOFF_INITIAL_SECONDS`].
 pub const OPTION_RETRY_BACKOFF_MULTIPLIER: &str = "spanner.retry.backoff.multiplier";
 
-/// Connection option: a transaction tag, applied to each read/write transaction the driver starts
-/// and attached by Spanner to every operation in it. Unset by default; `""` unsets. There is no
-/// statement-level override, since a transaction can span several statements.
+/// Connection option: a transaction tag, applied to each read/write and write-only transaction the
+/// driver starts and to BatchWrite requests, and attached by Spanner to every operation in them.
+/// Unset by default; `""` unsets. There is no statement-level override, since a transaction can
+/// span several statements.
 pub const OPTION_TRANSACTION_TAG: &str = "spanner.transaction.tag";
 
 /// Connection and statement option: the
 /// [maximum commit delay](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions)
-/// Spanner may add to each read/write commit so it can batch commits, trading latency for
-/// throughput.
+/// Spanner may add to each read/write and write-only commit so it can batch commits, trading
+/// latency for throughput.
 ///
 /// A duration in the [`OPTION_READ_STALENESS`] grammar (e.g. `100ms`, `0.2s`) between 0 and
 /// 500ms. Malformed and out-of-range values fail with
@@ -683,8 +687,8 @@ pub const OPTION_MAX_COMMIT_DELAY: &str = "spanner.commit.max_delay";
 
 /// Connection and statement option: request
 /// [commit statistics](https://docs.cloud.google.com/spanner/docs/commit-statistics) for the
-/// read/write commits the driver makes. Boolean (`true` or `false`), default `false`; `""` unsets
-/// it.
+/// read/write and write-only commits the driver makes. Boolean (`true` or `false`), default
+/// `false`; `""` unsets it.
 ///
 /// The mutation count of the latest such commit is readable through
 /// [`OPTION_COMMIT_STATS_MUTATION_COUNT`]: on the statement for autocommit DML and bulk ingest,

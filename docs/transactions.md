@@ -63,7 +63,9 @@ DML and ingest return `None` from `execute_update`, and commit doesn't report a 
 `THEN RETURN` and partitioned DML need autocommit.
 
 A manual read transaction takes its snapshot from the first query's staleness bound, converting
-`max:` and `min:` bounds to exact ones, and ignores the bounds of later queries.
+`max:` and `min:` bounds to exact ones, and ignores the bounds of later queries. If the first
+query fails, for example with a syntax error, the transaction hasn't begun and the next query
+starts it again.
 `execute_partitions` always creates its own batch snapshot and fails inside a manual write
 transaction. It passes the staleness bound through unchanged, and Spanner rejects bounded
 staleness for that transaction type, so use a strong, exact staleness or exact timestamp bound.
@@ -71,8 +73,10 @@ staleness for that transaction type, so use a strong, exact staleness or exact t
 At commit, buffered DML runs as one `ExecuteBatchDml`, followed by the buffered mutations. All
 mutations therefore apply after all DML, whatever order the ingests and DML were issued in.
 Mutation-only work uses the write-only path, which is protected against replay. If the commit
-fails, the buffer is kept. If it succeeds, only the applied work is removed, so work buffered
-concurrently survives. Turning autocommit back on also commits pending work.
+fails, the buffer is kept. A commit that was cancelled or timed out may still have been applied,
+so committing the kept work again could apply it twice; roll back to discard it. If the commit
+succeeds, only the applied work is removed, so work buffered concurrently survives. Turning
+autocommit back on also commits pending work.
 
 With `adbc.connection.readonly=true`, new writes and commits of pending writes fail with
 `InvalidState`, but rollback and commits of read-only or empty transactions still work.
@@ -91,11 +95,11 @@ The implementation is in [connection.rs](../src/connection.rs),
 | RPC | Used for |
 | --- | --- |
 | `CreateSession` | The client creates its multiplexed session and replaces it periodically. |
-| `BeginTransaction` | Write-only, batch read-only and partitioned DML transactions, and as a fallback when an inline begin fails. |
+| `BeginTransaction` | Write-only, batch read-only and partitioned DML transactions, `THEN RETURN` DML bound to several rows, and as a fallback when an inline begin fails. |
 | `ExecuteStreamingSql` | Queries, metadata, PLAN probes, partition reads, `THEN RETURN` and partitioned DML. |
 | `ExecuteBatchDml` | Ordinary DML, including single statements, and manual DML commits. |
 | `Commit` | Read/write and write-only transactions. |
-| `Rollback` | Sent by the client to clean up after a transaction body fails with an error other than `ABORTED`. |
+| `Rollback` | Sent by the client to clean up a read/write transaction with a known ID when its body fails with an error other than `ABORTED`, or when a cancel or timeout drops it. |
 | `PartitionQuery` | Descriptors for `execute_partitions`. |
 | `BatchWrite` | Opt-in autocommit ingest. |
 | `UpdateDatabaseDdl` | Schema changes through the gRPC Database Admin API, followed by operation polling. |
@@ -115,7 +119,7 @@ are all reached over gRPC, for queries and schema changes alike.
 
 Read/write and manual read-only transactions begin inline with their first request, so creating
 a manual read-only transaction sends no RPC. Write-only, partitioned DML and batch read-only
-transactions begin explicitly.
+transactions begin explicitly, as does `THEN RETURN` DML bound to several rows.
 
 ### Commit and rollback
 
@@ -131,7 +135,9 @@ with no default limit on attempts or time. `spanner.retry.*` doesn't limit these
 the `update` timeout does.
 
 ADBC `rollback()` sends no RPC: it discards buffered writes or drops the read-only snapshot. The
-client itself may send `Rollback` to clean up a failed read/write transaction that has an ID.
+client itself sends `Rollback` to clean up a read/write transaction whose body failed or that was
+cancelled or timed out, once the transaction has an ID. A transaction interrupted during its
+first request has no ID yet; see [known limitations](limitations.md#interrupted-writes-can-hold-locks).
 
 ### Streaming queries and batch DML
 

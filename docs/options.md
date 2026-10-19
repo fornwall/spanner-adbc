@@ -29,8 +29,9 @@ isolation level can only be set on the connection, but are copied into each new 
   accepts whole-number doubles.
 - Seconds accept numeric strings, integers or doubles within the range given in the table. They
   must be finite and fit in a duration.
-- Everything else is a string. Enumerated values are case-sensitive. Tags are stored verbatim;
-  values that are parsed, such as staleness, have surrounding whitespace trimmed.
+- Everything else is a string. Enumerated values are case-sensitive. Tags are stored verbatim.
+  Booleans, `spanner.instance_type`, isolation levels, ingest modes and `spanner.rows_per_batch`
+  must match exactly; other parsed values, such as staleness, have surrounding whitespace trimmed.
 
 Invalid values return `InvalidArguments`, except unknown ingest modes, which return
 `NotImplemented`.
@@ -54,7 +55,7 @@ connections keep theirs. Getters don't show values taken from the environment.
 | --- | --- | --- | --- | --- |
 | `uri` | `spanner://` URI | required | set, verbatim | Database path plus optional endpoint and options; see [connection URIs](#connection-uris). Without it, creating a connection fails with `InvalidState`. |
 | `spanner.endpoint` | gRPC endpoint URL; `""` unsets | production endpoint | set | Overrides the endpoint from `SPANNER_EMULATOR_HOST`. A bare `host:port` uses `http://`. Only `https://` uses TLS; other schemes are plaintext. |
-| `spanner.emulator` | boolean | `false` | always | Uses anonymous credentials. A non-empty `SPANNER_EMULATOR_HOST` also enables this mode. |
+| `spanner.emulator` | boolean | `false` | always | Uses anonymous credentials. The emulator's address still comes from `spanner.endpoint` or `SPANNER_EMULATOR_HOST`. A non-empty `SPANNER_EMULATOR_HOST` also enables this mode. |
 | `spanner.instance_type` | `cloud`, `omni` | `cloud` | always | Selects Cloud Spanner or Spanner Omni. Omni needs an explicit endpoint, ignores `SPANNER_EMULATOR_HOST` and can't be combined with `spanner.emulator=true`. Without explicit credentials, Omni connects anonymously; see [anonymous connections](#anonymous-connections). |
 | `spanner.auth.keyfile` | credential JSON file path | ADC | set | Supports `service_account`, `authorized_user`, `impersonated_service_account` and `external_account` JSON. |
 | `spanner.auth.keyfile_json` | inline credential JSON | ADC | write-only | Same formats as `keyfile`, and takes precedence over it. Not allowed in URIs. |
@@ -67,7 +68,8 @@ connections keep theirs. Getters don't show values taken from the environment.
 
 In emulator mode, creating the client stack fails with `InvalidState` if a keyfile, inline JSON,
 access token, impersonation target or quota project is set. Ambient ADC doesn't count. An access
-token can't be combined with a keyfile, inline JSON or an impersonation target.
+token can't be combined with a keyfile, inline JSON or an impersonation target, which also fails
+with `InvalidState`.
 
 A keyfile, inline JSON or ADC that can't be read or parsed, for example because
 `GOOGLE_APPLICATION_CREDENTIALS` names a missing file, fails with `InvalidArguments` when the
@@ -173,7 +175,7 @@ settings, but no request or transaction tags.
 | `spanner.data_boost` | boolean | `false` | always | Runs partitioned queries on [Data Boost](https://docs.cloud.google.com/spanner/docs/databoost/databoost-overview). Cloud Spanner only; Omni doesn't support it. Carried in partition descriptors. |
 | `adbc.statement.bind_by_name` | boolean | `false` | always | By default, columns bind to distinct parameters in SQL order. `true` matches column names to parameter names, case-insensitively as Spanner does; unknown names return `InvalidArguments`. |
 | `adbc.statement.exec.incremental` | boolean, only `false` supported | `false` | always | `true` returns `NotImplemented`; incremental partitioning is not supported. |
-| `adbc.ingest.target_table` | table name | unset | set | Selects bulk ingest and clears the SQL; setting SQL clears it. An empty name, or one containing a backtick, backslash or control character, returns `InvalidArguments`. |
+| `adbc.ingest.target_table` | table name | unset | set | Selects bulk ingest and clears the SQL; setting SQL clears it. Ingest rejects an empty name, or one containing a backtick, backslash or control character, with `InvalidArguments`. |
 | `adbc.ingest.target_db_schema` | schema name; `""` for the default schema | default schema | set | Schema of the target table. Setting SQL clears it. |
 | `adbc.ingest.target_catalog` | connection's database ID | connection's catalog | set | Other values, including `""`, return `NotImplemented`. Setting SQL clears it. |
 | `adbc.ingest.temporary` | boolean, only `false` supported | `false` | always | `true` returns `NotImplemented`; temporary tables are not supported. |

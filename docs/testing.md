@@ -15,7 +15,7 @@ instead.
 | Backend scripts | `python3 -m unittest discover -s scripts/tests -v` | No Docker needed |
 | ADBC C++ conformance | `scripts/run-adbc-validation.sh` | [harness](../adbc-validation/README.md) |
 | Foundry type and feature suite | `scripts/run-foundry-validation.sh` | [harness](../foundry-validation/README.md) |
-| Fuzzing | `cargo +nightly fuzz run <target>` | [below](#fuzzing) |
+| Fuzzing | `CARGO_PROFILE_RELEASE_LTO=false cargo +nightly fuzz run <target>` | [below](#fuzzing) |
 | Conversion benchmarks | `cargo bench --bench conversion` | [below](#benchmarks) |
 
 Unit tests cover SQL parsing, options, value conversion and transaction state. The in-process
@@ -24,9 +24,9 @@ retry limits, ingest failures and request options. Neither needs a backend or cr
 
 CI runs on pushes to `main` and on pull requests. It runs the Rust, Python, C++ validation and
 Foundry suites against both the emulator and Omni, the C++ suite also under sanitizers, and
-fault injection against the emulator. Fault injection also runs nightly, as does fuzzing. No CI
-job uses Cloud Spanner. CI lists the target-dependent test binaries explicitly, so add new ones to
-[ci.yml](../.github/workflows/ci.yml).
+fault injection against the emulator. Fault injection also runs nightly, and fuzzing runs only
+nightly. No CI job uses Cloud Spanner. CI lists the target-dependent test binaries explicitly,
+so add new ones to [ci.yml](../.github/workflows/ci.yml).
 
 ## Backends
 
@@ -44,8 +44,10 @@ removes the container. The tests use `test-project/test-instance/adbc-test`.
 
 The script never touches a container it didn't create. If the container name is taken, it
 fails; pick another with `SPANNER_EMULATOR_CONTAINER` (and `TOXIPROXY_CONTAINER` for fault
-tests). To run emulators in parallel, give each its own container name and Docker network IP,
-using the internal ports.
+tests). The pinned client's admin API needs ports 9010 and 9020, so the script always publishes
+those and only one copy can run at a time. To run emulators in parallel, start each container
+yourself under its own name and point `SPANNER_EMULATOR_HOST` at its Docker network IP on port
+9010.
 
 ### Omni
 
@@ -95,15 +97,19 @@ scripts/with-emulator.sh python -m pytest python/tests -v
 ```
 
 Use `libspanner_adbc.dylib` on macOS or `spanner_adbc.dll` on Windows. Repeat the build, copy
-and install after changing the driver. The suite also runs the Python README's examples.
+and install after changing the driver. The suite also runs the Python README's examples. It
+runs against the emulator or Omni (`scripts/with-omni.sh`), not Cloud Spanner.
 
 ## Fuzzing
 
-Install cargo-fuzz and a nightly toolchain, then run a target:
+Install cargo-fuzz and a nightly toolchain, then run a target with LTO off:
 
 ```sh
-cargo +nightly fuzz run sql
+CARGO_PROFILE_RELEASE_LTO=false cargo +nightly fuzz run sql
 ```
+
+The release profile's thin LTO strips the coverage counters from the driver crate, which leaves
+the fuzzer blind. The fuzz workflow turns it off the same way.
 
 | Target | Coverage |
 | --- | --- |

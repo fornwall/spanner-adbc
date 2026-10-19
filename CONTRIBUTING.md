@@ -27,8 +27,9 @@ scripts/with-emulator.sh cargo test
 ```
 
 For FFI or feature changes, also run `cargo build --no-default-features`. For rustdoc changes,
-run `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`. CI runs these along with
-the Python tests, the external validation suites and dependency checks.
+run `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`. For changes to `scripts/`,
+run `python3 -m unittest discover -s scripts/tests`. CI runs these along with the Python tests,
+the external validation suites and dependency checks.
 
 ## Coding conventions
 
@@ -104,8 +105,8 @@ The pre-release hook runs fmt, clippy and `cargo test`, and cargo-release also u
 fallback version in `python/spanner_adbc/_version.py`.
 
 Pushing a `vX.Y.Z` tag starts `.github/workflows/libraries.yml`. It checks that the tag matches
-the crate version and that CI passed for the tagged commit, attaches the shared libraries to a
-GitHub release, and publishes wheels to PyPI.
+the crate version and that CI and both validation workflows passed for the tagged commit,
+attaches the shared libraries to a GitHub release, and publishes wheels to PyPI.
 
 PyPI publishing uses trusted publishing for the `spanner-adbc` project, with owner `fornwall`,
 repository `spanner-adbc`, workflow `libraries.yml` and environment `pypi`.

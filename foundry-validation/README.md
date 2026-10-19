@@ -19,7 +19,8 @@ Rust, git and curl, plus Docker for the emulator. `PYTHON` selects the interpret
 [script](../scripts/run-foundry-validation.sh) builds the driver, installs the pinned suite if
 needed, sets up the target database and runs pytest. `ADBC_VALIDATION_REF` and
 `ADBC_VALIDATION_REPO` select a different upstream revision or repository. When running pytest
-directly, point `ADBC_SPANNER_LIBRARY` at a built library.
+directly, set `ADBC_SPANNER_URI`. The library defaults to `target/debug/`; set
+`ADBC_SPANNER_LIBRARY` to use another build.
 
 The target is chosen from `SPANNER_OMNI_ENDPOINT`, then `SPANNER_EMULATOR_HOST`, then
 `SPANNER_GCP_DATABASE`; with none set, the script starts a disposable emulator. For Omni, set
