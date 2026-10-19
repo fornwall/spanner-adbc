@@ -4,10 +4,8 @@
 //! scripts/with-toxiproxy.sh cargo test --test resilience -- --test-threads=1
 //! ```
 //!
-//! Tests skip unless `TOXIPROXY_URL` and `SPANNER_EMULATOR_HOST` are set;
-//! `ADBC_TEST_REQUIRE_TARGET=1` makes missing configuration fail instead.
-//! See `tests/RESILIENCE.md` for coverage and limitations. Logical gRPC errors
-//! such as `ABORTED` are covered separately in `tests/mock_spanner.rs`.
+//! Tests skip unless `TOXIPROXY_URL` and `SPANNER_EMULATOR_HOST` are set. See
+//! `tests/RESILIENCE.md` for coverage and limitations.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,40 +23,26 @@ use google_cloud_lro::Poller;
 use google_cloud_spanner_admin_database_v1::client::DatabaseAdmin;
 use google_cloud_spanner_admin_instance_v1::client::InstanceAdmin;
 use google_cloud_spanner_admin_instance_v1::model::Instance;
-use spanner_adbc::{SpannerConnection, SpannerDatabase, SpannerDriver};
+use spanner_adbc::{SpannerConnection, SpannerDatabase, SpannerDriver, SpannerStatement};
 
-// Fixed identifiers, matching tests/integration.rs so the emulator setup is interchangeable.
+// Same identifiers as tests/integration.rs.
 const PROJECT: &str = "test-project";
 const INSTANCE: &str = "test-instance";
 const DATABASE: &str = "adbc-test";
 const STREAM_TABLE: &str = "ResilStream";
-// A tiny table for the manual-transaction commit-fault test. The buffered DML is an idempotent
-// UPDATE so the test's assertions hold regardless of whether the faulted commit RPC reached the
-// emulator before the reset (a failed commit's outcome is inherently ambiguous at the transport
-// layer).
 const TXN_TABLE: &str = "ResilTxn";
-// The streaming table carries a wide payload so the result set is far larger than the gRPC/HTTP-2
-// receive buffer (empirically ~12 MB against the emulator). `execute()` fills that buffer and
-// returns; the remaining rows must then be pulled message-by-message over the network as the reader
-// is iterated — which is where a bandwidth toxic makes each pull slow and a cancel can land. Sized
-// generously (~48 MB) so plenty of data always remains to stream after the buffer fills, regardless
-// of the exact buffer size. The rows are generated server-side (REPEAT + GENERATE_ARRAY), so seeding
-// is cheap despite the volume.
+// About 48 MB of rows. `execute()` returns once the ~12 MB gRPC receive buffer is full, so most
+// of the result is fetched over the network while the reader is iterated, where the faults apply.
 const STREAM_ROWS: i64 = 24000;
 const PAYLOAD_BYTES: usize = 2000;
-// Downstream byte cap for the truncated-stream test's `limit_data` toxic: comfortably above the
-// ~12 MB transport receive buffer (so `execute()` and the first batches succeed) but far below the
-// ~48 MB result (so the stream is cut mid-way, on a later chunk fetch, not up front).
+// Above the receive buffer, so `execute()` and the first batches succeed, but well below the
+// full result.
 const TRUNCATE_AFTER_BYTES: u64 = 20 * 1024 * 1024;
 
 fn database_path() -> String {
     format!("projects/{PROJECT}/instances/{INSTANCE}/databases/{DATABASE}")
 }
 
-/// Whether `ADBC_TEST_REQUIRE_TARGET` demands a configured target (CI sets it).
-///
-/// When truthy, [`toxi`] panics instead of returning `None` when the Toxiproxy / emulator env
-/// wiring is missing, so CI cannot silently skip the suite.
 fn require_target() -> bool {
     matches!(
         std::env::var("ADBC_TEST_REQUIRE_TARGET").ok().as_deref(),
@@ -66,30 +50,30 @@ fn require_target() -> bool {
     )
 }
 
-/// The Toxiproxy admin API base and target proxy name, or `None` to skip the whole file.
-///
-/// Requires the proxy (created by `scripts/with-toxiproxy.sh`) *and* `SPANNER_EMULATOR_HOST` to be
-/// set — the latter must point at the proxy listener, which the script guarantees.
-///
-/// When `ADBC_TEST_REQUIRE_TARGET` is truthy (CI) and either variable is missing, this panics
-/// instead of returning `None`, so the resilience suite cannot silently skip in CI.
-fn toxi() -> Option<Toxiproxy> {
-    let resolved = resolve_toxi();
-    if resolved.is_none() && require_target() {
-        panic!(
-            "ADBC_TEST_REQUIRE_TARGET is set; configure both TOXIPROXY_URL and \
-             SPANNER_EMULATOR_HOST to run the resilience suite"
-        );
-    }
-    resolved
+/// Claims the shared proxy and creates fixtures, or returns `None` when the suite is not
+/// configured. Panics instead of skipping under `ADBC_TEST_REQUIRE_TARGET`.
+fn begin() -> Option<(Toxiproxy, SerialGuard)> {
+    let Some(toxi) = toxi() else {
+        if require_target() {
+            panic!(
+                "ADBC_TEST_REQUIRE_TARGET is set; configure both TOXIPROXY_URL and \
+                 SPANNER_EMULATOR_HOST to run the resilience suite"
+            );
+        }
+        eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set; skipping resilience tests");
+        return None;
+    };
+    // After the skip check, so a plain multi-threaded `cargo test` still skips.
+    let serial = SerialGuard::new();
+    ensure_setup();
+    Some((toxi, serial))
 }
 
-/// Inner resolver for [`toxi`]; returns `None` when the required env vars are unset.
-fn resolve_toxi() -> Option<Toxiproxy> {
+fn toxi() -> Option<Toxiproxy> {
     let url = std::env::var("TOXIPROXY_URL")
         .ok()
         .filter(|s| !s.is_empty())?;
-    // Without an emulator host the driver has nothing to talk to; the script always sets it.
+    // Points at the proxy listener; the helper script sets both.
     std::env::var("SPANNER_EMULATOR_HOST")
         .ok()
         .filter(|s| !s.is_empty())?;
@@ -97,16 +81,19 @@ fn resolve_toxi() -> Option<Toxiproxy> {
     Some(Toxiproxy { url, proxy })
 }
 
-/// A thin client for the Toxiproxy HTTP admin API, driven by shelling out to `curl` (already a
-/// dependency of the harness scripts) so the test needs no HTTP crate.
+/// Toxiproxy admin API client. It shells out to `curl`, which the harness scripts already need.
 struct Toxiproxy {
     url: String,
     proxy: String,
 }
 
 impl Toxiproxy {
-    /// POST a toxic to the proxy. `body` is the toxic's JSON. Panics on a non-2xx response.
-    fn add_toxic(&self, body: &str) {
+    /// Adds a downstream toxic with one attribute. Panics on a non-2xx response.
+    fn add_toxic(&self, name: &str, kind: &str, attribute: &str, value: u64) {
+        let body = format!(
+            "{{\"name\":\"{name}\",\"type\":\"{kind}\",\"stream\":\"downstream\",\
+              \"toxicity\":1.0,\"attributes\":{{\"{attribute}\":{value}}}}}"
+        );
         let (code, out) = curl(&[
             "-s",
             "-X",
@@ -115,7 +102,7 @@ impl Toxiproxy {
             "-H",
             "Content-Type: application/json",
             "-d",
-            body,
+            &body,
         ]);
         assert!(
             (200..300).contains(&code),
@@ -123,7 +110,7 @@ impl Toxiproxy {
         );
     }
 
-    /// Delete a toxic by name, ignoring a 404 (not present).
+    /// Ignores a missing toxic.
     fn remove_toxic(&self, name: &str) {
         let _ = curl(&[
             "-s",
@@ -133,39 +120,25 @@ impl Toxiproxy {
         ]);
     }
 
-    /// A downstream bandwidth cap of `rate` KB/s (server→client), named so it can be removed again.
-    /// Throttling a large result set to a trickle keeps the reader blocked in a genuine network read
-    /// for seconds, giving a deterministic in-flight operation for the cancel to interrupt.
+    /// Limits server-to-client throughput to `rate_kbps` KB/s.
     fn add_bandwidth(&self, name: &str, rate_kbps: u64) {
-        self.add_toxic(&format!(
-            "{{\"name\":\"{name}\",\"type\":\"bandwidth\",\"stream\":\"downstream\",\
-              \"toxicity\":1.0,\"attributes\":{{\"rate\":{rate_kbps}}}}}"
-        ));
+        self.add_toxic(name, "bandwidth", "rate", rate_kbps);
     }
 
-    /// A `reset_peer` toxic: after `timeout` ms of a stalled connection, close it with a TCP RST.
-    /// `timeout=0` resets immediately on the next data.
+    /// Resets the connection with a TCP RST after `timeout_ms`, or on the next data if 0.
     fn add_reset_peer(&self, name: &str, timeout_ms: u64) {
-        self.add_toxic(&format!(
-            "{{\"name\":\"{name}\",\"type\":\"reset_peer\",\"stream\":\"downstream\",\
-              \"toxicity\":1.0,\"attributes\":{{\"timeout\":{timeout_ms}}}}}"
-        ));
+        self.add_toxic(name, "reset_peer", "timeout", timeout_ms);
     }
 
-    /// A `limit_data` toxic: close the connection cleanly once `bytes` bytes have been transmitted
-    /// downstream (server→client). This truncates a large streamed result mid-flight — an orderly
-    /// close mid-message, as opposed to `reset_peer`'s abrupt TCP RST.
+    /// Closes the connection cleanly after `bytes` have been sent to the client.
     fn add_limit_data(&self, name: &str, bytes: u64) {
-        self.add_toxic(&format!(
-            "{{\"name\":\"{name}\",\"type\":\"limit_data\",\"stream\":\"downstream\",\
-              \"toxicity\":1.0,\"attributes\":{{\"bytes\":{bytes}}}}}"
-        ));
+        self.add_toxic(name, "limit_data", "bytes", bytes);
     }
 }
 
-/// Run `curl` with the given args, returning `(http_status, body)`. The `-w` trailer appends the
-/// status code on its own line so we can separate it from the body.
+/// Runs `curl` and returns `(http_status, body)`.
 fn curl(args: &[&str]) -> (u16, String) {
+    // `-w` appends the status code on its own line.
     let mut full: Vec<&str> = vec!["-w", "\n%{http_code}"];
     full.extend_from_slice(args);
     let output = Command::new("curl")
@@ -180,11 +153,9 @@ fn curl(args: &[&str]) -> (u16, String) {
     (code, body)
 }
 
-/// Count of resilience tests currently executing their body. The suite must run single-threaded
-/// (see [`SerialGuard`]); this backs the runtime assertion that enforces it.
 static ACTIVE_TESTS: AtomicUsize = AtomicUsize::new(0);
 
-/// Reject overlapping tests: each test changes faults on the same proxy.
+/// Fails a test that overlaps another, since all tests change faults on the same proxy.
 struct SerialGuard;
 
 impl SerialGuard {
@@ -192,8 +163,8 @@ impl SerialGuard {
         let previous = ACTIVE_TESTS.fetch_add(1, Ordering::SeqCst);
         assert_eq!(
             previous, 0,
-            "resilience tests must run serially, but another test body is already running. \
-             all tests share one proxy. Re-run with `--test-threads=1`."
+            "resilience tests share one proxy and must run serially; re-run with \
+             `--test-threads=1`"
         );
         SerialGuard
     }
@@ -205,7 +176,8 @@ impl Drop for SerialGuard {
     }
 }
 
-/// Create fixtures through the emulator's direct REST endpoint, bypassing faults.
+/// Creates the instance, database and tables through the emulator's admin port, bypassing the
+/// proxy.
 fn ensure_setup() {
     static DONE: Mutex<bool> = Mutex::new(false);
     let mut done = DONE.lock().expect("setup lock poisoned");
@@ -225,6 +197,7 @@ fn ensure_setup() {
     let endpoint = format!("http://{host}:9020");
     let credentials = AnonymousCredentials::new().build();
 
+    // Creation errors are only logged: the resources may exist from an earlier run.
     tokio::runtime::Runtime::new()
         .expect("setup runtime")
         .block_on(async {
@@ -280,8 +253,7 @@ fn ensure_setup() {
     *done = true;
 }
 
-/// Open a driver connection through the proxy, retrying briefly (a freshly-created emulator database
-/// can momentarily lag).
+/// Connects through the proxy, retrying while a new emulator database settles.
 fn connect() -> SpannerConnection {
     let mut driver = SpannerDriver::try_new().expect("create driver");
     let database: SpannerDatabase = driver
@@ -303,7 +275,6 @@ fn connect() -> SpannerConnection {
     panic!("connect failed after retries: {last:?}");
 }
 
-/// Run a statement for its side effect (DDL/DML), panicking on error.
 fn run(connection: &mut SpannerConnection, sql: &str) {
     let mut s = connection.new_statement().expect("new statement");
     s.set_sql_query(sql).unwrap();
@@ -311,8 +282,7 @@ fn run(connection: &mut SpannerConnection, sql: &str) {
         .unwrap_or_else(|e| panic!("run {sql:?}: {e:?}"));
 }
 
-/// Seed the streaming table with `STREAM_ROWS` wide rows (idempotent: clears first). Runs with no
-/// toxics active. Inserted in batches so a single DML stays well under Spanner's commit-size limit.
+/// Refills the streaming table, in batches that stay under the commit size limit.
 fn seed_stream_table(connection: &mut SpannerConnection) {
     run(
         connection,
@@ -334,36 +304,8 @@ fn seed_stream_table(connection: &mut SpannerConnection) {
     }
 }
 
-/// **The strong assertion.** With a downstream bandwidth toxic throttling a large result so every
-/// streamed chunk fetch blocks for real in a slow network read, cancelling the statement mid-stream
-/// (from another thread, while the result reader is blocked pulling the next chunk on a worker
-/// thread) must interrupt that blocked read promptly with an error — instead of waiting for the full
-/// slow fetch. This drives the real `CancelSignal` / `block_on_cancellable` path the driver uses for
-/// every network operation.
-///
-/// This complements `cancel_between_stream_chunks_cancels_the_next_fetch` in `tests/integration.rs`,
-/// which (against the un-throttled emulator) covers the *sticky-latch* behaviour — a cancel landing
-/// while the stream is idle between chunks still cancels the next fetch. Here the fetch is genuinely
-/// in flight and blocked on the (throttled) network, so this asserts the cancel *interrupts* a live
-/// `block_on`, not just that the latch is observed before a fast fetch.
-#[test]
-fn cancel_interrupts_in_flight_query() {
-    let Some(toxi) = toxi() else {
-        eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
-        return;
-    };
-    // Placed after the skip check so a plain multi-threaded `cargo test` (env unset) still skips.
-    let _serial = SerialGuard::new();
-    ensure_setup();
-
-    let mut connection = connect();
-    seed_stream_table(&mut connection);
-
-    // Throttle the server→client direction so each streamed message takes a noticeable fraction of a
-    // second and the ~48 MB result would take tens of seconds to drain — leaving the reader blocked
-    // in a genuine network read for the whole test. Small chunks (300 rows) so the reader issues many
-    // network pulls after the first.
-    let rate_kbps = 2000u64; // KB/s; the ~36 MB left after the receive buffer fills → ~18s to drain.
+/// A full scan of the streaming table in 300-row batches, so many fetches follow `execute()`.
+fn stream_statement(connection: &mut SpannerConnection) -> SpannerStatement {
     let mut statement = connection.new_statement().expect("new statement");
     statement
         .set_option(
@@ -376,43 +318,60 @@ fn cancel_interrupts_in_flight_query() {
             "SELECT Id, Payload FROM {STREAM_TABLE} ORDER BY Id"
         ))
         .unwrap();
+    statement
+}
 
-    // Throttle, then execute. `execute()` fills the transport receive buffer and returns a lazy
-    // reader; the rest of the result is pulled over the (now slow) network as the reader is iterated.
-    toxi.add_bandwidth("resil_bandwidth", rate_kbps);
+/// Resets the transaction table to the single row (Id=1, Val=0).
+fn seed_txn_row(connection: &Arc<Mutex<SpannerConnection>>) {
+    let mut conn = connection.lock().expect("connection lock");
+    run(&mut conn, &format!("DELETE FROM {TXN_TABLE} WHERE true"));
+    run(
+        &mut conn,
+        &format!("INSERT INTO {TXN_TABLE} (Id, Val) VALUES (1, 0)"),
+    );
+}
+
+/// Cancelling a throttled stream fetch that is blocked on the network interrupts it promptly.
+/// `cancel_between_stream_chunks_cancels_the_next_fetch` in `tests/integration.rs` covers a cancel
+/// that lands between fetches.
+#[test]
+fn cancel_interrupts_in_flight_query() {
+    let Some((toxi, _serial)) = begin() else {
+        return;
+    };
+    let mut connection = connect();
+    seed_stream_table(&mut connection);
+    let mut statement = stream_statement(&mut connection);
+
+    // At 2000 KB/s, the ~36 MB left after the receive buffer takes about 18 s to drain.
+    toxi.add_bandwidth("resil_bandwidth", 2000);
     let reader = statement
         .execute()
         .expect("execute (first chunk) should succeed");
 
-    // Iterate the reader on a worker thread so it blocks pulling the *next* (slow) chunk while we
-    // cancel from here. The reader carries a clone of the statement's cancel signal, so
-    // `statement.get_cancel_handle().try_cancel()` wakes the in-flight `block_on`.
+    // The reader shares the statement's cancel signal.
     let (tx, rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
         let start = Instant::now();
-        // Consume the reader; early chunks (already buffered by execute) come instantly, later ones
-        // block on slow throttled network pulls — where the cancel lands and turns into an error.
         let result: Result<Vec<_>, _> = reader.collect();
         let elapsed = start.elapsed();
         let _ = tx.send((result.is_err(), format!("{:?}", result.err()), elapsed));
     });
 
-    // Give the worker time to drain the buffered rows and settle into a slow throttled network pull,
-    // then cancel while that pull is genuinely in flight — so we are measuring interruption of a
-    // live, blocked `block_on`, not just the sticky latch being observed before the next fetch. (The
-    // `CancelSignal` latches, so even a cancel landing between chunks would not be lost; the timing
-    // here is about exercising the in-flight-interrupt path, not about avoiding a missed signal.)
+    // Let the worker drain the buffered rows and block on a throttled read. The cancel signal
+    // latches, so a cancel between fetches would not be lost either; the sleep makes this test
+    // exercise interrupting a read in progress.
     std::thread::sleep(Duration::from_millis(2000));
     let cancel_at = Instant::now();
     statement.get_cancel_handle().try_cancel().expect("cancel");
 
-    let (is_err, err_debug, worker_elapsed) = rx.recv_timeout(Duration::from_secs(20)).expect(
-        "worker did not finish within 20s — cancel failed to interrupt the in-flight fetch",
-    );
+    let (is_err, err_debug, worker_elapsed) = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("worker did not finish within 20s; cancel failed to interrupt the in-flight fetch");
     worker.join().ok();
     let cancel_latency = cancel_at.elapsed();
 
-    // Clean up the toxic regardless.
+    // Remove the fault before asserting so a failure doesn't leave the proxy broken.
     toxi.remove_toxic("resil_bandwidth");
 
     assert!(
@@ -423,12 +382,10 @@ fn cancel_interrupts_in_flight_query() {
         err_debug.to_lowercase().contains("cancel"),
         "error should be a cancellation, got: {err_debug}"
     );
-    // The cancel must land quickly — far under the ~18s a full throttled read of the remaining result
-    // would take. If cancellation did nothing, the worker would still be streaming at 2000 KB/s.
     assert!(
         cancel_latency < Duration::from_secs(4),
-        "cancel took {cancel_latency:?}; a full throttled read of the rest would take ~18s, so this \
-         shows cancellation did not interrupt the in-flight operation"
+        "cancel took {cancel_latency:?}; a full throttled read of the rest would take ~18s, so \
+         cancellation did not interrupt the in-flight operation"
     );
     eprintln!(
         "cancel interrupted the in-flight streamed fetch in {cancel_latency:?} \
@@ -436,21 +393,15 @@ fn cancel_interrupts_in_flight_query() {
     );
 }
 
-/// A `reset_peer` toxic makes RPCs fail at the transport layer. Assert the driver surfaces a clean
-/// ADBC error after the configured retry limit (no panic or watchdog expiry), and that once the toxic
-/// is removed a subsequent query **recovers** (the gRPC channel re-establishes through the proxy).
+/// A query under `reset_peer` fails with a transport error once retries run out, and a later
+/// query succeeds after the fault is removed.
 #[test]
 fn reset_peer_surfaces_error_then_recovers() {
-    let Some(toxi) = toxi() else {
-        eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
+    let Some((toxi, _serial)) = begin() else {
         return;
     };
-    // Placed after the skip check so a plain multi-threaded `cargo test` (env unset) still skips.
-    let _serial = SerialGuard::new();
-    ensure_setup();
 
-    // Initial streaming failures retry in the client. Bound attempts explicitly so this
-    // test exercises retry exhaustion without waiting for the client's default retry budget.
+    // Bound retries so the test doesn't wait out the client's default retry budget.
     let mut connection = connect();
     connection
         .set_option(
@@ -458,89 +409,51 @@ fn reset_peer_surfaces_error_then_recovers() {
             2i64.into(),
         )
         .unwrap();
-    // Wrap the connection so a watchdog thread can drive a query and we can bound its wall-clock.
     let connection = Arc::new(Mutex::new(connection));
 
-    // Sanity: with no faults, a trivial query succeeds.
     assert!(
         query_one(&connection).is_ok(),
         "baseline query (no toxics) should succeed"
     );
 
-    // Inject an immediate connection reset, then run a query on a watchdog thread. It must return an
-    // error (not hang, not panic) within a generous bound.
     toxi.add_reset_peer("resil_reset", 0);
     let faulted = run_query_bounded(&connection, Duration::from_secs(45));
-    // Always clear the toxic before asserting, so a failure doesn't leave the proxy poisoned.
     toxi.remove_toxic("resil_reset");
 
     match faulted {
         Some(Ok(())) => panic!(
-            "query under reset_peer reported success — the RST never reached the driver \
+            "query under reset_peer reported success; the RST never reached the driver \
              (toxiproxy problem?)"
         ),
         Some(Err(error)) => {
-            // Not a bare `is_err()`: a `NotImplemented`, an `InvalidArguments` from a malformed
-            // request or any other unrelated failure would satisfy that and prove nothing about
-            // transport handling. See `assert_transport_error`.
             assert_transport_error(&error, "the query run under a reset_peer toxic");
             eprintln!(
                 "reset_peer surfaced {:?} (vendor_code {}): {}",
                 error.status, error.vendor_code, error.message
             );
         }
-        None => panic!("query under reset_peer hung past the watchdog — driver did not fail fast"),
+        None => panic!("query under reset_peer hung past the watchdog; driver did not fail fast"),
     }
 
-    // Recovery: with the toxic gone, a query should succeed again once the channel re-establishes.
-    // Allow a few attempts for the reconnect.
-    let mut recovered = false;
-    for _ in 0..20 {
-        if query_one(&connection).is_ok() {
-            recovered = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
     assert!(
-        recovered,
+        recovers(&connection),
         "driver did not recover after the reset_peer toxic was removed"
     );
-    eprintln!("reset_peer surfaced a clean error and the driver recovered afterwards");
 }
 
-/// A manual-transaction commit must preserve buffered writes across a transient transport fault.
-///
-/// The pinned client marks data-plane RPCs idempotent (DML has `seqno` replay protection) and
-/// retries without an attempt cap, so the same commit call succeeds once the network recovers.
-/// If the client instead returns a transport error, a retried commit must replay the buffered
-/// work. `tests/integration.rs` also checks buffer preservation after a deterministic SQL error.
-///
-/// `SET Val = 1` is idempotent, so the result remains testable even if the commit reached the
-/// emulator before the fault. A lost write leaves the seeded value at 0.
+/// A buffered write survives a transport fault during commit. The pinned client retries
+/// data-plane RPCs without an attempt cap (DML has `seqno` replay protection), so commit normally
+/// blocks until the fault clears. If a future client returns the error instead, a retried commit
+/// must replay the buffer. `SET Val = 1` is idempotent, so the check holds even if a faulted
+/// attempt reached the emulator; a lost write leaves the seeded 0.
 #[test]
 fn commit_under_transport_fault_never_loses_the_write() {
-    let Some(toxi) = toxi() else {
-        eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
+    let Some((toxi, _serial)) = begin() else {
         return;
     };
-    // Placed after the skip check so a plain multi-threaded `cargo test` (env unset) still skips.
-    let _serial = SerialGuard::new();
-    ensure_setup();
-
     let connection = Arc::new(Mutex::new(connect()));
+    seed_txn_row(&connection);
 
-    // Seed one row (Id=1, Val=0) in autocommit mode, idempotently across re-runs.
-    {
-        let mut conn = connection.lock().expect("connection lock");
-        run(&mut conn, &format!("DELETE FROM {TXN_TABLE} WHERE true"));
-        run(
-            &mut conn,
-            &format!("INSERT INTO {TXN_TABLE} (Id, Val) VALUES (1, 0)"),
-        );
-    }
-
-    // Enter manual mode and buffer the update — buffering is local, no RPC happens yet.
     connection
         .lock()
         .expect("connection lock")
@@ -561,8 +474,7 @@ fn commit_under_transport_fault_never_loses_the_write() {
         );
     }
 
-    // Give the commit five seconds under the fault, then clear it before asserting so a test
-    // failure cannot leave the proxy broken for other tests.
+    // Hold the fault for five seconds.
     toxi.add_reset_peer("resil_commit_reset", 0);
     let (tx, rx) = mpsc::channel();
     let commit_conn = connection.clone();
@@ -574,8 +486,7 @@ fn commit_under_transport_fault_never_loses_the_write() {
     toxi.remove_toxic("resil_commit_reset");
 
     match during_fault {
-        // The pinned client retries inside commit. Allow for backoff and reconnection after
-        // the fault clears.
+        // The pinned client is still retrying; allow for backoff and reconnection.
         Err(_) => {
             eprintln!("commit is blocked retrying under the fault (expected); removing the fault");
             let healed = rx
@@ -584,8 +495,6 @@ fn commit_under_transport_fault_never_loses_the_write() {
             worker.join().expect("commit worker panicked");
             healed.expect("commit should succeed once the transport fault is gone");
         }
-        // A client that surfaces the transport error instead: the driver must have kept the
-        // buffer, so a retried commit() replays it once the channel re-establishes.
         Ok(Err(error)) => {
             eprintln!("commit surfaced the fault as an error ({error}); retrying the commit");
             worker.join().expect("commit worker panicked");
@@ -607,12 +516,11 @@ fn commit_under_transport_fault_never_loses_the_write() {
             );
         }
         Ok(Ok(())) => panic!(
-            "commit reported success while the transport to the emulator was reset — \
+            "commit reported success while the transport to the emulator was reset; \
              the fault did not take effect (toxiproxy problem?)"
         ),
     }
 
-    // The buffered update must persist whether the first commit or a retried commit applied it.
     assert_eq!(
         query_int(
             &connection,
@@ -622,7 +530,6 @@ fn commit_under_transport_fault_never_loses_the_write() {
         "the buffered update must not be lost by a commit under a transport fault"
     );
 
-    // Leave the connection in autocommit mode (the buffer is empty now, so this commits nothing).
     connection
         .lock()
         .expect("connection lock")
@@ -631,52 +538,21 @@ fn commit_under_transport_fault_never_loses_the_write() {
             OptionValue::String("true".into()),
         )
         .expect("re-enable autocommit");
-    eprintln!("the write survived a transport fault during commit");
 }
 
-/// **The RPC-timeout assertion.** With `spanner.rpc.timeout_seconds.update` set, a write launched
-/// under a *persistent* transport fault must fail with ADBC [`Status::Timeout`] within the deadline
-/// — instead of blocking indefinitely — and the error must name the responsible option. Then the
-/// contrast: with the deadline unset (and the fault cleared) the same write succeeds, proving the
-/// expired deadline poisoned nothing (no lingering cancellation, session damage, or lost write).
-///
-/// This is the toxic-driven counterpart to `commit_under_transport_fault_never_loses_the_write`,
-/// which established the behaviour this test bounds: under a `reset_peer` toxic the pinned client
-/// marks every data-plane RPC idempotent and retries with no attempt cap, so an autocommit write
-/// (a read/write transaction: begin + `ExecuteBatchDml` + commit) *blocks and heals* — it never
-/// surfaces the transport error, it just retries until the network recovers. Without a deadline
-/// that is an unbounded hang; `spanner.rpc.timeout_seconds.update` wraps the whole driver-side
-/// operation (including the client's internal retries) in a `tokio::time::timeout` and turns the
-/// hang into a prompt `Timeout`.
-///
-/// The write runs on a worker thread bounded by a generous watchdog: if the deadline fails to fire
-/// the test fails loudly rather than hanging the suite. The seeded row plus the idempotent
-/// `SET Val = 1` make the recovery assertion immune to whether any faulted attempt happened to
-/// reach the emulator before the reset.
+/// Under `reset_peer` an autocommit write retries forever (see the commit test), so
+/// `spanner.rpc.timeout_seconds.update` must end it with `Timeout`, naming the option. After the
+/// deadline is unset and the fault removed, the same write succeeds.
 #[test]
 fn update_timeout_bounds_a_faulted_write_then_recovers_when_unset() {
-    let Some(toxi) = toxi() else {
-        eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
+    let Some((toxi, _serial)) = begin() else {
         return;
     };
-    let _serial = SerialGuard::new();
-    ensure_setup();
-
     let connection = Arc::new(Mutex::new(connect()));
+    // Seeding also warms the session and channel before the fault.
+    seed_txn_row(&connection);
 
-    // Seed one row (Id=1, Val=0) in autocommit mode, idempotently across re-runs. This also warms
-    // the session/channel through the proxy while there is no fault, so the faulted write below is
-    // a genuine block-and-heal (retrying data-plane RPC), not a cold-start failure.
-    {
-        let mut conn = connection.lock().expect("connection lock");
-        run(&mut conn, &format!("DELETE FROM {TXN_TABLE} WHERE true"));
-        run(
-            &mut conn,
-            &format!("INSERT INTO {TXN_TABLE} (Id, Val) VALUES (1, 0)"),
-        );
-    }
-
-    // A short update deadline on the connection; the statement created below inherits it.
+    // Statements created below inherit the connection's deadline.
     let deadline_secs = 2.0_f64;
     connection
         .lock()
@@ -687,9 +563,6 @@ fn update_timeout_bounds_a_faulted_write_then_recovers_when_unset() {
         )
         .expect("set update timeout");
 
-    // Break the transport, then run an autocommit UPDATE on a worker thread. Under `reset_peer` the
-    // client retries internally with no cap (see the commit-fault test), so without the deadline
-    // this call would block forever; with it, it must return a `Timeout` in ~`deadline_secs`.
     toxi.add_reset_peer("resil_update_timeout_reset", 0);
     let (tx, rx) = mpsc::channel();
     let write_conn = connection.clone();
@@ -703,16 +576,14 @@ fn update_timeout_bounds_a_faulted_write_then_recovers_when_unset() {
         let _ = tx.send(result);
     });
 
-    // Watchdog: the 2s deadline must fire far under this bound. If it hangs past here the timeout
-    // did not bound the operation — fail loudly (leaking the worker is fine; the process reaps it).
+    // If the deadline doesn't fire, the worker is leaked and the test fails here.
     let outcome = rx.recv_timeout(Duration::from_secs(30));
     let elapsed = start.elapsed();
-    // Clear the toxic regardless, so a failure doesn't leave the proxy poisoned for other tests.
     toxi.remove_toxic("resil_update_timeout_reset");
 
     let Ok(result) = outcome else {
         panic!(
-            "execute_update under a transport fault hung past the 30s watchdog — the \
+            "execute_update under a transport fault hung past the 30s watchdog; the \
              spanner.rpc.timeout_seconds.update deadline ({deadline_secs}s) did not bound it"
         )
     };
@@ -733,17 +604,13 @@ fn update_timeout_bounds_a_faulted_write_then_recovers_when_unset() {
         "the timeout error must name the responsible option; got: {}",
         error.message
     );
-    // Bounded time: it fired near the 2s deadline, nowhere near a hang. The upper bound is generous
-    // (retry backoff + scheduling) but far below the 30s watchdog, so an actual hang still fails.
+    // Generous for retry backoff and scheduling, but well under the watchdog.
     assert!(
         elapsed < Duration::from_secs(15),
-        "the timeout fired after {elapsed:?}; expected ~{deadline_secs}s, well under the watchdog — \
-         a value near the watchdog would mean the deadline did not bound the retry loop"
+        "the timeout fired after {elapsed:?}; expected ~{deadline_secs}s, well under the watchdog"
     );
 
-    // Contrast / recovery: unset the deadline (`""` unsets) and, with the fault gone, run the SAME
-    // write — it must succeed once the channel re-establishes through the proxy, proving the expired
-    // deadline left no lingering damage. Unbounded again, so it block-and-heals if still reconnecting.
+    // An empty string unsets the option.
     connection
         .lock()
         .expect("connection lock")
@@ -776,7 +643,6 @@ fn update_timeout_bounds_a_faulted_write_then_recovers_when_unset() {
         "the write did not succeed after the deadline was unset and the fault removed: {last:?}"
     );
 
-    // The recovered write landed.
     assert_eq!(
         query_int(
             &connection,
@@ -785,59 +651,25 @@ fn update_timeout_bounds_a_faulted_write_then_recovers_when_unset() {
         1,
         "the write must have applied once the deadline was unset and the transport healed"
     );
-    eprintln!(
-        "update timeout bounded a faulted write in {elapsed:?} with Status::Timeout naming \
-         spanner.rpc.timeout_seconds.update; the same write succeeded once the deadline was unset"
-    );
+    eprintln!("update timeout bounded a faulted write in {elapsed:?}");
 }
 
-/// A mid-stream transport disconnect **after** some batches have already been consumed must surface
-/// a clean ADBC error on the next chunk fetch — not a panic, not an unbounded hang, and not a
-/// silently-short result that looks complete. Then, once the fault clears, a fresh query
-/// **recovers**.
-///
-/// This is the counterpart to `reset_peer_surfaces_error_then_recovers`, which resets a query
-/// *before* it starts: here the query is already streaming and the consumer has pulled real rows
-/// off the reader before the connection dies, so it drives the resumption path (`SpannerBatchReader`
-/// fetching a later chunk over a channel that has just been reset). The result is sized well past
-/// the transport receive buffer (see `STREAM_ROWS`/`PAYLOAD_BYTES`) and read in small chunks, so
-/// plenty of rows still have to come over the network after the first few batches are consumed —
-/// guaranteeing the reset lands on a genuine mid-stream fetch rather than on already-buffered data.
+/// A reset after some batches were consumed fails a later fetch with a transport error; the
+/// stream must not end as if complete. A fresh query then succeeds.
 #[test]
 fn mid_stream_disconnect_after_batches_surfaces_error_then_recovers() {
-    let Some(toxi) = toxi() else {
-        eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
+    let Some((toxi, _serial)) = begin() else {
         return;
     };
-    // Placed after the skip check so a plain multi-threaded `cargo test` (env unset) still skips.
-    let _serial = SerialGuard::new();
-    ensure_setup();
-
     let mut connection = connect();
     seed_stream_table(&mut connection);
-
-    // Small chunks so the reader issues many network pulls after the first, and the buffered prefix
-    // is only a fraction of the ~48 MB result.
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
-            OptionValue::Int(300),
-        )
-        .expect("set rows_per_batch");
-    statement
-        .set_sql_query(format!(
-            "SELECT Id, Payload FROM {STREAM_TABLE} ORDER BY Id"
-        ))
-        .unwrap();
+    let mut statement = stream_statement(&mut connection);
 
     let mut reader = statement
         .execute()
         .expect("execute (first chunk) should succeed");
 
-    // Consume a few batches with no fault active — these come from the prefix `execute()` already
-    // buffered, so they must all succeed. This proves the disconnect below lands *after* real rows
-    // were delivered to the consumer, i.e. it is a genuine mid-stream disconnect.
+    // These batches were buffered by `execute()`, before any fault.
     let mut consumed_rows = 0usize;
     for _ in 0..3 {
         match reader.next() {
@@ -851,21 +683,17 @@ fn mid_stream_disconnect_after_batches_surfaces_error_then_recovers() {
         "expected to consume at least one batch before injecting the fault"
     );
 
-    // Now break the transport and drain the rest on a worker thread (bounded by a watchdog). Once
-    // the buffered prefix is exhausted the reader must pull a later chunk over the reset channel,
-    // which has to surface an error rather than hang or panic.
     toxi.add_reset_peer("resil_midstream_reset", 0);
     let (tx, rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
         let _ = tx.send(drain_counting_rows(reader));
     });
     let outcome = rx.recv_timeout(Duration::from_secs(45));
-    // Clear the toxic regardless, so a failure doesn't leave the proxy poisoned for other tests.
     toxi.remove_toxic("resil_midstream_reset");
 
     let Ok((post_fault_rows, error)) = outcome else {
         panic!(
-            "draining the reader after a mid-stream reset hung past the 45s watchdog — the driver \
+            "draining the reader after a mid-stream reset hung past the 45s watchdog; the driver \
              did not surface the disconnect"
         )
     };
@@ -873,19 +701,15 @@ fn mid_stream_disconnect_after_batches_surfaces_error_then_recovers() {
     let error = error.unwrap_or_else(|| {
         panic!(
             "a mid-stream disconnect after {consumed_rows} rows were consumed must surface an \
-             error, but the stream ended cleanly after {post_fault_rows} further rows — the \
+             error, but the stream ended cleanly after {post_fault_rows} further rows; the \
              driver treated a truncated stream as complete"
         )
     });
-    // Not a bare `is_err()`: assert this is the driver's rendering of the injected transport
-    // failure, so an unrelated error (or a driver-side guard) cannot satisfy the test.
     let error = adbc_error_of(&error);
     assert_transport_error(error, "the chunk fetch after a mid-stream reset");
-    // And it really was mid-stream: the query asks for every row, so a short result plus an error
-    // is the shape a truncated stream must have.
     assert!(
         consumed_rows + post_fault_rows < STREAM_ROWS as usize,
-        "the reset landed after all {STREAM_ROWS} rows had been delivered — nothing was actually \
+        "the reset landed after all {STREAM_ROWS} rows had been delivered; nothing was \
          interrupted mid-stream"
     );
     eprintln!(
@@ -893,66 +717,26 @@ fn mid_stream_disconnect_after_batches_surfaces_error_then_recovers() {
         error.status, error.message
     );
 
-    // Recovery: with the toxic gone, a fresh query succeeds again once the channel re-establishes.
     let connection = Arc::new(Mutex::new(connection));
-    let mut recovered = false;
-    for _ in 0..20 {
-        if query_one(&connection).is_ok() {
-            recovered = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
     assert!(
-        recovered,
+        recovers(&connection),
         "driver did not recover after the mid-stream reset toxic was removed"
     );
-    eprintln!("driver recovered after the mid-stream disconnect");
 }
 
-/// A **truncated** stream — the server-side connection closed part-way through a large result,
-/// after the driver has already received and returned some rows — must surface a clean ADBC error
-/// on the fetch that runs past the truncation point, never a silently-short (but "successful")
-/// result. Then a fresh query **recovers** once the fault clears.
-///
-/// Toxiproxy's `limit_data` toxic closes the connection cleanly after a fixed number of downstream
-/// bytes, which is exactly a truncated stream: the byte cap ([`TRUNCATE_AFTER_BYTES`]) sits above
-/// the transport receive buffer (so `execute()` and the first batches succeed) but well below the
-/// ~48 MB result (so the reader runs into the truncation while fetching a later chunk). Unlike
-/// `reset_peer` (an abrupt TCP RST), this is an orderly close mid-message, so it specifically guards
-/// against the driver mistaking a truncated result for a complete one.
+/// `limit_data` closes the connection cleanly partway through the result. Unlike an RST, this
+/// could be mistaken for the end of the stream, so the driver must report an error rather than a
+/// short result. A fresh query then succeeds.
 #[test]
 fn truncated_stream_surfaces_error_then_recovers() {
-    let Some(toxi) = toxi() else {
-        eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set — skipping resilience tests");
+    let Some((toxi, _serial)) = begin() else {
         return;
     };
-    // Placed after the skip check so a plain multi-threaded `cargo test` (env unset) still skips.
-    let _serial = SerialGuard::new();
-    ensure_setup();
-
     let mut connection = connect();
     seed_stream_table(&mut connection);
+    let mut statement = stream_statement(&mut connection);
 
-    // Small chunks so the reader issues many network pulls after the first — plenty of fetches to
-    // run past the byte cap.
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
-            OptionValue::Int(300),
-        )
-        .expect("set rows_per_batch");
-    statement
-        .set_sql_query(format!(
-            "SELECT Id, Payload FROM {STREAM_TABLE} ORDER BY Id"
-        ))
-        .unwrap();
-
-    // Install the byte cap *before* execute so it counts from the very start of the result stream,
-    // then drain the reader on a worker thread bounded by a watchdog. `execute()` succeeds (the cap
-    // is above the receive buffer) and the first batches come through, but a later chunk fetch runs
-    // past the cap onto a closed connection and must fail rather than hang or return short.
+    // Install the cap before `execute()` so it counts from the start of the stream.
     toxi.add_limit_data("resil_truncate", TRUNCATE_AFTER_BYTES);
     let reader = statement
         .execute()
@@ -963,12 +747,11 @@ fn truncated_stream_surfaces_error_then_recovers() {
         let _ = tx.send(drain_counting_rows(reader));
     });
     let outcome = rx.recv_timeout(Duration::from_secs(45));
-    // Clear the toxic regardless, so a failure doesn't leave the proxy poisoned for other tests.
     toxi.remove_toxic("resil_truncate");
 
     let Ok((rows, error)) = outcome else {
         panic!(
-            "draining a truncated stream hung past the 45s watchdog — the driver did not surface \
+            "draining a truncated stream hung past the 45s watchdog; the driver did not surface \
              the truncation"
         )
     };
@@ -976,24 +759,19 @@ fn truncated_stream_surfaces_error_then_recovers() {
     let error = error.unwrap_or_else(|| {
         panic!(
             "a truncated stream must surface an error, but the stream ended cleanly with {rows} \
-             rows — the driver treated a truncated result as complete (the query selects all \
+             rows; the driver treated a truncated result as complete (the query selects all \
              {STREAM_ROWS} rows)"
         )
     });
-    // The premise of this test is that the cut lands *mid*-stream: rows must have reached the
-    // consumer before it, and the result must be short. Without both, a cap that truncated the
-    // very first fetch (or none at all) would satisfy a bare `is_err()`.
     assert!(
         rows > 0,
-        "no rows were delivered before the truncation — the {TRUNCATE_AFTER_BYTES}-byte cap cut \
-         the stream before any batch reached the consumer, so this did not exercise a truncation \
-         *mid*-stream"
+        "no rows were delivered before the truncation; the {TRUNCATE_AFTER_BYTES}-byte cap cut \
+         the stream before any batch reached the consumer"
     );
     assert!(
         rows < STREAM_ROWS as usize,
-        "all {STREAM_ROWS} rows arrived before the error — the byte cap did not truncate anything"
+        "all {STREAM_ROWS} rows arrived before the error; the byte cap did not truncate anything"
     );
-    // Not a bare `is_err()`: pin the failure to the driver's transport-error path.
     let error = adbc_error_of(&error);
     assert_transport_error(error, "the chunk fetch that ran past the truncation point");
     eprintln!(
@@ -1001,24 +779,13 @@ fn truncated_stream_surfaces_error_then_recovers() {
         error.status, error.message
     );
 
-    // Recovery: with the cap gone, a fresh query succeeds again once the channel re-establishes.
     let connection = Arc::new(Mutex::new(connection));
-    let mut recovered = false;
-    for _ in 0..20 {
-        if query_one(&connection).is_ok() {
-            recovered = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
     assert!(
-        recovered,
+        recovers(&connection),
         "driver did not recover after the limit_data truncation toxic was removed"
     );
-    eprintln!("driver recovered after the truncated stream");
 }
 
-/// Run a query expected to return a single INT64 cell and return its value.
 fn query_int(connection: &Arc<Mutex<SpannerConnection>>, sql: &str) -> i64 {
     let mut conn = connection.lock().expect("connection lock");
     let mut s = conn.new_statement().expect("new statement");
@@ -1036,11 +803,8 @@ fn query_int(connection: &Arc<Mutex<SpannerConnection>>, sql: &str) -> i64 {
         .value(0)
 }
 
-/// Run `SELECT 1` on the shared connection, returning the ADBC result.
-///
-/// A stream failure is unwrapped back to the driver's **own** [`AdbcError`] rather than re-wrapped
-/// as `Internal`: the callers assert on `status`/`message`, and flattening every stream error to
-/// one status here would make those assertions vacuous.
+/// Runs `SELECT 1`. Stream errors are unwrapped to the driver's own error so callers can check
+/// its status.
 fn query_one(connection: &Arc<Mutex<SpannerConnection>>) -> AdbcResult<()> {
     let mut conn = connection.lock().expect("connection lock");
     let mut s = conn.new_statement()?;
@@ -1052,13 +816,18 @@ fn query_one(connection: &Arc<Mutex<SpannerConnection>>) -> AdbcResult<()> {
     Ok(())
 }
 
-/// Recover the driver's own [`AdbcError`] from an error surfaced by a streaming reader.
-///
-/// A [`RecordBatchReader`](arrow_array::RecordBatchReader)'s only error channel is [`ArrowError`],
-/// so the driver boxes its ADBC error inside `ArrowError::ExternalError` — the same wrapping
-/// `src/ffi/stream.rs` unwraps to turn a cancelled read into `ECANCELED`. Walking the source chain
-/// back down to it is what lets these tests assert on the ADBC `status` instead of grepping a
-/// stringified debug blob.
+/// Retries `SELECT 1` for up to ten seconds while the channel reconnects.
+fn recovers(connection: &Arc<Mutex<SpannerConnection>>) -> bool {
+    for _ in 0..20 {
+        if query_one(connection).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    false
+}
+
+/// Finds the driver's error inside a reader error, which wraps it in `ArrowError::ExternalError`.
 fn adbc_error_of(error: &ArrowError) -> &AdbcError {
     std::iter::successors(Some(error as &(dyn std::error::Error + 'static)), |error| {
         error.source()
@@ -1067,22 +836,11 @@ fn adbc_error_of(error: &ArrowError) -> &AdbcError {
     .unwrap_or_else(|| panic!("the reader error does not wrap an ADBC error: {error:?}"))
 }
 
-/// Assert that `error` is the driver's translation of a genuine **transport** failure, in the
-/// situation named by `context`.
-///
-/// A bare `assert!(result.is_err())` is satisfied by anything that fails — a `NotImplemented`, an
-/// `InvalidArguments` from a malformed request, a driver-side `InvalidState` guard — so it proves
-/// nothing about how the driver handles the injected fault. Every fault this harness injects
-/// reaches the caller through `error::from_spanner`, which
-///
-/// - prefixes the message with `Spanner error:` (a driver-side guard never does), and
-/// - maps the failure to exactly one of two statuses: [`AdbcStatus::Internal`] when the client
-///   reports a transport error carrying no gRPC status — what a `reset_peer` RST or a `limit_data`
-///   close produces, observed as `the transport reports an error: ... h2 protocol error ...` — or
-///   [`AdbcStatus::IO`] when the same fault arrives as a gRPC `UNAVAILABLE`/`ABORTED` instead.
-///
-/// Both are accepted because which of the two a TCP-level fault turns into is the client's
-/// business and not a driver contract; everything else is not this fault.
+/// Asserts that `error` is the driver's rendering of a Spanner client transport failure, not an
+/// unrelated error. `error::from_spanner` prefixes `Spanner error:` and maps a transport error
+/// without a gRPC status, which is what an RST or truncation usually produces, to `Internal`.
+/// A gRPC `UNAVAILABLE` or `ABORTED` maps to `IO`. Which one a TCP fault becomes is up to the
+/// client.
 fn assert_transport_error(error: &AdbcError, context: &str) {
     assert!(
         matches!(error.status, AdbcStatus::Internal | AdbcStatus::IO),
@@ -1095,17 +853,12 @@ fn assert_transport_error(error: &AdbcError, context: &str) {
     assert!(
         error.message.starts_with("Spanner error:"),
         "{context} must surface the Spanner client's own failure (a `Spanner error:` message from \
-         error::from_spanner), not a driver-side error that merely happens to be an Err; got: {}",
+         error::from_spanner); got: {}",
         error.message
     );
 }
 
-/// Drain a record-batch reader to exhaustion or to its first error, returning the number of rows
-/// delivered **before** that error.
-///
-/// `collect::<Result<Vec<_>, _>>()` throws the successfully-yielded batches away, which loses
-/// exactly the fact a mid-stream fault test needs: that real rows reached the consumer before the
-/// stream died, and that the result was nonetheless short.
+/// Drains `reader` to its end or first error, returning the rows delivered before it.
 fn drain_counting_rows(
     reader: impl Iterator<Item = Result<RecordBatch, ArrowError>>,
 ) -> (usize, Option<ArrowError>) {
@@ -1119,9 +872,8 @@ fn drain_counting_rows(
     (rows, None)
 }
 
-/// Drive `query_one` on a worker thread and wait up to `timeout`. Returns `Some(result)` if the
-/// query completed in time, or `None` if it hung past the watchdog (a leaked worker thread is
-/// acceptable — the process reaps it on exit).
+/// Runs [`query_one`] on a worker thread, returning `None` if it doesn't finish within `timeout`.
+/// A hung worker is left behind.
 fn run_query_bounded(
     connection: &Arc<Mutex<SpannerConnection>>,
     timeout: Duration,
