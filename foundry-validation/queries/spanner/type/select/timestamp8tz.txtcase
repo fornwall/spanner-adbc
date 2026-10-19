@@ -1,7 +1,7 @@
 // Spanner override: idx PRIMARY KEY, one native TIMESTAMP column, GoogleSQL literals.
 // Spanner TIMESTAMP stores nanoseconds and the case's values sit inside Arrow's
 // nanosecond range (~1677-2262, inclusive of both i64 boundaries), so the driver's
-// default nanosecond read mode round-trips every digit — no precision option needed.
+// default nanosecond read mode round-trips every digit without a precision option.
 
 // part: metadata
 

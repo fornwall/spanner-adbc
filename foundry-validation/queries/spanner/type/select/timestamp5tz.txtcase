@@ -1,7 +1,7 @@
 // Spanner override: idx PRIMARY KEY, one native TIMESTAMP column, GoogleSQL literals.
 // The case reaches 0001-01-01 / 9999-12-31, outside Arrow's nanosecond range, so read it
 // under spanner.max_timestamp_precision=microseconds, which returns Timestamp(Microsecond,
-// "UTC") over Spanner's full 0001-9999 range — matching the case's tsu:UTC schema. The
+// "UTC") over Spanner's full 0001-9999 range, matching the case's tsu:UTC schema. The
 // values carry at most 6 fractional digits, so nothing is lost. Reverted after the case.
 
 // part: metadata
