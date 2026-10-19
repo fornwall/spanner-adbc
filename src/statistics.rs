@@ -1,8 +1,7 @@
 //! Exact row, null and distinct counts for
-//! [`Connection::get_statistics`](adbc_core::Connection::get_statistics).
-//! Each table needs one aggregate scan. Approximate requests use the same exact counts;
-//! results use the statistic union's `int64` branch and report `is_approximate = false`.
-//! Min/max values are omitted because the union cannot represent all Spanner types.
+//! [`Connection::get_statistics`](adbc_core::Connection::get_statistics), one aggregate scan per
+//! table. Min/max values are omitted because the statistic union cannot represent every Spanner
+//! type.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,11 +46,10 @@ mod columns_col {
 /// One computed statistic for a table (or one of its columns).
 pub(crate) struct Statistic {
     pub table: String,
-    /// The column the statistic applies to, or `None` for a table-level statistic (e.g. `ROW_COUNT`).
+    /// `None` for table-level statistics such as `ROW_COUNT`.
     pub column: Option<String>,
-    /// The ADBC statistic key (`ADBC_STATISTIC_*_KEY`).
+    /// `ADBC_STATISTIC_*_KEY`.
     pub key: i16,
-    /// The value; all reported statistics are counts, so they go in the union's `int64` branch.
     pub value: i64,
 }
 
@@ -62,7 +60,7 @@ pub(crate) struct SchemaStatistics {
 }
 
 /// Compute exact statistics for the base tables matching the `LIKE` filters: `ROW_COUNT` per
-/// table, and `NULL_COUNT` (+ `DISTINCT_COUNT` for groupable types) per column.
+/// table, and per column `NULL_COUNT` plus `DISTINCT_COUNT` for groupable types.
 pub(crate) fn collect_statistics(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
@@ -164,7 +162,7 @@ pub(crate) fn collect_statistics(
         });
     }
 
-    // buffered preserves input order. One cancellation signal and deadline cover all scans.
+    // `buffered` keeps input order. One cancel signal and deadline cover all scans.
     let batches: Vec<RecordBatch> = block_on_cancellable(
         runtime,
         cancel,
@@ -297,8 +295,7 @@ fn is_groupable(spanner_type: &str) -> bool {
         || t == "INTERVAL")
 }
 
-/// Build the single-catalog `get_statistics` record batch from per-schema statistics. `catalog` is
-/// the name reported for that catalog (the connection's database id).
+/// Build the `get_statistics` batch for `catalog`, the connection's only catalog.
 pub(crate) fn build(
     catalog: &str,
     schemas: Vec<SchemaStatistics>,
@@ -310,8 +307,7 @@ pub(crate) fn build(
     let db_schema_item = list_item(&db_schemas_field)?;
     let db_schema_fields = struct_fields(&db_schema_item)?;
 
-    // db_schema_statistics: list<statistic struct> per schema. Flatten the statistics across
-    // schemas to build one struct array, then re-group by per-schema lengths.
+    // Flatten statistics across schemas into one struct array, then split by schema.
     let stats_field = field(&db_schema_fields, "db_schema_statistics")?;
     let stat_item = list_item(&stats_field)?;
     let stat_fields = struct_fields(&stat_item)?;
@@ -337,12 +333,10 @@ pub(crate) fn build(
     RecordBatch::try_new(out_schema, vec![catalog_name, catalog_db_schemas]).map_err(arrow_err)
 }
 
-/// Build the statistic struct array (`table_name` / `column_name` / `statistic_key` /
-/// `statistic_value` / `statistic_is_approximate`). All values are exact integers.
+/// Build the statistic struct array. All values are exact integers.
 fn build_statistic_struct(stat_fields: &Fields, stats: &[&Statistic]) -> Result<ArrayRef> {
     let n = stats.len();
 
-    // statistic_value: a dense union with every value in the `int64` branch.
     let value_field = field(stat_fields, "statistic_value")?;
     let union_fields = match value_field.data_type() {
         DataType::Union(fields, _) => fields.clone(),
@@ -355,8 +349,7 @@ fn build_statistic_struct(stat_fields: &Fields, stats: &[&Statistic]) -> Result<
     };
     let int64_values: ArrayRef =
         Arc::new(Int64Array::from_iter_values(stats.iter().map(|s| s.value)));
-    // Every statistic value lives in the `int64` branch; `dense_union` fills the other branches with
-    // empty children so the union type still matches the schema.
+    // Every value is in the `int64` branch; `dense_union` fills the others with empty children.
     let type_ids = vec![INT64_BRANCH; n];
     let offsets: Vec<i32> = (0..n as i32).collect();
     let statistic_value = dense_union(
@@ -372,7 +365,7 @@ fn build_statistic_struct(stat_fields: &Fields, stats: &[&Statistic]) -> Result<
             "table_name" => Arc::new(StringArray::from_iter_values(
                 stats.iter().map(|s| s.table.as_str()),
             )) as ArrayRef,
-            // `column_name` is NULL for the table-level ROW_COUNT rows, so it keeps `from_iter`.
+            // NULL for table-level statistics.
             "column_name" => Arc::new(StringArray::from_iter(
                 stats.iter().map(|s| s.column.as_deref()),
             )) as ArrayRef,

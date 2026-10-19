@@ -1,6 +1,4 @@
-//! The manual-transaction state machine: the kind a transaction has been fixed to ([`TxnKind`]),
-//! the payload it buffers ([`ManualTxn`]) and the [`TxnState`] a connection shares with every
-//! statement it creates.
+//! Manual-transaction state shared by a connection and its statements.
 
 use std::sync::{Arc, Mutex};
 
@@ -11,24 +9,18 @@ use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
 
 use crate::error::invalid_state;
 
-/// What a manual transaction has become — fixed by its **first** statement, after which work of
-/// the other kind is rejected with [`Status::InvalidState`](adbc_core::error::Status::InvalidState) until `commit` or `rollback` (see
-/// [`TxnState::check_kind_allowed`]).
-///
-/// DDL is deliberately **not** a kind: it executes immediately through the admin API (Spanner DDL
-/// is never transactional) and leaves the transaction state untouched.
+/// What a manual transaction holds, fixed by its first statement. DDL has no kind: it runs
+/// immediately and leaves the transaction alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TxnKind {
-    /// Data-returning queries, all running on one shared multi-use read-only transaction (a
-    /// single consistent snapshot).
+    /// Queries sharing one multi-use read-only transaction.
     Read,
-    /// DML statements and bulk-ingest mutations, buffered and applied atomically in one
-    /// read/write transaction on commit.
+    /// DML and bulk-ingest mutations, applied atomically on commit.
     Dml,
 }
 
 impl TxnKind {
-    /// How the kind reads in an error message, as the thing being run / that began the txn.
+    /// How the kind reads in an error message.
     fn what(self) -> &'static str {
         match self {
             TxnKind::Read => "a query",
@@ -36,7 +28,7 @@ impl TxnKind {
         }
     }
 
-    /// Why work of the other kind cannot join a transaction of this (active) kind.
+    /// Why work of the other kind cannot join a transaction of this kind.
     fn rationale(self) -> &'static str {
         match self {
             TxnKind::Read => "the transaction is pinned to a multi-use read-only snapshot",
@@ -48,25 +40,18 @@ impl TxnKind {
     }
 }
 
-/// The state — kind *and* payload — of a manual transaction. The kind is fixed by the
-/// transaction's **first** statement; holding the payload inside the variant makes the kinds
-/// mutually exclusive by construction (a transaction cannot simultaneously carry a read-only
-/// snapshot and buffered DML).
+/// A manual transaction's kind and payload. Keeping the payload in the variant makes a read-only
+/// snapshot and buffered DML mutually exclusive.
 #[derive(Debug, Default, Clone)]
 pub(super) enum ManualTxn {
-    /// No statement has fixed the transaction's kind yet.
+    /// No statement has fixed the kind yet.
     #[default]
     Unset,
-    /// Began with a data-returning query: every query in the transaction runs on this shared
-    /// multi-use read-only transaction, so all reads observe one consistent snapshot.
-    /// `Arc`-shared so a statement can execute on it without holding the [`SharedTxn`] lock;
-    /// dropped (no commit/rollback RPC needed) when the transaction ends.
+    /// Shared by every query in the transaction. The `Arc` lets a statement execute on it without
+    /// holding the [`SharedTxn`] lock; dropping it ends the transaction.
     Read(Arc<MultiUseReadOnlyTransaction>),
-    /// Began with DML or a bulk ingest: statements and insert mutations buffered here are
-    /// applied atomically in one read/write transaction on commit. Built statements (not raw
-    /// SQL) so that parameterized DML — which carries bound values — buffers just like a plain
-    /// `;`-batch does. Spanner applies buffered mutations at commit time, so they land *after*
-    /// every buffered DML statement executes, regardless of the order they were issued in.
+    /// Holds built statements, so parameterized DML keeps its bound values.
+    /// Spanner applies `mutations` at commit, after every statement, whatever the issue order.
     Dml {
         statements: Vec<SpannerSql>,
         mutations: Vec<Mutation>,
@@ -82,8 +67,7 @@ impl ManualTxn {
         }
     }
 
-    /// Whether there is buffered work a commit must apply (a read-only transaction has none —
-    /// it ends by being dropped).
+    /// Whether a commit has anything to apply.
     fn has_pending_work(&self) -> bool {
         match self {
             ManualTxn::Unset | ManualTxn::Read(_) => false,
@@ -98,11 +82,8 @@ impl ManualTxn {
 /// Transaction state shared between a connection and the statements it creates.
 #[derive(Debug)]
 pub(crate) struct TxnState {
-    /// When false, the connection is in manual transaction mode: DML buffers into
-    /// [`Self::txn`] and queries run on its shared read-only transaction.
     pub(super) autocommit: bool,
-    /// The manual transaction's state. Always [`ManualTxn::Unset`] in autocommit mode (ending a
-    /// manual transaction resets it, and nothing buffers while autocommit is on).
+    /// Always `Unset` in autocommit mode.
     pub(super) txn: ManualTxn,
 }
 
@@ -114,22 +95,15 @@ impl TxnState {
         }
     }
 
-    /// Whether the connection is currently in autocommit mode.
     pub(crate) fn autocommit(&self) -> bool {
         self.autocommit
     }
 
-    /// Check that work of `attempted` kind may run in the current transaction. Always allowed in
-    /// autocommit mode; in manual mode the transaction's kind is fixed by its **first** statement
-    /// (queries or DML) and the other kind is rejected with [`Status::InvalidState`](adbc_core::error::Status::InvalidState) — naming
-    /// both kinds and the reason — until `commit` or `rollback` ends the transaction. (DDL has no
-    /// kind and is never checked: it executes immediately, outside the transaction.)
+    /// Fail with `InvalidState` if a manual transaction already holds work of the other kind.
     ///
-    /// The statement paths call this under the [`SharedTxn`] lock as part of buffering (the
-    /// `buffer_*` methods) or when adopting the shared read-only transaction
-    /// ([`Self::start_read_txn`]), which is what keeps the kinds mutually exclusive under
-    /// concurrent statements; the read paths additionally call it up front so a mixed-kind query
-    /// fails before any work is done.
+    /// The buffer methods and [`Self::start_read_txn`] call this under the [`SharedTxn`] lock,
+    /// which keeps the kinds exclusive under concurrent statements. Read paths also call it up
+    /// front so a mixed-kind query fails before doing any work.
     pub(crate) fn check_kind_allowed(&self, attempted: TxnKind) -> Result<()> {
         if self.autocommit {
             return Ok(());
@@ -150,7 +124,7 @@ impl TxnState {
         )))
     }
 
-    /// The manual transaction's shared read-only transaction, if one is active.
+    /// The shared read-only transaction, if one is active.
     pub(crate) fn read_txn(&self) -> Option<Arc<MultiUseReadOnlyTransaction>> {
         match &self.txn {
             ManualTxn::Read(txn) => Some(txn.clone()),
@@ -158,15 +132,12 @@ impl TxnState {
         }
     }
 
-    /// Install `txn` as the manual transaction's shared read-only transaction and return the
-    /// effective one — the existing transaction if a concurrent statement won the install race
-    /// (`txn` is dropped; it has issued no RPC yet under the default inline begin), otherwise
-    /// `txn` itself.
+    /// Install `txn` as the shared read-only transaction and return the effective one. If a
+    /// concurrent statement installed one first, `txn` is dropped; with inline begin it has issued
+    /// no RPC yet.
     ///
-    /// Re-checks the transaction kind first: the caller built `txn` outside the lock (the build
-    /// is async), so a concurrent statement may have fixed the transaction to DML in the
-    /// window — re-checking here, under the same lock the buffer paths write under, closes that
-    /// race with the same rejection the caller's up-front guard produces.
+    /// The caller built `txn` outside the lock, so check the kind again: a concurrent statement
+    /// may have buffered DML in the meantime.
     pub(crate) fn start_read_txn(
         &mut self,
         txn: Arc<MultiUseReadOnlyTransaction>,
@@ -181,8 +152,7 @@ impl TxnState {
         }
     }
 
-    /// Buffer DML statements to be applied on the next commit, fixing the transaction's kind to
-    /// [`TxnKind::Dml`] (rejecting the buffer if a query fixed it to read-only).
+    /// Buffer DML for the next commit.
     pub(crate) fn buffer_dml(&mut self, new: Vec<SpannerSql>) -> Result<()> {
         self.check_kind_allowed(TxnKind::Dml)?;
         if new.is_empty() {
@@ -200,8 +170,7 @@ impl TxnState {
         Ok(())
     }
 
-    /// Buffer a bulk-ingest insert mutation to be applied on the next commit (alongside any
-    /// buffered DML — an ingest counts as DML for the transaction's kind).
+    /// Buffer a bulk-ingest mutation for the next commit. Ingest counts as DML.
     pub(crate) fn buffer_mutation(&mut self, mutation: Mutation) -> Result<()> {
         self.check_kind_allowed(TxnKind::Dml)?;
         match &mut self.txn {
@@ -216,35 +185,26 @@ impl TxnState {
         Ok(())
     }
 
-    /// Atomically flip into autocommit mode and take the manual transaction's state — whose
-    /// buffered DML work, if any, must be committed first (a taken read-only transaction
-    /// needs no commit; taking it out ends it by drop).
+    /// Switch to autocommit and take the manual transaction for the caller to commit.
     ///
-    /// Both must happen in one lock acquisition: the buffer paths check the mode under this same
-    /// mutex, so once the mode reads autocommit no statement can add to the buffer and the state
-    /// taken here is the complete transaction. Flipping only *after* the apply (in a later
-    /// acquisition) would strand any DML buffered while the commit RPC was in flight.
+    /// The buffer methods check the mode under the same lock, so the taken state is complete.
+    /// Flipping after the commit instead would strand DML buffered while it ran.
     pub(super) fn enter_autocommit(&mut self) -> ManualTxn {
         self.autocommit = true;
         std::mem::take(&mut self.txn)
     }
 
-    /// Re-enter manual mode with the taken state restored — the failure path of
-    /// [`Self::enter_autocommit`], so a failed apply keeps the transaction open and replayable
-    /// (retry the toggle or `commit`, or `rollback` to discard). Nothing can have buffered while
-    /// autocommit was on (see [`Self::enter_autocommit`]), so the current state is still `Unset`
-    /// and the taken state simply moves back in.
+    /// Undo [`Self::enter_autocommit`] after a failed commit, keeping the transaction replayable.
+    /// Nothing buffers in autocommit mode, so the current state is still `Unset`.
     pub(super) fn restore_manual(&mut self, work: ManualTxn) {
         self.autocommit = false;
         debug_assert!(matches!(self.txn, ManualTxn::Unset));
         self.txn = work;
     }
 
-    /// End a committed transaction: remove exactly the `applied` work — anything buffered
-    /// *concurrently* while the commit RPC ran (appended behind the applied prefix under this
-    /// mutex) stays pending, and keeps the kind, for the next commit — and otherwise reset the
-    /// state, which also ends a read-only transaction by dropping its snapshot, so the next
-    /// statement fixes a fresh kind.
+    /// Remove the `applied` work after a commit. Work buffered while the commit ran sits behind
+    /// it and stays pending; if nothing remains, the state resets and the next statement picks a
+    /// fresh kind.
     pub(super) fn finish_commit(&mut self, applied: &ManualTxn) {
         if let (
             ManualTxn::Dml {
@@ -266,21 +226,9 @@ impl TxnState {
     }
 }
 
-/// Enforce `adbc.connection.readonly` on the commit paths: committing buffered DML / ingest
-/// mutations is a write like any other, so without this the flag would be a statement-path-only
-/// guard that `commit()` — or the autocommit toggle, which commits pending work as a side effect —
-/// silently walks around.
-///
-/// `read_only` is the flag's live value; `work` is the state the caller is about to apply. Only
-/// work that would actually *write* is rejected, so ending a transaction that writes nothing still
-/// succeeds on a read-only connection: an `Unset` transaction and a query transaction
-/// ([`ManualTxn::Read`]) apply nothing — their commit only drops the snapshot.
-///
-/// The rejection leaves the buffer with the caller (`commit` never reaches `finish_commit`; the
-/// autocommit toggle restores the taken state via [`TxnState::restore_manual`]), so the
-/// transaction stays open and replayable, like any other failed commit. Clearing the flag and
-/// committing again applies exactly the buffered work; `rollback` is never gated, since discarding
-/// buffered work writes nothing.
+/// Enforce `adbc.connection.readonly` on commit, including the commit done by enabling
+/// autocommit. Only pending writes are rejected, so ending a query or empty transaction still
+/// works. The caller keeps the buffer, so clearing the flag and committing again applies it.
 pub(super) fn check_commit_writable(read_only: bool, work: &ManualTxn) -> Result<()> {
     if read_only && work.has_pending_work() {
         return Err(invalid_state(
@@ -295,13 +243,10 @@ pub(super) fn check_commit_writable(read_only: bool, work: &ManualTxn) -> Result
 /// A handle to a connection's transaction state, shared with its statements.
 pub(crate) type SharedTxn = Arc<Mutex<TxnState>>;
 
-/// Lock the shared [`TxnState`], recovering the guard even if the mutex was poisoned.
+/// Lock the shared [`TxnState`], ignoring poisoning.
 ///
-/// `TxnState` holds no invariant a poisoned-but-consistent state could violate: every method
-/// leaves it well-formed, so a panic while the guard is held (e.g. in a callee) leaves the buffered
-/// work either wholly applied or wholly not, never half-updated. Propagating the poison via
-/// `.lock().unwrap()` would instead brick the whole connection — one panic latches the mutex and
-/// every later txn-state op panics across the C ABI — so we take the inner guard on poison.
+/// No method leaves the state half-updated, so it is safe to use after a panic. Propagating the
+/// poison would make every later transaction call on the connection panic across the C ABI.
 pub(crate) fn lock_txn(txn: &SharedTxn) -> std::sync::MutexGuard<'_, TxnState> {
     txn.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

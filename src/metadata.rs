@@ -1,6 +1,5 @@
-//! The driver's `INFORMATION_SCHEMA` plumbing: the statement builder every driver-internal
-//! metadata read goes through, the shared `table_exists` probe and catalog check, the
-//! `StringArray` column accessor its consumers decode with, and the ADBC `LIKE` matcher.
+//! Shared metadata helpers: the statement builder for internal reads, table and catalog
+//! lookups, and the ADBC `LIKE` matcher.
 
 use adbc_core::error::{Error, Result, Status};
 use arrow_array::{RecordBatch, StringArray};
@@ -14,19 +13,15 @@ use crate::options::SharedConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::timeout::with_timeout;
 
-/// The ADBC catalog name for a Spanner database path: the database id, i.e. the `<d>` of
-/// `projects/<p>/instances/<i>/databases/<d>`, or the whole string if it is not in that form. A
-/// connection reaches exactly one database, so this is its only catalog.
+/// The catalog name for a database path: the `<d>` of `projects/<p>/instances/<i>/databases/<d>`,
+/// or the whole string otherwise.
 pub(crate) fn database_catalog(database: &str) -> &str {
     database.rsplit_once('/').map_or(database, |(_, id)| id)
 }
 
-/// Validate a lookup's `catalog` argument against the one catalog the connection has, `reported`
-/// (its database id — what `get_objects` names). `None` means "do not filter"; the reported name
-/// matches exactly (a lookup catalog is not a pattern). Any other catalog does not exist on this
-/// connection — nothing can be found in it — so the lookup fails with [`Status::NotFound`]
-/// (matching how a missing table is reported). Note `Some("")` is adbc.h's "objects with no
-/// catalog", which a Spanner database never has.
+/// Check a lookup's `catalog` argument, which is not a pattern, against the connection's only
+/// catalog. Any name other than `reported` is [`Status::NotFound`], like a missing table. That
+/// includes `Some("")`, which adbc.h defines as objects without a catalog.
 pub(crate) fn check_lookup_catalog(catalog: Option<&str>, reported: &str) -> Result<()> {
     match catalog {
         None => Ok(()),
@@ -40,22 +35,12 @@ pub(crate) fn check_lookup_catalog(catalog: Option<&str>, reported: &str) -> Res
     }
 }
 
-/// Whether a table exists, via a parameterized `INFORMATION_SCHEMA.TABLES` lookup. The default
-/// (unnamed) schema is the empty string in Spanner.
+/// Whether a table exists. The default schema is `""` in Spanner.
 ///
-/// A free function (rather than only a [`SpannerConnection`] method) so the statement's bulk-ingest
-/// error path can reuse the exact same probe to remap a failed `append` to the spec-mandated status
-/// (a missing table → `NotFound`, an existing-but-incompatible table → `AlreadyExists`).
-///
-/// **Probe-failure policy, shared by every caller that probes on an error path**
-/// ([`SpannerConnection::get_table_schema`], [`SpannerStatement`](crate::statement::SpannerStatement)'s
-/// two ingest remaps): the probe only *refines* an error the user's own operation already produced,
-/// so when the probe itself fails — a transport blip, a cancel, or simply no `INFORMATION_SCHEMA`
-/// read permission on a connection that may still write — that original error is returned unchanged.
-/// It is the error from the operation the caller actually asked for, and on a genuine outage it
-/// already reports the outage; replacing it with a failure from an internal metadata query the
-/// caller never issued would only hide the cause. So each site matches
-/// `Ok(true)`/`Ok(false)`/`Err(_) => original`, and none propagates the probe error with `?`.
+/// Callers probe on error paths to refine an error into the status ADBC requires, such as
+/// `NotFound` or `AlreadyExists`. If the probe itself fails (a transport error, a cancel, or no
+/// `INFORMATION_SCHEMA` read permission), they return the original error: it comes from the
+/// operation the user asked for, and the probe's failure would only hide the cause.
 pub(crate) fn table_exists(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
@@ -66,8 +51,6 @@ pub(crate) fn table_exists(
 ) -> Result<bool> {
     let client = client.clone();
     let (schema, table) = (db_schema.to_string(), table_name.to_string());
-    // A metadata read, so the caller's query timeout (`spanner.rpc.timeout_seconds.query`) bounds
-    // it; unset (the default) leaves it unbounded.
     block_on_cancellable(
         runtime,
         cancel,
@@ -88,7 +71,6 @@ pub(crate) fn table_exists(
                     .execute_query(statement)
                     .await
                     .map_err(from_spanner)?;
-                // A TABLE_NAME probe returns only strings, so the timestamp precision is irrelevant.
                 let (_schema, batch) =
                     result_set_to_batch(result_set, TimestampPrecision::default()).await?;
                 Ok::<bool, Error>(batch.num_rows() > 0)
@@ -97,16 +79,11 @@ pub(crate) fn table_exists(
     )
 }
 
-/// A Spanner statement builder for a **driver-internal metadata read**: the `INFORMATION_SCHEMA`
-/// queries and full-table aggregate scans of [`get_objects`](crate::objects::collect_objects),
-/// [`get_statistics`](crate::statistics::collect_statistics) and
-/// [`SpannerConnection::get_table_schema`].
+/// Statement builder for driver-internal metadata reads: `INFORMATION_SCHEMA` queries and
+/// statistics scans.
 ///
-/// These are the heaviest queries the driver issues on its own, so they honour the connection's
-/// retry bounds (an unbounded retry of a `COUNT(*)` over every table is a real hazard), its
-/// directed-read replica selection (legal here because they all run read-only) and its request
-/// **priority**. They stay untagged — see
-/// [`apply_priority_to_statement`](crate::request::RequestConfig::apply_priority_to_statement).
+/// A statistics scan runs `COUNT(*)` over every table, so these reads honour the connection's
+/// retry bounds, directed reads (they are read-only) and priority. They stay untagged.
 #[must_use]
 pub(crate) fn metadata_sql_builder(
     config: &SharedConfig,
@@ -121,13 +98,9 @@ pub(crate) fn metadata_sql_builder(
     )
 }
 
-/// Run one metadata statement on a shared multi-use read-only transaction and materialise its
-/// result batch.
-///
-/// Every driver-internal read of `get_objects` and `get_statistics` — `INFORMATION_SCHEMA`
-/// discovery and per-table aggregate scan alike — goes through one transaction, so they all observe
-/// a single consistent snapshot. The results are string metadata or INT64 counts, never a
-/// TIMESTAMP, so the default timestamp precision is fine.
+/// Run a metadata statement on a shared read-only transaction, so all reads of one `get_objects`
+/// or `get_statistics` call see the same snapshot. Results hold no TIMESTAMPs, so the default
+/// precision is fine.
 pub(crate) async fn query_txn(
     txn: &MultiUseReadOnlyTransaction,
     statement: impl Into<SpannerSql>,
@@ -140,11 +113,9 @@ pub(crate) async fn query_txn(
     Ok(batch)
 }
 
-/// Extract column `index` of an `INFORMATION_SCHEMA` batch as a [`StringArray`]. Shared with the
-/// collectors in [`crate::objects`] and [`crate::statistics`].
+/// Column `index` of an `INFORMATION_SCHEMA` batch as a [`StringArray`].
 pub(crate) fn str_col(batch: &RecordBatch, index: usize) -> Result<&StringArray> {
-    // `RecordBatch::column` panics on an out-of-range index; a malformed / unexpectedly-shaped
-    // (e.g. zero-column) metadata batch must surface as an error, not a panic.
+    // `RecordBatch::column` panics when out of range.
     if index >= batch.num_columns() {
         return Err(err(
             format!(
@@ -166,12 +137,11 @@ pub(crate) fn str_col(batch: &RecordBatch, index: usize) -> Result<&StringArray>
         })
 }
 
-/// A compiled ADBC `LIKE` pattern (`%` = any run, `_` = one char), matched case-sensitively.
+/// A compiled ADBC `LIKE` pattern, where `%` matches any run and `_` one character.
+/// Case-sensitive.
 ///
-/// The pattern chars are collected once so a collector can reuse one matcher across every candidate
-/// row; the free [`like_match`] helper wraps it for one-off matches.
-/// [`matches`](LikeMatcher::matches) is iterative with backtrack pointers (O(pattern × value), no
-/// recursion) so adversarial patterns like `%a%a%a…` cannot blow up or overflow the stack.
+/// Matching backtracks iteratively in O(pattern * value) time, so patterns like `%a%a%a` cannot
+/// blow up or overflow the stack.
 pub(crate) struct LikeMatcher {
     pattern: Vec<char>,
 }
@@ -185,18 +155,13 @@ impl LikeMatcher {
 
     pub(crate) fn matches(&self, value: &str) -> bool {
         let p = &self.pattern;
-        // Walk the value by byte offset, decoding one `char` at a time, so matching a candidate
-        // allocates nothing. `_` still consumes exactly one *character*: every advance steps by
-        // the decoded char's UTF-8 width.
+        // Walk `value` by byte offset to avoid allocating; each step advances one character.
         let (mut pi, mut vi) = (0usize, 0usize);
         // Pattern index / value byte offset to backtrack to after the most recent `%`.
         let mut star: Option<(usize, usize)> = None;
         while vi < value.len() {
-            // The char starting at byte offset `vi`; `vi` only ever lands on char boundaries.
             let ch = value[vi..].chars().next().expect("vi is a char boundary");
-            // `%` must be tested before the literal/`_` branch: otherwise a `%` in the pattern that
-            // happens to equal the current value char (e.g. both are `%`) would be consumed as a
-            // literal instead of acting as a wildcard.
+            // Check `%` first so it stays a wildcard when the value char is also `%`.
             if pi < p.len() && p[pi] == '%' {
                 star = Some((pi, vi));
                 pi += 1;
@@ -220,10 +185,7 @@ impl LikeMatcher {
     }
 }
 
-/// Match an ADBC `LIKE` pattern (`%` = any run, `_` = one char) against a value, case-sensitively.
-///
-/// A one-off wrapper over [`LikeMatcher`]; use [`LikeMatcher`] directly to match one pattern against
-/// many values without re-compiling it each time.
+/// Match one value against an ADBC `LIKE` pattern; see [`LikeMatcher`].
 pub(crate) fn like_match(pattern: &str, value: &str) -> bool {
     LikeMatcher::new(pattern).matches(value)
 }

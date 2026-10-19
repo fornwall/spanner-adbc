@@ -1,5 +1,4 @@
-//! Offline tests for the metadata plumbing: the ADBC `LIKE` matcher, the catalog check, the
-//! `INFORMATION_SCHEMA` column accessor and what a metadata statement builder carries.
+//! Offline tests for the metadata helpers.
 
 use std::sync::Arc;
 
@@ -24,8 +23,7 @@ fn like_matching() {
     assert!(like_match("%a%a%", "banana"));
     assert!(!like_match("%x%", "banana"));
     assert!(!like_match("", "x"));
-    // A pattern `%` must stay a wildcard even when the value has a literal `%` where the
-    // wildcard begins matching — the value starts with `%`, or a `%` follows matched literals.
+    // `%` stays a wildcard where the value has a literal `%`.
     assert!(like_match("%", "%foo"));
     assert!(like_match("%", "%^%?"));
     assert!(like_match("a%", "a%b"));
@@ -33,8 +31,7 @@ fn like_matching() {
 
 #[test]
 fn like_matching_multibyte_utf8() {
-    // The matcher walks values by byte offset; `_` must still consume one *character* (of any
-    // UTF-8 width), never one byte, and `%` backtracking must skip whole characters.
+    // The matcher walks bytes, but `_` and `%` backtracking must step over whole characters.
     assert!(like_match("_", "é")); // 2-byte char is one `_`
     assert!(!like_match("__", "é")); // ... not two
     assert!(like_match("caf_", "café"));
@@ -55,18 +52,16 @@ fn database_catalog_is_the_database_id() {
         database_catalog("projects/p/instances/i/databases/adbc-test"),
         "adbc-test"
     );
-    // A path that is not in the canonical form is reported verbatim rather than mangled.
+    // Other forms are reported verbatim.
     assert_eq!(database_catalog("adbc-test"), "adbc-test");
     assert_eq!(database_catalog(""), "");
 }
 
 #[test]
 fn lookup_catalog_accepts_only_the_connections_own_catalog() {
-    // `None` means "don't filter"; the connection's one catalog — its database id — matches.
     assert!(check_lookup_catalog(None, "adbc-test").is_ok());
     assert!(check_lookup_catalog(Some("adbc-test"), "adbc-test").is_ok());
-    // Any other catalog does not exist here, so a lookup in it is NotFound. `""` included: it is
-    // adbc.h's "objects with no catalog", and every Spanner object has one.
+    // adbc.h defines `""` as objects with no catalog; every Spanner object has one.
     for absent in ["main", ""] {
         let err = check_lookup_catalog(Some(absent), "adbc-test").unwrap_err();
         assert_eq!(err.status, Status::NotFound);
@@ -76,12 +71,10 @@ fn lookup_catalog_accepts_only_the_connections_own_catalog() {
 
 #[test]
 fn str_col_errors_on_out_of_range_index() {
-    // A zero-column batch: any column index is out of range and must error, not panic.
     let empty = RecordBatch::new_empty(Arc::new(Schema::empty()));
     let err = str_col(&empty, 0).unwrap_err();
     assert_eq!(err.status, Status::Internal);
 
-    // A one-column batch: index 0 is fine, index 1 is out of range.
     let schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, true)]));
     let col: ArrayRef = Arc::new(StringArray::from(vec![Some("x")]));
     let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
@@ -89,8 +82,7 @@ fn str_col_errors_on_out_of_range_index() {
     assert_eq!(str_col(&batch, 1).unwrap_err().status, Status::Internal);
 }
 
-/// A config with every knob `metadata_sql_builder` cares about set — plus the tags, which it
-/// must *not* forward.
+/// Sets every option `metadata_sql_builder` forwards, plus tags, which it must not forward.
 fn configured() -> SharedConfig {
     let mut config = SharedConfig::default();
     config
@@ -113,8 +105,7 @@ fn configured() -> SharedConfig {
     config
 }
 
-/// The built request is the only inspection surface the client crate offers (its `Statement`
-/// fields are `pub(crate)`), so these assert on its `Debug` rendering.
+/// The client's `Statement` fields are private, so these tests inspect its `Debug` output.
 #[test]
 fn metadata_statements_carry_priority_replicas_and_retry_bounds() {
     let built = format!(
@@ -126,8 +117,8 @@ fn metadata_statements_carry_priority_replicas_and_retry_bounds() {
     assert!(built.contains("maximum_attempts: 3"), "{built}");
 }
 
-/// Tags stay off driver-internal metadata reads: they attribute the *user's* statements in
-/// Spanner's introspection tables.
+/// Tags attribute the user's statements in Spanner's introspection tables, so internal reads
+/// stay untagged.
 #[test]
 fn metadata_statements_are_never_tagged() {
     let built = format!(
@@ -140,7 +131,6 @@ fn metadata_statements_are_never_tagged() {
     assert!(built.contains("transaction_tag: \"\""), "{built}");
 }
 
-/// An unconfigured connection still sends a bare statement — nothing is forced on by default.
 #[test]
 fn unconfigured_metadata_statements_stay_bare() {
     let built = format!(

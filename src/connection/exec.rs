@@ -1,6 +1,4 @@
-//! The read/write-transaction execution paths: the isolation-level plumbing plus the three
-//! runners every DML/commit site shares — batch DML, the manual-commit batch, and the
-//! mutations-only write-only commit.
+//! Read/write transaction execution: isolation levels, batch DML and write-only commits.
 
 use adbc_core::error::{Error, Result};
 use adbc_core::options::OptionValue;
@@ -19,7 +17,6 @@ use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::timeout::with_timeout;
 
 /// Apply an explicit isolation level; unspecified leaves Spanner's SERIALIZABLE default.
-/// Only read/write transactions use this setting. Read-only queries use timestamp bounds.
 #[must_use]
 pub(super) fn apply_isolation(
     builder: TransactionRunnerBuilder,
@@ -61,11 +58,9 @@ pub(super) fn parse_isolation_level(value: OptionValue) -> Result<IsolationLevel
         ADBC_OPTION_ISOLATION_LEVEL_DEFAULT => Ok(IsolationLevel::Unspecified),
         ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE => Ok(IsolationLevel::Serializable),
         ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ => Ok(IsolationLevel::RepeatableRead),
-        // Spanner implements `REPEATABLE_READ` as snapshot isolation, so `snapshot` is an exact
-        // native match rather than a promotion (see this function's rustdoc).
+        // A native match, not a promotion: REPEATABLE_READ is snapshot isolation.
         ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT => Ok(IsolationLevel::RepeatableRead),
-        // Promote levels Spanner does not natively expose to the weakest supported level that
-        // still satisfies their guarantees.
+        // Promote to the weakest supported level that satisfies the request.
         ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED
         | ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED => Ok(IsolationLevel::RepeatableRead),
         ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE => Ok(IsolationLevel::Serializable),
@@ -75,35 +70,29 @@ pub(super) fn parse_isolation_level(value: OptionValue) -> Result<IsolationLevel
     }
 }
 
-/// The ADBC value string for the stored isolation level, so `get_option` round-trips what was set.
+/// The ADBC option value for a stored isolation level.
 pub(super) fn isolation_to_adbc_string(isolation: &IsolationLevel) -> &'static str {
     use adbc_core::constants::*;
     match isolation {
         IsolationLevel::Serializable => ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE,
         IsolationLevel::RepeatableRead => ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ,
-        // Unspecified and any future variant report as `default` (no level sent → SERIALIZABLE).
+        // Unspecified, and any future variant, sends no level.
         _ => ADBC_OPTION_ISOLATION_LEVEL_DEFAULT,
     }
 }
 
-/// Apply DML `statements` and buffered `mutations` atomically in **one** read/write transaction,
-/// returning the DML statements' total affected-row count (mutations report no count).
+/// Apply DML `statements` and `mutations` atomically in one read/write transaction, returning the
+/// statements' total affected-row count.
 ///
-/// The statements run via `ExecuteBatchDml` (a single RPC); the mutations are buffered on the
-/// transaction and applied by Spanner as part of its commit — i.e. *after* every statement has
-/// executed, whatever order they were issued in. The runner may retry the closure on abort, so both
-/// (cloned) lists are replayed on each attempt.
+/// The statements run as one `ExecuteBatchDml`; Spanner applies the mutations at commit, after
+/// every statement. The runner replays the closure on abort.
 ///
-/// `last_statements` flags the batch as the transaction's last request
-/// (`ExecuteBatchDmlRequest.last_statements`), letting Spanner release the transaction in the same
-/// round-trip. Only the autocommit DML path may pass `true`: that batch is by construction the
-/// transaction's entire content. The manual-commit path must pass `false` — its commit still
-/// applies the buffered `mutations`, so the batch is *not* the last request.
+/// `last_statements` marks the batch as the transaction's last request, letting Spanner commit in
+/// the same round trip. Only autocommit DML may pass `true`; a manual commit with buffered
+/// mutations has more to apply.
 ///
-/// `spanner.rpc.timeout_seconds.update` is an overall deadline on the whole transaction (including
-/// the runner's abort retries); expiry fails with
-/// [`Status::Timeout`](adbc_core::error::Status::Timeout), and a commit whose confirmation the
-/// driver stopped waiting for may still have landed server-side.
+/// The update timeout covers the whole transaction, including abort retries. A commit that timed
+/// out may still have landed.
 pub(crate) fn run_batch_txn(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
@@ -116,15 +105,13 @@ pub(crate) fn run_batch_txn(
     if statements.is_empty() && mutations.is_empty() {
         return Ok(0);
     }
-    // Owned copies for the `async move` below (the runner replays its closure on abort).
     let isolation = config.isolation.clone();
     let request = config.request.clone();
     let retry = config.retry;
     let timeout = config.timeouts.update_timeout();
     let client = client.clone();
     let transaction = async move {
-        // The commit priority and transaction tag ride on the runner; the request tag rides on the
-        // ExecuteBatchDml batch inside the (retryable) closure.
+        // Commit priority and transaction tag go on the runner, the request tag on the batch.
         let runner = runner_builder(&client, isolation, &request, retry).build();
         let outcome = runner
             .run(move |transaction: ReadWriteTransaction| {
@@ -146,8 +133,7 @@ pub(crate) fn run_batch_txn(
             })
             .await
             .map_err(from_spanner)?;
-        // The commit stats (if any — only when `spanner.commit_stats` requested them) ride on the
-        // commit response; capture the mutation count so the caller can record it into its cell.
+        // Present only when `spanner.commit_stats` is enabled.
         let mutation_count = outcome
             .commit_response
             .commit_stats
@@ -164,19 +150,13 @@ pub(crate) fn run_batch_txn(
     Ok(count)
 }
 
-/// Commit `mutations` alone — no DML — in one **write-only** transaction
-/// (`WriteOnlyTransaction::write`): the mutations-only manual-commit path, and (via the
-/// statement's `write_mutation_range`) each chunk of an autocommit bulk ingest.
+/// Commit `mutations` without DML in one write-only transaction. Used by mutations-only manual
+/// commits and by each chunk of an autocommit bulk ingest.
 ///
-/// Unlike the read/write runner — whose commit, replayed after an *ambiguous* transport failure,
-/// can apply the batch twice — `write` is replay-protected: it begins the transaction with a
-/// mutation key and retries internally on `ABORTED`, so on success the mutations were applied
-/// **exactly once** whatever the underlying network did. The same commit configuration as the
-/// runner path is applied via
-/// [`RequestConfig::apply_to_write_only`](crate::request::RequestConfig::apply_to_write_only) /
-/// [`RetryConfig::apply_to_write_only`](crate::retry::RetryConfig::apply_to_write_only).
-/// `config.isolation` is deliberately ignored — the write-only builder exposes no isolation setter,
-/// and a transaction that performs no reads has none for a level to constrain.
+/// A read/write runner that replays its commit after an ambiguous transport failure can apply the
+/// mutations twice. `write` begins the transaction with a mutation key and retries `ABORTED`
+/// internally, so success means the mutations were applied once. Isolation does not apply: the
+/// transaction performs no reads, and the builder has no isolation setter.
 pub(crate) fn write_mutations_txn(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
@@ -187,7 +167,6 @@ pub(crate) fn write_mutations_txn(
     if mutations.is_empty() {
         return Ok(());
     }
-    // Owned copies for the `async move` below.
     let request = config.request.clone();
     let retry = config.retry;
     let timeout = config.timeouts.update_timeout();
@@ -199,8 +178,7 @@ pub(crate) fn write_mutations_txn(
             .write(mutations)
             .await
             .map_err(from_spanner)?;
-        // The commit stats (only when `spanner.commit_stats` requested them) ride on the
-        // write-only commit response.
+        // Present only when `spanner.commit_stats` is enabled.
         Ok::<Option<i64>, Error>(
             response
                 .commit_stats

@@ -5,11 +5,9 @@ use adbc_core::constants::{
 use adbc_core::schemas::GET_STATISTICS_SCHEMA;
 use arrow_array::{ListArray, UnionArray};
 
-/// The catalog name `build` reports: a connection's database id.
 const CATALOG: &str = "adbc-test";
 
-/// The statistic structs of the one catalog's one db schema, unwrapped from the nested
-/// `catalog → list<db_schema → list<statistic>>` result [`build`] produces.
+/// The statistics of the first db schema in a [`build`] result.
 fn only_schema_statistics(batch: &RecordBatch) -> StructArray {
     let list = |array: &dyn Array| {
         array
@@ -33,9 +31,7 @@ fn only_schema_statistics(batch: &RecordBatch) -> StructArray {
         .clone()
 }
 
-/// Every statistic the driver reports is an exact count read off an aggregate scan, so the
-/// `statistic_is_approximate` column is `false` on every row — a documented contract of
-/// `get_statistics` (and the reason `approximate = true` is served from the same scans).
+/// Statistics are exact counts, so `statistic_is_approximate` is always false.
 #[test]
 fn build_reports_each_statistic_exactly_and_never_as_approximate() {
     let schemas = vec![SchemaStatistics {
@@ -72,8 +68,6 @@ fn build_reports_each_statistic_exactly_and_never_as_approximate() {
     let approximate = approximate.as_any().downcast_ref::<BooleanArray>().unwrap();
     let values = column("statistic_value");
     let values = values.as_any().downcast_ref::<UnionArray>().unwrap();
-    // The values live in the union's `int64` branch, which is what makes them readable at
-    // all: a caller selects the branch by the row's type id.
     let int64 = |row: usize| -> i64 {
         assert_eq!(values.type_id(row), INT64_BRANCH, "row {row}");
         let child = values.value(row);
@@ -84,12 +78,10 @@ fn build_reports_each_statistic_exactly_and_never_as_approximate() {
             .value(0)
     };
 
-    // The table-level row count: no column name, and the exact value it was given.
     assert_eq!(tables.value(0), "Users");
     assert!(columns.is_null(0), "ROW_COUNT is a table-level statistic");
     assert_eq!(keys.value(0), ADBC_STATISTIC_ROW_COUNT_KEY);
     assert_eq!(int64(0), 42);
-    // The per-column null count.
     assert_eq!(tables.value(1), "Users");
     assert_eq!(columns.value(1), "Name");
     assert_eq!(keys.value(1), ADBC_STATISTIC_NULL_COUNT_KEY);
@@ -101,15 +93,12 @@ fn build_reports_each_statistic_exactly_and_never_as_approximate() {
     );
 }
 
-/// The aggregate `SELECT` and the `plan` that reads its result back are produced together and
-/// must stay in lockstep: `plan[i]` names the statistic at result column `i + 1`. Asserting
-/// the SQL *and* the plan side by side is what pins that pairing.
+/// `plan[i]` names the statistic at result column `i + 1`.
 #[test]
 fn build_table_query_pairs_each_aggregate_with_its_plan_entry() {
     let columns = vec![
         ("Id".to_string(), true),
-        // Not groupable (an ARRAY column): a COUNTIF, but no COUNT(DISTINCT) — the whole
-        // reason `is_groupable` exists, since a COUNT(DISTINCT) over it fails the scan.
+        // Not groupable, like an ARRAY column: no COUNT(DISTINCT).
         ("Tags".to_string(), false),
         ("Name".to_string(), true),
     ];
@@ -137,10 +126,8 @@ fn build_table_query_pairs_each_aggregate_with_its_plan_entry() {
     assert!(plan.is_empty());
 }
 
-/// The parser indexes the aggregate result by `plan` position (`value(index + 1)`), so an
-/// off-by-one there would silently report each column's null count *as* its distinct count —
-/// wrong numbers with no error. Feeding it a result whose counts are all distinct, laid out in
-/// the order the matching [`build_table_query`] emitted, is what catches that.
+/// Distinct counts catch an off-by-one between `plan` and the result columns, which would
+/// silently report one statistic's value as another's.
 #[test]
 fn parse_table_statistics_reads_each_plan_entry_at_its_own_aggregate() {
     let columns = vec![("Id".to_string(), true), ("Tags".to_string(), false)];
@@ -172,9 +159,7 @@ fn parse_table_statistics_reads_each_plan_entry_at_its_own_aggregate() {
     assert!(stats.iter().all(|s| s.table == "Users"));
 }
 
-/// A result set that is not the single row of integers the aggregate query promises is an
-/// `Internal` error, not a panic: this crate is loaded as a cdylib, so nothing here may unwind
-/// into the C ABI.
+/// A malformed aggregate result is an `Internal` error; nothing may panic across the C ABI.
 #[test]
 fn parse_table_statistics_rejects_a_result_that_is_not_one_row_of_integers() {
     let plan = vec![("Id".to_string(), ADBC_STATISTIC_NULL_COUNT_KEY)];
@@ -188,7 +173,7 @@ fn parse_table_statistics_rejects_a_result_that_is_not_one_row_of_integers() {
     };
     assert_eq!(error.status, Status::Internal);
 
-    // The right shape, but the aggregate came back as a string rather than an integer.
+    // The right shape, but a string aggregate.
     let wrong_type = RecordBatch::try_from_iter([
         ("a", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
         ("b", Arc::new(StringArray::from(vec!["3"])) as ArrayRef),
@@ -237,7 +222,6 @@ fn parse_table_statistics_rejects_null_and_negative_counts() {
 
 #[test]
 fn groupable_types() {
-    // Ordinary scalar types are distinct-countable.
     for t in [
         "INT64",
         "STRING(MAX)",
@@ -246,13 +230,12 @@ fn groupable_types() {
         "NUMERIC",
         "TIMESTAMP",
         "DATE",
-        // UUID is groupable (it can even be a primary key), verified on the emulator.
+        // Verified on the emulator.
         "UUID",
     ] {
         assert!(is_groupable(t), "{t} should be groupable");
     }
-    // Non-groupable Spanner types: a COUNT(DISTINCT) over any of these fails the aggregate
-    // scan, which would otherwise break get_statistics for the whole database.
+    // COUNT(DISTINCT) over these fails the scan.
     for t in [
         "ARRAY<INT64>",
         "STRUCT<a INT64>",

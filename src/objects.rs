@@ -1,12 +1,9 @@
-//! Building the nested result of [`Connection::get_objects`](adbc_core::Connection::get_objects).
+//! Builds the nested [`Connection::get_objects`](adbc_core::Connection::get_objects) result from
+//! `INFORMATION_SCHEMA`.
 //!
-//! The ADBC `get_objects` result is a deeply nested structure:
-//! `catalog → list<db_schema → list<table → list<column>>>`. We populate it from Spanner's
-//! `INFORMATION_SCHEMA`. A Spanner database is a single catalog, reported under the database id
-//! (the `<d>` of `projects/<p>/instances/<i>/databases/<d>`). Levels strictly below
-//! the requested [`ObjectDepth`] are left null via [`new_null_array`]; a list at or above the
-//! requested depth is always a valid (possibly **empty**) list — per the ADBC spec, a filter that
-//! matches nothing must still yield the parent skeleton with empty lists, never NULL.
+//! Levels below the requested [`ObjectDepth`] are null. Lists at or above it are always valid,
+//! possibly empty: per the ADBC spec, a filter that matches nothing still yields the parent
+//! skeleton.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,8 +34,7 @@ pub(crate) struct Column {
     pub name: String,
     pub ordinal: i32,
     pub nullable: bool,
-    /// The Spanner-native type name (`INFORMATION_SCHEMA.COLUMNS.SPANNER_TYPE`), e.g.
-    /// `STRING(MAX)` or `ARRAY<INT64>`; reported as `xdbc_type_name`.
+    /// `SPANNER_TYPE`, e.g. `STRING(MAX)`; reported as `xdbc_type_name`.
     pub type_name: String,
 }
 
@@ -52,12 +48,11 @@ pub(crate) struct Usage {
 /// A constraint on a table (primary key, foreign key, unique, check).
 pub(crate) struct Constraint {
     pub name: Option<String>,
-    /// ADBC constraint type string, e.g. `"PRIMARY KEY"`, `"FOREIGN KEY"`.
+    /// e.g. `"PRIMARY KEY"` or `"FOREIGN KEY"`.
     pub constraint_type: String,
-    /// The constraint's key columns, in key order (empty for e.g. check constraints).
+    /// Key columns in key order; empty for check constraints.
     pub columns: Vec<String>,
-    /// For a foreign key, the referenced (parent) columns, in the same order as `columns`.
-    /// Empty for non-foreign-key constraints.
+    /// A foreign key's parent columns, in the order of `columns`.
     pub usages: Vec<Usage>,
 }
 
@@ -75,11 +70,7 @@ pub(crate) struct DbSchema {
     pub tables: Vec<Table>,
 }
 
-/// Zero-based column indices into each `INFORMATION_SCHEMA` result batch read below, one module per
-/// query in [`collect_objects`], named to mirror that query's `SELECT` list. They must stay in
-/// lockstep with those `SELECT`s: reading through the names (rather than bare integers) makes a
-/// query edit that reorders or adds a column a compile-time concern here instead of a silent
-/// misread. Each module's doc comment reproduces the `SELECT` it indexes.
+/// Column positions in the [`collect_objects`] queries; keep these aligned with their SELECT lists.
 mod schemata_col {
     // `SELECT SCHEMA_NAME`
     pub(super) const SCHEMA_NAME: usize = 0;
@@ -125,12 +116,8 @@ mod referential_constraints_col {
     pub(super) const UNIQUE_CONSTRAINT_NAME: usize = 3;
 }
 
-/// The filters `get_objects` was called with: an ADBC `LIKE` pattern for each of the schema, table
-/// and column names, plus an exact-match list of table types. `None` means "no filter" — which,
-/// for `table_type`, is not the same as an empty list (that one matches nothing).
-///
-/// Each is applied twice: pushed down into the `INFORMATION_SCHEMA` query as a bound-parameter
-/// predicate, and applied authoritatively client-side in [`assemble_objects`].
+/// `get_objects` filters: ADBC `LIKE` patterns for names and an exact-match list of table types.
+/// `None` means no filter; an empty `table_type` list matches nothing.
 pub(crate) struct ObjectFilters<'a> {
     pub db_schema: Option<&'a str>,
     pub table_name: Option<&'a str>,
@@ -138,8 +125,7 @@ pub(crate) struct ObjectFilters<'a> {
     pub column_name: Option<&'a str>,
 }
 
-/// The `INFORMATION_SCHEMA` batches [`collect_objects`] fetches, as handed to [`assemble_objects`].
-/// The five optional ones are `None` at a depth that does not populate them — no query was issued.
+/// Batches fetched by [`collect_objects`]; `None` when the depth skips the query.
 struct ObjectBatches {
     schemata: RecordBatch,
     tables: Option<RecordBatch>,
@@ -149,8 +135,7 @@ struct ObjectBatches {
     referential: Option<RecordBatch>,
 }
 
-/// Query `INFORMATION_SCHEMA` and assemble the schema→table→column hierarchy for `get_objects`,
-/// applying the ADBC `LIKE`/type filters and the requested depth.
+/// Query `INFORMATION_SCHEMA` and assemble the schema/table/column hierarchy for `get_objects`.
 pub(crate) fn collect_objects(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
@@ -165,11 +150,7 @@ pub(crate) fn collect_objects(
         column_name,
         ..
     } = *filters;
-    // At catalog depth the result is just the single catalog with a null db_schemas
-    // list — `build` ignores the collected schemas entirely — so skip INFORMATION_SCHEMA
-    // (and any RPC) altogether. The remaining depths each fetch only what they populate:
-    // Schemas queries SCHEMATA only; Tables adds TABLES; All/Columns add COLUMNS and the
-    // constraint tables.
+    // `build` ignores the schemas at catalog depth. Deeper levels fetch only what they populate.
     if depth == ObjectDepth::Catalogs {
         return Ok(Vec::new());
     }
@@ -181,12 +162,9 @@ pub(crate) fn collect_objects(
     let client = client.clone();
     let timeout = config.timeouts.query_timeout();
 
-    // Each present ADBC pattern filter is also pushed down into the corresponding
-    // INFORMATION_SCHEMA query as a bound-parameter `LIKE` predicate (never interpolated into
-    // the SQL text — the pattern is data, not SQL). The push-down only cuts transferred rows:
-    // the client-side `like_match` passes below remain the authoritative filter, so any corner
-    // where GoogleSQL `LIKE` and the ADBC pattern contract could disagree cannot change the
-    // result (see [`sql_like_pattern`] for the one known divergence, the escape character).
+    // Pattern filters are pushed down only to cut transferred rows. `assemble_objects` applies
+    // them authoritatively, so differences between GoogleSQL `LIKE` and ADBC patterns cannot
+    // change the result.
     let schemata_stmt = filtered_query(
         config,
         "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA",
@@ -218,12 +196,6 @@ pub(crate) fn collect_objects(
             Some("TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"),
         )
     });
-    // Constraints (primary/foreign/unique/check) and their key columns, populated at the
-    // same depth as columns. KEY_COLUMN_USAGE covers the key-based constraints; its rows are
-    // ordered so each constraint's columns come out in key order. For foreign keys,
-    // REFERENTIAL_CONSTRAINTS maps the FK to the referenced unique/primary-key constraint,
-    // whose own KEY_COLUMN_USAGE rows give the referenced (parent) columns in order — the
-    // ordering CONSTRAINT_COLUMN_USAGE does not preserve.
     let constraints_stmt = populate_columns.then(|| {
         filtered_query(
             config,
@@ -234,10 +206,8 @@ pub(crate) fn collect_objects(
             None,
         )
     });
-    // KEY_COLUMN_USAGE and REFERENTIAL_CONSTRAINTS stay unfiltered on purpose: a foreign key on
-    // a kept table may reference a unique/primary-key constraint on a table (or in a schema)
-    // that the filters exclude, and resolving `constraint_column_usage` needs the referenced
-    // constraint's own key-column rows.
+    // Unfiltered: a foreign key on a kept table may reference a constraint on a table or schema
+    // that the filters exclude.
     let key_columns_stmt = populate_columns.then(|| {
         metadata_sql_builder(
             config,
@@ -259,23 +229,13 @@ pub(crate) fn collect_objects(
         .build()
     });
 
-    // The whole metadata fetch shares one multi-use read-only transaction, so honour the
-    // connection's read staleness (pinned to a legal multi-use equivalent) as `get_table_schema`
-    // and the statistics scans do.
     let bound = config.read_staleness.multi_use_timestamp_bound()?;
     let batches = block_on_cancellable(
         runtime,
         cancel,
-        // The whole `get_objects` metadata fetch is one query-side operation, bounded by the
-        // connection's query timeout (`spanner.rpc.timeout_seconds.query`); unset leaves it
-        // unbounded.
         with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
-            // All the metadata queries run concurrently, sharing ONE multi-use read-only
-            // transaction so they observe a single snapshot.
-            // INFORMATION_SCHEMA queries are allowed in read-only transactions, and the client
-            // supports concurrent statements on one transaction: `execute_query` takes `&self`,
-            // and the inline-begin state machine serialises the implicit `BeginTransaction`
-            // among concurrent first statements (later ones wait for the begun transaction id).
+            // The queries run concurrently on one snapshot. The client's inline begin makes
+            // concurrent first statements wait for the transaction id.
             let txn = crate::staleness::multi_use(&client, bound).await?;
             let (schemata, tables, columns, constraints, key_columns, referential) = try_join!(
                 query_txn(&txn, schemata_stmt),
@@ -299,29 +259,20 @@ pub(crate) fn collect_objects(
     assemble_objects(&batches, filters)
 }
 
-/// Assemble the schema→table→column hierarchy from the fetched `INFORMATION_SCHEMA` batches,
-/// applying the ADBC filters.
-///
-/// Split from [`collect_objects`] because it is the whole of `get_objects`' *logic* — the
-/// authoritative client-side filtering, the depth-gated skeleton, and the foreign-key usage
-/// resolution — with none of its I/O, so it is unit-testable offline (the fetch it is split from
-/// is only reachable against a live database).
+/// Assemble the hierarchy from the fetched batches and apply the filters. Kept apart from the
+/// I/O in [`collect_objects`] so it can be tested offline.
 fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Result<Vec<DbSchema>> {
     let schema_batch = &batches.schemata;
     let schema_names = str_col(schema_batch, schemata_col::SCHEMA_NAME)?;
 
-    // Group each INFORMATION_SCHEMA batch ONCE into lookup maps keyed by (schema, table) — and
-    // the key/referential batches by (constraint_schema, constraint_name) — so the assembly
-    // below is a series of hash lookups rather than a full rescan of each batch per table (which
-    // was quadratic for large schemas). This mirrors `collect_statistics`. The per-group `Vec`s
-    // keep batch (i.e. `ORDER BY`) order, so column and key-column ordering is preserved exactly.
+    // Group each batch once, so assembly does lookups instead of rescanning per table. Groups
+    // keep the queries' ORDER BY order.
     let tables_by_schema = group_opt(batches.tables.as_ref(), group_tables)?;
     let columns_by_table = group_opt(batches.columns.as_ref(), group_columns)?;
     let constraints_by_table = group_opt(batches.constraints.as_ref(), group_constraints)?;
     let key_columns_by_constraint = group_opt(batches.key_columns.as_ref(), group_key_columns)?;
     let referential_by_constraint = group_opt(batches.referential.as_ref(), group_referential)?;
 
-    // The `LIKE` patterns are loop-invariant, so compile each once and reuse it across every row.
     let db_schema_matcher = filters.db_schema.map(LikeMatcher::new);
     let table_name_matcher = filters.table_name.map(LikeMatcher::new);
     let column_name_matcher = filters.column_name.map(LikeMatcher::new);
@@ -336,8 +287,6 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
             continue;
         }
         let mut tables = Vec::new();
-        // `tables_by_schema` is empty unless tables were populated, so this yields no tables at
-        // schema-only depth.
         for table in tables_by_schema.get(schema_name).into_iter().flatten() {
             let name = table.name;
             if table_name_matcher
@@ -346,7 +295,6 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
             {
                 continue;
             }
-            // Filter on the borrowed type name; only a kept row pays for the `String`.
             let ttype = table.table_type;
             if filters
                 .table_type
@@ -354,7 +302,6 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
             {
                 continue;
             }
-            // Empty maps (columns/constraints not populated at this depth) yield empty lists.
             let columns = collect_columns(
                 &columns_by_table,
                 schema_name,
@@ -383,27 +330,20 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
     Ok(result)
 }
 
-/// `WHERE` predicate keeping only the columns a `SELECT *` would return.
+/// Keeps only the columns `SELECT *` returns, so `get_objects` agrees with `get_table_schema`.
+/// Spanner hides the implicit `rowid` key that bulk ingest creates for tables without a primary
+/// key (see [`bind::create_table_sql`](crate::bind::create_table_sql)).
 ///
-/// Spanner excludes `HIDDEN` columns from `SELECT *`, including the implicit `rowid` key on
-/// tables created without a `PRIMARY KEY` clause by bulk ingest (see
-/// [`bind::create_table_sql`](crate::bind::create_table_sql)). Excluding them here keeps
-/// `get_objects` consistent with `get_table_schema`, which reads `SELECT * LIMIT 0`.
-///
-/// `IS_HIDDEN` is documented as the `STRING` `"TRUE"`/`"FALSE"` (like `IS_NULLABLE`'s `"YES"`/
-/// `"NO"`), but the emulator types it as a `BOOL`; the `CAST` accepts both (GoogleSQL parses
-/// `"TRUE"` case-insensitively into `TRUE`).
+/// `IS_HIDDEN` is documented as the `STRING` `"TRUE"`/`"FALSE"`, but the emulator types it as a
+/// `BOOL`; the `CAST` accepts both.
 const HIDE_HIDDEN_COLUMNS: &str = "NOT CAST(IS_HIDDEN AS BOOL)";
 
-/// `WHERE` predicate dropping the constraints that exist only to describe a hidden column — the
-/// companion to [`HIDE_HIDDEN_COLUMNS`], keeping the constraint list consistent with the column
-/// list rather than pointing at columns `get_objects` does not report.
+/// Drops constraints on hidden columns, so no constraint names a column `get_objects` omits.
 ///
-/// A table created without a `PRIMARY KEY` gets two such constraints on its implicit `rowid`: the
-/// `PK_<table>` primary key and a `CK_IS_NOT_NULL_<table>_rowid` check. `CONSTRAINT_COLUMN_USAGE`
-/// covers both shapes (key columns *and* the columns a check constraint reads), where
-/// `KEY_COLUMN_USAGE` would miss the check. A foreign key's usage rows name the *parent* columns,
-/// which are never hidden, so real constraints are untouched.
+/// A table without a primary key gets a `PK_<table>` primary key and a
+/// `CK_IS_NOT_NULL_<table>_rowid` check on its `rowid`. `CONSTRAINT_COLUMN_USAGE` covers both;
+/// `KEY_COLUMN_USAGE` would miss the check. A foreign key's usage rows name its parent columns,
+/// which are never hidden.
 const HIDE_HIDDEN_COLUMN_CONSTRAINTS: &str = "NOT EXISTS ( \
      SELECT 1 FROM INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS u \
      JOIN INFORMATION_SCHEMA.COLUMNS AS c \
@@ -413,22 +353,16 @@ const HIDE_HIDDEN_COLUMN_CONSTRAINTS: &str = "NOT EXISTS ( \
        AND u.CONSTRAINT_NAME = tc.CONSTRAINT_NAME \
        AND CAST(c.IS_HIDDEN AS BOOL))";
 
-/// Escape an ADBC `LIKE` pattern for GoogleSQL `LIKE`.
+/// Escape an ADBC `LIKE` pattern for GoogleSQL.
 ///
-/// The ADBC pattern contract (implemented client-side by [`like_match`](crate::metadata::like_match)) has no escape syntax:
-/// `%` and `_` are always wildcards and every other character — including `\` — is a literal.
-/// GoogleSQL `LIKE` agrees on `%`/`_` and case sensitivity, but treats `\` as an escape
-/// character; doubling each backslash turns it back into a literal, making the server-side
-/// predicate match the ADBC semantics. (`like_match` stays the authoritative filter regardless,
-/// so the push-down can only ever over-fetch, never change the result.)
+/// ADBC patterns have no escape character, so `\` is a literal, but GoogleSQL treats it as an
+/// escape. Doubling each backslash restores the ADBC meaning.
 fn sql_like_pattern(pattern: &str) -> String {
     pattern.replace('\\', "\\\\")
 }
 
-/// Build the SQL text and bound parameters for an `INFORMATION_SCHEMA` query: a fixed
-/// `base_predicate` (driver-authored SQL, not user data — see [`HIDE_HIDDEN_COLUMNS`]) plus one
-/// `column LIKE @pN` predicate per present ADBC pattern filter. Split from [`filtered_query`] so
-/// the generated SQL is unit-testable offline.
+/// SQL text and parameters for an `INFORMATION_SCHEMA` query: the driver-written
+/// `base_predicate` plus `column LIKE @pN` for each present filter.
 fn filtered_sql(
     base: &str,
     base_predicate: Option<&str>,
@@ -456,10 +390,9 @@ fn filtered_sql(
     (sql, params)
 }
 
-/// Build an `INFORMATION_SCHEMA` statement with each present ADBC pattern filter pushed down as
-/// a **bound-parameter** `LIKE` predicate. The pattern must never be interpolated into the SQL
-/// text: it is user-controlled data (the Snowflake ADBC driver shipped a SQL injection,
-/// apache/arrow-adbc#1338, by string-formatting these very patterns).
+/// Build an `INFORMATION_SCHEMA` statement with pattern filters as bound `LIKE` parameters.
+/// Patterns are user data: formatting them into SQL caused a SQL injection in the Snowflake ADBC
+/// driver (apache/arrow-adbc#1338).
 fn filtered_query(
     config: &SharedConfig,
     base: &str,
@@ -475,8 +408,7 @@ fn filtered_query(
     builder.build()
 }
 
-/// [`query_txn`] for a depth-gated statement: `None` (depth doesn't need the query) issues no
-/// RPC and yields `None`.
+/// [`query_txn`] for a statement the depth may skip.
 async fn query_txn_opt(
     txn: &MultiUseReadOnlyTransaction,
     statement: Option<SpannerSql>,
@@ -487,17 +419,16 @@ async fn query_txn_opt(
     }
 }
 
-/// One grouped `INFORMATION_SCHEMA.TABLES` row (per schema group).
+/// One `INFORMATION_SCHEMA.TABLES` row.
 struct TableRow<'a> {
     name: &'a str,
     table_type: &'a str,
 }
 
-/// Maps each foreign key's (constraint_schema, constraint_name) to the referenced constraint's
-/// (unique_schema, unique_name), grouped once from `REFERENTIAL_CONSTRAINTS`.
+/// Foreign key (schema, name) to the referenced constraint's (schema, name).
 type ReferentialMap<'a> = HashMap<(&'a str, &'a str), (&'a str, &'a str)>;
 
-/// One grouped `INFORMATION_SCHEMA.COLUMNS` row (per (schema, table) group, in ordinal order).
+/// One `INFORMATION_SCHEMA.COLUMNS` row.
 struct ColumnRow<'a> {
     name: &'a str,
     ordinal: i32,
@@ -505,15 +436,14 @@ struct ColumnRow<'a> {
     type_name: &'a str,
 }
 
-/// One grouped `INFORMATION_SCHEMA.TABLE_CONSTRAINTS` row (per (schema, table) group).
+/// One `INFORMATION_SCHEMA.TABLE_CONSTRAINTS` row.
 struct ConstraintRow<'a> {
     name: &'a str,
     constraint_type: &'a str,
 }
 
-/// One grouped `INFORMATION_SCHEMA.KEY_COLUMN_USAGE` row (per (constraint_schema, constraint_name)
-/// group, in `ORDINAL_POSITION` order). `position` is `POSITION_IN_UNIQUE_CONSTRAINT`, null except
-/// for foreign-key columns.
+/// One `INFORMATION_SCHEMA.KEY_COLUMN_USAGE` row. `position` is `POSITION_IN_UNIQUE_CONSTRAINT`,
+/// set only for foreign-key columns.
 struct KeyColumnRow<'a> {
     column: &'a str,
     table_schema: &'a str,
@@ -522,10 +452,7 @@ struct KeyColumnRow<'a> {
     position: Option<&'a str>,
 }
 
-/// Apply one of the `group_*` functions below to a batch that may not have been fetched.
-///
-/// A `None` batch means that depth never issued the query, which groups to an empty map — so the
-/// assembly in [`collect_objects`] simply finds nothing at that depth.
+/// Group a batch, or return an empty map if the depth skipped its query.
 fn group_opt<'a, T: Default>(
     batch: Option<&'a RecordBatch>,
     group: impl FnOnce(&'a RecordBatch) -> Result<T>,
@@ -533,7 +460,7 @@ fn group_opt<'a, T: Default>(
     Ok(batch.map(group).transpose()?.unwrap_or_default())
 }
 
-/// Group `INFORMATION_SCHEMA.TABLES` rows by `TABLE_SCHEMA`, preserving batch order within a schema.
+/// Group `TABLES` rows by schema.
 fn group_tables(batch: &RecordBatch) -> Result<HashMap<&str, Vec<TableRow<'_>>>> {
     let (ts, tn, tt) = (
         str_col(batch, tables_col::TABLE_SCHEMA)?,
@@ -550,8 +477,7 @@ fn group_tables(batch: &RecordBatch) -> Result<HashMap<&str, Vec<TableRow<'_>>>>
     Ok(map)
 }
 
-/// Group `INFORMATION_SCHEMA.COLUMNS` rows by (schema, table); each group keeps ordinal order (the
-/// query's `ORDER BY`).
+/// Group `COLUMNS` rows by (schema, table).
 fn group_columns(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<ColumnRow<'_>>>> {
     let (ts, tn, cn, nul, typ) = (
         str_col(batch, columns_col::TABLE_SCHEMA)?,
@@ -579,7 +505,7 @@ fn group_columns(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<Column
     Ok(map)
 }
 
-/// Group `INFORMATION_SCHEMA.TABLE_CONSTRAINTS` rows by (schema, table).
+/// Group `TABLE_CONSTRAINTS` rows by (schema, table).
 fn group_constraints(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<ConstraintRow<'_>>>> {
     let (ts, tn, cn, ct) = (
         str_col(batch, table_constraints_col::TABLE_SCHEMA)?,
@@ -599,8 +525,7 @@ fn group_constraints(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<Co
     Ok(map)
 }
 
-/// Group `INFORMATION_SCHEMA.KEY_COLUMN_USAGE` rows by (constraint_schema, constraint_name); each
-/// group keeps `ORDINAL_POSITION` order (the query's `ORDER BY`).
+/// Group `KEY_COLUMN_USAGE` rows by constraint (schema, name).
 fn group_key_columns(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<KeyColumnRow<'_>>>> {
     let (kcs, kcn, kts, ktn, kcol, kord, kpos) = (
         str_col(batch, key_column_usage_col::CONSTRAINT_SCHEMA)?,
@@ -620,19 +545,13 @@ fn group_key_columns(batch: &RecordBatch) -> Result<HashMap<(&str, &str), Vec<Ke
                 table_schema: kts.value(r),
                 table: ktn.value(r),
                 ordinal: kord.value(r),
-                position: if kpos.is_null(r) {
-                    None
-                } else {
-                    Some(kpos.value(r))
-                },
+                position: kpos.is_valid(r).then(|| kpos.value(r)),
             });
     }
     Ok(map)
 }
 
-/// Group `INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS` by (constraint_schema, constraint_name),
-/// mapping each foreign key to its referenced (unique_schema, unique_name). Keeps the first row per
-/// key.
+/// Map each foreign key to its referenced constraint, keeping the first row per key.
 fn group_referential(batch: &RecordBatch) -> Result<ReferentialMap<'_>> {
     let (rcs, rcn, rus, run) = (
         str_col(batch, referential_constraints_col::CONSTRAINT_SCHEMA)?,
@@ -648,7 +567,7 @@ fn group_referential(batch: &RecordBatch) -> Result<ReferentialMap<'_>> {
     Ok(map)
 }
 
-/// Collect the columns of one table from the pre-grouped `COLUMNS` map, applying the `LIKE` filter.
+/// One table's columns that match `filter`.
 fn collect_columns<'a>(
     columns_by_table: &HashMap<(&'a str, &'a str), Vec<ColumnRow<'a>>>,
     schema: &'a str,
@@ -670,10 +589,7 @@ fn collect_columns<'a>(
     columns
 }
 
-/// Assemble the constraints for one table from the pre-grouped `TABLE_CONSTRAINTS`,
-/// `KEY_COLUMN_USAGE` and `REFERENTIAL_CONSTRAINTS` maps. Each constraint's key columns come out in
-/// key order (the `KEY_COLUMN_USAGE` group keeps `ORDINAL_POSITION` order); check/... constraints
-/// have no key columns and get an empty list.
+/// One table's constraints, with key columns in key order.
 fn collect_constraints<'a>(
     constraints_by_table: &HashMap<(&'a str, &'a str), Vec<ConstraintRow<'a>>>,
     key_columns_by_constraint: &HashMap<(&'a str, &'a str), Vec<KeyColumnRow<'a>>>,
@@ -715,25 +631,22 @@ fn collect_constraints<'a>(
     out
 }
 
-/// The referenced (parent) columns of one foreign key, in the same order as its own key columns.
+/// A foreign key's parent columns, in the order of its own key columns.
 ///
-/// `CONSTRAINT_COLUMN_USAGE` lists the referenced columns but does not preserve order, so instead:
-/// find the referenced unique constraint via `REFERENTIAL_CONSTRAINTS`, index its key columns by
-/// ordinal, then walk the FK's own columns (ordered) mapping each through
-/// `POSITION_IN_UNIQUE_CONSTRAINT` to the referenced column at that ordinal.
+/// `CONSTRAINT_COLUMN_USAGE` does not preserve that order. Instead, find the referenced constraint
+/// in `REFERENTIAL_CONSTRAINTS`, index its key columns by ordinal, and map each FK column through
+/// `POSITION_IN_UNIQUE_CONSTRAINT`.
 fn foreign_key_usages<'a>(
     key_columns_by_constraint: &HashMap<(&'a str, &'a str), Vec<KeyColumnRow<'a>>>,
     referential_by_constraint: &ReferentialMap<'a>,
     schema: &'a str,
     fk_name: &'a str,
 ) -> Vec<Usage> {
-    // The referenced unique/primary-key constraint.
     let Some(&(unique_schema, unique_name)) = referential_by_constraint.get(&(schema, fk_name))
     else {
         return Vec::new();
     };
 
-    // Index the referenced constraint's key columns by ordinal position.
     let referenced: HashMap<i64, &KeyColumnRow> = key_columns_by_constraint
         .get(&(unique_schema, unique_name))
         .into_iter()
@@ -741,7 +654,6 @@ fn foreign_key_usages<'a>(
         .filter_map(|k| Some((k.ordinal.parse::<i64>().ok()?, k)))
         .collect();
 
-    // Walk the FK's own columns in key order, mapping each to its referenced column.
     let mut fk_columns: Vec<(i64, i64)> = key_columns_by_constraint
         .get(&(schema, fk_name))
         .into_iter()
@@ -762,9 +674,8 @@ fn foreign_key_usages<'a>(
         .collect()
 }
 
-/// Build the single-catalog `get_objects` record batch. `catalog` is the name reported for that
-/// catalog (the connection's database id) — also the `fk_catalog` of every foreign-key usage, since
-/// a foreign key cannot cross databases.
+/// Build the `get_objects` batch for the connection's only catalog. `catalog` is also every
+/// foreign-key usage's `fk_catalog`, since foreign keys cannot cross databases.
 pub(crate) fn build(
     depth: ObjectDepth,
     catalog: &str,
@@ -780,7 +691,6 @@ pub(crate) fn build(
     );
     let populate_columns = matches!(depth, ObjectDepth::All | ObjectDepth::Columns);
 
-    // catalog_db_schemas: list<db_schema> — one entry (the single catalog).
     let db_schemas_field = field(top_fields, "catalog_db_schemas")?;
     let db_schema_item = list_item(&db_schemas_field)?;
     let db_schema_fields = struct_fields(&db_schema_item)?;
@@ -819,8 +729,6 @@ pub(crate) fn build(
                 let lengths: Vec<usize> = tables.iter().map(|t| t.columns.len()).collect();
                 list_of(col_item, &lengths, column_struct)?
             };
-            // table_constraints: a non-null (possibly empty) list per table at column depth,
-            // otherwise a null list per table (like table_columns).
             let cons_field = field(&table_fields, "table_constraints")?;
             let table_constraints: ArrayRef = if !populate_columns {
                 new_null_array(cons_field.data_type(), tables.len())
@@ -862,8 +770,7 @@ pub(crate) fn build(
     RecordBatch::try_new(out_schema, vec![catalog_name, catalog_db_schemas]).map_err(arrow_err)
 }
 
-/// Build the column struct array, populating the fields we know and leaving the rest of the
-/// `xdbc_*` metadata null (all nullable in the ADBC schema).
+/// Build the column struct array; unknown `xdbc_*` fields are null.
 fn build_column_struct(column_fields: &Fields, columns: &[&Column]) -> Result<ArrayRef> {
     let n = columns.len();
     let arrays: Vec<ArrayRef> = column_fields
@@ -891,9 +798,7 @@ fn build_column_struct(column_fields: &Fields, columns: &[&Column]) -> Result<Ar
     ))
 }
 
-/// Build the constraint struct array: `constraint_name` / `constraint_type` / the key-column list
-/// (`constraint_column_names`) / and, for foreign keys, the referenced columns
-/// (`constraint_column_usage`).
+/// Build the constraint struct array.
 fn build_constraint_struct(
     constraint_fields: &Fields,
     catalog: &str,
@@ -901,7 +806,6 @@ fn build_constraint_struct(
 ) -> Result<ArrayRef> {
     let n = constraints.len();
 
-    // constraint_column_names: one non-null list<utf8> per constraint, its key columns in order.
     let names_field = field(constraint_fields, "constraint_column_names")?;
     let name_item = list_item(&names_field)?;
     let column_child: ArrayRef = Arc::new(StringArray::from_iter(
@@ -913,9 +817,8 @@ fn build_constraint_struct(
     let column_lengths: Vec<usize> = constraints.iter().map(|c| c.columns.len()).collect();
     let constraint_column_names = list_of(name_item, &column_lengths, column_child)?;
 
-    // constraint_column_usage: a list<struct> of the referenced (parent) columns for a FOREIGN KEY,
-    // and SQL NULL (not an empty list) for every other constraint type — matching the ADBC spec and
-    // what the driver validation suite expects for PRIMARY KEY / CHECK / UNIQUE constraints.
+    // The ADBC spec and validation suite expect a NULL usage list for constraints other than
+    // foreign keys.
     let usage_field = field(constraint_fields, "constraint_column_usage")?;
     let usage_item = list_item(&usage_field)?;
     let usage_fields = struct_fields(&usage_item)?;
@@ -936,7 +839,6 @@ fn build_constraint_struct(
     let arrays: Vec<ArrayRef> = constraint_fields
         .iter()
         .map(|f| match f.name().as_str() {
-            // `constraint_name` is the one nullable column here, so it keeps `from_iter`.
             "constraint_name" => Arc::new(StringArray::from_iter(
                 constraints.iter().map(|c| c.name.as_deref()),
             )) as ArrayRef,
@@ -953,9 +855,7 @@ fn build_constraint_struct(
     ))
 }
 
-/// Build the foreign-key `constraint_column_usage` struct array (one entry per referenced column):
-/// `fk_table` / `fk_column_name` from the parent side, `fk_db_schema` the parent schema, and
-/// `fk_catalog` the connection's catalog (a foreign key cannot cross databases).
+/// Build the `constraint_column_usage` struct array, one entry per parent column.
 fn build_usage_struct(usage_fields: &Fields, catalog: &str, usages: &[&Usage]) -> Result<ArrayRef> {
     let n = usages.len();
     let arrays: Vec<ArrayRef> = usage_fields

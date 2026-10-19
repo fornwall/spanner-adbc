@@ -1,5 +1,5 @@
-//! Offline tests for the connection's own surfaces: isolation-level parsing/rendering, the
-//! fixed "current" catalog/schema, and the opaque partition-descriptor envelope.
+//! Offline tests for isolation levels, the fixed current catalog/schema and partition
+//! descriptors.
 
 use adbc_core::error::Status;
 use adbc_core::options::OptionValue;
@@ -22,14 +22,12 @@ fn parses_supported_isolation_levels() {
         parse(ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ).unwrap(),
         IsolationLevel::RepeatableRead
     );
-    // Spanner implements REPEATABLE_READ as snapshot isolation (its proto definition matches
-    // ADBC's `snapshot` almost verbatim), so `snapshot` is a native mapping, not a promotion.
+    // Spanner's REPEATABLE_READ is snapshot isolation.
     assert_eq!(
         parse(ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT).unwrap(),
         IsolationLevel::RepeatableRead
     );
-    // `default` maps to the client's unspecified level: no level is sent, and Spanner reads
-    // that as SERIALIZABLE.
+    // No level is sent; Spanner defaults to SERIALIZABLE.
     assert_eq!(
         parse(ADBC_OPTION_ISOLATION_LEVEL_DEFAULT).unwrap(),
         IsolationLevel::Unspecified
@@ -40,9 +38,6 @@ fn parses_supported_isolation_levels() {
 fn promotes_unsupported_isolation_levels() {
     use adbc_core::constants::*;
     let parse = |s: &str| parse_isolation_level(OptionValue::String(s.to_string()));
-    // Spec levels Spanner does not natively expose are promoted upward to the weakest
-    // supported level that still satisfies their guarantees (never rejected). `snapshot` is
-    // not among them — it maps natively (see `parses_supported_isolation_levels`).
     assert_eq!(
         parse(ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED).unwrap(),
         IsolationLevel::RepeatableRead
@@ -55,12 +50,10 @@ fn promotes_unsupported_isolation_levels() {
         parse(ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE).unwrap(),
         IsolationLevel::Serializable
     );
-    // A completely unknown value is still an invalid argument.
     assert_eq!(
         parse("not-a-level").unwrap_err().status,
         Status::InvalidArguments
     );
-    // A non-string option value is rejected.
     assert_eq!(
         parse_isolation_level(OptionValue::Int(1))
             .unwrap_err()
@@ -89,8 +82,7 @@ fn isolation_level_round_trips_to_adbc_string() {
 #[test]
 fn promoted_isolation_level_round_trips_to_effective_level() {
     use adbc_core::constants::*;
-    // `get_option` reports the effective level that will actually run, not the input that was
-    // set: parse then render must land on a level Spanner exposes.
+    // `get_option` reports the level that will run, not the one that was set.
     let effective = |s: &str| {
         let level = parse_isolation_level(OptionValue::String(s.to_string())).expect("parses");
         isolation_to_adbc_string(&level)
@@ -103,8 +95,6 @@ fn promoted_isolation_level_round_trips_to_effective_level() {
         effective(ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED),
         ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ
     );
-    // `snapshot` reports as `repeatable_read` — the native level it maps onto, which is what
-    // Spanner will run.
     assert_eq!(
         effective(ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT),
         ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ
@@ -124,20 +114,15 @@ fn setting_current_catalog_or_schema_accepts_only_the_reported_value() {
             "adbc-test",
         )
     };
-    // The current catalog is the connection's database, and the current schema the unnamed one:
-    // setting either to the value `get_option` reports is a no-op success.
     assert!(set("adbc-test").is_ok());
     assert!(
         check_fixed_catalog_or_schema(OptionValue::String(String::new()), "current schema", "")
             .is_ok()
     );
-    // Neither is switchable, so any other value is unsupported → NotImplemented (aligned with the
-    // C++ PostgreSQL driver's `set` on this class). The one legal value is named in the error.
     let err = set("foo").unwrap_err();
     assert_eq!(err.status, Status::NotImplemented);
     assert!(err.message.contains("\"foo\""), "{}", err.message);
     assert!(err.message.contains("\"adbc-test\""), "{}", err.message);
-    // A non-string option value is a malformed argument, rejected as InvalidArguments.
     assert_eq!(
         check_fixed_catalog_or_schema(OptionValue::Int(1), "current schema", "")
             .unwrap_err()
@@ -146,10 +131,7 @@ fn setting_current_catalog_or_schema_accepts_only_the_reported_value() {
     );
 }
 
-/// A garbage partition descriptor — `read_partition`'s input is caller-supplied opaque bytes —
-/// must be rejected as `InvalidArguments` by the decode step (before anything executes), never
-/// panic. Covers empty input, non-JSON bytes, truncated JSON, and well-formed JSON that is not
-/// a partition descriptor.
+/// `read_partition` takes caller-supplied bytes, so decoding must reject garbage cleanly.
 #[test]
 fn garbage_partition_descriptors_error_cleanly() {
     let cases: [&[u8]; 6] = [
@@ -158,7 +140,7 @@ fn garbage_partition_descriptors_error_cleanly() {
         b"{",                     // truncated JSON
         b"{}",                    // valid JSON object missing every descriptor field
         br#"{"hello": "world"}"#, // valid JSON object of the wrong shape
-        b"[1, 2, 3]",             // valid JSON that is not even an object
+        b"[1, 2, 3]",             // valid JSON that is not an object
     ];
     for descriptor in cases {
         let error = decode_partition(descriptor).unwrap_err();
@@ -175,8 +157,7 @@ fn garbage_partition_descriptors_error_cleanly() {
     }
 }
 
-/// `encode_partition` writes the versioned envelope, and decode → encode is a byte-for-byte
-/// fixed point.
+/// `encode_partition` writes the versioned envelope, and decode then encode is a fixed point.
 #[test]
 fn partition_descriptor_envelope_round_trips() {
     let descriptor = include_bytes!("../../fuzz/seeds/partition/enveloped-query-descriptor");
@@ -190,7 +171,6 @@ fn partition_descriptor_envelope_round_trips() {
         "envelope carries the partition payload: {value}"
     );
 
-    // The enveloped form is canonical: decode → encode reproduces it exactly.
     let again = decode_partition(&encoded).expect("enveloped descriptor decodes");
     assert_eq!(encode_partition(&again).expect("re-encode"), encoded);
 }
@@ -244,8 +224,7 @@ fn partition_descriptor_preserves_fallback_types_and_reader_precision() {
     assert_eq!(error.status, Status::InvalidArguments);
 }
 
-/// Every partition descriptor must carry a versioned envelope; a bare payload is rejected
-/// before it can be interpreted as an executable partition.
+/// A payload without the versioned envelope is rejected.
 #[test]
 fn bare_partition_descriptor_is_rejected() {
     let bare: &[u8] = br#"{"inner":{"Query":{"sql":"SELECT 1"}}}"#;
@@ -258,8 +237,7 @@ fn bare_partition_descriptor_is_rejected() {
     );
 }
 
-/// An envelope with an unknown version must be rejected up front with a clean
-/// `InvalidArguments` naming the version — not fail on its (unknown-format) payload shape.
+/// An unknown version is rejected on the version, not on the payload shape.
 #[test]
 fn unsupported_partition_descriptor_version_errors_cleanly() {
     for descriptor in [
@@ -275,7 +253,6 @@ fn unsupported_partition_descriptor_version_errors_cleanly() {
             error.message
         );
     }
-    // The version 2 rejection names the version.
     let error = decode_partition(br#"{"v":2,"partition":{}}"#).unwrap_err();
     assert!(
         error
@@ -286,8 +263,7 @@ fn unsupported_partition_descriptor_version_errors_cleanly() {
     );
 }
 
-/// Malformed envelopes — non-integer version, or a supported version with a missing/wrong
-/// payload — are `InvalidArguments`, never a panic.
+/// Non-integer versions and missing or malformed payloads are `InvalidArguments`.
 #[test]
 fn malformed_partition_descriptor_envelopes_error_cleanly() {
     let cases: [&[u8]; 4] = [
@@ -313,18 +289,16 @@ fn malformed_partition_descriptor_envelopes_error_cleanly() {
 
 #[test]
 fn partition_descriptor_round_trips_large_floats() {
-    // Integer literals beyond i64/u64 become f64 values in `_unknown_fields`. Re-encoding
-    // must be byte-stable: serde_json's `float_roundtrip` feature prevents rounding drift
-    // across decode → encode passes, including for unknown request fields.
+    // Integer literals beyond i64/u64 become f64 values in `_unknown_fields`. serde_json's
+    // `float_roundtrip` feature keeps re-encoding them byte-stable.
     let descriptor = br#"{"v": 1, "partition": {"version": 1, "inner": {"Query": {"session":"projects/p/instances/i/databases/d/sessions/s","transaction":{"id":"dHg="},"partitionToken":"dG9rZW4=","sql":"SELECT 1","con[": 44444424444444444249, "/+%n":4444440000000000000000074074764, "/s%n": "prns/s"}}}}"#;
 
     let partition = decode_partition(descriptor).expect("descriptor decodes");
     let first = encode_partition(&partition).expect("a decoded partition re-encodes");
-    // `encode_partition`'s own output must be a byte-stable fixed point under decode → encode.
     let normalized = decode_partition(&first).expect("re-encoded descriptor decodes");
     let again = encode_partition(&normalized).expect("a decoded partition re-encodes");
     assert_eq!(
         first, again,
-        "decode → encode of an encoder's output must be byte-stable"
+        "re-encoding the encoder's output must be byte-stable"
     );
 }
