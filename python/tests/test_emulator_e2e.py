@@ -1,5 +1,7 @@
 """Exercise SQL, Arrow results, ingest and transactions on the configured Spanner target."""
 
+import datetime
+
 import pytest
 
 from conftest import database_options
@@ -50,6 +52,32 @@ def test_ddl_dml_query_roundtrip(spanner_database):
         assert table.column("Active").to_pylist() == [True, False]
     finally:
         conn.close()
+
+
+def test_dbapi_type_objects_match_result_columns(spanner_database):
+    conn = _connect(spanner_database, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT @n AS n, @s AS s, @b AS b, @d AS d, @t AS t",
+                (
+                    1,
+                    "x",
+                    spanner.Binary(b"\x00\xff"),
+                    spanner.Date(2024, 2, 29),
+                    spanner.Timestamp(2024, 2, 29, 12, 30, tzinfo=datetime.timezone.utc),
+                ),
+            )
+            columns = {d[0]: d[1] for d in cur.description}
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    assert columns["n"] == spanner.NUMBER
+    assert columns["s"] == spanner.STRING
+    assert columns["b"] == spanner.BINARY
+    assert columns["d"] == spanner.DATETIME
+    assert columns["t"] == spanner.DATETIME
+    assert row[:4] == (1, "x", b"\x00\xff", spanner.Date(2024, 2, 29))
 
 
 def test_fetch_dataframe(spanner_database):
@@ -177,5 +205,35 @@ def test_manual_commit_and_rollback(spanner_database):
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS n FROM AdbcPyTxn")
             assert cur.fetch_arrow_table().column("n").to_pylist() == [1]
+    finally:
+        conn.close()
+
+
+def test_failed_commit_keeps_buffer_until_rollback(spanner_database):
+    conn = _connect(spanner_database, autocommit=False)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS AdbcPyFailedCommit")
+            cur.execute("CREATE TABLE AdbcPyFailedCommit (Id INT64 NOT NULL) PRIMARY KEY (Id)")
+            cur.execute("INSERT INTO AdbcPyFailedCommit (Id) VALUES (1)")
+        conn.commit()
+
+        with conn.cursor() as cur:
+            # Buffered: the duplicate key is only detected when the commit runs the DML.
+            cur.execute("INSERT INTO AdbcPyFailedCommit (Id) VALUES (1)")
+        with pytest.raises(spanner.Error, match="(?i)exist"):
+            conn.commit()
+        # The failed work stays buffered, as the Python README says.
+        with pytest.raises(spanner.Error, match="(?i)exist"):
+            conn.commit()
+        conn.rollback()
+
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO AdbcPyFailedCommit (Id) VALUES (2)")
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute("SELECT Id FROM AdbcPyFailedCommit ORDER BY Id")
+            assert cur.fetchall() == [(1,), (2,)]
+        conn.rollback()
     finally:
         conn.close()

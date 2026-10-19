@@ -180,6 +180,10 @@ whichever comes first. Mixing the two raises `spanner.ProgrammingError` until yo
 roll back. Queries share a snapshot. DML is buffered until `conn.commit()`, so queries can't see
 buffered writes.
 
+Buffered DML runs at commit, so errors such as a missing table or a duplicate key come from
+`conn.commit()`, not `execute()`. A failed commit keeps the buffered writes and later commits
+fail the same way. Call `conn.rollback()` to discard them.
+
 Leaving a `with spanner.connect(...)` block closes the connection without committing. Call
 `conn.commit()` before the end of the block to keep buffered writes.
 

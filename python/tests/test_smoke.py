@@ -3,6 +3,7 @@
 import spanner_adbc
 import spanner_adbc.dbapi
 import adbc_driver_manager
+import adbc_driver_manager.dbapi
 import pytest
 
 
@@ -27,6 +28,22 @@ def test_dbapi_exposes_connect():
 def test_dbapi_exports_driver_manager_exceptions(name):
     assert getattr(spanner_adbc.dbapi, name) is getattr(adbc_driver_manager, name)
     assert name in spanner_adbc.dbapi.__all__
+
+
+def test_dbapi_module_globals_follow_pep_249():
+    assert spanner_adbc.dbapi.apilevel == "2.0"
+    assert spanner_adbc.dbapi.threadsafety == adbc_driver_manager.dbapi.threadsafety
+    # Spanner rejects `?`, so the driver manager's "qmark" would be wrong.
+    assert spanner_adbc.dbapi.paramstyle == "named"
+    assert spanner_adbc.dbapi.Binary(b"\x00") == b"\x00"
+    for name in (
+        "apilevel", "threadsafety", "paramstyle", "Date", "Time", "Timestamp",
+        "DateFromTicks", "TimeFromTicks", "TimestampFromTicks", "Binary",
+        "STRING", "BINARY", "NUMBER", "DATETIME", "ROWID",
+    ):
+        assert name in spanner_adbc.dbapi.__all__
+        if name not in ("paramstyle", "Binary"):
+            assert getattr(spanner_adbc.dbapi, name) is getattr(adbc_driver_manager.dbapi, name)
 
 
 def test_dbapi_errors_can_be_caught_through_the_driver_module(monkeypatch):

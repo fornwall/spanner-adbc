@@ -27,6 +27,23 @@ from adbc_driver_manager import (
     Warning,
 )
 
+# PEP 249 type objects and constructors. Spanner has no TIME type, so `Time` values can't be bound.
+from adbc_driver_manager.dbapi import (
+    BINARY,
+    DATETIME,
+    NUMBER,
+    ROWID,
+    STRING,
+    Date,
+    DateFromTicks,
+    Time,
+    TimeFromTicks,
+    Timestamp,
+    TimestampFromTicks,
+    apilevel,
+    threadsafety,
+)
+
 from . import (
     ENTRYPOINT,
     ConnectionOptions,
@@ -35,11 +52,34 @@ from . import (
     _driver_path,
 )
 
+# GoogleSQL marks parameters as `@name`; `?` is rejected. A mapping binds by name and a sequence
+# binds in order of first appearance. "named" is the closest PEP 249 style, but its `:name`
+# spelling is not accepted, so code that generates SQL must emit `@name` itself.
+paramstyle = "named"
+
+#: PEP 249 constructor for BYTES values.
+Binary = bytes
+
 __all__ = [
     "connect",
     "DatabaseOptions",
     "ConnectionOptions",
     "StatementOptions",
+    "apilevel",
+    "threadsafety",
+    "paramstyle",
+    "Date",
+    "Time",
+    "Timestamp",
+    "DateFromTicks",
+    "TimeFromTicks",
+    "TimestampFromTicks",
+    "Binary",
+    "STRING",
+    "BINARY",
+    "NUMBER",
+    "DATETIME",
+    "ROWID",
     "Warning",
     "Error",
     "InterfaceError",
