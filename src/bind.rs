@@ -31,8 +31,8 @@ use google_cloud_spanner::types::{self, Type};
 use google_cloud_spanner::value::{ToValue, Value};
 
 use crate::conversion::is_json_field;
-use crate::error::invalid_argument;
-use crate::sql::{named_parameters, qualified_table, quote_ident};
+use crate::error::{annotate, invalid_argument};
+use crate::sql::{has_positional_placeholder, named_parameters, qualified_table, quote_ident};
 
 /// Bind one row using parameter names resolved once for the SQL and batch schema.
 pub(crate) fn bind_params(
@@ -59,11 +59,29 @@ pub(crate) fn bind_params(
 /// Positional binding pairs columns with distinct parameters in query order and requires equal
 /// counts. By-name binding matches case-insensitively, rejecting unknown or duplicate columns;
 /// omitted query parameters remain unbound for Spanner to report.
+///
+/// A failure on SQL written with `?` placeholders says that GoogleSQL needs `@name` parameters.
 pub(crate) fn resolve_parameter_names(
     sql: &str,
     batch: &RecordBatch,
     bind_by_name: bool,
 ) -> Result<Vec<String>> {
+    resolve_names(sql, batch, bind_by_name).map_err(|error| {
+        if has_positional_placeholder(sql) {
+            annotate(error, |message| {
+                format!("{message}; {POSITIONAL_PLACEHOLDER_HINT}")
+            })
+        } else {
+            error
+        }
+    })
+}
+
+/// Appended to a failed parameter resolution when the SQL contains `?`.
+const POSITIONAL_PLACEHOLDER_HINT: &str = "the SQL contains a `?` placeholder, which GoogleSQL \
+     does not support: use named parameters such as `@p1`, `@p2` instead";
+
+fn resolve_names(sql: &str, batch: &RecordBatch, bind_by_name: bool) -> Result<Vec<String>> {
     let schema = batch.schema();
     let params = named_parameters(sql);
 

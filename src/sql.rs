@@ -341,6 +341,12 @@ pub(crate) fn named_parameters(sql: &str) -> Vec<String> {
     params
 }
 
+/// Whether `sql` has a `?` outside literals, quoted identifiers and comments: a positional
+/// placeholder from another SQL dialect, which GoogleSQL doesn't accept.
+pub(crate) fn has_positional_placeholder(sql: &str) -> bool {
+    lex(sql).any(|lexeme| lexeme == Lexeme::Other('?'))
+}
+
 /// Backtick-quote a Spanner identifier, rejecting names backticks cannot safely contain.
 ///
 /// Caller-supplied table, schema and column names reach generated SQL through here. Spanner's

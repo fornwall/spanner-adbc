@@ -2099,11 +2099,7 @@ fn ingest_does_not_bisect_a_non_mutation_limit_error() {
         .execute_update()
         .expect_err("a duplicate-key commit must fail the ingest, not be bisected away");
 
-    assert_eq!(
-        error.status,
-        AdbcStatus::AlreadyExists,
-        "got error: {error}"
-    );
+    assert_eq!(error.status, AdbcStatus::Integrity, "got error: {error}");
     assert!(
         error.message.contains("MockTable"),
         "the append remap should name the target table; got: {}",
@@ -2213,7 +2209,7 @@ fn ingest_append_keeps_the_original_error_when_the_exists_probe_fails() {
     let probes_in_mock = probes.clone();
     let server = MockServer::start(move |mock| {
         serve_begin_transaction(mock);
-        // Neither `AlreadyExists` nor the mutation limit, both of which skip the probe.
+        // Neither a constraint violation nor the mutation limit, both of which skip the probe.
         mock.expect_commit().returning(|_| {
             Err(tonic::Status::invalid_argument(
                 "Invalid value for column c in table MockTable",
@@ -2294,11 +2290,7 @@ fn batch_write_group_failure_forwards_status_details() {
         1,
         "the ingest must have gone through the BatchWrite RPC, not a write-only Commit"
     );
-    assert_eq!(
-        error.status,
-        AdbcStatus::AlreadyExists,
-        "got error: {error}"
-    );
+    assert_eq!(error.status, AdbcStatus::Integrity, "got error: {error}");
     assert_eq!(
         error.vendor_code, 6,
         "vendor_code must carry ALREADY_EXISTS = 6; got error: {error}"
@@ -2363,11 +2355,7 @@ fn batch_write_folds_same_chunk_applied_rows_into_committed_count() {
         .execute_update()
         .expect_err("a failed mutation group must fail the ingest");
 
-    assert_eq!(
-        error.status,
-        AdbcStatus::AlreadyExists,
-        "got error: {error}"
-    );
+    assert_eq!(error.status, AdbcStatus::Integrity, "got error: {error}");
     assert!(
         error.message.contains("MockTable"),
         "the append remap should name the target table; got: {}",

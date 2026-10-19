@@ -59,7 +59,8 @@ stateDiagram-v2
 ```
 
 Mixing queries and writes fails with `InvalidState`, so there is no read-your-writes. Buffered
-DML and ingest return `None` from `execute_update`, and commit doesn't report a row count.
+DML and ingest return `None` from `execute_update` and -1 as the C ABI's `rows_affected` (the
+DBAPI `rowcount`), and commit doesn't report a row count.
 `THEN RETURN` and partitioned DML need autocommit.
 
 A manual read transaction takes its snapshot from the first query's staleness bound, converting

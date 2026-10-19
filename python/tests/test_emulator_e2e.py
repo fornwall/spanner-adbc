@@ -221,10 +221,11 @@ def test_failed_commit_keeps_buffer_until_rollback(spanner_database):
         with conn.cursor() as cur:
             # Buffered: the duplicate key is only detected when the commit runs the DML.
             cur.execute("INSERT INTO AdbcPyFailedCommit (Id) VALUES (1)")
-        with pytest.raises(spanner.Error, match="(?i)exist"):
+            assert cur.rowcount == -1
+        with pytest.raises(spanner.IntegrityError, match="(?i)exist"):
             conn.commit()
         # The failed work stays buffered, as the Python README says.
-        with pytest.raises(spanner.Error, match="(?i)exist"):
+        with pytest.raises(spanner.IntegrityError, match="(?i)exist"):
             conn.commit()
         conn.rollback()
 
@@ -235,5 +236,79 @@ def test_failed_commit_keeps_buffer_until_rollback(spanner_database):
             cur.execute("SELECT Id FROM AdbcPyFailedCommit ORDER BY Id")
             assert cur.fetchall() == [(1,), (2,)]
         conn.rollback()
+    finally:
+        conn.close()
+
+
+def test_rowcount_after_execute(spanner_database):
+    conn = _connect(spanner_database, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS AdbcPyRowcount")
+            assert cur.rowcount == -1
+            cur.execute(
+                "CREATE TABLE AdbcPyRowcount (Id INT64 NOT NULL, V STRING(MAX)) PRIMARY KEY (Id)"
+            )
+            cur.execute("INSERT INTO AdbcPyRowcount (Id, V) VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            assert cur.rowcount == 3
+            cur.execute(
+                "UPDATE AdbcPyRowcount SET V = 'x' WHERE Id < 3; "
+                "DELETE FROM AdbcPyRowcount WHERE Id = 3"
+            )
+            assert cur.rowcount == 3
+            cur.execute("UPDATE AdbcPyRowcount SET V = 'y' WHERE TRUE THEN RETURN Id")
+            assert cur.rowcount == 2
+            assert sorted(cur.fetch_arrow_table().column("Id").to_pylist()) == [1, 2]
+            cur.execute("SELECT Id FROM AdbcPyRowcount")
+            assert cur.rowcount == -1
+            cur.fetchall()
+        with conn.cursor() as cur:
+            cur.adbc_statement.set_options(**{StatementOptions.DML_PARTITIONED.value: "true"})
+            cur.execute("UPDATE AdbcPyRowcount SET V = 'p' WHERE TRUE")
+            assert cur.rowcount == 2
+    finally:
+        conn.close()
+
+    conn = _connect(spanner_database, autocommit=False)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM AdbcPyRowcount WHERE TRUE")
+            # Buffered DML runs at commit, so its count is unknown.
+            assert cur.rowcount == -1
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_constraint_violations_raise_integrity_error(spanner_database):
+    conn = _connect(spanner_database, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS AdbcPyIntegrity")
+            cur.execute(
+                "CREATE TABLE AdbcPyIntegrity (Id INT64 NOT NULL, Name STRING(MAX) NOT NULL) "
+                "PRIMARY KEY (Id)"
+            )
+            cur.execute("INSERT INTO AdbcPyIntegrity (Id, Name) VALUES (1, 'a')")
+            with pytest.raises(spanner.IntegrityError):
+                cur.execute("INSERT INTO AdbcPyIntegrity (Id, Name) VALUES (1, 'b')")
+            with pytest.raises(spanner.IntegrityError):
+                cur.execute("INSERT INTO AdbcPyIntegrity (Id, Name) VALUES (2, NULL)")
+            with pytest.raises(spanner.IntegrityError):
+                cur.adbc_ingest(
+                    "AdbcPyIntegrity",
+                    pa.table({"Id": pa.array([1], pa.int64()), "Name": ["c"]}),
+                    mode="append",
+                )
+    finally:
+        conn.close()
+
+
+def test_question_mark_placeholder_error_names_the_fix(spanner_database):
+    conn = _connect(spanner_database, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            with pytest.raises(spanner.ProgrammingError, match="@p1"):
+                cur.execute("SELECT ? AS x", (1,))
     finally:
         conn.close()

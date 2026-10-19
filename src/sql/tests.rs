@@ -498,6 +498,28 @@ fn extracts_named_parameters() {
 }
 
 #[test]
+fn detects_positional_placeholders_outside_literals_and_comments() {
+    for sql in [
+        "SELECT * FROM t WHERE id = ?",
+        "INSERT INTO t (a, b) VALUES (?,?)",
+        "SELECT '?', ? -- ?",
+        "UPDATE t SET a = @a WHERE b = ?;",
+    ] {
+        assert!(has_positional_placeholder(sql), "{sql}");
+    }
+    for sql in [
+        "SELECT * FROM t WHERE id = @id",
+        "SELECT '?', \"?\", r'?', b'?', '''?''', `?` FROM t",
+        "SELECT 1 -- ?\n",
+        "SELECT 1 # ?",
+        "SELECT /* ? */ 1",
+        "",
+    ] {
+        assert!(!has_positional_placeholder(sql), "{sql}");
+    }
+}
+
+#[test]
 fn named_parameters_skip_raw_and_triple_quoted_strings() {
     // `r'\'` is unterminated, so `@p` is inside the literal.
     assert_eq!(named_parameters(r"SELECT r'\', @p"), Vec::<String>::new());

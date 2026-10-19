@@ -224,20 +224,21 @@ pub(super) unsafe extern "C" fn statement_execute_query(
 ) -> AdbcStatusCode {
     unsafe {
         with_state(statement, error, |state| {
-            // A null `out` asks for an update without results, the only path that can report a
-            // row count.
+            // A null `out` asks for an update without results.
             if out.is_null() {
                 let affected = state.execute_update()?.unwrap_or(-1);
                 write_rows_affected(rows_affected, affected);
                 return Ok(());
             }
-            // The row count of a stream is unknown; -1 also overwrites any previous count.
-            let reader = state.execute()?;
+            // DML and ingest report their count with a stream too, since the Python DBAPI runs
+            // every `execute` this way. Queries, DDL and buffered writes report -1 (unknown),
+            // which also overwrites any previous count.
+            let (reader, affected) = state.execute_counted()?;
             std::ptr::write_unaligned(
                 out,
                 super::stream::export_reader(reader, driver_of(statement)),
             );
-            write_rows_affected(rows_affected, -1);
+            write_rows_affected(rows_affected, affected.unwrap_or(-1));
             Ok(())
         })
     }

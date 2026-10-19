@@ -451,6 +451,11 @@ struct MockStatement {
 
 impl MockStatement {
     fn start() -> Self {
+        Self::start_with(|_| {})
+    }
+
+    /// `script` adds expectations after the one serving sessions.
+    fn start_with(script: impl FnOnce(&mut spanner_grpc_mock::MockSpanner)) -> Self {
         use spanner_grpc_mock::MockSpanner;
         use spanner_grpc_mock::google::spanner::v1;
 
@@ -465,6 +470,7 @@ impl MockStatement {
                 ..Default::default()
             }))
         });
+        script(&mut mock);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -600,4 +606,144 @@ fn binding_an_array_that_disagrees_with_its_schema_keeps_the_statement_usable() 
         unsafe { statement_set_sql_query(s, query.as_ptr(), null()) },
         ADBC_STATUS_OK
     );
+}
+
+/// Serves batch DML reporting one affected row per statement, commits, and queries returning one
+/// row.
+fn serve_dml_and_queries(mock: &mut spanner_grpc_mock::MockSpanner) {
+    use spanner_grpc_mock::google::spanner::v1;
+
+    mock.expect_execute_batch_dml().returning(|request| {
+        let request = request.into_inner();
+        let inline_begin = matches!(
+            request
+                .transaction
+                .as_ref()
+                .and_then(|t| t.selector.as_ref()),
+            Some(v1::transaction_selector::Selector::Begin(_))
+        );
+        let result_sets = (0..request.statements.len())
+            .map(|i| v1::ResultSet {
+                metadata: Some(v1::ResultSetMetadata {
+                    transaction: (i == 0 && inline_begin).then(|| v1::Transaction {
+                        id: b"rw-txn".to_vec(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                stats: Some(v1::ResultSetStats {
+                    row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .collect();
+        Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
+            result_sets,
+            ..Default::default()
+        }))
+    });
+    mock.expect_commit()
+        .returning(|_| Ok(tonic::Response::new(v1::CommitResponse::default())));
+    mock.expect_execute_streaming_sql().returning(|_| {
+        let row = v1::PartialResultSet {
+            metadata: Some(v1::ResultSetMetadata {
+                row_type: Some(v1::StructType {
+                    fields: vec![v1::struct_type::Field {
+                        name: "c".into(),
+                        r#type: Some(v1::Type {
+                            code: v1::TypeCode::String as i32,
+                            ..Default::default()
+                        }),
+                    }],
+                }),
+                ..Default::default()
+            }),
+            values: vec![prost_types::Value {
+                kind: Some(prost_types::value::Kind::StringValue("v".into())),
+            }],
+            last: true,
+            ..Default::default()
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(Ok(row)).unwrap();
+        Ok(tonic::Response::new(rx))
+    });
+}
+
+/// Run `sql` through `AdbcStatementExecuteQuery`, with a result stream unless `stream` is false.
+/// Returns `rows_affected`, which starts at a sentinel so a missing write shows, and the rows read.
+fn execute_query(statement: *mut AdbcStatement, sql: &str, stream: bool) -> (i64, usize) {
+    use arrow_array::ffi_stream::RecordBatchStreamReader;
+
+    use crate::ffi::test_support::{error_message, zeroed_error};
+
+    let query = key(sql);
+    assert_eq!(
+        unsafe { statement_set_sql_query(statement, query.as_ptr(), null()) },
+        ADBC_STATUS_OK
+    );
+    let mut out = FFI_ArrowArrayStream::empty();
+    let out_ptr = if stream { &raw mut out } else { null() };
+    let mut rows_affected = 42_i64;
+    let mut error = zeroed_error();
+    assert_eq!(
+        unsafe {
+            statement_execute_query(statement, out_ptr, &raw mut rows_affected, &raw mut error)
+        },
+        ADBC_STATUS_OK,
+        "{sql}: {:?}",
+        error_message(&error)
+    );
+    if !stream {
+        return (rows_affected, 0);
+    }
+    let rows = RecordBatchStreamReader::try_new(out)
+        .unwrap()
+        .map(|batch| batch.unwrap().num_rows())
+        .sum();
+    (rows_affected, rows)
+}
+
+/// The Python DBAPI runs every `execute` through `AdbcStatementExecuteQuery` with a result stream,
+/// so DML must report its affected-row count there too, for `cursor.rowcount`.
+#[test]
+fn execute_query_reports_the_dml_row_count_with_or_without_a_stream() {
+    let mut mock = MockStatement::start_with(serve_dml_and_queries);
+    let s = &raw mut mock.statement;
+    let update = "UPDATE t SET c = 'x' WHERE TRUE";
+    let batch = "UPDATE t SET c = 'x' WHERE TRUE; DELETE FROM t WHERE TRUE";
+    for stream in [true, false] {
+        assert_eq!(execute_query(s, update, stream), (1, 0), "stream: {stream}");
+        assert_eq!(execute_query(s, batch, stream), (2, 0), "stream: {stream}");
+        // A query's row count is unknown; -1 overwrites the sentinel.
+        let rows = usize::from(stream);
+        assert_eq!(
+            execute_query(s, "SELECT c FROM t", stream),
+            (-1, rows),
+            "stream: {stream}"
+        );
+    }
+
+    // Buffered DML has not run yet, so its count is unknown until commit.
+    let autocommit = key("adbc.connection.autocommit");
+    let disabled = key("false");
+    assert_eq!(
+        unsafe {
+            set_option_string(
+                &raw mut mock.connection,
+                autocommit.as_ptr(),
+                disabled.as_ptr(),
+                null(),
+            )
+        },
+        ADBC_STATUS_OK
+    );
+    for stream in [true, false] {
+        assert_eq!(
+            execute_query(s, update, stream),
+            (-1, 0),
+            "stream: {stream}"
+        );
+    }
 }

@@ -3,10 +3,7 @@ use super::*;
 #[test]
 fn maps_grpc_codes_to_adbc_status() {
     assert_eq!(status_for_grpc_code(Code::NotFound), Status::NotFound);
-    assert_eq!(
-        status_for_grpc_code(Code::AlreadyExists),
-        Status::AlreadyExists
-    );
+    assert_eq!(status_for_grpc_code(Code::AlreadyExists), Status::Integrity);
     assert_eq!(
         status_for_grpc_code(Code::Unauthenticated),
         Status::Unauthenticated
@@ -43,7 +40,7 @@ fn maps_grpc_codes_to_adbc_status() {
 fn from_status_parts_maps_numeric_codes_like_from_spanner() {
     // Ingest error handling relies on BatchWrite failures matching the write-only path.
     let adbc = from_status_parts(Code::AlreadyExists as i32, "Row already exists", &[]);
-    assert_eq!(adbc.status, Status::AlreadyExists);
+    assert_eq!(adbc.status, Status::Integrity);
     assert_eq!(adbc.vendor_code, 6);
     assert!(adbc.message.contains("Row already exists"));
     assert_eq!(adbc.details, None);
@@ -58,6 +55,143 @@ fn from_status_parts_maps_numeric_codes_like_from_spanner() {
     let internal = from_status_parts(13, "boom", &[]);
     assert_eq!(internal.status, Status::Internal);
     assert_eq!(internal.vendor_code, 13);
+}
+
+/// Constraint violations as Spanner (Omni) and the emulator report them.
+const CONSTRAINT_VIOLATIONS: &[(Code, &str)] = &[
+    // Spanner.
+    (Code::AlreadyExists, "Row [1] in table P already exists"),
+    (
+        Code::AlreadyExists,
+        "Unique index violation on index PByName at index key [a,1]. It conflicts with row [1] in \
+         table P.",
+    ),
+    (
+        Code::FailedPrecondition,
+        "Name must not be NULL in table P.",
+    ),
+    (
+        Code::FailedPrecondition,
+        "A new row in table P does not specify a non-null value for these NOT NULL columns: Name.",
+    ),
+    (
+        Code::FailedPrecondition,
+        "Adding a NOT NULL constraint on a column D.V is not allowed because it has a NULL value \
+         at key: [3]",
+    ),
+    (
+        Code::FailedPrecondition,
+        "Foreign key constraint `FkP` is violated on table `C`. Cannot find referenced values in \
+         P(Id).",
+    ),
+    (
+        Code::FailedPrecondition,
+        "Foreign key constraint violation when deleting or updating referenced row(s): \
+         referencing row(s) found in table `C`.",
+    ),
+    (
+        Code::FailedPrecondition,
+        "Found uniqueness violation: [x,1] [x,2].",
+    ),
+    (
+        Code::OutOfRange,
+        "Check constraint `P`.`CkAge` is violated for key (5)",
+    ),
+    (
+        Code::NotFound,
+        "Parent row for row [99,1] in table I is missing. Row cannot be written.",
+    ),
+    // The emulator.
+    (
+        Code::AlreadyExists,
+        "Failed to insert row with primary key ({pk#Id:1}) due to previously existing row",
+    ),
+    (
+        Code::AlreadyExists,
+        "Table P: Row {Int64(1)} already exists.",
+    ),
+    (
+        Code::AlreadyExists,
+        "UNIQUE violation on index PByName,  duplicate key: {String(\"a\")} in this transaction.",
+    ),
+    (
+        Code::FailedPrecondition,
+        "Cannot specify a null value for column: P.Name in table: P",
+    ),
+    (
+        Code::FailedPrecondition,
+        "A new row in table P does not specify a non-null value for NOT NULL column: Name",
+    ),
+    (
+        Code::FailedPrecondition,
+        "Foreign key `FkP` constraint violation on table `C`. Cannot find referenced key \
+         `{Int64(99)}` in table `P`.",
+    ),
+    (
+        Code::FailedPrecondition,
+        "Found uniqueness violation on index DByV,  duplicate key: {String(\"x\")}",
+    ),
+    (
+        Code::OutOfRange,
+        "Check constraint `P`.`CkAge` is violated for key {Int64(5)}",
+    ),
+    (
+        Code::NotFound,
+        "Insert failed because key was not found in parent table:  Parent Table: P  Child \
+         Table: I  Key: {Int64(99)}",
+    ),
+];
+
+#[test]
+fn constraint_violations_map_to_integrity() {
+    use google_cloud_gax::error::Error as GaxError;
+    use google_cloud_gax::error::rpc::Status as RpcStatus;
+
+    for &(code, message) in CONSTRAINT_VIOLATIONS {
+        let adbc = from_spanner(GaxError::service(
+            RpcStatus::default().set_code(code).set_message(message),
+        ));
+        assert_eq!(adbc.status, Status::Integrity, "{code:?}: {message}");
+        assert_eq!(adbc.vendor_code, code as i32);
+        assert!(adbc.message.contains(message), "{}", adbc.message);
+        // Ingest through BatchWrite reports its failures as status parts.
+        let batch_write = from_status_parts(code as i32, message, &[]);
+        assert_eq!(batch_write.status, Status::Integrity, "{code:?}: {message}");
+    }
+}
+
+#[test]
+fn unrelated_errors_with_constraint_codes_keep_their_status() {
+    for (code, message, status) in [
+        (
+            Code::FailedPrecondition,
+            "Duplicate name in schema: P.",
+            Status::InvalidState,
+        ),
+        (
+            Code::FailedPrecondition,
+            "Cannot start a read-write transaction in a read-only session",
+            Status::InvalidState,
+        ),
+        (Code::NotFound, "Table not found: Missing", Status::NotFound),
+        (
+            Code::NotFound,
+            "Column not found in table P: Nope",
+            Status::NotFound,
+        ),
+        (
+            Code::OutOfRange,
+            "Integer overflow in addition",
+            Status::InvalidData,
+        ),
+        (
+            Code::InvalidArgument,
+            "Foreign key `FkP` constraint violation on table `C`",
+            Status::InvalidArguments,
+        ),
+    ] {
+        assert_eq!(status_for_rpc(code, message), status, "{code:?}: {message}");
+    }
 }
 
 #[test]
@@ -325,7 +459,7 @@ fn from_status_parts_forwards_status_details_like_from_spanner() {
             })),
         ],
     );
-    assert_eq!(adbc.status, Status::AlreadyExists);
+    assert_eq!(adbc.status, Status::Integrity);
     assert_eq!(adbc.vendor_code, 6);
 
     let details = adbc

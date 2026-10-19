@@ -63,6 +63,10 @@ Both execution methods accept queries, DML, DDL and bulk ingest:
 | DDL | Empty result stream | `None` |
 | Bulk ingest | Empty result stream | Ingested-row count in autocommit; `None` when buffered. |
 
+Through the C ABI, `AdbcStatementExecuteQuery` sets `rows_affected` to the `execute_update()`
+count, or -1 for `None`, whether or not the caller requests a result stream. The Python DBAPI
+requests one for every `execute`, so `cursor.rowcount` reports DML counts too.
+
 [sql.rs](../src/sql.rs) classifies and splits SQL. A `;`-separated DML batch must contain only
 DML and runs atomically through `ExecuteBatchDml`. DDL goes through the Database Admin API.
 DML with `THEN RETURN` needs autocommit and can't be part of a batch.
@@ -170,6 +174,12 @@ idle handle succeeds; the driver doesn't track whether an operation is running.
 [error.rs](../src/error.rs) maps gRPC failures to ADBC status codes and keeps the structured
 error details. For example, `PERMISSION_DENIED` becomes `Unauthorized`, `FAILED_PRECONDITION`
 becomes `InvalidState` and `DEADLINE_EXCEEDED` becomes `Timeout`.
+
+Constraint violations become `Integrity`, which Python raises as `IntegrityError`. Spanner reports
+a duplicate primary or unique index key as `ALREADY_EXISTS`. NOT NULL, foreign key, CHECK and
+missing parent row violations share their codes with unrelated errors, so the driver recognizes
+them by message. Bulk ingest returns `AlreadyExists` only for a table that exists or doesn't match
+the bound schema, as ADBC requires.
 
 Rust callers and C ABI 1.0.0 callers get the numeric gRPC code in `vendor_code`. ADBC 1.1.0
 reserves that field, so C ABI 1.1.0 callers get the code as the error detail

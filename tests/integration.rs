@@ -1578,7 +1578,7 @@ fn ingest_create_append_mode_creates_then_appends() {
 }
 
 /// Append ingest respects a table's user-defined primary key: duplicate keys fail with
-/// `AlreadyExists`. Keys are declared in DDL; `spanner.ingest.primary_key` is unsupported.
+/// `Integrity`. Keys are declared in DDL; `spanner.ingest.primary_key` is unsupported.
 #[test]
 fn ingest_appends_into_a_user_keyed_table() {
     let Some(mut fx) = fixture() else {
@@ -1601,8 +1601,8 @@ fn ingest_appends_into_a_user_keyed_table() {
     let dup_err = keyed_ingest(connection).expect_err("appending duplicate primary keys must fail");
     assert_eq!(
         dup_err.status,
-        adbc_core::error::Status::AlreadyExists,
-        "duplicate primary key must be AlreadyExists, got: {dup_err:?}"
+        adbc_core::error::Status::Integrity,
+        "duplicate primary key must be Integrity, got: {dup_err:?}"
     );
     drop_tables(connection, &["AdbcIngestPk"]);
     let mut gone = connection.new_statement().expect("new statement");
@@ -1616,6 +1616,106 @@ fn ingest_appends_into_a_user_keyed_table() {
         gone_err.status,
         adbc_core::error::Status::NotImplemented,
         "an unsupported option must report NotImplemented, got: {gone_err:?}"
+    );
+}
+
+/// Constraint violations are `Integrity` errors from DML, a manual commit and ingest. Spanner
+/// reports most of them with codes it also uses for unrelated failures, so this checks the
+/// driver's message matching against the backend's wording.
+#[test]
+fn constraint_violations_are_integrity_errors() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
+
+    run(
+        connection,
+        "DROP TABLE IF EXISTS AdbcIntegrityChild; \
+         DROP TABLE IF EXISTS AdbcIntegrityRef; \
+         DROP INDEX IF EXISTS AdbcIntegrityByName; \
+         DROP TABLE IF EXISTS AdbcIntegrity",
+    );
+    run(
+        connection,
+        "CREATE TABLE AdbcIntegrity (Id INT64 NOT NULL, Name STRING(MAX) NOT NULL, Age INT64, \
+         CONSTRAINT AdbcIntegrityAge CHECK (Age >= 0)) PRIMARY KEY (Id); \
+         CREATE UNIQUE INDEX AdbcIntegrityByName ON AdbcIntegrity (Name); \
+         CREATE TABLE AdbcIntegrityRef (Id INT64 NOT NULL, ParentId INT64, \
+         CONSTRAINT AdbcIntegrityFk FOREIGN KEY (ParentId) REFERENCES AdbcIntegrity (Id)) \
+         PRIMARY KEY (Id); \
+         CREATE TABLE AdbcIntegrityChild (Id INT64 NOT NULL, Sub INT64 NOT NULL) \
+         PRIMARY KEY (Id, Sub), INTERLEAVE IN PARENT AdbcIntegrity ON DELETE CASCADE",
+    );
+    run(
+        connection,
+        "INSERT INTO AdbcIntegrity (Id, Name, Age) VALUES (1, 'a', 1)",
+    );
+    run(
+        connection,
+        "INSERT INTO AdbcIntegrityRef (Id, ParentId) VALUES (1, 1)",
+    );
+
+    for sql in [
+        "INSERT INTO AdbcIntegrity (Id, Name, Age) VALUES (1, 'b', 1)",
+        "INSERT INTO AdbcIntegrity (Id, Name, Age) VALUES (2, 'a', 1)",
+        "INSERT INTO AdbcIntegrity (Id, Name, Age) VALUES (3, NULL, 1)",
+        "INSERT INTO AdbcIntegrity (Id, Age) VALUES (4, 1)",
+        "UPDATE AdbcIntegrity SET Name = NULL WHERE Id = 1",
+        "INSERT INTO AdbcIntegrity (Id, Name, Age) VALUES (5, 'c', -1)",
+        "INSERT INTO AdbcIntegrityRef (Id, ParentId) VALUES (2, 99)",
+        "DELETE FROM AdbcIntegrity WHERE Id = 1",
+        "INSERT INTO AdbcIntegrityChild (Id, Sub) VALUES (99, 1)",
+    ] {
+        let mut statement = connection.new_statement().expect("new statement");
+        statement.set_sql_query(sql).unwrap();
+        let error = statement.execute_update().expect_err(sql);
+        assert_eq!(error.status, Status::Integrity, "{sql}: {error}");
+    }
+
+    let autocommit = |connection: &mut SpannerConnection, enabled: &str| {
+        connection
+            .set_option(
+                OptionConnection::AutoCommit,
+                OptionValue::String(enabled.into()),
+            )
+            .expect("set autocommit");
+    };
+    autocommit(connection, "false");
+    run(
+        connection,
+        "INSERT INTO AdbcIntegrity (Id, Name, Age) VALUES (1, 'd', 1)",
+    );
+    let error = connection
+        .commit()
+        .expect_err("the buffered duplicate key fails at commit");
+    assert_eq!(error.status, Status::Integrity, "{error}");
+    connection.rollback().unwrap();
+    autocommit(connection, "true");
+
+    let rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("Id", DataType::Int64, false),
+            Field::new("Name", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![6])),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+        ],
+    )
+    .unwrap();
+    let mut ingest = ingest_stmt(connection, "AdbcIntegrity", "append");
+    ingest.bind(rows).unwrap();
+    let error = ingest
+        .execute_update()
+        .expect_err("a NULL in a NOT NULL column fails the ingest");
+    assert_eq!(error.status, Status::Integrity, "{error}");
+    assert!(error.message.contains("AdbcIntegrity"), "{error}");
+
+    run(connection, "DROP INDEX AdbcIntegrityByName");
+    drop_tables(
+        connection,
+        &["AdbcIntegrityChild", "AdbcIntegrityRef", "AdbcIntegrity"],
     );
 }
 
@@ -2496,7 +2596,7 @@ fn bulk_ingest_chunks_past_the_byte_budget() {
 }
 
 /// `spanner.ingest.batch_write` ingests through the BatchWrite RPC with the same row count and
-/// `AlreadyExists` mapping as the transactional path.
+/// `Integrity` mapping as the transactional path.
 #[test]
 fn bulk_ingest_via_batch_write() {
     let Some(mut fx) = fixture() else {
@@ -2602,10 +2702,10 @@ fn bulk_ingest_via_batch_write() {
     let error = dup
         .execute_update()
         .expect_err("a duplicate primary key must fail the BatchWrite ingest");
-    assert_eq!(error.status, Status::AlreadyExists);
+    assert_eq!(error.status, Status::Integrity, "{error}");
     assert!(
         error.message.contains("AdbcBatchWrite"),
-        "the AlreadyExists error should name the target table: {error}"
+        "the Integrity error should name the target table: {error}"
     );
 
     drop_tables(connection, &["AdbcBatchWrite"]);
@@ -3044,8 +3144,8 @@ fn bulk_ingest_edge_cases() {
         .expect_err("duplicate-PK ingest must fail");
     assert_eq!(
         error.status,
-        adbc_core::error::Status::AlreadyExists,
-        "a duplicate primary key must surface as AlreadyExists, got: {error:?}"
+        adbc_core::error::Status::Integrity,
+        "a duplicate primary key must surface as Integrity, got: {error:?}"
     );
     assert!(
         error.message.contains("AdbcEdge"),
@@ -3385,8 +3485,8 @@ fn bulk_ingest_mid_chunk_failure_reports_committed_rows() {
 
     assert_eq!(
         error.status,
-        adbc_core::error::Status::AlreadyExists,
-        "a duplicate key in a later chunk must be AlreadyExists, got: {error:?}"
+        adbc_core::error::Status::Integrity,
+        "a duplicate key in a later chunk must be Integrity, got: {error:?}"
     );
     assert!(
         error.message.contains("AdbcMidFail"),
@@ -5523,7 +5623,7 @@ fn dml_then_return_round_trip() {
     let Err(error) = bound.execute() else {
         panic!("duplicate second row must fail");
     };
-    assert_eq!(error.status, Status::AlreadyExists, "{error}");
+    assert_eq!(error.status, Status::Integrity, "{error}");
     assert_eq!(count_rows(connection, "AdbcReturn"), 4);
 
     connection

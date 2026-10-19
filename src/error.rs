@@ -69,8 +69,9 @@ pub(crate) fn chain<'a>(
 /// Translate a Spanner client error into an ADBC error.
 ///
 /// A gRPC status maps to the closest [`Status`], and its numeric code is kept in `vendor_code` so
-/// callers can tell apart codes that share a status (for example `ABORTED` = 10). Errors without
-/// a status have `vendor_code` 0 and become [`Status::Unauthenticated`] for credential failures,
+/// callers can tell apart codes that share a status (for example `ABORTED` = 10). A duplicate key
+/// and other constraint violations become [`Status::Integrity`]. Errors without a status have
+/// `vendor_code` 0 and become [`Status::Unauthenticated`] for credential failures,
 /// [`Status::Timeout`] for client deadlines and [`Status::Internal`] otherwise. The C ABI's 1.1.0
 /// error layout reserves `vendor_code`, so `src/ffi/error.rs` passes a non-zero code there as the
 /// detail `adbc.spanner.vendor_code` instead.
@@ -108,7 +109,7 @@ pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
         (without_status, 0, None, None),
         |status| {
             (
-                status_for_grpc_code(status.code),
+                status_for_rpc(status.code, &status.message),
                 status.code as i32,
                 details_for_adbc(&status.details),
                 Some(status.code),
@@ -153,7 +154,7 @@ fn map_detail(detail: &StatusDetails) -> Option<(String, Vec<u8>)> {
 /// Build an ADBC error from a `google.rpc.Status` embedded in a `BatchWriteResponse`, matching
 /// [`from_spanner`] so bulk-ingest error handling is the same for both ingest paths.
 pub(crate) fn from_status_parts(code: i32, message: &str, details: &[Any]) -> Error {
-    let status = status_for_grpc_code(Code::from(code));
+    let status = status_for_rpc(Code::from(code), message);
     let mut full = format!("Spanner batch-write error: {message}");
     if Code::from(code) == Code::PermissionDenied {
         full.push_str(PERMISSION_DENIED_GUIDANCE);
@@ -170,20 +171,56 @@ pub(crate) fn from_builder<E: std::fmt::Display>(error: E) -> Error {
     err(format!("Spanner error: {error}"), Status::Internal)
 }
 
+/// Map a gRPC status to an ADBC [`Status`]: [`Status::Integrity`] for a violated data constraint,
+/// otherwise by code alone.
+fn status_for_rpc(code: Code, message: &str) -> Status {
+    if violates_constraint(code, message) {
+        Status::Integrity
+    } else {
+        status_for_grpc_code(code)
+    }
+}
+
+/// Whether an error with a code that Spanner also uses for unrelated failures reports a violated
+/// NOT NULL, foreign key, unique index, CHECK or interleaving constraint. Only the message tells
+/// them apart, so match the wording of both Spanner (as Omni reports it) and the emulator,
+/// ignoring case. The unit tests list both.
+fn violates_constraint(code: Code, message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    let has = |needle: &str| message.contains(needle);
+    match code {
+        Code::FailedPrecondition => {
+            // NOT NULL, including DDL that adds it over existing NULLs.
+            has("must not be null")
+                || has("non-null value for")
+                || has("null value for column")
+                || has("has a null value")
+                || (has("foreign key") && has("violat"))
+                // DDL that adds a unique index over existing duplicates.
+                || has("uniqueness violation")
+        }
+        Code::OutOfRange => has("check constraint") && has("violated"),
+        // An interleaved row whose parent row is missing.
+        Code::NotFound => (has("parent row") && has("missing")) || has("not found in parent table"),
+        _ => false,
+    }
+}
+
 /// Map a gRPC status [`Code`] to the closest ADBC [`Status`], or `Internal` when none fits.
 fn status_for_grpc_code(code: Code) -> Status {
     match code {
         Code::NotFound => Status::NotFound,
-        Code::AlreadyExists => Status::AlreadyExists,
+        // Spanner returns this only for a duplicate primary or unique index key. An existing
+        // schema object is FAILED_PRECONDITION ("Duplicate name in schema"); the ingest create
+        // path remaps that to AlreadyExists.
+        Code::AlreadyExists => Status::Integrity,
         Code::Unauthenticated => Status::Unauthenticated,
         Code::PermissionDenied => Status::Unauthorized,
         Code::InvalidArgument => Status::InvalidArguments,
         // Spanner raises this for bad values during execution, such as numeric overflow, which
         // matches adbc.h's InvalidData and the PostgreSQL driver's SQLSTATE class 22 mapping.
         Code::OutOfRange => Status::InvalidData,
-        // Not Integrity: Spanner uses this code for constraint violations but also for plain
-        // wrong-state failures, and only the message text tells them apart. Callers that need the
-        // distinction have `vendor_code` and the `PreconditionFailure` detail.
+        // Also used for constraint violations, which `violates_constraint` recognizes.
         Code::FailedPrecondition => Status::InvalidState,
         Code::DeadlineExceeded => Status::Timeout,
         Code::Cancelled => Status::Cancelled,

@@ -958,6 +958,53 @@ mod manual_txn {
         statement
     }
 
+    /// Run `statement` through `execute_counted`, returning the rows read and the count.
+    fn counted(mut statement: SpannerStatement) -> (usize, Option<i64>) {
+        let (reader, count) = statement.execute_counted().unwrap();
+        (reader.map(|batch| batch.unwrap().num_rows()).sum(), count)
+    }
+
+    fn sql_statement(connection: &mut SpannerConnection, sql: &str) -> SpannerStatement {
+        let mut statement = connection.new_statement().unwrap();
+        statement.set_sql_query(sql).unwrap();
+        statement
+    }
+
+    /// `execute` knows the count of the writes it ran, as `execute_update` reports it, so the C
+    /// ABI can return it alongside a result stream. Queries and buffered writes have none.
+    #[test]
+    fn execute_counts_the_rows_of_writes_that_ran() {
+        let server = start();
+        let mut connection = connect(&server);
+        for (sql, expected) in [
+            ("UPDATE t SET c = 'x' WHERE TRUE", (0, Some(1))),
+            (
+                "UPDATE t SET c = 'x' WHERE TRUE; DELETE FROM t WHERE TRUE",
+                (0, Some(2)),
+            ),
+            ("INSERT INTO t (c) VALUES ('v') THEN RETURN c", (1, Some(1))),
+            ("SELECT c FROM t", (1, None)),
+        ] {
+            assert_eq!(
+                counted(sql_statement(&mut connection, sql)),
+                expected,
+                "{sql}"
+            );
+        }
+        assert_eq!(counted(ingest(&mut connection, 3)), (0, Some(3)));
+
+        let mut connection = manual(&server);
+        assert_eq!(
+            counted(sql_statement(
+                &mut connection,
+                "UPDATE t SET c = 'x' WHERE TRUE"
+            )),
+            (0, None)
+        );
+        assert_eq!(counted(ingest(&mut connection, 3)), (0, None));
+        connection.commit().unwrap();
+    }
+
     /// A failed first query begins nothing, so it must not poison the manual transaction: with
     /// an inline begin the client marks the unstarted transaction permanently failed.
     #[test]

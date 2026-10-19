@@ -601,6 +601,33 @@ fn positional_binding_rejects_count_mismatch() {
         "unexpected error: {}",
         err.message
     );
+    assert!(!err.message.contains('?'), "{}", err.message);
+}
+
+#[test]
+fn a_failed_resolution_of_question_mark_sql_points_to_named_parameters() {
+    let b = int_batch(&["x"]);
+    for (sql, columns, by_name) in [
+        ("SELECT * FROM t WHERE id = ?", &["x"][..], false),
+        ("INSERT INTO t (a, b) VALUES (@a, ?)", &["x", "y"], false),
+        ("SELECT * FROM t WHERE id = ?", &["x"], true),
+    ] {
+        let err = resolve_parameter_names(sql, &int_batch(columns), by_name).unwrap_err();
+        assert_eq!(err.status, Status::InvalidArguments);
+        assert!(
+            err.message.contains("`?` placeholder") && err.message.contains("`@p1`"),
+            "{sql}: {}",
+            err.message
+        );
+    }
+    // A `?` in a literal or comment is not a placeholder.
+    let err = resolve_parameter_names("SELECT '?' -- ?", &b, false).unwrap_err();
+    assert!(!err.message.contains("placeholder"), "{}", err.message);
+    // Resolution that succeeds is unaffected.
+    assert_eq!(
+        resolve_parameter_names("SELECT @p, '?'", &b, false).unwrap(),
+        vec!["p"]
+    );
 }
 
 #[test]

@@ -69,8 +69,8 @@ impl SpannerStatement {
     /// table exists, so only the mismatch applies to it. `create` and `replace` keep the raw error;
     /// their DDL step handles table existence.
     ///
-    /// An error that is already `AlreadyExists` (a duplicate primary key) only gets the table name
-    /// added. Operational failures keep their original status and details.
+    /// A constraint violation (`Integrity`, such as a duplicate primary key) only gets the table
+    /// name added. Operational failures keep their original status and details.
     fn remap_ingest_append_error(&self, table: &str, error: Error) -> Error {
         if !matches!(
             self.ingest_mode,
@@ -82,16 +82,14 @@ impl SpannerStatement {
         // transport failure, and probing could delay cancellation.
         if !matches!(
             error.status,
-            Status::InvalidArguments
-                | Status::InvalidData
-                | Status::NotFound
-                | Status::AlreadyExists
+            Status::InvalidArguments | Status::InvalidData | Status::NotFound | Status::Integrity
         ) {
             return error;
         }
-        // A duplicate primary key already has the right status. Skip the probe, whose
-        // "incompatible schema" message would misreport it, and keep the vendor code and details.
-        if error.status == Status::AlreadyExists {
+        // The rows conflict with the table's data or constraints, not its schema. Skip the probe,
+        // whose "incompatible schema" message would misreport it, and keep the vendor code and
+        // details.
+        if error.status == Status::Integrity {
             return annotate(error, |message| {
                 format!("bulk ingest append into table {table:?} failed: {message}")
             });
@@ -185,12 +183,14 @@ impl SpannerStatement {
         if !matches!(self.ingest_mode, None | Some(IngestMode::Create)) {
             return error;
         }
+        // `Integrity` covers a backend reporting the table as gRPC ALREADY_EXISTS.
         if !matches!(
             error.status,
             Status::InvalidArguments
                 | Status::InvalidState
                 | Status::NotFound
                 | Status::AlreadyExists
+                | Status::Integrity
         ) {
             return error;
         }

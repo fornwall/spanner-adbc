@@ -44,6 +44,9 @@ use crate::timeout::with_timeout;
 /// `Connection::read_partition`, which has no per-statement batch size.
 pub(crate) const DEFAULT_ROWS_PER_BATCH: usize = 8192;
 
+/// The reader [`Statement::execute`] returns.
+type ResultReader = Box<dyn RecordBatchReader + Send + 'static>;
+
 /// Builds each statement of a multi-row bound query only when the reader asks for it, so a large
 /// `executemany` SELECT doesn't hold one statement per row in memory.
 struct LazyBoundStatements {
@@ -438,10 +441,11 @@ impl SpannerStatement {
     }
 
     /// Body of `execute` for SQL, split out so the caller clears bound data however it ends.
-    fn run_sql(&self, sql: &str) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+    /// Also returns the affected-row count, as [`execute_counted`](Self::execute_counted) does.
+    fn run_sql(&self, sql: &str) -> Result<(ResultReader, Option<i64>)> {
         if crate::sql::is_ddl(sql) {
             self.run_ddl(crate::sql::split_statements(sql))?;
-            return Ok(Self::empty_reader());
+            return Ok((Self::empty_reader(), None));
         }
         // Clients such as the Python DBAPI and R send every statement through `ExecuteQuery`, so
         // DML must take the read/write path here; the read-only path would reject it.
@@ -449,19 +453,45 @@ impl SpannerStatement {
         if crate::sql::is_dml(sql) {
             return match self.run_dml(sql)? {
                 DmlOutcome::Returning {
-                    batches, schema, ..
+                    batches,
+                    schema,
+                    affected,
                 } => {
                     let batches: Vec<std::result::Result<RecordBatch, ArrowError>> =
                         split_batches(batches, self.rows_per_batch)
                             .into_iter()
                             .map(Ok)
                             .collect();
-                    Ok(Box::new(RecordBatchIterator::new(batches, schema)))
+                    let reader: ResultReader = Box::new(RecordBatchIterator::new(batches, schema));
+                    Ok((reader, Some(affected)))
                 }
-                DmlOutcome::Plain(_) => Ok(Self::empty_reader()),
+                DmlOutcome::Plain(count) => Ok((Self::empty_reader(), count)),
             };
         }
-        self.execute_query_reader(sql)
+        Ok((self.execute_query_reader(sql)?, None))
+    }
+
+    /// [`Statement::execute`], plus the affected-row count of the DML or bulk ingest it ran, as
+    /// `execute_update` reports it. `None` means unknown: queries, DDL, and writes buffered in a
+    /// manual transaction, which run only at commit. The C ABI returns it as `rows_affected`,
+    /// since clients such as the Python DBAPI run DML through `ExecuteQuery` with a result stream.
+    pub(crate) fn execute_counted(&mut self) -> Result<(ResultReader, Option<i64>)> {
+        self.cancel.begin_operation();
+        // FFI callers may run a bulk ingest through `ExecuteQuery` with a non-null stream
+        // pointer; it yields an empty stream.
+        if self.sql.is_none()
+            && let Some(table) = self.target_table.clone()
+        {
+            let count = self.run_ingest(&table)?;
+            return Ok((Self::empty_reader(), count));
+        }
+        self.check_bound_has_destination()?;
+        let sql = self.sql()?;
+        // Bound rows are consumed even if execution fails, so a reused handle can't apply them
+        // to a later statement.
+        let result = self.run_sql(&sql);
+        self.clear_bound();
+        result
     }
 
     /// Body of `execute_update` for SQL, split out so the caller clears bound data however it
@@ -882,22 +912,7 @@ impl Statement for SpannerStatement {
     }
 
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        self.cancel.begin_operation();
-        // FFI callers may run a bulk ingest through `ExecuteQuery` with a non-null stream
-        // pointer. The row count has nowhere to go, so return an empty stream.
-        if self.sql.is_none()
-            && let Some(table) = self.target_table.clone()
-        {
-            self.run_ingest(&table)?;
-            return Ok(Self::empty_reader());
-        }
-        self.check_bound_has_destination()?;
-        let sql = self.sql()?;
-        // Bound rows are consumed even if execution fails, so a reused handle can't apply them
-        // to a later statement.
-        let result = self.run_sql(&sql);
-        self.clear_bound();
-        result
+        self.execute_counted().map(|(reader, _)| reader)
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
