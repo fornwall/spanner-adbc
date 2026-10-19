@@ -1,81 +1,81 @@
 # Foundry validation
 
-Runs the ADBC Driver Foundry type/feature suite against the shared library through the ADBC
-driver manager. The [C++ harness](../adbc-validation/README.md) covers ADBC conformance;
-[this harness](../scripts/run-foundry-validation.sh) adapts Foundry's query corpus to GoogleSQL.
-See the [testing overview](../docs/testing.md) for other suites.
+Runs the [ADBC Driver Foundry](https://github.com/adbc-drivers/validation) type and feature suite
+against the shared library through the ADBC driver manager. The suite's queries are adapted to
+GoogleSQL. ADBC conformance is tested separately by the [C++ harness](../adbc-validation/README.md);
+see [testing](../docs/testing.md) for the other suites.
 
-## Run
+## Running
 
 ```sh
 scripts/run-foundry-validation.sh
 scripts/run-foundry-validation.sh -k ingest  # extra arguments go to pytest
+scripts/run-foundry-validation.sh --prepare  # build and install only
 ```
 
-Use Python 3.13+ with pip (the [pinned suite's requirement](https://github.com/adbc-drivers/validation/blob/68242ee13524e8f2b36038764e2f439d4cb49f33/pyproject.toml)),
-Rust, git and curl, plus Docker when starting an emulator. `PYTHON` selects the interpreter.
-The script builds the driver, installs the pinned suite if needed, creates the emulator
-instance/database and runs pytest. The upstream revision is selected by `ADBC_VALIDATION_REF`
-in the script; `ADBC_VALIDATION_REPO` can select another repository.
-`ADBC_SPANNER_LIBRARY` selects an existing shared library when invoking pytest directly.
+You need Python 3.13+ with pip (required by the
+[pinned suite](https://github.com/adbc-drivers/validation/blob/68242ee13524e8f2b36038764e2f439d4cb49f33/pyproject.toml)),
+Rust, git and curl, plus Docker for the emulator. `PYTHON` selects the interpreter. The
+[script](../scripts/run-foundry-validation.sh) builds the driver, installs the pinned suite if
+needed, sets up the target database and runs pytest. `ADBC_VALIDATION_REF` and
+`ADBC_VALIDATION_REPO` select a different upstream revision or repository. When running pytest
+directly, point `ADBC_SPANNER_LIBRARY` at a built library.
 
-Set `SPANNER_OMNI_ENDPOINT=http://localhost:15000` to run the same suite against a local Omni
-instance, using database `projects/default/instances/default/databases/adbc-test`. Do not set
-`SPANNER_EMULATOR_HOST` for Omni. The driver selects the Omni transport explicitly.
+The target is chosen from `SPANNER_OMNI_ENDPOINT`, then `SPANNER_EMULATOR_HOST`, then
+`SPANNER_GCP_DATABASE`; with none set, the script starts a disposable emulator. For Omni, set
+`SPANNER_OMNI_ENDPOINT=http://localhost:15000` and provide the database
+`projects/default/instances/default/databases/adbc-test`. A Cloud Spanner database must already
+exist and is reached with ADC. The quirks expect the database to be called `adbc-test`, so
+adjust them for a different name.
 
-An existing `SPANNER_EMULATOR_HOST` takes precedence over `SPANNER_GCP_DATABASE`. With no target,
-the script starts a disposable emulator. A cloud target must already exist and use ADC; the
-current quirks expect database/catalog `adbc-test`, so adjust that expectation when using a
-differently named test database.
+The [workflow](../.github/workflows/foundry-validation.yml) runs on pushes to `main` and pull
+requests. Every case must pass or skip with a reason; there are no expected failures.
 
-The [workflow](../.github/workflows/foundry-validation.yml) runs on pushes to `main`, pull requests
-and manual dispatch. Cases must pass or skip with a reason; there are no expected failures.
+## Adaptations
 
-## Adaptations and coverage
+- [`tests/spanner.py`](tests/spanner.py) declares capabilities, connection options, identifier
+  quoting, `@pN` parameters and DDL overrides. Metadata tests expect catalog `adbc-test` and the
+  default schema `""`. Primary key, foreign key and CHECK constraints, XDBC type names and
+  nullability, named-schema metadata and ingest, and exact statistics are enabled. The
+  connection fixture creates `validation_schema` for schema-scoped tests.
+- [`queries/spanner/`](queries/spanner/) overrides the upstream bind, select, literal and ingest
+  cases with native type names, typed parameters, explicit `INSERT` column lists and
+  deterministic ordering. The `.txtcase` files hold the expected schemas and skip reasons.
+- [`tests/test_ingest.py`](tests/test_ingest.py) enables the long-value tests for string, large
+  string, string view, binary, large binary and binary view. Its fixture applies each case's
+  connection options to both ingest and readback, and restores the previous values afterwards.
+  Other test modules reuse upstream classes and fixtures through [`tests/conftest.py`](tests/conftest.py).
 
-- [`tests/spanner.py`](tests/spanner.py) defines capabilities, connection options, identifier
-  quoting, `@pN` parameters and DDL overrides. Metadata expects catalog `adbc-test` and default
-  schema `""`. Primary/foreign-key and CHECK constraints, XDBC type names/nullability, named-schema
-  metadata and ingest, and exact aggregate statistics are enabled. The connection fixture creates
-  `validation_schema` for the schema-scoped tests.
-- [`queries/spanner/`](queries/spanner/) overlays the upstream bind, select, literal and ingest
-  cases with native type names, typed parameters, explicit INSERT column lists and deterministic
-  readback ordering. The `.txtcase` files contain the exact expected schemas and skip reasons.
-- [`tests/test_ingest.py`](tests/test_ingest.py) enables long-value tests for string, large string,
-  string view, binary, large binary and binary view. Its fixture applies each case's connection
-  options to ingest and readback, restoring the previous values even when a test fails. Other test
-  modules reuse upstream classes and fixtures through [`tests/conftest.py`](tests/conftest.py).
+Timestamp cases keep the upstream naive and timezone-aware inputs and expected instants, and
+read back in UTC. Nanosecond cases keep nanosecond precision; lower-precision cases use the
+microsecond option to cover years 1 to 9999. Expected integer timestamps are rescaled, and SQL
+timestamp literals state UTC explicitly.
 
-Timestamp cases retain the upstream naive/timezone-aware inputs and expected instants, with
-UTC readback. Nanosecond cases preserve nanosecond precision; lower-precision cases use the
-microsecond option to cover years 1–9999. Expected integer timestamps are rescaled exactly, and
-SQL timestamp literals specify UTC explicitly.
+Type adaptations keep the original input schemas and values and assert what Spanner returns:
+narrow integers widen to `INT64`, fixed-size binary comes back as variable-width binary,
+`float16` as `FLOAT32`, and decimals (including negative scales) as `Decimal128(38,9)`. No schema
+or value comparison is disabled.
 
-Type adaptations preserve the original input schemas and values while asserting Spanner's output:
-narrow integers widen to `INT64`, fixed-size binary returns variable-width binary, `float16`
-returns `FLOAT32`, and decimals (including negative scales) return `Decimal128(38,9)`.
-No schema or value comparisons are disabled.
-
-The [skip inventory](skip_baseline.txt) contains only TIME-of-day cases and unavailable harness
-features: temporary tables, cross-catalog operations, changing the current catalog/schema,
-UNIQUE table constraints, and ingest nullability (the driver does not report `xdbc_nullable`
-or create NOT NULL columns from Arrow field nullability).
+The [skip list](skip_baseline.txt) contains only TIME-of-day cases and features the driver
+lacks: temporary tables, cross-catalog operations, changing the current catalog or schema,
+UNIQUE table constraints, and ingest nullability (the driver doesn't report `xdbc_nullable` or
+create NOT NULL columns from Arrow field nullability).
 
 ## Skip baseline
 
-CI enables two guards in `tests/conftest.py`:
+CI sets two variables read by `tests/conftest.py`:
 
-- `FOUNDRY_VALIDATION_REQUIRE_PASSES=1` rejects an otherwise successful run with no passing tests.
-- `FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE=1` compares skipped pytest node IDs with
-  `skip_baseline.txt`, rejecting unlisted skips and entries that no longer skip. Trailing reason
-  annotations are for readers and are not compared. Omni uses the same inventory; its backend
-  label is normalized to `emulator` for this comparison only.
+- `FOUNDRY_VALIDATION_REQUIRE_PASSES=1` fails a run in which no test passed.
+- `FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE=1` compares the skipped test IDs with
+  `skip_baseline.txt` and fails on skips missing from the file and on entries that no longer
+  skip. Reason annotations are ignored. Omni runs use the same list, with their backend label
+  read as `emulator`.
 
-The baseline comparison is bypassed for `-k`/`-m` runs. Use a complete run for baseline checks or
-updates. An explicit `.txtcase` skip prevents execution, so the guard cannot discover that a
-still-skipped case would now pass; review skip reasons when driver capabilities change.
+The comparison is skipped for `-k` and `-m` runs, so check or update the baseline with a full
+run. A case skipped in its `.txtcase` file never runs, so the check can't notice when it would
+pass; review skip reasons when the driver gains features.
 
-After investigating a legitimate change, regenerate and review the inventory:
+When a change to the skip set is expected, regenerate the file and review the diff:
 
 ```sh
 FOUNDRY_UPDATE_SKIP_BASELINE=1 scripts/run-foundry-validation.sh

@@ -1,8 +1,8 @@
 # ADBC interface
 
-`spanner-adbc` implements the [ADBC interfaces](https://arrow.apache.org/adbc/current/format/specification.html)
-using Google Cloud Spanner and Arrow record batches. See the [README](../README.md) for usage,
-[options](options.md) for configuration, and [transactions](transactions.md) for transaction rules.
+How `spanner-adbc` maps the [ADBC API](https://arrow.apache.org/adbc/current/format/specification.html)
+onto Spanner. See the [README](../README.md) for usage, [options](options.md) for configuration
+and [transactions](transactions.md) for transaction rules.
 
 ## Objects and loading
 
@@ -10,22 +10,18 @@ using Google Cloud Spanner and Arrow record batches. See the [README](../README.
 | --- | --- | --- |
 | `SpannerDriver` | Owns the Tokio runtime shared by its databases, connections and statements. | [driver.rs](../src/driver.rs) |
 | `SpannerDatabase` | Stores endpoint, database and credential options; lazily caches the client stack. | [driver.rs](../src/driver.rs) |
-| `SpannerConnection` | Owns independent transaction state and metadata operations. Connections from one database share its client stack. | [connection.rs](../src/connection.rs) |
+| `SpannerConnection` | Owns transaction state and metadata operations. Connections from one database share its client stack. | [connection.rs](../src/connection.rs) |
 | `SpannerStatement` | Configures SQL or bulk ingest, binds data and executes work. | [statement.rs](../src/statement.rs) |
 
-Rust callers construct `SpannerDriver::try_new()`. The synchronous ADBC methods drive the async
-Spanner client on the driver's runtime. The C ABI uses one process-wide driver/runtime.
+Rust callers start with `SpannerDriver::try_new()`. The synchronous ADBC methods run the async
+Spanner client on the driver's runtime, so don't call them directly from an async task; see
+[synchronous calls from Tokio](limitations.md#synchronous-calls-from-tokio).
 
-Calling these methods directly from a Tokio async task can panic when they block on the driver's
-runtime. Use `tokio::task::spawn_blocking` or a dedicated blocking thread for driver creation,
-calls, result consumption and handle cleanup. Keeping cleanup there also avoids shutting down
-the native Rust driver's runtime in an async context. See [known limitations](limitations.md).
-
-Other languages load the shared library, built with `cargo build --release`, through an ADBC
-driver manager. It exports `AdbcSpannerInit` and the fallback `AdbcDriverInit`; both populate
-an ADBC 1.0.0 or 1.1.0 function table. [src/ffi/](../src/ffi) implements the C ABI and exchanges
-Arrow data through the Arrow C Data and Stream interfaces. All crate `unsafe` code is confined
-there; `--no-default-features` builds the Rust interface without it.
+Other languages load the shared library through an ADBC driver manager. It exports
+`AdbcSpannerInit` and the fallback `AdbcDriverInit`, and both provide an ADBC 1.0.0 or 1.1.0
+function table. The C ABI shares one driver and runtime across the process. It lives in
+[src/ffi/](../src/ffi), which holds all of the crate's `unsafe` code; building with
+`--no-default-features` leaves it out.
 
 ```python
 import adbc_driver_manager
@@ -37,10 +33,11 @@ db = adbc_driver_manager.AdbcDatabase(
 )
 ```
 
-The [Python package](../python/README.md) bundles the library and supplies a DBAPI interface.
-The database object performs no network I/O until its first connection. That connection builds
-the shared credentials, channels and multiplexed session; later connections reuse them. Setting
-any database option invalidates the cache for future connections.
+The [Python package](../python/README.md) bundles the library and adds a DBAPI interface.
+
+A database does no network I/O until its first connection, which builds the credentials,
+channels and multiplexed session. Later connections reuse them. Setting a database option
+discards the cache for future connections.
 
 ## Execution
 
@@ -52,93 +49,127 @@ for batch in statement.execute()? {
 }
 ```
 
-Queries return a streaming `RecordBatchReader`. Execution fetches the initial chunk to obtain the
-schema, then a background task prefetches bounded chunks as the reader advances. Batches contain
-up to `spanner.rows_per_batch` rows (default 8192), subject to the conversion byte budget.
-See [type mapping](../README.md#type-mapping), including the timestamp range/precision choice.
+Queries return a streaming `RecordBatchReader`. Execution fetches the first chunk to learn the
+schema, and a background task prefetches later chunks as the reader advances. Batches hold up
+to `spanner.rows_per_batch` rows (default 8192) and are also capped by size.
 
-Both execution entry points accept queries, DML, DDL and bulk ingest:
+Both execution methods accept queries, DML, DDL and bulk ingest:
 
 | Work | `execute()` | `execute_update()` |
 | --- | --- | --- |
 | Query | Arrow result stream | Drains and discards rows; returns `None`. |
 | Plain DML | Empty result stream | Affected-row count in autocommit; `None` when buffered. |
-| DML with `THEN RETURN` | Returned rows, materialized before commit completes | Discards returned rows; reports affected count. |
-| DDL | Empty result stream | `None`. |
+| DML with `THEN RETURN` | Returned rows, materialized before commit completes | Discards returned rows; returns the affected-row count. |
+| DDL | Empty result stream | `None` |
 | Bulk ingest | Empty result stream | Ingested-row count in autocommit; `None` when buffered. |
 
-SQL classification and splitting live in [sql.rs](../src/sql.rs). A semicolon-separated DML
-batch must contain only DML and executes atomically through `ExecuteBatchDml`. DDL uses the
-Database Admin API. DML with `THEN RETURN` requires autocommit and cannot be combined with
-other statements in a batch.
+[sql.rs](../src/sql.rs) classifies and splits SQL. A `;`-separated DML batch must contain only
+DML and runs atomically through `ExecuteBatchDml`. DDL goes through the Database Admin API.
+DML with `THEN RETURN` needs autocommit and can't be part of a batch.
 
-Autocommit is the default. In manual mode, the first query or write chooses the transaction kind:
-queries share a read-only snapshot; DML and ingest mutations buffer until commit. Mixing reads
-and writes fails with `InvalidState`, so there is no read-your-writes. DDL always executes
-immediately and cannot be rolled back. See [transactions](transactions.md).
+Autocommit is the default. In a manual transaction, queries share a snapshot and writes are
+buffered until commit; one transaction can't do both. DDL always runs immediately. See
+[transactions](transactions.md).
+
+### Result types
+
+The [README](../README.md#type-mapping) has the type table. In addition:
+
+- SQL `NULL` becomes an Arrow null. A malformed non-null value is an error.
+- Struct fields are matched by position, so duplicate and empty field names survive.
+- JSON fields carry the `arrow.json` extension, including JSON elements of arrays.
+- Timestamps are nanoseconds by default, which limits their range. See
+  [timestamp precision](options.md#timestamp-precision).
 
 ## Parameters and ingest
 
-`bind` supplies an Arrow batch; `bind_stream` accepts a reader but collects its batches
-in memory before execution. For large ingests, use separate autocommit calls in append mode
-with bounded batches.
+`bind` takes an Arrow batch. `bind_stream` takes a reader but collects all of its batches in
+memory before executing; for large loads, ingest bounded batches in separate autocommit calls
+in append mode.
 
-- For SQL parameters, columns bind positionally to distinct `@name` parameters in SQL order.
-  A parameter may be written `@name`, ``@`name` `` or with whitespace or a comment after the `@`,
-  and names are matched case-insensitively, as Spanner resolves them.
-  `adbc.statement.bind_by_name=true` matches column names instead. Multiple bound rows execute
-  the query for each row, sharing one snapshot.
-- For ingest, `adbc.ingest.target_table` selects a table and `adbc.ingest.mode` controls its
-  creation or replacement. Table, schema and column names are validated before any RPC: a name
-  containing a backtick, a backslash or a control character is rejected rather than escaped,
-  because Spanner's DDL parser does not honour escapes inside backticks. Rows become insert
-  mutations. Autocommit ingest commits chunks, so a whole ingest is not atomic; manual mode
-  buffers all mutations for one commit. Any table DDL executes immediately.
+SQL parameters are bound positionally by default: the first column binds to the first distinct
+`@name` parameter in the SQL, and so on. With `adbc.statement.bind_by_name=true`, column names
+are matched to parameter names instead. Names are case-insensitive, as in Spanner, and the
+parser also accepts ``@`name` `` and whitespace or comments after the `@`. Binding several rows
+runs the statement once per row, and a query's runs share one snapshot.
 
-Setting SQL clears an ingest target, and setting an ingest target clears SQL. `prepare()` checks
-that a destination is configured; Spanner plans SQL during execution.
+For ingest, `adbc.ingest.target_table` selects the table and `adbc.ingest.mode` decides whether
+to create or replace it. Each row becomes an insert mutation. Autocommit ingest commits in
+chunks, so a large ingest is not atomic; in a manual transaction all mutations wait for one
+commit. Creating or replacing the table is DDL and happens immediately.
+
+The driver checks table, schema and column names before sending anything. It rejects names
+containing a backtick, a backslash or a control character, because Spanner's DDL parser doesn't
+honour escapes inside backtick-quoted identifiers.
+
+Setting SQL clears the ingest target and vice versa. `prepare()` only checks that one of them is
+set; Spanner plans the SQL when it runs.
+
+### Bound types
+
+Parameters and ingested columns keep their Arrow type:
+
+- `UInt8`, `UInt16` and `UInt32` widen to `INT64`, and `Float16` to `FLOAT32`. `FixedSizeBinary`
+  maps to `BYTES`.
+- `UInt64`, structs and nested lists are not supported.
+- `Date64` values must be whole days (multiples of 86,400,000 ms). Use an Arrow timestamp to keep
+  a time of day.
+- `Decimal128` values with a negative scale keep their value (`99` at scale `-2` is `9900`).
+  Spanner checks the `NUMERIC` range, and values read back with scale 9.
+- Timestamps of any unit keep their precision; `spanner.max_timestamp_precision` only affects
+  reads.
+- Strings tagged with the `arrow.json` extension bind and ingest as `JSON`. For an untagged
+  string, write `PARSE_JSON(@p)` in the SQL.
+- `ENUM`, `PROTO`, `INTERVAL` and `UUID` have no Arrow extension type, so parameters bind as their
+  storage type (`Int64`, `Binary` or `Utf8`). Cast them to the intended SQL type. Ingest creates
+  columns with the storage type.
+
+To read `ENUM` or `PROTO` values as text, use `CAST(col AS STRING)`; otherwise decode the proto
+bytes with your own descriptors.
 
 ## Metadata and planning
 
 | Method | Result |
 | --- | --- |
-| `get_info` | Driver/vendor metadata; unsupported info codes are omitted. |
+| `get_info` | Driver and vendor metadata. Unsupported info codes are omitted. |
 | `get_objects` | Catalogs, schemas, tables, columns and constraints from `INFORMATION_SCHEMA`. |
-| `get_table_schema` | A table's columns mapped to Arrow fields. |
+| `get_table_schema` | A table's columns as Arrow fields. |
 | `get_table_types` | `BASE TABLE` and `VIEW`. |
-| `get_statistics` | Exact row, distinct and null counts from one aggregate scan per table, even when approximation is requested. |
-| `get_statistic_names` | An empty, typed result: there are no driver-specific statistics. |
-| `get_parameter_schema` | The bound schema, or parameter names/types from a best-effort PLAN probe; unresolved types are Arrow `Null`. |
-| `execute_schema` | Query result schema from a PLAN probe; DML and DDL are rejected. |
+| `get_statistics` | Exact row, distinct and null counts from one aggregate scan per table, even when approximate statistics are requested. |
+| `get_statistic_names` | An empty, typed result: the driver defines no statistics of its own. |
+| `get_parameter_schema` | The bound schema, or parameter names and types from a best-effort PLAN probe. Unresolved types are Arrow `Null`. |
+| `execute_schema` | The result schema from a PLAN probe. DML and DDL are rejected. |
 
 ### Catalogs
 
-The catalog is the database id: `<d>` in `projects/<p>/instances/<i>/databases/<d>`. Metadata
-results, `adbc.connection.catalog` and foreign-key usages report this same name. Catalog filters
-must match it; an empty catalog filter matches nothing. `get_table_schema` and ingest catalog
-options use an exact name, while `get_objects` and `get_statistics` accept catalog patterns.
+The catalog is the database ID, `<d>` in `projects/<p>/instances/<i>/databases/<d>`. Metadata
+results, `adbc.connection.catalog` and foreign-key references all use this name. Catalog filters
+must match it, and an empty catalog filter matches nothing. `get_table_schema` and the ingest
+catalog option take an exact name; `get_objects` and `get_statistics` accept patterns.
 
-`adbc.connection.db_schema` is `""`. Named schemas are supported through qualified names and
-metadata, but there is no selectable session schema.
+`adbc.connection.db_schema` is `""`. Named schemas work through qualified names and appear in
+metadata, but you can't select one as the current schema.
 
 ## Partitioning and cancellation
 
-`execute_partitions` produces descriptors for a root-partitionable query; `read_partition`
-executes one and streams its rows. Partitioning accepts at most one bound parameter row and
-always uses its own batch read-only transaction. Descriptors contain SQL and session/transaction
-identity and are not authenticated: only accept them from trusted sources. Set the reading
-connection's timestamp precision to match the producing statement.
+`execute_partitions` returns descriptors for a root-partitionable query, and `read_partition`
+runs one and streams its rows. Partitioning accepts at most one row of bound parameters and
+always uses its own batch read-only transaction. Set the reading connection's timestamp
+precision to match the producing statement.
 
-Cancellation interrupts the object's current blocking call and remains latched for that
-operation, including subsequent result fetches. A new operation gets a fresh signal. Cancelling
-an idle object succeeds; the driver does not track operation liveness to report `InvalidState`.
+Descriptors contain the SQL and the session and transaction IDs, and are not authenticated.
+Only accept them from trusted sources.
+
+Cancelling interrupts the handle's current blocking call and stays in effect for that
+operation, including later result fetches. The next operation starts uncancelled. Cancelling an
+idle handle succeeds; the driver doesn't track whether an operation is running.
 
 ## Errors
 
-[error.rs](../src/error.rs) maps gRPC failures to ADBC statuses and preserves structured details.
-For example, `PERMISSION_DENIED` becomes `Unauthorized`, `FAILED_PRECONDITION` becomes
-`InvalidState`, and `DEADLINE_EXCEEDED` becomes `Timeout`.
+[error.rs](../src/error.rs) maps gRPC failures to ADBC status codes and keeps the structured
+error details. For example, `PERMISSION_DENIED` becomes `Unauthorized`, `FAILED_PRECONDITION`
+becomes `InvalidState` and `DEADLINE_EXCEEDED` becomes `Timeout`.
 
-Rust callers and C ABI 1.0.0 callers receive the numeric gRPC status in `vendor_code`. C ABI
-1.1.0 reserves that field for its details sentinel, so the driver supplies the original code as
-the decimal-valued `adbc.spanner.vendor_code` detail instead.
+Rust callers and C ABI 1.0.0 callers get the numeric gRPC code in `vendor_code`. ADBC 1.1.0
+reserves that field, so C ABI 1.1.0 callers get the code as the error detail
+`adbc.spanner.vendor_code`, a decimal string.

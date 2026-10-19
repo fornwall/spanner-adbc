@@ -7,12 +7,13 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver for
-[Google Cloud Spanner](https://cloud.google.com/spanner) and Spanner Omni, available as a
-[Python package](https://pypi.org/project/spanner-adbc/), a Rust crate from git, and a
-[loadable shared library](#shared-library-loadable-driver). CI tests against both the Spanner
-emulator and Omni; managed-cloud and authentication tests run locally. See [testing](docs/testing.md).
+[Google Cloud Spanner](https://cloud.google.com/spanner) and Spanner Omni. Query results come
+back as Arrow record batches. The driver ships as a [Python package](https://pypi.org/project/spanner-adbc/),
+a [shared library](#shared-library) for any ADBC driver manager, and a [Rust crate](#rust).
+CI tests it against the Spanner emulator and Spanner Omni; Cloud Spanner and authentication
+tests run locally.
 
-The driver supports GoogleSQL databases; PostgreSQL-dialect databases are not supported.
+Only GoogleSQL databases are supported, not the PostgreSQL dialect.
 
 ## Quickstart
 
@@ -22,7 +23,7 @@ Install the Python package (Python 3.11+):
 pip install "spanner-adbc[dbapi]"
 ```
 
-With an existing database and [Application Default Credentials](#authentication):
+Connect to an existing database using [Application Default Credentials](#authentication):
 
 ```python
 import spanner_adbc.dbapi as spanner
@@ -35,112 +36,95 @@ with spanner.connect(db_kwargs={
         print(cur.fetch_arrow_table())
 ```
 
-See the [Python guide](python/README.md) for parameters, DataFrames, authentication and ingest,
-or [build the shared library](#shared-library-loadable-driver) for another ADBC client.
+The [Python guide](python/README.md) covers parameters, transactions, DataFrames, bulk ingest
+and partitioned reads.
 
-## Supported functionality
+## Features
 
-- **Queries:** lazy Arrow `RecordBatchReader` results, with bounded batches and background
-  prefetching (`spanner.rows_per_batch`, default 8192).
-- **DML and DDL:** single statements and homogeneous `;`-separated batches. Autocommit DML
-  supports `THEN RETURN`; use `execute()` to read returned rows or `execute_update()` for the count.
-- **Manual transactions:** `adbc.connection.autocommit=false`, `commit()` and `rollback()`.
-  A transaction supports either snapshot queries or buffered writes; it cannot mix the two.
-- **Binding:** Arrow batches or streams supply one execution per row. Binding is positional by
-  default; `adbc.statement.bind_by_name=true` matches column names to `@name` parameters.
-  Parameters retain their Arrow types, including typed nulls and empty arrays. Multi-row bound
-  queries share one read-only snapshot.
-- **Bulk ingest:** all four `adbc.ingest.mode` values, using insert mutations. Table creation
-  leaves primary-key generation to Spanner's
-  [hidden `rowid`](https://docs.cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys).
-- **Partitioned queries:** `execute_partitions()` and `read_partition()`, optionally with
-  [Data Boost](https://docs.cloud.google.com/spanner/docs/databoost/databoost-overview) on Cloud Spanner.
-- **Schema discovery:** `execute_schema()` and `get_parameter_schema()` use PLAN probes;
-  undetermined parameter types are reported as Arrow `Null`.
-- **Metadata:** `get_info()`, `get_objects()` (including foreign keys and native type names),
-  `get_table_types()` and `get_table_schema()`.
-- **Statistics:** exact row, null and distinct counts through aggregate scans, including when
-  approximate results are requested. `get_statistic_names()` returns an empty typed result.
-- **Cancellation:** connection and statement cancel handles interrupt calls and subsequent fetches
-  of the same result. Each new operation gets a fresh cancellation signal.
-- **Options:** read-only connections, write isolation, timestamp bounds, priorities, request and
-  transaction tags, directed reads, commit statistics, retry policies, timeouts, commit delay,
-  partitioned DML and BatchWrite ingest. See the [option reference](docs/options.md).
+- Streaming queries, returned in Arrow batches of up to 8192 rows and prefetched in the background.
+- DML and DDL, including `;`-separated batches of one kind. DML batches are atomic, and
+  autocommit DML supports `THEN RETURN`.
+- Manual transactions.
+- Parameter binding from Arrow data, by position or by name, preserving Arrow types.
+- Bulk ingest in all four ADBC modes.
+- Partitioned queries, optionally on [Data Boost](https://docs.cloud.google.com/spanner/docs/databoost/databoost-overview)
+  (Cloud Spanner only).
+- Result and parameter schemas from the query plan, without running the query.
+- Metadata through `get_objects()`, `get_table_schema()`, `get_statistics()` and the other ADBC
+  metadata calls.
+- Cancellation of running calls and result fetches.
+- Spanner-specific options such as stale reads, isolation level, request priority and tags,
+  directed reads, retries, timeouts, partitioned DML and BatchWrite ingest. See the
+  [option reference](docs/options.md).
 
-Change-stream DDL, metadata queries and `READ_<stream>` queries use the ordinary SQL paths;
-returned nested records map to Arrow lists and structs.
+Change streams work through ordinary SQL: DDL to create them and `READ_<stream>` queries to
+read them.
 
-## Transaction and API limits
+## Limitations
 
-- Ordinary DML batches run atomically in one read/write transaction. Mixed query/DML/DDL batches
-  are rejected; `THEN RETURN` requires a single SQL statement and autocommit.
-- DDL uses the Database Admin `UpdateDatabaseDdl` API. A batch is one
-  [schema-update operation](https://docs.cloud.google.com/spanner/docs/schema-updates), **not an
-  atomic transaction**. DDL runs immediately, before buffered writes, and rollback cannot undo it.
-- Large autocommit ingests can span multiple commits. BatchWrite ingest is also non-atomic.
-- `bind_stream()` collects all input batches in memory before execution. For large ingests,
-  use separate autocommit calls in append mode with bounded batches.
-- Partition descriptors contain SQL and session/transaction identity. They are unauthenticated
-  and execute with the receiving connection's credentials; exchange them only over trusted channels.
-- Substrait plans, incremental partitioning and temporary ingest tables are unsupported.
-- The current catalog is the connected database ID; only that same value can be set.
-  `adbc.ingest.target_catalog` also accepts only that ID; leave it unset to use the default.
-  The current schema is fixed at `""`; qualify named schemas in SQL or use `adbc.ingest.target_db_schema`.
+- A manual transaction either runs queries or buffers writes until commit. It can't mix the
+  two, so there is no read-your-writes.
+- DDL runs immediately, even inside a manual transaction, and rollback can't undo it. A
+  multi-statement DDL batch is not atomic: if it fails partway, earlier statements can stay applied.
+- A batch can't mix queries, DML and DDL. `THEN RETURN` needs autocommit and a single statement.
+- Large autocommit ingests commit in chunks, so a failed ingest can leave rows behind.
+  BatchWrite ingest can partially succeed even within a chunk.
+- `bind_stream()` reads all input into memory before executing. For large loads, ingest
+  bounded batches with separate calls in append mode.
+- Tables created by ingest get Spanner's
+  [hidden `rowid`](https://docs.cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys)
+  as primary key. To choose the key, create the table yourself and ingest in `append` mode.
+- Partition descriptors contain the SQL and session and transaction IDs. They are not
+  authenticated and run with the reading connection's credentials, so only accept them from
+  trusted sources.
+- The catalog is the connected database's ID and can't be changed. The current schema is always
+  `""`, so use qualified names for named schemas.
+- Substrait plans, incremental partitioning and temporary ingest tables are not supported.
 
-See [transactions](docs/transactions.md) for transaction boundaries and RPC behavior, and
-[ADBC concepts](docs/adbc.md) for handle ownership and errors. [Known limitations](docs/limitations.md)
-cover dependency constraints, streaming retry deadlines and calling the driver from Tokio.
-Spanner errors retain their gRPC code and structured details; C ABI 1.1 callers retrieve the
-code through error details.
+See [transactions](docs/transactions.md), the [ADBC interface](docs/adbc.md) and
+[known limitations](docs/limitations.md) for details.
 
-## Shared library (loadable driver)
+## Shared library
 
-The library exports `AdbcSpannerInit` and the `AdbcDriverInit` fallback:
+Other ADBC clients load the driver as a shared library: `libspanner_adbc.so` on Linux,
+`libspanner_adbc.dylib` on macOS or `spanner_adbc.dll` on Windows. Its entrypoint is
+`AdbcSpannerInit`, with `AdbcDriverInit` as a fallback.
 
-| Platform | Library |
-| --- | --- |
-| Linux | `libspanner_adbc.so` |
-| macOS | `libspanner_adbc.dylib` |
-| Windows | `spanner_adbc.dll` |
+Download it from a [release](https://github.com/fornwall/spanner-adbc/releases) or the
+[shared libraries workflow](https://github.com/fornwall/spanner-adbc/actions/workflows/libraries.yml),
+or build it with `cargo build --release`, which writes it to `target/release/`.
 
-Download artifacts from the
-[Shared libraries workflow](https://github.com/fornwall/spanner-adbc/actions/workflows/libraries.yml)
-or a tagged [release](https://github.com/fornwall/spanner-adbc/releases). To build locally, run
-`cargo build --release`; the library is written under `target/release/`.
+### Configuration
 
-### Configuration options
-
-Set options on the corresponding database, connection or statement. Driver options use
-`spanner.*`; standard ADBC options use `adbc.*`. The [option reference](docs/options.md) lists
-accepted types, defaults and getter behavior.
-
-The database `uri` option accepts a `spanner://` connection URI, for example:
+Set options on the database, connection or statement. Driver options start with `spanner.`
+and standard ADBC options with `adbc.`. The database needs a `uri`:
 
 ```text
 spanner:///projects/p/instances/i/databases/d
 spanner://localhost:9010/projects/p/instances/i/databases/d?spanner.emulator=true
 ```
 
-The second form selects an emulator endpoint. See [connection URIs](docs/options.md#connection-uris)
-for query options and precedence.
+The second form connects to an emulator on `localhost:9010`. For Spanner Omni, set
+`spanner.instance_type=omni` and `spanner.endpoint`. The [option reference](docs/options.md)
+lists every option with its type and default, and describes [connection URIs](docs/options.md#connection-uris).
 
 ### Authentication
 
-- **Emulator:** non-empty `SPANNER_EMULATOR_HOST` or `spanner.emulator=true` selects anonymous
-  credentials. An explicit endpoint overrides the environment's endpoint. Explicit credentials
-  and quota-project options conflict with emulator mode; ambient ADC does not.
-- **Access token:** `spanner.auth.access_token` supplies a bearer token without refresh and cannot
-  be combined with keyfile or impersonation options.
-- **Credential JSON:** `spanner.auth.keyfile_json` takes precedence over `spanner.auth.keyfile`.
-  Supported JSON types are `service_account`, `authorized_user`, `impersonated_service_account`
-  and `external_account`.
-- **Application Default Credentials:** used when no explicit credential source is set; see
-  [Google's ADC guide](https://docs.cloud.google.com/docs/authentication/application-default-credentials).
+The driver uses [Application Default Credentials](https://docs.cloud.google.com/docs/authentication/application-default-credentials)
+unless you configure something else:
 
-`spanner.auth.impersonate.*` can wrap keyfile or ADC credentials. `spanner.auth.quota_project`
-selects the quota project for authenticated requests. Inline JSON and access tokens are
-write-only and prohibited in URI query parameters; keyfile paths remain readable and URI-compatible.
-See [database options](docs/options.md#database-options) for details.
+- `spanner.auth.keyfile` (a path) or `spanner.auth.keyfile_json` (the contents) loads service
+  account, authorized user, impersonated service account or external account credentials.
+- `spanner.auth.access_token` sends a fixed bearer token. The driver never refreshes it.
+- `spanner.auth.impersonate.target_principal` impersonates a service account, using the keyfile
+  or ADC as base credentials.
+- `spanner.auth.quota_project` sets the project billed for quota.
+
+For the emulator, set `SPANNER_EMULATOR_HOST` or `spanner.emulator=true`. The driver then
+connects without credentials and rejects explicit credential options.
+
+Keep secrets out of URIs: the driver rejects `keyfile_json` and `access_token` as URI query
+parameters. See [database options](docs/options.md#database-options) for precedence rules.
 
 ## Type mapping
 
@@ -154,46 +138,36 @@ See [database options](docs/options.md#database-options) for details.
 | `NUMERIC` | `Decimal128(38, 9)` |
 | `BYTES` | `Binary` |
 | `STRING` / `UUID` / `INTERVAL` | `Utf8` |
-| `JSON` | `Utf8` with the `arrow.json` extension |
-| `ARRAY<T>` | `List<T>`, recursively |
-| `STRUCT<..>` | `Struct<..>`, recursively |
+| `JSON` | `Utf8` with the [`arrow.json`](https://arrow.apache.org/docs/format/CanonicalExtensions.html#json) extension |
+| `ARRAY<T>` | `List<T>` |
+| `STRUCT<...>` | `Struct<...>` |
 | `ENUM` | `Int64` ordinal |
 | `PROTO` | `Binary` serialized bytes |
 
-SQL `NULL` becomes an Arrow null. Malformed non-null values produce errors. Struct fields are
-matched by position, preserving duplicate or empty names.
+Nanosecond timestamps only cover the years 1677 to 2262, and reading a value outside that range
+fails. Set `spanner.max_timestamp_precision=microseconds` to read Spanner's full range (years 1
+to 9999) at microsecond precision. See [timestamp precision](docs/options.md#timestamp-precision).
 
-JSON fields carry [`arrow.json`](https://arrow.apache.org/docs/format/CanonicalExtensions.html#json)
-metadata, including on list child fields. Tagged strings bind and ingest as JSON; untagged string
-parameters need `PARSE_JSON(@p)` when inserting JSON.
+Binding and ingest accept most Arrow types and widen narrow ones. Some Spanner types, such as
+`JSON`, `UUID` and `ENUM`, need a cast or an extension type on the parameter. See
+[bound types](docs/adbc.md#bound-types).
 
-`ENUM`, `PROTO`, `INTERVAL` and `UUID` have no bind-side extension tag. Bound values use their
-Arrow storage type, so cast parameters to the intended SQL type. Decode proto bytes with your
-own descriptors, or use `CAST(col AS STRING)` for server-formatted enum/proto text. Ingest-created
-tables use the Arrow storage types for these columns.
+## Rust
 
-Binding and ingest widen `UInt8`/`UInt16`/`UInt32` to `INT64` and `Float16` to `FLOAT32`;
-`UInt64`, structs and nested lists are unsupported inputs. `FixedSizeBinary` maps to `BYTES`.
-`Date64` values must contain whole days (multiples of 86,400,000 milliseconds); use an
-Arrow timestamp to preserve a time of day.
-`Decimal128` binding and ingest preserve values with negative scales (for example, `99` at
-scale `-2` is `9900`); Spanner validates the `NUMERIC` range, and readback uses scale 9.
+The crate isn't on crates.io because it depends on git revisions of the Google Cloud, ADBC and
+Arrow crates. To use it, add it as a git dependency and use the same `adbc_core` revision as
+this repository's [Cargo.toml](Cargo.toml). With the default `ffi` feature, also copy the four
+`arrow-*` entries under `[patch.crates-io]` into your workspace's root `Cargo.toml`, since Cargo
+ignores patches declared by dependencies. [Dependency pins](CONTRIBUTING.md#dependency-pins)
+explains why they exist.
 
-Nanosecond timestamps cover roughly 1677–2262; values outside that range fail with
-`InvalidArguments`. Set `spanner.max_timestamp_precision=microseconds` to cover Spanner's full
-year 1–9999 range, truncating sub-microsecond digits toward negative infinity. See
-[timestamp precision](docs/options.md#timestamp-precision).
-
-The crate uses git-pinned Google Cloud, ADBC and Arrow dependencies and is not published to crates.io.
-Downstream Rust users must use the same `adbc_core` revision as [Cargo.toml](Cargo.toml). For the
-default `ffi` feature, also copy its four Arrow `[patch.crates-io]` entries into your own workspace's
-root `Cargo.toml`: Cargo does not inherit dependency patches, and the FFI code needs the pinned
-Arrow stream APIs. See [dependency pins](CONTRIBUTING.md#dependency-pins).
+The ADBC Rust traits are synchronous. From async code, call the driver inside
+`tokio::task::spawn_blocking`; see [synchronous calls from Tokio](docs/limitations.md#synchronous-calls-from-tokio).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for checks and releases, and [docs/testing.md](docs/testing.md)
-for test suites and CI coverage.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for checks and releases, and [testing](docs/testing.md)
+for the test suites.
 
 ## License
 

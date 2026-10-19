@@ -1,61 +1,62 @@
 # ADBC C++ validation
 
-Runs Apache Arrow ADBC's driver-independent C++ validation suite against the built shared
-library through the ADBC driver manager. This checks the driver's C ABI alongside the
-[Rust and Python tests](../docs/testing.md).
+Runs Apache Arrow ADBC's driver-independent C++ validation suite against the shared library,
+loaded through the ADBC driver manager. It tests the C ABI; see [testing](../docs/testing.md)
+for the other suites.
 
-## Run
+## Running
 
 ```sh
-scripts/run-adbc-validation.sh                 # emulator: normal CI checks
+scripts/run-adbc-validation.sh                 # the CI checks, on a disposable emulator
 scripts/run-adbc-validation.sh --full          # every case, including known failures
-scripts/run-adbc-validation.sh --check-drift   # build and check exclusions; no database
+scripts/run-adbc-validation.sh --check-drift   # build and check the exclusions; no database
 
 SPANNER_EMULATOR_HOST=localhost:9010 scripts/run-adbc-validation.sh
 SPANNER_GCP_DATABASE=my-project.my-instance.my-test-db scripts/run-adbc-validation.sh
 ```
 
-Requirements: Rust, Bash 4+, a C compiler, a C++20 compiler, CMake 3.20+, git, Python 3 and curl;
-Docker when starting an emulator. The script builds the driver and harness and prepares the emulator
-database. A real target uses ADC and must already exist; use a dedicated test database.
-`SPANNER_EMULATOR_HOST` takes precedence over `SPANNER_GCP_DATABASE`.
+You need Rust, Bash 4+, C and C++20 compilers, CMake 3.20+, git, Python 3 and curl, plus Docker
+for the emulator. The script builds the driver and the harness, and creates the emulator
+database. Without a configured target it starts an emulator. The target is chosen from
+`SPANNER_OMNI_ENDPOINT`, then `SPANNER_EMULATOR_HOST`, then `SPANNER_GCP_DATABASE`. A Cloud
+Spanner database must already exist and is reached with ADC; use a dedicated test database.
 
-[CMakeLists.txt](CMakeLists.txt) pins arrow-adbc with `ARROW_ADBC_TAG` and fetches/builds the C++
-dependencies. Keep that revision aligned with the Rust arrow-adbc dependencies in `Cargo.toml`.
+[CMakeLists.txt](CMakeLists.txt) pins arrow-adbc with `ARROW_ADBC_TAG` and fetches and builds
+the C++ dependencies. Keep that revision in line with the arrow-adbc crates in `Cargo.toml`.
 `ADBC_VALIDATION_BUILD_DIR` overrides the build directory.
 
-`--full` uses CTest to run cases in separate processes. It prints failures but does not propagate
-CTest's failure exit status; use the default mode for CI.
+`--full` runs each case in its own process through CTest and prints failures, but always exits
+successfully. Use the default mode for CI.
 
 ## Coverage and exclusions
 
-[`SpannerQuirks`](spanner_validation.cc) declares capabilities, readback type conversions,
-identifier/parameter syntax and GoogleSQL rewrites. Rewrites assert the expected upstream SQL
-so changed queries require review when the pin advances.
+[`SpannerQuirks`](spanner_validation.cc) declares the driver's capabilities, readback type
+conversions, identifier and parameter syntax, and GoogleSQL rewrites of the suite's SQL. Each
+rewrite asserts the upstream SQL it expects, so a changed query needs review when the pin moves.
 
-The suite covers database/connection lifetimes, metadata, transaction options, queries, prepared
-parameters, row counts, partitioning, cancellation, error/stream lifetimes and all four ingest
-modes. It includes native, widened, large/view, dictionary and list Arrow representations where
-supported. Exact cases come from the pinned suite, rather than a separately maintained count.
+The suite covers database and connection lifetimes, metadata, transaction options, queries,
+prepared parameters, row counts, partitioning, cancellation, error and stream lifetimes, and all
+four ingest modes. It exercises native, widened, large, view, dictionary and list Arrow
+types where the driver supports them.
 
-[`run-adbc-validation.sh`](../scripts/run-adbc-validation.sh) has one `EXCLUDED` list:
+[`run-adbc-validation.sh`](../scripts/run-adbc-validation.sh) excludes three cases:
 
-| Excluded case | Current limitation |
+| Excluded case | Reason |
 | --- | --- |
-| `SpannerStatementTest.SqlIngestUInt64` | The driver cannot create a column for Arrow `UInt64`; its full range cannot fit `INT64`. |
-| `SpannerStatementTest.SqlIngestDuration` | No ingest column mapping. |
-| `SpannerStatementTest.SqlIngestInterval` | No ingest column mapping. |
+| `SpannerStatementTest.SqlIngestUInt64` | Arrow `UInt64` doesn't fit in `INT64`, so the driver can't create a column for it. |
+| `SpannerStatementTest.SqlIngestDuration` | No column mapping for ingest. |
+| `SpannerStatementTest.SqlIngestInterval` | No column mapping for ingest. |
 
-The default run enforces three checks:
+The default run then checks that:
 
-1. Every non-excluded case passes or self-skips, including cases added upstream.
-2. Every excluded case still fails or skips; an unexpected pass requires removing the exclusion.
-3. Every exclusion still names an available test; renamed or removed cases fail the drift check.
+1. every other case passes or skips itself, including cases added upstream;
+2. every excluded case still fails or skips, so an unexpected pass means the exclusion should go;
+3. every excluded case still exists, so renamed or removed cases are caught.
 
-Quirk-controlled skips remain in the normal run: `Transactions` requires behavior incompatible
-with immediate DDL and buffered manual writes; `SqlIngestPrimaryKey` expects ordered generated
-keys; the `SqlIngestTemporary*` cases require temporary tables. These skips are not covered by the
-unexpected-pass guard and should be reviewed when capabilities change.
+Some cases skip through quirks instead: `Transactions` expects behavior that conflicts with
+immediate DDL and buffered manual writes, `SqlIngestPrimaryKey` expects ordered generated keys,
+and the `SqlIngestTemporary*` cases need temporary tables. Check 2 doesn't cover these, so review
+them when the driver's capabilities change.
 
 ## Sanitizers
 
@@ -63,8 +64,8 @@ The [CI workflow](../.github/workflows/adbc-validation.yml) runs the same checks
 
 | Mode | Instrumentation |
 | --- | --- |
-| `plain` | Normal Rust and C++ builds |
-| `asan-ubsan` | C/C++ address and undefined-behavior sanitizers; Rust stays uninstrumented |
+| `plain` | None |
+| `asan-ubsan` | AddressSanitizer and UndefinedBehaviorSanitizer for C and C++; Rust is not instrumented |
 | `rust-asan` | Rust and its standard library built with nightly ASan; C++ built with clang ASan |
 
 ```sh
@@ -74,17 +75,17 @@ ADBC_VALIDATION_SANITIZE=address ADBC_VALIDATION_RUST_SANITIZE=address \
   scripts/run-adbc-validation.sh
 ```
 
-The Rust mode needs nightly with `rust-src`, clang and clang++. It uses `-Zsanitizer=address`
-and `-Zbuild-std`, defaults `CC`/`CXX` to clang, and loads the library from
-`target/<host-triple>/debug/`. Keep the C++ and Rust ASan runtimes compatible when overriding
-compilers. Rust mode supports `address`; UBSan coverage comes from the separate C++ mode.
+The Rust mode needs nightly with `rust-src`, clang and clang++. It builds with
+`-Zsanitizer=address` and `-Zbuild-std`, defaults `CC` and `CXX` to clang, and loads the library
+from `target/<host-triple>/debug/`. If you override the compilers, keep the C++ and Rust ASan
+runtimes compatible. Rust mode only supports `address`; UBSan runs in the C++ mode.
 
-C++ ASan can catch errors reaching its process-wide allocator/memory interceptors, but cannot
-check every memory access inside uninstrumented Rust. Rust ASan covers those instrumented
-accesses. Its positive-control [canary](asan_canary.cc) calls a test-only out-of-bounds Rust
-function on a C++ allocation and requires an ASan heap-buffer-overflow report before the suite
-runs. That symbol is enabled only by the script's `--cfg asan_canary` build.
+C++ ASan catches errors that reach its allocator and memory interceptors, but can't see memory
+accesses inside uninstrumented Rust. Rust ASan covers those. As a positive control, its
+[canary](asan_canary.cc) calls a test-only Rust function that writes past a C++ allocation, and
+the suite only runs if ASan reports the heap buffer overflow. The script enables that function
+with `--cfg asan_canary`.
 
-Leak detection is disabled by default for process-lifetime runtime/client state; ASan memory
-errors and UBSan reports remain fatal. Native TLS C/assembly is not instrumented by the Rust
-flag. Plain, C++-sanitized and Rust-sanitized runs use separate build directories.
+Leak detection is off, because the runtime and client state live for the whole process. ASan
+memory errors and UBSan reports are still fatal. The Rust flag doesn't instrument the native TLS
+C and assembly code. Each mode uses its own build directory.

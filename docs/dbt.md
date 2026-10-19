@@ -5,13 +5,13 @@ with the Rust implementation at [dbt-labs/dbt][dbt] would use this driver's shar
 Installing the Python package or shared library does not add `type: spanner` to dbt; the profile,
 SQL and materialization designs below are not implemented.
 
-Reviewed on **2026-10-18**, against:
+Reviewed on 2026-10-18 against:
 
-- **spanner-adbc 0.9.0**, repository commit
+- spanner-adbc 0.9.0, repository commit
   [`90bd3c5`](https://github.com/fornwall/spanner-adbc/commit/90bd3c5).
-- **dbt v2.0.8**, released October 14
+- dbt v2.0.8, released October 14
   ([release][dbt-release], commit `43918198c2f02366ceb33f60006812872b0bab40`).
-- **dbt upstream `main`**, commit
+- dbt upstream `main`, commit
   [`00e5d9ef340bd07476f8f02e4e6d048fa8749993`][dbt-main].
   Source links pin this snapshot; `main` and the release differ. These observations need
   revalidation before implementation or issue reports. dbt v1 is outside this proposal.
@@ -24,7 +24,7 @@ as bugs. They are independent of a local Spanner prototype.
 
 ### Correctness candidates
 
-1. **Make option debug formatting consistently redact credentials.**
+1. Make option debug formatting consistently redact credentials.
    The [database builder][database-debug] masks only a few option-name patterns; existing
    BigQuery/Databricks credential keys such as `auth_credentials`, `auth.access_token` and
    `oauth.client_secret` do not all match. The [connection builder][connection-debug] prints
@@ -33,13 +33,13 @@ as bugs. They are independent of a local Spanner prototype.
    not evidence that production logs have exposed credentials. Cover Spanner's inline JSON
    and token options when adding the adapter.
 
-2. **Canonicalize each relation component using its own quote policy.**
+2. Canonicalize each relation component using its own quote policy.
    [`get_canonical_fqn`][canonical-fqn] checks `quote_policy().database` when normalizing the
    database, schema and identifier. Schema and identifier should use their own flags. Test
    all combinations with mixed-case Snowflake/Postgres names and relation-cache lookup, then
    keep Spanner's namespace/case rules explicit when introducing it.
 
-3. **Fix SQL literal escaping and make binding substitution SQL-aware.**
+3. Fix SQL literal escaping and make binding substitution SQL-aware.
    [`SqlLiteralFormatter`][formatter] escapes quotes but not existing backslashes for
    BigQuery/Databricks; its tests currently accept a trailing-backslash literal that needs
    closer validation. Separately, `format_sql_with_bindings` splits raw text on `%s` or `?`,
@@ -50,7 +50,7 @@ as bugs. They are independent of a local Spanner prototype.
    parsing in `dbt-adapter-sql`. Do not copy textual
    substitution into Spanner's native `@name` parameter path.
 
-4. **Preserve update counts and error identity in record/replay.**
+4. Preserve update counts and error identity in record/replay.
    [`RecordingStatement::execute_update`][record-update] returns a live affected-row count but
    does not record it, while [replay][replay-update] returns `None`. Update errors are reduced
    to `Internal` errors in these paths. Record optional counts and structured error identity,
@@ -64,7 +64,7 @@ impact still needs a reproducer.
 
 ### Shared adapter features
 
-5. **Make execution completion and affected-row reporting explicit at the adapter layer.**
+5. Make execution completion and affected-row reporting explicit at the adapter layer.
    The [engine][engine-execute] uses `execute_update()` for selected backends, but usually calls
    `execute()` and can drop the reader when `fetch=false`. The [driver manager][execute-rows]
    discards the standard affected-row output on that query path. Establish when a non-fetching
@@ -72,10 +72,10 @@ impact still needs a reproducer.
    Spanner's ordinary DML commits before returning, so this is not a claim that its writes
    currently depend on draining. Test exact/unknown row counts, delayed fetch errors, and
    cancellation during execution and fetch. Preserve existing BigQuery and Snowflake behavior;
-   [#16159][skip-drain] deliberately avoids unnecessary BigQuery DML draining. Do not replace
+   [#16159][skip-drain] avoids unnecessary BigQuery DML draining. Do not replace
    this with unconditional draining or unconditional `execute_update()` for every adapter.
 
-6. **Use ADBC schema-only execution where supported, including record/replay.**
+6. Use ADBC schema-only execution where supported, including record/replay.
    [`dbt-adbc::Statement`][statement-api] already exposes `execute_schema()`; a new low-level API
    is unnecessary. [Adapter schema inference][schema-inference] currently obtains schemas through
    query execution or backend-specific SQL such as DESCRIBE, and
@@ -85,7 +85,7 @@ impact still needs a reproducer.
    types and permission errors without scanning model data. This prepares table construction
    on databases without CTAS, including Spanner.
 
-7. **Generalize the existing Arrow seed path where it is useful.**
+7. Generalize the existing Arrow seed path where it is useful.
    [DuckDB seed ingestion][duckdb-seed] already provides an Arrow-based implementation;
    [#16560][seed-pr] is related ongoing work. Discuss extracting reusable batch/type/ingest
    handling instead of adding another SQL-literal seed loader. Keep target-schema selection,
@@ -94,7 +94,7 @@ impact still needs a reproducer.
    Spanner's `bind_stream()` currently buffers its input, so the adapter must submit bounded
    batches if it promises bounded seed memory.
 
-8. **Document and test the route for a community ADBC-backed adapter.**
+8. Document and test the route for a community ADBC-backed adapter.
    [Generic/system driver loading][driver-backend] exists, but it does not register a dbt
    adapter, profile or dialect. Document the required integration points, local development
    loading, experimental gating, supported platforms and eventual distribution/checksums.
@@ -108,11 +108,11 @@ with maintainers while prototyping; a general plugin-system redesign is outside 
 
 ## Integration boundary and driver behavior
 
-Use the **ADBC C ABI**, loading `libspanner_adbc.so`, `libspanner_adbc.dylib` or `spanner_adbc.dll`
+Use the ADBC C ABI, loading `libspanner_adbc.so`, `libspanner_adbc.dylib` or `spanner_adbc.dll`
 with `AdbcSpannerInit` (fallback `AdbcDriverInit`). The driver supports ADBC 1.0 and 1.1.
 For an initial Rust harness, dbt's existing `Backend::Generic` can describe library name
 `spanner_adbc` and the explicit entrypoint. A supported dbt adapter still needs registration.
-See [shared-library setup](../README.md#shared-library-loadable-driver) and the
+See [shared-library setup](../README.md#shared-library) and the
 [FFI implementation](../src/ffi/mod.rs).
 
 This boundary avoids unifying this crate's git-pinned ADBC/Arrow types with dbt's different
@@ -260,7 +260,7 @@ Use fresh reads for correctness-sensitive incremental predicates; read-staleness
 make the read side of `INSERT … SELECT` stale.
 
 For delete-and-insert, stage the source and commit the staging load first. Then execute the final
-DELETE and INSERT as **one homogeneous DML batch** within transaction limits, preserving it through
+DELETE and INSERT as one homogeneous DML batch within transaction limits, preserving it through
 dbt's statement splitter. Separate autocommitted calls expose a missing-row interval. In manual
 mode, ingest mutations are applied after DML, so buffering the stage ingest with its consuming DML
 in one commit does not work. Start `on_schema_change` conservatively with explicit errors;

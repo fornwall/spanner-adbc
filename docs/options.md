@@ -1,76 +1,77 @@
 # Configuration options
 
-Set options with Rust `set_option` or constructor options, the C `Adbc*SetOption` functions,
-or Python driver-manager `db_kwargs` / `conn_kwargs`. Unknown keys return `NotImplemented` on
-set and `NotFound` on get.
+Set options with `set_option` or constructor options in Rust, the `Adbc*SetOption` functions in
+C, or `db_kwargs`, `conn_kwargs` and `adbc_stmt_kwargs` in Python. Setting an unknown key
+returns `NotImplemented`, and getting one returns `NotFound`.
 
-## Option levels
+Options live at three levels:
 
 | Level | Scope |
 | --- | --- |
 | [Database](#database-options) | Database path, endpoint and credentials. |
-| [Connection](#connection-only-options) | Transaction mode, isolation and defaults for new statements. |
-| [Statement](#statement-only-options) | SQL/ingest execution and overrides of shared options. |
+| [Connection](#connection-only-options) | Transactions, isolation and defaults for new statements. |
+| [Statement](#statement-only-options) | SQL and ingest execution, and overrides of the [shared options](#shared-options-connection-and-statement). |
 
-### Inheritance: connection → statement
+## Inheritance
 
-A new statement copies the connection's [shared options](#shared-options-connection-and-statement).
-Later connection changes do not affect existing statements. Clearing a copied option resets the
-statement to that option's unset/default state; it does not restore the connection's value.
+A new statement copies the connection's shared options. Changing the connection afterwards
+doesn't affect existing statements. Clearing a copied option on a statement resets it to the
+option's default, not to the connection's value.
 
-`adbc.connection.readonly` is live: existing statements observe changes immediately. Commit
-statistics are per object and are not inherited. The connection-only transaction tag and isolation
-level are copied into new statements' execution configuration.
+A few options behave differently. Existing statements see changes to `adbc.connection.readonly`
+immediately. Commit statistics belong to each object and aren't copied. The transaction tag and
+isolation level can only be set on the connection, but are copied into each new statement.
 
 ## Values and getters
 
-- Booleans accept only string `true` or `false`, not integers or alternate spellings.
-- Positive integers accept an integer or integer string; retry attempts also accept whole doubles.
-- Fractional seconds accept numeric strings, integers or doubles, subject to the table's range.
-  Values must be finite and representable as a duration.
-- Other values must be strings. Enumerated values are case-sensitive. Tags are stored verbatim;
-  structured parsers such as staleness trim surrounding whitespace.
+- Booleans are the strings `true` and `false`. Integers and other spellings are rejected.
+- Positive integers accept an integer or an integer string. `spanner.retry.max_attempts` also
+  accepts whole-number doubles.
+- Seconds accept numeric strings, integers or doubles within the range given in the table. They
+  must be finite and fit in a duration.
+- Everything else is a string. Enumerated values are case-sensitive. Tags are stored verbatim;
+  values that are parsed, such as staleness, have surrounding whitespace trimmed.
 
-Invalid values generally return `InvalidArguments`; unknown ingest modes return `NotImplemented`.
-Unless a default is reported, an unset option returns
-`NotFound`. The **Get** column describes the string getter: “set” means available only when set,
-“always” includes the default, and “write-only” always returns `NotFound`. Typed getters parse
-that same string as an integer/double (or return its UTF-8 bytes); failed numeric parsing returns
-`InvalidArguments`.
+Invalid values return `InvalidArguments`, except unknown ingest modes, which return
+`NotImplemented`.
 
-At the C ABI, database/connection options set before `Init` are buffered, with the last value for
-each key retained. Validation happens at `Init`, and every pre-`Init` get returns `NotFound`.
-Statements have no pre-initialization phase.
+The Get column describes the string getter. "always" returns the value or its default; "set"
+returns a value only once it has been set and otherwise `NotFound`; "write-only" always returns
+`NotFound`. Typed getters parse the same string as an integer or double, or return its UTF-8
+bytes. A failed numeric parse returns `InvalidArguments`.
+
+In the C ABI, database and connection options set before `Init` are buffered, keeping the last
+value for each key, and validated at `Init`. Getting any option before `Init` returns
+`NotFound`. Statements have no such phase.
 
 ## Database options
 
-The first connection builds and caches the database's client stack. Later connections share it.
-Setting any database option invalidates the cache for future connections; existing connections
-keep their current stack. Environment-derived values are not reflected by option getters.
+The first connection builds the database's client stack, and later connections share it.
+Setting any database option discards the cached stack for future connections; existing
+connections keep theirs. Getters don't show values taken from the environment.
 
 | Option | Values | Default | Get | Effect |
 | --- | --- | --- | --- | --- |
-| `uri` | `spanner://` URI | required | set, verbatim | Database path plus optional endpoint/query options; see [URIs](#connection-uris). Missing URI fails connection creation with `InvalidState`. |
+| `uri` | `spanner://` URI | required | set, verbatim | Database path plus optional endpoint and options; see [connection URIs](#connection-uris). Without it, creating a connection fails with `InvalidState`. |
 | `spanner.endpoint` | gRPC endpoint URL | production endpoint | set | Overrides the endpoint from `SPANNER_EMULATOR_HOST`. |
-| `spanner.emulator` | boolean | `false` | always | Uses anonymous credentials. A nonempty emulator environment variable also enables this mode. |
-| `spanner.instance_type` | `cloud`, `omni` | `cloud` | always | Selects Cloud Spanner or Spanner Omni. Omni requires an explicit endpoint, ignores `SPANNER_EMULATOR_HOST`, and cannot combine with `spanner.emulator=true`. Without explicit credentials, Omni uses anonymous authentication. |
+| `spanner.emulator` | boolean | `false` | always | Uses anonymous credentials. A non-empty `SPANNER_EMULATOR_HOST` also enables this mode. |
+| `spanner.instance_type` | `cloud`, `omni` | `cloud` | always | Selects Cloud Spanner or Spanner Omni. Omni needs an explicit endpoint, ignores `SPANNER_EMULATOR_HOST` and can't be combined with `spanner.emulator=true`. Without explicit credentials, Omni connects anonymously. |
 | `spanner.auth.keyfile` | credential JSON file path | ADC | set | Supports `service_account`, `authorized_user`, `impersonated_service_account` and `external_account` JSON. |
-| `spanner.auth.keyfile_json` | inline credential JSON | ADC | write-only | Same credential formats; takes precedence over `keyfile`. Not allowed in URIs. |
-| `spanner.auth.impersonate.target_principal` | service-account email | unset | set | Impersonates the target using keyfile/ADC base credentials. |
-| `spanner.auth.impersonate.delegates` | comma-separated service-account emails | no delegates | nonempty | Delegation chain; entries are trimmed and empty entries removed. Used only with a target principal. |
-| `spanner.auth.impersonate.scopes` | comma-separated OAuth scopes | `cloud-platform` | nonempty | Impersonated-token scopes; normalized like delegates. Used only with a target principal. |
-| `spanner.auth.impersonate.lifetime` | non-negative integer seconds | `3600` | explicitly set only | Impersonated-token lifetime; accepts an integer or integer string. |
-| `spanner.auth.access_token` | OAuth bearer token | ADC | write-only | Caller manages token validity; no refresh. Not allowed in URIs. |
-| `spanner.auth.quota_project` | project id; `""` unsets | credential default | set | Sends `x-goog-user-project`; the caller needs `serviceusage.services.use`. With ADC, `GOOGLE_CLOUD_QUOTA_PROJECT` takes precedence. |
+| `spanner.auth.keyfile_json` | inline credential JSON | ADC | write-only | Same formats as `keyfile`, and takes precedence over it. Not allowed in URIs. |
+| `spanner.auth.impersonate.target_principal` | service account email | unset | set | Impersonates this account, using the keyfile or ADC as base credentials. |
+| `spanner.auth.impersonate.delegates` | comma-separated service account emails | no delegates | nonempty | Delegation chain. Entries are trimmed and empty entries dropped. Needs a target principal. |
+| `spanner.auth.impersonate.scopes` | comma-separated OAuth scopes | `cloud-platform` | nonempty | Scopes for the impersonated token, normalized like delegates. Needs a target principal. |
+| `spanner.auth.impersonate.lifetime` | non-negative integer seconds | `3600` | explicitly set only | Lifetime of the impersonated token. Accepts an integer or integer string. |
+| `spanner.auth.access_token` | OAuth bearer token | ADC | write-only | Sent as is and never refreshed. Not allowed in URIs. |
+| `spanner.auth.quota_project` | project ID; `""` unsets | credential default | set | Sends `x-goog-user-project`; the caller needs `serviceusage.services.use`. With ADC, `GOOGLE_CLOUD_QUOTA_PROJECT` takes precedence. |
 
-At connection-stack creation, emulator mode rejects explicit keyfile, inline JSON, access token,
-impersonation target or quota project with `InvalidState`; ambient ADC does not conflict.
-An access token is mutually exclusive with keyfile, inline JSON and an impersonation target.
-See [authentication](../README.md#authentication) for setup.
+In emulator mode, creating the client stack fails with `InvalidState` if a keyfile, inline JSON,
+access token, impersonation target or quota project is set. Ambient ADC doesn't count. An access
+token can't be combined with a keyfile, inline JSON or an impersonation target.
 
 ### Connection URIs
 
-The scheme is required and matched case-insensitively. Bare database paths and other schemes
+The `spanner` scheme is required and case-insensitive. Bare database paths and other schemes
 return `InvalidArguments`.
 
 ```text
@@ -78,114 +79,107 @@ spanner:///projects/<p>/instances/<i>/databases/<d>?spanner.emulator=true
 spanner://localhost:9010/projects/<p>/instances/<i>/databases/<d>
 ```
 
-The path identifies the database. An authority (`host:port`) supplies `spanner.endpoint`; use
-three slashes when there is no authority. An endpoint alone does not enable anonymous credentials.
-Query keys must be database options above, except `uri`, `spanner.auth.keyfile_json` and
-`spanner.auth.access_token`; unknown or forbidden keys return `InvalidArguments`. Values are
-percent-decoded, with `+` kept as a literal plus. URI fragments and userinfo (`user:password@host`)
-are rejected; supply credentials through the `spanner.auth.*` options.
+The path names the database. A `host:port` authority sets `spanner.endpoint`; without one, use
+three slashes. An endpoint alone doesn't switch to anonymous credentials.
 
-Setting a URI expands its options immediately. The last writer wins per option, and the URI
-changes only the options it contains. `get_option("uri")` returns the last accepted URI verbatim;
-individual getters show the current expanded values, including any later overrides. Secret
-values must be supplied separately; a keyfile path is allowed in the URI.
+Query parameters can set any database option except `uri`, `spanner.auth.keyfile_json` and
+`spanner.auth.access_token`. Unknown or forbidden keys return `InvalidArguments`. Values are
+percent-decoded, and `+` stays a literal plus. Fragments and userinfo (`user:password@host`) are
+rejected: set secrets through the `spanner.auth.*` options instead. A keyfile path is allowed.
+
+Setting a URI applies its options immediately and leaves other options alone; a later setting
+of the same option wins. `get_option("uri")` returns the last accepted URI as given, while each
+option's getter shows its current value.
 
 ## Connection-only options
 
 | Option | Values | Default | Get | Effect |
 | --- | --- | --- | --- | --- |
-| `adbc.connection.autocommit` | boolean | `true` | always | `false` enables manual transactions. Returning to `true` commits pending work; failure preserves it. |
-| `adbc.connection.readonly` | boolean | `false` | always | Rejects DML, DDL, ingest and commits of buffered writes with `InvalidState`. Rollback and read-only/empty commits remain available. |
-| `adbc.connection.transaction.isolation_level` | full ADBC isolation constant; see below | `adbc.connection.transaction.isolation.default` | always, effective level | Configures read/write transactions; copied into new statements. |
-| `spanner.transaction.tag` | string; `""` unsets | unset | set | Tags read/write and write-only transactions and BatchWrite groups. Copied into new statements, which cannot set it. |
-| `adbc.connection.catalog` | database id | current database id | always | Only the current value is accepted; another value returns `NotImplemented`. |
-| `adbc.connection.db_schema` | `""` | `""` | always | Only `""` is accepted. Named schemas use qualified names; there is no selectable session schema. |
-
-### Manual transactions
-
-The first query or write determines the transaction kind. Queries share a read-only snapshot;
-DML and ingest mutations buffer until commit. Mixing kinds fails with `InvalidState`, so there
-is no read-your-writes. Buffered `execute_update` calls return `None`; commit returns no row count.
-DDL applies immediately and cannot be rolled back. See [transactions](transactions.md).
+| `adbc.connection.autocommit` | boolean | `true` | always | `false` starts [manual transactions](transactions.md#adbc-transactions). Switching back to `true` commits pending work; if that fails, the work stays pending. |
+| `adbc.connection.readonly` | boolean | `false` | always | Rejects DML, DDL, ingest and commits of buffered writes with `InvalidState`. Rollback and read-only or empty commits still work. |
+| `adbc.connection.transaction.isolation_level` | full ADBC isolation constant; see below | `adbc.connection.transaction.isolation.default` | always, effective level | Isolation for read/write transactions. Copied into new statements. |
+| `spanner.transaction.tag` | string; `""` unsets | unset | set | Tags read/write and write-only transactions and BatchWrite groups. Copied into new statements, which can't set it. |
+| `adbc.connection.catalog` | database ID | current database ID | always | Only the current value is accepted; anything else returns `NotImplemented`. |
+| `adbc.connection.db_schema` | `""` | `""` | always | Only `""` is accepted. Use qualified names for named schemas. |
 
 ### Isolation levels
 
-Values require the prefix `adbc.connection.transaction.isolation.`. Getters report the effective
-level; unknown values return `InvalidArguments`.
+Values need the `adbc.connection.transaction.isolation.` prefix. Unknown values return
+`InvalidArguments`. The getter reports the effective level:
 
 | Suffix | Effective level |
 | --- | --- |
-| `default` | Spanner default: `SERIALIZABLE`; getter retains `default`. |
+| `default` | Spanner's default, `SERIALIZABLE`. The getter keeps `default`. |
 | `serializable`, `linearizable` | `serializable` |
 | `repeatable_read`, `snapshot`, `read_committed`, `read_uncommitted` | `repeatable_read` |
 
-The option applies to DML read/write transactions. Queries use staleness instead; mutation-only
-ingest commits and partitioned DML do not use this option. Spanner's repeatable read provides
-snapshot isolation and permits write skew, even for a single autocommit statement that reads rows
-it does not write. See [isolation and locking](transactions.md#isolation-and-locking).
+The level applies to transactions that run DML. Queries use staleness instead, and mutation-only
+ingest commits and partitioned DML ignore it. Repeatable read permits write skew; see
+[isolation and locking](transactions.md#isolation-and-locking).
 
 ## Shared options (connection and statement)
 
-All settable options below accept `""` to clear/reset their value. Statement getters report their
-own effective values after inheritance or overrides.
+Every settable option below accepts `""` to reset it. A statement's getters report its own
+effective value, whether inherited or overridden.
 
 | Option | Values | Default | Get | Effect |
 | --- | --- | --- | --- | --- |
 | `spanner.read.staleness` | [staleness grammar](#stale-reads) | strong read | set, trimmed | Timestamp bound for read-only queries. Clearing an inherited bound restores strong reads. |
-| `spanner.max_timestamp_precision` | `nanoseconds_error_on_overflow`, `microseconds` | `nanoseconds_error_on_overflow` | always | Arrow timestamp unit/range; also used by connection schema and partition reads. |
-| `spanner.request.priority` | `low`, `medium`, `high` | service default: high | set | Query/DML, commit and BatchWrite priority; also applied to internal metadata reads. |
-| `spanner.request.tag` | string | unset | set, verbatim | Tags user query/DML requests and batch DML. Internal metadata and BatchWrite requests remain untagged. |
-| `spanner.directed_read` | [replica-selection grammar](#directed-reads) | service routing | set, trimmed | Replica selection for read-only queries, including metadata. |
-| `spanner.query.optimizer_version` | version string or `latest` | database/service default | set, verbatim | Query optimizer version. |
+| `spanner.max_timestamp_precision` | `nanoseconds_error_on_overflow`, `microseconds` | `nanoseconds_error_on_overflow` | always | Arrow timestamp unit and range; see [timestamp precision](#timestamp-precision). Also used for connection metadata schemas and partition reads. |
+| `spanner.request.priority` | `low`, `medium`, `high` | service default: high | set | Priority for queries, DML, commits and BatchWrite, and for internal metadata reads. |
+| `spanner.request.tag` | string | unset | set, verbatim | Tags user queries, DML and batch DML. Internal metadata reads and BatchWrite stay untagged. |
+| `spanner.directed_read` | [replica selection grammar](#directed-reads) | service routing | set, trimmed | Replica selection for read-only queries, including metadata reads. |
+| `spanner.query.optimizer_version` | version string or `latest` | database or service default | set, verbatim | Query optimizer version. |
 | `spanner.query.optimizer_statistics_package` | package name | database default | set, verbatim | Query optimizer statistics package. |
-| `spanner.commit.max_delay` | duration from `0` through `500ms` | unset | set, trimmed | Maximum extra commit delay for batching; same duration units as staleness. |
-| `spanner.commit_stats` | boolean | `false` | always | Requests mutation statistics on read/write and write-only commits. |
-| `spanner.commit_stats.mutation_count` | read-only | unavailable | after a stats-enabled commit | Most recent recorded mutation count for this object: manual commit on the connection, autocommit DML/ingest on the statement. For chunked ingest, the last chunk's count. Setting returns `NotImplemented`. |
-| `spanner.transaction.exclude_from_change_streams` | boolean | `false` | always | Excludes writes from streams configured with `allow_txn_exclusion=true`; applies to ordinary writes, BatchWrite and partitioned DML. |
-| `spanner.rpc.timeout_seconds.query` | non-negative fractional seconds | unset | set | Initial query/first chunk, PLAN and partition probes, initial partition fetch, and internal metadata reads. |
-| `spanner.rpc.timeout_seconds.update` | non-negative fractional seconds | unset | set | DML, manual commit, each ingest chunk, BatchWrite, partitioned DML, and DDL plus operation polling. |
-| `spanner.rpc.timeout_seconds.fetch` | non-negative fractional seconds | unset | set | Each later streamed chunk. |
-| `spanner.retry.max_attempts` | integer `1..=4294967295` | client default | set | Attempt cap including the first try; `1` disables retries. See [retry tuning](#retry-tuning). |
-| `spanner.retry.max_elapsed_seconds` | positive fractional seconds | unset | set | Retry elapsed-time limit; ineffective for streaming query and BatchWrite resumption. |
+| `spanner.commit.max_delay` | duration from `0` to `500ms` | unset | set, trimmed | Extra delay Spanner may add to a commit to batch it with others. Uses the staleness duration units. |
+| `spanner.commit_stats` | boolean | `false` | always | Requests mutation counts for read/write and write-only commits. |
+| `spanner.commit_stats.mutation_count` | read-only | unavailable | after a stats-enabled commit | The last recorded mutation count for this object: manual commits on the connection, autocommit DML and ingest on the statement. For chunked ingest, the last chunk's count. Setting it returns `NotImplemented`. |
+| `spanner.transaction.exclude_from_change_streams` | boolean | `false` | always | Excludes writes from change streams created with `allow_txn_exclusion=true`. Applies to ordinary writes, BatchWrite and partitioned DML. |
+| `spanner.rpc.timeout_seconds.query` | non-negative fractional seconds | unset | set | Deadline for starting queries, planning, partitioning and metadata reads; see [RPC timeouts](#rpc-timeouts). |
+| `spanner.rpc.timeout_seconds.update` | non-negative fractional seconds | unset | set | Deadline for each write and DDL operation; see [RPC timeouts](#rpc-timeouts). |
+| `spanner.rpc.timeout_seconds.fetch` | non-negative fractional seconds | unset | set | Deadline for each later result chunk; see [RPC timeouts](#rpc-timeouts). |
+| `spanner.retry.max_attempts` | integer `1..=4294967295` | client default | set | Maximum attempts, including the first; `1` disables retries. See [retry tuning](#retry-tuning). |
+| `spanner.retry.max_elapsed_seconds` | positive fractional seconds | unset | set | Time limit for retrying. Has no effect on resuming streamed queries and BatchWrite. |
 | `spanner.retry.backoff.initial_seconds` | positive fractional seconds | `1` | explicitly set only | Initial backoff delay, clamped at execution. |
 | `spanner.retry.backoff.max_seconds` | positive fractional seconds | `60` | explicitly set only | Maximum backoff delay, clamped at execution. |
 | `spanner.retry.backoff.multiplier` | positive finite number | `2` | explicitly set only | Backoff growth factor, clamped at execution. |
 
-Commit delay/stats apply to the read/write runner and write-only commits. They do not apply to
-BatchWrite or partitioned DML. Internal metadata reads inherit priority, directed reads, retry
-settings and timeouts, but no request/transaction tags.
+Commit delay and commit statistics apply to read/write and write-only commits, not to BatchWrite
+or partitioned DML. Internal metadata reads use the priority, directed read, retry and timeout
+settings, but no request or transaction tags.
 
 ## Statement-only options
 
 | Option | Values | Default | Get | Effect |
 | --- | --- | --- | --- | --- |
-| `spanner.rows_per_batch` | positive integer | `8192` | always | Maximum rows per Arrow batch, also subject to the conversion byte budget. |
-| `spanner.data_boost` | boolean | `false` | always | Enables [Data Boost](https://docs.cloud.google.com/spanner/docs/databoost/databoost-overview) for partitioned execution on Cloud Spanner; Omni does not support it. Carried in partition descriptors. |
-| `adbc.statement.bind_by_name` | boolean | `false` | always | By default, columns bind to distinct parameters in SQL order. `true` matches column names, case-insensitively as Spanner resolves them; unknown names return `InvalidArguments`. |
-| `adbc.statement.exec.incremental` | boolean, only `false` supported | `false` | always | `true` returns `NotImplemented`; incremental partition generation is unsupported. |
-| `adbc.ingest.target_table` | table name | unset | set | Selects bulk ingest and clears SQL. Setting SQL clears this target. Names containing a backtick, a backslash or a control character, and the empty name, return `InvalidArguments`. |
-| `adbc.ingest.target_db_schema` | schema name; `""` for default schema | default schema | set | Qualifies the target table. |
-| `adbc.ingest.target_catalog` | connection's database id | connection's catalog | set | Other values, including `""`, return `NotImplemented`. |
-| `adbc.ingest.temporary` | boolean, only `false` supported | `false` | always | `true` returns `NotImplemented`; temporary tables are unsupported. |
-| `adbc.ingest.mode` | `adbc.ingest.mode.append`, `create`, `create_append`, `replace` (prefix applies to each; bare suffixes also accepted) | `adbc.ingest.mode.create` | always, full constant | `append` requires a table; `create` requires absence; `create_append` creates if absent; `replace` drops and recreates. All insert rows. |
-| `spanner.ingest.batch_write` | boolean; `""` resets | `false` | always | Uses non-atomic BatchWrite for autocommit ingest; ignored in manual mode. |
-| `spanner.dml.partitioned` | boolean; `""` resets | `false` | always | Runs DML as partitioned DML; ignored for queries, DDL and ingest. |
+| `spanner.rows_per_batch` | positive integer | `8192` | always | Maximum rows per Arrow batch. Batches are also capped by size. |
+| `spanner.data_boost` | boolean | `false` | always | Runs partitioned queries on [Data Boost](https://docs.cloud.google.com/spanner/docs/databoost/databoost-overview). Cloud Spanner only; Omni doesn't support it. Carried in partition descriptors. |
+| `adbc.statement.bind_by_name` | boolean | `false` | always | By default, columns bind to distinct parameters in SQL order. `true` matches column names to parameter names, case-insensitively as Spanner does; unknown names return `InvalidArguments`. |
+| `adbc.statement.exec.incremental` | boolean, only `false` supported | `false` | always | `true` returns `NotImplemented`; incremental partitioning is not supported. |
+| `adbc.ingest.target_table` | table name | unset | set | Selects bulk ingest and clears the SQL; setting SQL clears it. An empty name, or one containing a backtick, backslash or control character, returns `InvalidArguments`. |
+| `adbc.ingest.target_db_schema` | schema name; `""` for the default schema | default schema | set | Schema of the target table. |
+| `adbc.ingest.target_catalog` | connection's database ID | connection's catalog | set | Other values, including `""`, return `NotImplemented`. |
+| `adbc.ingest.temporary` | boolean, only `false` supported | `false` | always | `true` returns `NotImplemented`; temporary tables are not supported. |
+| `adbc.ingest.mode` | `adbc.ingest.mode.append`, `create`, `create_append`, `replace` (each with the prefix; bare suffixes are also accepted) | `adbc.ingest.mode.create` | always, full constant | `append` needs an existing table; `create` needs it to be absent; `create_append` creates it if absent; `replace` drops and recreates it. All modes then insert the rows. |
+| `spanner.ingest.batch_write` | boolean; `""` resets | `false` | always | Uses non-atomic BatchWrite for autocommit ingest. Ignored in manual mode. |
+| `spanner.dml.partitioned` | boolean; `""` resets | `false` | always | Runs DML as partitioned DML. Ignored for queries, DDL and ingest. |
 
-Table-building ingest modes derive columns from Arrow and omit an explicit primary key; Spanner
-supplies a hidden row id. Create the table yourself and use `append` to choose its keys. Table
-DDL is immediate even in manual mode. See [primary keys](https://docs.cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys).
+Ingest modes that create a table derive its columns from the Arrow schema and declare no primary
+key, so Spanner adds a [hidden row ID](https://docs.cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys).
+To choose the key, create the table yourself and use `append`. Creating the table is DDL and
+happens immediately, even in manual mode.
 
-BatchWrite uses one mutation group per row, so a chunk can partially succeed. Priority,
-transaction tag, change-stream exclusion, retry tuning and the update timeout apply; request tags
-and commit delay/stats do not. Ordinary autocommit ingest is atomic per chunk, while manual
-ingest buffers mutations for one commit.
+BatchWrite sends one mutation group per row, so a chunk can partially succeed. Priority,
+transaction tag, change-stream exclusion, retry settings and the update timeout apply; request
+tags and commit delay and statistics don't. Ordinary autocommit ingest is atomic per chunk, and
+manual ingest buffers all mutations for one commit.
 
-[Partitioned DML](https://docs.cloud.google.com/spanner/docs/dml-partitioned) requires an idempotent
-`UPDATE`/`DELETE`: partitions commit independently and may execute more than once. The reported
-row count is a lower bound. Manual mode returns `InvalidState`; multiple statements/parameter
-rows or `THEN RETURN` return `InvalidArguments`. Priority/request tag, optimizer settings,
-change-stream exclusion, statement retry tuning and the update timeout apply. Commit settings,
-transaction tag and connection isolation do not.
+[Partitioned DML](https://docs.cloud.google.com/spanner/docs/dml-partitioned) needs an idempotent
+`UPDATE` or `DELETE`, because partitions commit independently and can run more than once. The
+reported row count is a lower bound. It returns `InvalidState` in manual mode, and
+`InvalidArguments` for multiple statements, multiple parameter rows or `THEN RETURN`. Priority,
+request tag, optimizer settings, change-stream exclusion, retry settings and the update timeout
+apply; commit settings, the transaction tag and the isolation level don't.
 
 ## Stale reads
 
@@ -194,18 +188,18 @@ Queries default to strong reads. `spanner.read.staleness` accepts:
 | Form | Meaning |
 | --- | --- |
 | `exact:<duration>` | Read exactly that far in the past. |
-| `max:<duration>` | Server chooses a timestamp no older than the duration. |
-| `read:<rfc3339>` or bare RFC 3339 | Read at the given timestamp. |
-| `min:<rfc3339>` | Server chooses that timestamp or a later one. |
+| `max:<duration>` | Spanner picks a timestamp no older than the duration. |
+| `read:<rfc3339>` or a bare RFC 3339 timestamp | Read at that timestamp. |
+| `min:<rfc3339>` | Spanner picks that timestamp or a later one. |
 
-Durations are non-negative numbers with optional units: seconds by default, or `s`, `ms`,
-`us`/`µs`, `ns`, `m`, `h`. Examples: `exact:2.5s`, `max:1m`,
-`read:2026-07-07T00:00:00Z`. Prefixes are lowercase; surrounding whitespace is trimmed.
+Durations are non-negative numbers, in seconds unless followed by a unit: `s`, `ms`, `us` or
+`µs`, `ns`, `m` or `h`. Examples: `exact:2.5s`, `max:1m`, `read:2026-07-07T00:00:00Z`. Prefixes
+are lowercase, and surrounding whitespace is trimmed.
 
-Spanner accepts `max:` and `min:` only for single-use reads. Manual query transactions and
-multi-row bound queries pin them to their most-stale legal equivalent: `max:<d>` becomes exact
-staleness `<d>`, and `min:<t>` becomes exact timestamp `<t>`. `execute_partitions` currently
-passes the bound unchanged to a multi-use transaction; use strong, `exact:` or `read:` there.
+Spanner only accepts `max:` and `min:` for single-use reads. Manual query transactions and
+queries bound to several rows convert them to the stalest equivalent exact bound: `max:<d>`
+becomes `exact:<d>` and `min:<t>` becomes `read:<t>`. `execute_partitions` passes the bound
+through unchanged to a multi-use transaction, so use a strong, `exact:` or `read:` bound there.
 
 ## Directed reads
 
@@ -215,81 +209,89 @@ passes the bound unchanged to a multi-use transaction; use strong, `exact:` or `
 <mode> [ ":" <selection> ("," <selection>)* ] [ ";auto_failover_disabled" ]
 ```
 
-- Mode is `include` (ordered preferences) or `exclude` (avoid these replicas).
-- A selection is a location, `location:type`, or `:type`. Types are `read_write`, `read_only`,
-  or `any`; omitted type means any. Each selection must constrain a location or a specific type.
-- `;auto_failover_disabled` is valid only with `include` and prevents fallback outside the list.
-  Only `include;auto_failover_disabled` may omit the selection list.
+- The mode is `include` (replicas in order of preference) or `exclude` (replicas to avoid).
+- A selection is a location, `location:type` or `:type`. Types are `read_write`, `read_only` and
+  `any`; no type means any. Each selection must name a location or a specific type.
+- `;auto_failover_disabled` only works with `include` and stops Spanner from falling back to
+  other replicas. `include;auto_failover_disabled` is the only form that may omit the selections.
 
 Examples: `include:us-east1`, `include:us-east1:read_only,us-east4:read_write`,
 `exclude:us-central1`, `include::read_only`, `include:us-east1;auto_failover_disabled`.
-Values are trimmed; invalid grammar returns `InvalidArguments`. See [directed reads](https://docs.cloud.google.com/spanner/docs/directed-reads).
+Values are trimmed, and invalid ones return `InvalidArguments`. See
+[directed reads](https://docs.cloud.google.com/spanner/docs/directed-reads).
 
 ## Timestamp precision
 
-Spanner timestamps cover years 0001–9999. Arrow nanoseconds use an `i64`, covering roughly
-1677–2262. `spanner.max_timestamp_precision` chooses:
+Spanner timestamps cover the years 0001 to 9999. Arrow nanosecond timestamps are an `i64`, which
+only covers about 1677 to 2262. `spanner.max_timestamp_precision` chooses between:
 
-- `nanoseconds_error_on_overflow`: `Timestamp(Nanosecond, "UTC")`; out-of-range values return
-  `InvalidArguments` with the column and value.
+- `nanoseconds_error_on_overflow`: `Timestamp(Nanosecond, "UTC")`. Out-of-range values return
+  `InvalidArguments` naming the column and value.
 - `microseconds`: `Timestamp(Microsecond, "UTC")`, covering Spanner's full range. Sub-microsecond
-  digits round toward negative infinity; one nanosecond before the epoch becomes microsecond `-1`.
+  digits are rounded toward negative infinity, so one nanosecond before the epoch becomes
+  microsecond `-1`.
 
-The mode applies to results and schemas, including returning DML, metadata schemas and partition
-reads. `read_partition` uses the reading connection's mode; match it to the producing statement.
-Clearing the option restores `nanoseconds_error_on_overflow`. Bound Arrow timestamps of any unit
-retain their source precision; this option only changes the read direction.
+The mode applies to all results and schemas, including `THEN RETURN` rows, metadata schemas and
+partition reads. `read_partition` uses the reading connection's mode, so match it to the
+producing statement. Clearing the option restores `nanoseconds_error_on_overflow`. Bound
+timestamps keep their own unit; this option only affects reads.
 
 ## RPC timeouts
 
-`spanner.rpc.timeout_seconds.{query,update,fetch}` sets an overall deadline for each covered
-operation, including client retries. `0` disables the deadline; `""` unsets it. Expiry returns
-`Timeout`. A timed-out commit or DDL operation may already have applied server-side.
+`spanner.rpc.timeout_seconds.{query,update,fetch}` set an overall deadline for each operation
+they cover, including the client's retries. `0` disables the deadline and `""` unsets it. When
+a deadline expires, the call returns `Timeout`. A commit or DDL operation that timed out may
+still have been applied.
 
-The initial query/first chunk uses `query`; each later chunk uses `fetch`. For multi-row bound
-queries, later per-row executions also fall under `fetch`. DDL submission and polling share
-one `update` deadline. Client-stack creation/session maintenance is outside these wrappers.
-See [timeout coverage](transactions.md#timeouts).
+| Option | Covers |
+| --- | --- |
+| `query` | The initial query request and first chunk, PLAN probes (including DML parameter planning), creating partitions and the first chunk of a partition read, and internal metadata reads. |
+| `update` | DML transactions including replays after `ABORTED`, manual commits, each ingest chunk, BatchWrite, partitioned DML, and DDL submission plus polling, under one deadline. |
+| `fetch` | Each later result chunk, including the later per-row runs of a query bound to several rows. |
+
+Creating the client stack and maintaining the session fall outside these deadlines. Starting a
+manual read-only transaction sends no RPC, so it needs none.
 
 ## Retry tuning
 
-`spanner.retry.*` configures query/DML statement requests, batch DML, BatchWrite and the
-begin/commit RPCs of read/write and write-only transactions. It preserves the client's retryable-error policy.
-It does not configure session creation, `PartitionQuery` or admin DDL requests.
-Whole-transaction retries on `ABORTED` use a separate, uncapped default policy; use an RPC timeout
-to bound the enclosing operation.
+`spanner.retry.*` configures retries of query and DML requests, batch DML, BatchWrite, and the
+begin and commit RPCs of read/write and write-only transactions. The client's choice of
+retryable errors is kept. These options don't affect session creation, `PartitionQuery` or DDL
+requests.
+
+When Spanner aborts a transaction, the client reruns the whole transaction under a separate
+policy with no attempt limit. Use the `update` timeout to bound it.
 
 ### Attempt and elapsed limits
 
-| Setting | Unary RPCs | Query/BatchWrite stream resumption |
+| Setting | Unary RPCs | Resuming query and BatchWrite streams |
 | --- | --- | --- |
 | `max_attempts=N` | At most N attempts | At most N attempts |
-| `max_elapsed_seconds` | Bounds retry decisions | Ineffective: client resets the retry state's start time. |
-| Neither limit set | No cap | Default cap of 10 attempts |
+| `max_elapsed_seconds` | Limits retry time | No effect; see [known limitations](limitations.md#streaming-retries-ignore-the-elapsed-time-limit) |
+| Neither set | No limit | At most 10 attempts |
 
-The query stream's initial open can fail without reaching its resumption retry loop. Setting
-only `max_elapsed_seconds` replaces the default streaming policy, so set `max_attempts` too if
-you need an attempt cap. Use `query`/`fetch` timeouts for query wall-clock bounds and the `update`
-timeout for BatchWrite. See `retry_max_*` and `batch_write_honors_retry_attempt_limit` in
-[mock_spanner.rs](../tests/mock_spanner.rs) for regression coverage.
+If the first request of a query stream fails, the stream's resume loop isn't involved. Setting
+only `max_elapsed_seconds` replaces the default streaming policy and its 10-attempt limit, so
+also set `max_attempts` if you want an attempt limit. Use the `query` and `fetch` timeouts to
+bound a query's total time and the `update` timeout for BatchWrite.
 
 ### Backoff
 
-Setting any backoff option builds exponential backoff with jitter; unset components use
-1 second / 60 seconds / factor 2. Effective values are clamped: maximum delay to 1 second–24 hours,
-initial delay to 1 millisecond–the effective maximum, and multiplier to 1–32. In particular,
-an initial delay above the maximum is lowered to the maximum. Getters retain configured values.
-Backoff settings are independent of attempt/time caps.
+Setting any backoff option switches to exponential backoff with jitter; unset components default
+to 1 second initial delay, 60 seconds maximum and a factor of 2. The driver clamps effective
+values: the maximum delay to between 1 second and 24 hours, the initial delay to between 1
+millisecond and the effective maximum, and the multiplier to between 1 and 32. Getters return the
+configured values. Backoff is independent of the attempt and time limits.
 
 ## Environment
 
-- `SPANNER_EMULATOR_HOST` is consulted when the shared client stack is built. A nonempty value
-  forces emulator mode and supplies an endpoint unless `spanner.endpoint` overrides it.
-  It is ignored in Omni mode. Bare `host:port` gains `http://`; use the gRPC endpoint (normally `9010`).
-  The driver uses gRPC for queries and schema changes on every backend.
-- Without explicit credentials, emulator mode or Omni mode, the auth library resolves
+- `SPANNER_EMULATOR_HOST` is read when the client stack is built. A non-empty value turns on
+  emulator mode and supplies the endpoint unless `spanner.endpoint` is set. Omni mode ignores it.
+  A bare `host:port` gets `http://` prepended; point it at the emulator's gRPC port, normally
+  `9010`. The driver uses gRPC for queries and schema changes on every backend.
+- Without explicit credentials, emulator mode or Omni mode, the driver uses
   [Application Default Credentials](https://docs.cloud.google.com/docs/authentication/application-default-credentials),
-  including `GOOGLE_APPLICATION_CREDENTIALS`, local gcloud ADC and the metadata server.
-- `GOOGLE_CLOUD_QUOTA_PROJECT` overrides the quota-project option during ADC resolution.
-  Explicit keyfile, impersonation and access-token credentials use the option on the final
-  credential; an ADC source for impersonation can still use the environment value for its own requests.
+  including `GOOGLE_APPLICATION_CREDENTIALS`, gcloud's local credentials and the metadata server.
+- `GOOGLE_CLOUD_QUOTA_PROJECT` overrides the quota project option when credentials come from ADC.
+  Keyfile, impersonated and access token credentials use the option instead, though an ADC source
+  used as the base for impersonation can still apply the environment value to its own requests.

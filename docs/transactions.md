@@ -1,49 +1,50 @@
-# Transactions and RPC paths
+# Transactions and RPCs
 
-This reference describes the driver's transaction behavior. See [options](options.md) for
-configuration and [ADBC](adbc.md) for the public interface. Client details refer to the revision
-pinned in `Cargo.lock`; locate its source with `cargo metadata --format-version 1 --locked`.
+How the driver uses Spanner transactions and RPCs. See [options](options.md) for configuration
+and the [ADBC interface](adbc.md) for the public API. Client behavior described here is that of
+the `google-cloud-spanner` revision pinned in `Cargo.lock`.
 
-## Spanner's transaction model
+## Spanner's transaction modes
 
-| Mode | Driver use | Completion |
+| Mode | Used for | Completion |
 | --- | --- | --- |
-| Read/write | DML and mixed DML/mutation commits | Commit; the client can replay the transaction on `ABORTED`. |
+| Read/write | DML, and commits that mix DML and mutations | Commit. The client can replay the transaction on `ABORTED`. |
 | Read-only | Queries and metadata | No commit or rollback RPC. |
-| Batch read-only | Partitioned queries | Partition tokens execute against the same session and snapshot. |
-| Write-only | Mutation-only ingest commits | Explicit begin followed by a commit using the transaction id. |
-| Partitioned DML | Opt-in large `UPDATE`/`DELETE` | Partitions commit independently; no explicit commit. |
+| Batch read-only | Partitioned queries | Partition tokens run against the same session and snapshot. |
+| Write-only | Commits with only mutations (ingest) | Explicit begin, then a commit with the transaction ID. |
+| Partitioned DML | Opt-in large `UPDATE` and `DELETE` | Partitions commit independently; no explicit commit. |
 
-Read-only transactions take no locks. Single-use reads carry their options on one request;
-multi-use reads retain a transaction id and snapshot across requests. Spanner permits bounded
-staleness only on single-use reads. See [Spanner transactions](https://docs.cloud.google.com/spanner/docs/transactions).
+Read-only transactions take no locks. A single-use read carries its options on one request; a
+multi-use read keeps a transaction ID and snapshot across requests. Spanner only allows bounded
+staleness on single-use reads. See [Spanner transactions](https://docs.cloud.google.com/spanner/docs/transactions).
 
 ### Isolation and locking
 
-`adbc.connection.transaction.isolation_level` configures the driver's read/write transactions.
-Queries use `spanner.read.staleness` instead; mutation-only commits and partitioned DML do not
-use the connection's isolation option.
+`adbc.connection.transaction.isolation_level` sets the isolation of the driver's read/write
+transactions. Queries use `spanner.read.staleness` instead, and mutation-only commits and
+partitioned DML ignore the setting.
 
 | ADBC level suffix | Spanner level | Default read lock mode |
 | --- | --- | --- |
 | `default`, `serializable`, `linearizable` | `SERIALIZABLE` | Pessimistic |
 | `repeatable_read`, `snapshot`, `read_committed`, `read_uncommitted` | `REPEATABLE_READ` | Optimistic |
 
-The driver leaves read lock mode unset, so Spanner derives it from isolation. Repeatable read
-uses snapshot isolation and permits write skew when a statement reads rows it does not write,
-including a single autocommit statement. See [isolation levels](https://docs.cloud.google.com/spanner/docs/isolation-levels)
-and [transaction options](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions).
-The mapping is implemented in [connection/exec.rs](../src/connection/exec.rs).
+The driver leaves the read lock mode unset, so Spanner derives it from the isolation level.
+Repeatable read is snapshot isolation: it permits write skew when a statement reads rows it
+doesn't write, even a single autocommit statement. See
+[isolation levels](https://docs.cloud.google.com/spanner/docs/isolation-levels) and
+[transaction options](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions).
+The mapping is in [connection/exec.rs](../src/connection/exec.rs).
 
 ## ADBC transactions
 
-Autocommit is enabled by default. Queries use single-use read-only transactions, except a query
-bound to multiple parameter rows, which shares one multi-use snapshot across those executions.
-Ordinary DML runs in a read/write transaction and commits before returning.
+Autocommit is on by default. Each query runs in a single-use read-only transaction, except that
+a query bound to several parameter rows shares one multi-use snapshot across its runs. DML runs
+in a read/write transaction that commits before the call returns.
 
-Setting `adbc.connection.autocommit=false` enters manual mode. The pinned client exposes
-read/write transactions through a replayable closure, so the driver buffers writes until commit.
-The first query or write determines the transaction kind:
+Setting `adbc.connection.autocommit=false` starts manual mode. The pinned client only exposes
+read/write transactions as a closure it may replay, so the driver buffers writes and runs them
+at commit. The first query or write decides what the transaction is:
 
 ```mermaid
 stateDiagram-v2
@@ -57,150 +58,137 @@ stateDiagram-v2
     Dml --> Unset: rollback discards buffered work
 ```
 
-Mixing queries and writes fails with `InvalidState`; there is no read-your-writes. Buffered DML
-and ingest return `None` from `execute_update`, and commit returns no affected-row count.
-DML with `THEN RETURN` and partitioned DML require autocommit.
+Mixing queries and writes fails with `InvalidState`, so there is no read-your-writes. Buffered
+DML and ingest return `None` from `execute_update`, and commit doesn't report a row count.
+`THEN RETURN` and partitioned DML need autocommit.
 
-A manual query snapshot uses the first query's staleness bound. `max:<duration>` becomes exact
-staleness and `min:<timestamp>` becomes that exact timestamp; later queries' bounds are ignored.
-`execute_partitions` always creates a separate batch snapshot and is rejected in a manual DML
-transaction. Its staleness bound is passed through unchanged; use strong, exact staleness or an
-exact timestamp because Spanner does not accept bounded staleness for that transaction type.
+A manual read transaction takes its snapshot from the first query's staleness bound, converting
+`max:` and `min:` bounds to exact ones, and ignores the bounds of later queries.
+`execute_partitions` always creates its own batch snapshot and fails inside a manual write
+transaction. It passes the staleness bound through unchanged, and Spanner rejects bounded
+staleness for that transaction type, so use a strong, exact staleness or exact timestamp bound.
 
-On commit, buffered DML runs as one `ExecuteBatchDml`, followed by any buffered mutations at
-commit. Mutations therefore run after all DML, regardless of the order in which ingests and DML
-were buffered. Mutation-only work uses the replay-protected write-only path. A failed commit
-preserves the buffer; a successful commit removes only the applied prefix, retaining work
-buffered concurrently. Re-enabling autocommit also commits pending work.
+At commit, buffered DML runs as one `ExecuteBatchDml`, followed by the buffered mutations. All
+mutations therefore apply after all DML, whatever order the ingests and DML were issued in.
+Mutation-only work uses the write-only path, which is protected against replay. If the commit
+fails, the buffer is kept. If it succeeds, only the applied work is removed, so work buffered
+concurrently survives. Turning autocommit back on also commits pending work.
 
-`adbc.connection.readonly=true` rejects both new writes and commits of pending writes with
-`InvalidState`. It still permits rollback and completion of read-only or empty transactions.
-`commit()` and `rollback()` with autocommit enabled fail with `InvalidState`.
+With `adbc.connection.readonly=true`, new writes and commits of pending writes fail with
+`InvalidState`, but rollback and commits of read-only or empty transactions still work.
+`commit()` and `rollback()` fail with `InvalidState` in autocommit mode.
 
-**DDL always executes immediately**, including table creation/replacement during ingest. It
-neither selects nor joins a manual transaction's kind, cannot be rolled back, and executes ahead
-of previously buffered DML. A failed multi-statement schema change may leave earlier DDL applied.
+DDL always runs immediately, including the table creation or replacement done by ingest. It
+doesn't start or join a manual transaction, can't be rolled back, and runs before any DML that
+is already buffered. If a multi-statement schema change fails, earlier statements may stay
+applied.
 
-Implementation: [connection.rs](../src/connection.rs), [connection/txn.rs](../src/connection/txn.rs)
-and [statement.rs](../src/statement.rs).
+The implementation is in [connection.rs](../src/connection.rs),
+[connection/txn.rs](../src/connection/txn.rs) and [statement.rs](../src/statement.rs).
 
-## RPC paths
+## RPCs
 
-| RPC | Driver use |
+| RPC | Used for |
 | --- | --- |
-| `CreateSession` | The client creates and periodically replaces its multiplexed session. |
-| `BeginTransaction` | Explicit begin for write-only, batch read-only and partitioned DML; fallback when inline begin fails. |
+| `CreateSession` | The client creates its multiplexed session and replaces it periodically. |
+| `BeginTransaction` | Write-only, batch read-only and partitioned DML transactions, and as a fallback when an inline begin fails. |
 | `ExecuteStreamingSql` | Queries, metadata, PLAN probes, partition reads, `THEN RETURN` and partitioned DML. |
-| `ExecuteBatchDml` | Ordinary DML, including a single statement, and manual DML commits. |
+| `ExecuteBatchDml` | Ordinary DML, including single statements, and manual DML commits. |
 | `Commit` | Read/write and write-only transactions. |
-| `Rollback` | The client's cleanup after a non-`ABORTED` transaction-body failure. |
-| `PartitionQuery` | Produces descriptors for `execute_partitions`. |
+| `Rollback` | Sent by the client to clean up after a transaction body fails with an error other than `ABORTED`. |
+| `PartitionQuery` | Descriptors for `execute_partitions`. |
 | `BatchWrite` | Opt-in autocommit ingest. |
 | `UpdateDatabaseDdl` | Schema changes through the gRPC Database Admin API, followed by operation polling. |
 
-The driver does not use unary `ExecuteSql`, key-based `Read`/`StreamingRead`/`PartitionRead`, or
-session-pool APIs (`BatchCreateSessions`, `GetSession`, `ListSessions`, `DeleteSession`).
+The driver doesn't use unary `ExecuteSql`, the key-based `Read`, `StreamingRead` and
+`PartitionRead`, or the session pool RPCs (`BatchCreateSessions`, `GetSession`, `ListSessions`,
+`DeleteSession`).
 
 ### Sessions and transaction begin
 
-One cached client stack is shared by all connections from a database object; connections still
-have independent ADBC transaction state. The pinned client maintains a multiplexed session,
-checks its age hourly, and rotates it after seven days. There is no session pool. Setting a
-database option invalidates the cache for new connections; existing connections retain their
-stack. The admin client is built lazily on the first DDL operation and shared with the same stack.
-Queries and schema changes use gRPC on Cloud Spanner, the emulator and Omni.
+All connections from a database object share one cached client stack, though each has its own
+transaction state. The client keeps a single multiplexed session, checks its age hourly and
+replaces it after seven days; there is no session pool. Setting a database option discards the
+cache for new connections, and existing connections keep their stack. The admin client is built
+on the first DDL operation and shared by the same stack. Cloud Spanner, the emulator and Omni
+are all reached over gRPC, for queries and schema changes alike.
 
-Read/write and manual read-only transactions normally begin inline with their first request.
-Building the manual read-only handle therefore sends no RPC. Write-only, partitioned-DML and
-batch read-only transactions issue an explicit begin.
+Read/write and manual read-only transactions begin inline with their first request, so creating
+a manual read-only transaction sends no RPC. Write-only, partitioned DML and batch read-only
+transactions begin explicitly.
 
 ### Commit and rollback
 
-[runner_builder](../src/connection/exec.rs) centralizes read/write transaction configuration for
-batch DML, returning DML and DML parameter planning. Write-only commits use the client's `write`
-method: explicit begin plus `Commit(transaction_id)`, which protects against replay. The driver
-does not use the client's at-least-once single-use mutation commit.
+`runner_builder` in [connection/exec.rs](../src/connection/exec.rs) configures read/write
+transactions for batch DML, `THEN RETURN` DML and DML parameter planning. Write-only commits use
+the client's `write` method, an explicit begin followed by `Commit(transaction_id)`, which
+protects against replay. The driver doesn't use the client's at-least-once single-use mutation
+commit.
 
-A multiplexed-session commit can require a second `Commit` carrying a precommit token; that
-follow-up carries no mutations. The transaction runner separately retries whole transactions on
-`ABORTED`, without a default attempt/time cap. `spanner.retry.*` does not limit those replays;
-the enclosing RPC timeout does.
+On a multiplexed session, a commit can need a second `Commit` carrying a precommit token; the
+follow-up carries no mutations. Separately, the client reruns whole transactions on `ABORTED`
+with no default limit on attempts or time. `spanner.retry.*` doesn't limit these reruns, but
+the `update` timeout does.
 
-ADBC `rollback()` sends no rollback RPC: it discards buffered writes or drops a read-only
-snapshot. The client can send `Rollback` to clean up a failed read/write transaction with an id.
+ADBC `rollback()` sends no RPC: it discards buffered writes or drops the read-only snapshot. The
+client itself may send `Rollback` to clean up a failed read/write transaction that has an ID.
 
-### Streaming SQL and batch DML
+### Streaming queries and batch DML
 
-Query results stream through bounded Arrow chunks. The pinned client resumes eligible streams
-from the last resume token; long stretches without tokens can exhaust its buffering allowance
-and disable resumption. An error returned before the initial stream opens is not retried by
-that resumption loop. See [retry tuning](options.md#retry-tuning) for attempt and elapsed limits.
+Query results stream in bounded Arrow chunks. The client resumes interrupted streams from the
+last resume token. A long stretch of results without a token can exhaust its buffer and
+disable resumption, and an error before the stream opens isn't handled by resumption at all.
+See [retry tuning](options.md#retry-tuning).
 
-`ExecuteBatchDml` executes statements sequentially in one read/write transaction. The driver
-sets `last_statements=true` for autocommit batches and `false` for manual commits. Returning DML
-uses `ExecuteStreamingSql` instead and materializes returned rows inside the transaction closure.
+`ExecuteBatchDml` runs statements in order in one read/write transaction. The driver sets
+`last_statements=true` for autocommit batches and `false` for manual commits. `THEN RETURN` DML
+uses `ExecuteStreamingSql` instead, and reads the returned rows inside the transaction closure.
 
 ### Partitioned queries
 
-`execute_partitions` creates a batch read-only transaction, calls `PartitionQuery`, and obtains
-the Arrow schema with a separate PLAN probe. It accepts at most one bound parameter row. A
-partition descriptor carries the query and original session/transaction identity; `read_partition`
-uses those identities even on another connection. Descriptors are executable and unauthenticated;
-only accept them from trusted sources.
+`execute_partitions` creates a batch read-only transaction, calls `PartitionQuery`, and gets the
+Arrow schema from a separate PLAN probe. It accepts at most one row of bound parameters. A
+descriptor carries the query and the original session and transaction IDs, which
+`read_partition` uses even on another connection. Descriptors can be executed by anyone who
+holds them and are not authenticated, so only accept them from trusted sources.
 
-The driver exposes no partition-size/count setting: Spanner currently ignores both
-[PartitionOptions hints](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/PartitionOptions).
-The geo-partitioning quota is unrelated to query partitions.
+The driver has no setting for partition size or count because Spanner ignores both
+[PartitionOptions](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/PartitionOptions) hints.
 
 ### BatchWrite and partitioned DML
 
-`spanner.ingest.batch_write=true` uses one mutation group per row. Groups commit independently,
-so even a single ingest chunk can partially succeed. This path has no replay protection. Manual
-mode ignores the option and buffers mutations for an atomic commit.
+With `spanner.ingest.batch_write=true`, each row is its own mutation group. Groups commit
+independently, so even one ingest chunk can partially succeed, and there is no replay
+protection. Manual mode ignores the option and buffers mutations for an atomic commit. Stream
+retries respect the attempt limit but not the elapsed-time limit, so use the `update` timeout as
+a deadline.
 
-BatchWrite receives request priority, transaction tag, change-stream exclusion, retry tuning
-and the update timeout. Request tags and commit delay/stats do not apply. Streaming retries
-honor the attempt cap but not the retry elapsed-time limit; use the update timeout for a deadline.
+`spanner.dml.partitioned=true` runs an idempotent `UPDATE` or `DELETE` as partitioned DML. It is
+not atomic and reports a lower bound on affected rows. See
+[statement options](options.md#statement-only-options) for the restrictions and which settings
+apply to both paths.
 
-`spanner.dml.partitioned=true` opts into non-atomic, idempotent `UPDATE`/`DELETE`. It returns a
-lower bound on affected rows and rejects manual mode, multiple statements/parameter rows and
-`THEN RETURN`. Request priority/tag, optimizer settings, change-stream exclusion, statement
-retry tuning and the update timeout apply. Commit options, transaction tags and connection
-isolation do not. See [partitioned DML](https://docs.cloud.google.com/spanner/docs/dml-partitioned).
+## Limits and ingest chunks
 
-## Timeouts
-
-| `spanner.rpc.timeout_seconds.*` class | Coverage |
-| --- | --- |
-| `query` | Initial query and first chunk, PLAN probes (including DML parameter planning), partition creation/initial read, and internal metadata reads. |
-| `update` | DML transaction including abort replays, manual write commit, each ingest chunk, BatchWrite, partitioned DML, and DDL submission plus operation polling. |
-| `fetch` | Each later streamed chunk, including subsequent bound-query executions. |
-
-These are operation deadlines, including internal retries. Client-stack creation/session
-maintenance is outside these per-operation wrappers. Manual read-only handle creation has no
-wrapper because it sends no RPC. A timed-out write or DDL operation may already have applied.
-See [RPC timeouts](options.md#rpc-timeouts).
-
-## Limits and ingest budgets
-
-Relevant [published limits](https://docs.cloud.google.com/spanner/quotas), checked September 2026:
+Relevant [published limits](https://docs.cloud.google.com/spanner/quotas), as of September 2026:
 
 | Limit | Value |
 | --- | --- |
-| Mutation API commit, including index changes | 80,000 mutations |
-| One DML statement, including index changes | 80,000 mutations |
-| One BatchWrite mutation group | 80,000 mutations |
-| Commit payload, including indexes and change streams | 100 MiB |
-| Requests other than commits | 10 MiB |
+| Mutations per commit, including index changes | 80,000 |
+| Mutations per DML statement, including index changes | 80,000 |
+| Mutations per BatchWrite group | 80,000 |
+| Commit size, including indexes and change streams | 100 MiB |
+| Size of requests other than commits | 10 MiB |
 | SQL text | 1 million characters |
 | DDL text for one schema change | 10 MiB |
-| Concurrent partitioned-DML statements per database | 20,000 |
+| Concurrent partitioned DML statements per database | 20,000 |
 
-Mutation counts depend on affected columns, keys, generated/default columns and indexes, not
-just row count. The quota page does not give a statement-count limit for `ExecuteBatchDml`, a
-group-count limit for BatchWrite, or a statement-count limit for a DDL request.
+Mutation counts depend on the columns written, keys, generated and default columns, and indexes,
+not just on the number of rows. Spanner publishes no limit on the number of statements in an
+`ExecuteBatchDml` or DDL request, or on the number of groups in a BatchWrite.
 
-The driver budgets autocommit ingest chunks at 20,000 estimated mutations and 4 MiB estimated
-row data to leave headroom for indexes. A write-only chunk rejected for too many mutations is
-bisected and retried down to a single row. These estimates do not guarantee a chunk fits every
-server limit. Manual transactions are not split. See [statement/ingest.rs](../src/statement/ingest.rs).
+The driver splits autocommit ingest into chunks of at most 20,000 estimated mutations and 4 MiB
+of estimated row data, leaving headroom for indexes. If Spanner rejects a write-only chunk for
+having too many mutations, the driver splits it in half and retries, down to single rows. A
+chunk can still exceed other server limits. Manual transactions are not split.
+See [statement/ingest.rs](../src/statement/ingest.rs).

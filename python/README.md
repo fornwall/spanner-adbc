@@ -8,23 +8,22 @@
 [![License](https://img.shields.io/pypi/l/spanner-adbc.svg)](https://github.com/fornwall/spanner-adbc/blob/main/LICENSE)
 [![Build](https://github.com/fornwall/spanner-adbc/actions/workflows/libraries.yml/badge.svg)](https://github.com/fornwall/spanner-adbc/actions/workflows/libraries.yml)
 
-A Python [ADBC](https://arrow.apache.org/adbc/) driver for **Google Cloud Spanner**.
-Supports GoogleSQL databases; PostgreSQL-dialect databases are not supported.
-
-Query Spanner through [DBAPI 2.0](https://peps.python.org/pep-0249/) and fetch
-[Apache Arrow](https://arrow.apache.org/) results for pandas, Polars, DuckDB, or PyArrow.
+A Python [ADBC](https://arrow.apache.org/adbc/) driver for Google Cloud Spanner. Query Spanner
+through [DBAPI 2.0](https://peps.python.org/pep-0249/) and get [Apache Arrow](https://arrow.apache.org/)
+results for pandas, Polars, DuckDB or PyArrow. Only GoogleSQL databases are supported, not the
+PostgreSQL dialect.
 
 ## Install
 
-Requires Python 3.11 or later. Wheels bundle the native driver; see
-[Supported platforms](#supported-platforms) for OS requirements.
+Requires Python 3.11 or later. Wheels include the native driver; see
+[supported platforms](#supported-platforms).
 
 ```sh
 pip install "spanner-adbc[dbapi]"  # includes PyArrow and pandas
 ```
 
-For the low-level ADBC API without DataFrame dependencies, install `spanner-adbc`.
-The Python import name is `spanner_adbc`.
+Install plain `spanner-adbc` for the low-level ADBC API without the DataFrame dependencies. The
+import name is `spanner_adbc`.
 
 ## Quickstart
 
@@ -42,8 +41,8 @@ with spanner.connect(
         df = cur.fetch_df()          # -> pandas.DataFrame
 ```
 
-Use GoogleSQL `@name` parameters with `cur.execute(...)`; `?` placeholders are unsupported.
-Pass a tuple in first-occurrence order instead of formatting values into SQL:
+Queries use GoogleSQL `@name` parameters; `?` placeholders don't work. Pass the values as a
+tuple, in the order the parameters first appear, rather than formatting them into the SQL:
 
 ```python
 import spanner_adbc.dbapi as spanner
@@ -57,21 +56,21 @@ with spanner.connect(
         assert cur.fetchone() == ("Alice", 42)
 ```
 
-`fetchone()` and `fetchall()` return Python rows; Arrow and DataFrame helpers are shown below.
+`fetchone()` and `fetchall()` return Python tuples. The Arrow and DataFrame helpers are shown
+[below](#working-with-dataframes).
 
 ## Driver manifest (`driver="spanner"`)
 
-The package's `spanner.connect()` loads its bundled library directly. To use the generic
-`adbc_driver_manager` by driver name, install an [ADBC driver manifest][manifests].
-Use a current driver manager; Python manifest support requires
-[version 1.8.0 or later](https://arrow.apache.org/blog/2025/09/12/adbc-20-release/).
+`spanner.connect()` loads the bundled library directly. To load the driver by name through the
+generic `adbc_driver_manager` (version 1.8.0 or later), install an
+[ADBC driver manifest][manifests]:
 
 ```sh
 pip install --upgrade adbc-driver-manager
 python -m spanner_adbc.manifest install
 ```
 
-The equivalent console command is `spanner-adbc-install-manifest`.
+`spanner-adbc-install-manifest` does the same.
 
 ```python docs-test: skip
 import adbc_driver_manager.dbapi
@@ -83,40 +82,38 @@ with adbc_driver_manager.dbapi.connect(
     ...
 ```
 
-Current driver managers can also infer `spanner` from the URI scheme when `driver` is omitted.
+Recent driver managers also infer `spanner` from the URI scheme if you leave out `driver`.
 
-- Re-run the installer after upgrading, reinstalling, or moving the environment: the manifest
-  contains the library's absolute path.
-- The default directory is `<sys.prefix>/etc/adbc/drivers` inside a virtual environment, or the
-  platform's user configuration directory otherwise. `python -m spanner_adbc.manifest path`
-  prints the target path.
-- Use `install --dir /path/to/drivers` for a custom directory on `ADBC_DRIVER_PATH`.
-- For a standalone shared library, edit the `Driver.shared` paths in the repository's
-  [spanner.toml][manifest-file].
+The manifest records the library's absolute path, so re-run the installer after upgrading,
+reinstalling or moving the environment. It goes to `<sys.prefix>/etc/adbc/drivers` in a
+virtual environment and to the platform's user configuration directory otherwise;
+`python -m spanner_adbc.manifest path` prints it. Use `install --dir /path/to/drivers` to
+install into a directory on `ADBC_DRIVER_PATH`. For a standalone shared library, edit the
+`Driver.shared` paths in the repository's [spanner.toml][manifest-file].
 
 [manifests]: https://arrow.apache.org/adbc/current/format/driver_manifests.html
 [manifest-file]: https://github.com/fornwall/spanner-adbc/blob/main/spanner.toml
 
 ## Authentication
 
-With no credential options, the driver uses
+Without credential options, the driver uses
 [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials):
-run `gcloud auth application-default login` locally, set `GOOGLE_APPLICATION_CREDENTIALS`, or use
-an attached service account on Google Cloud.
+run `gcloud auth application-default login` locally, set `GOOGLE_APPLICATION_CREDENTIALS`, or
+use an attached service account on Google Cloud.
 
-Pass explicit credentials in `db_kwargs` alongside `DatabaseOptions.URI`:
+To pass credentials explicitly, add one of these to `db_kwargs`:
 
 | Option | Value |
 | --- | --- |
-| `DatabaseOptions.KEYFILE` | Credential JSON file path |
+| `DatabaseOptions.KEYFILE` | Path to a credential JSON file |
 | `DatabaseOptions.KEYFILE_JSON` | Credential JSON contents |
-| `DatabaseOptions.ACCESS_TOKEN` | OAuth bearer token; never refreshed |
-| `DatabaseOptions.IMPERSONATE_TARGET_PRINCIPAL` | Service account to impersonate using ADC or explicit base credentials |
+| `DatabaseOptions.ACCESS_TOKEN` | OAuth bearer token, never refreshed |
+| `DatabaseOptions.IMPERSONATE_TARGET_PRINCIPAL` | Service account to impersonate, using ADC or the explicit credentials |
 
-Use each enum member directly as the key, or use its `.value`. `ACCESS_TOKEN` cannot be combined with key-file
-credentials or impersonation. See the [option reference][options] for scopes and other auth settings.
+`ACCESS_TOKEN` can't be combined with a keyfile or impersonation. The [option reference][options]
+lists scopes and the other authentication settings.
 
-For the [Spanner emulator](https://cloud.google.com/spanner/docs/emulator), use anonymous mode:
+For the [Spanner emulator](https://cloud.google.com/spanner/docs/emulator), connect anonymously:
 
 ```python docs-test: skip
 import spanner_adbc.dbapi as spanner
@@ -130,12 +127,12 @@ with spanner.connect(db_kwargs={
     ...
 ```
 
-Emulator mode rejects explicit credential options; ambient ADC is ignored.
+In emulator mode the driver ignores ambient ADC and rejects explicit credential options.
 
-For Spanner Omni, set `DatabaseOptions.INSTANCE_TYPE` to `"omni"` and
-`DatabaseOptions.ENDPOINT` to the server endpoint, such as `"http://localhost:15000"`.
-Use `spanner:///projects/default/instances/default/databases/<database>` as the URI.
-Omni uses its own transport; leave `DatabaseOptions.EMULATOR` unset.
+For Spanner Omni, set `DatabaseOptions.INSTANCE_TYPE` to `"omni"` and `DatabaseOptions.ENDPOINT`
+to the server, such as `"http://localhost:15000"`, and use
+`spanner:///projects/default/instances/default/databases/<database>` as the URI. Leave
+`DatabaseOptions.EMULATOR` unset.
 
 ## Options
 
@@ -143,15 +140,13 @@ Omni uses its own transport; leave `DatabaseOptions.EMULATOR` unset.
 | --- | --- |
 | `db_kwargs` | Database options, including the required `uri` |
 | `conn_kwargs` | Connection options |
-| `autocommit` | `False` by default; see [Transactions](#transactions) |
+| `autocommit` | `False` by default; see [transactions](#transactions) |
 
-Use `DatabaseOptions`, `ConnectionOptions`, and `StatementOptions` enums, or raw option keys.
-These are `StrEnum` members: `str(DatabaseOptions.URI)` and `f"{DatabaseOptions.URI}"`
-both produce `"uri"` on every supported Python version. Members work directly as dictionary
-keys; `.value` remains useful for driver-manager getters whose Cython arguments require an
-exact `str` rather than a subclass.
-The [option reference][options] lists types, defaults, and accepted values. Set cursor options with
-`conn.cursor(adbc_stmt_kwargs={...})` or `cur.adbc_statement.set_options(**{...})`.
+Option keys are available as the `DatabaseOptions`, `ConnectionOptions` and `StatementOptions`
+enums, or you can use the raw strings. The enums are `StrEnum`s, so members work as dictionary
+keys. Pass `.value` to driver manager getters such as `get_option`, which need a plain `str`.
+The [option reference][options] lists types, defaults and accepted values. Set cursor options
+with `conn.cursor(adbc_stmt_kwargs={...})` or `cur.adbc_statement.set_options(**{...})`.
 
 [options]: https://github.com/fornwall/spanner-adbc/blob/main/docs/options.md
 
@@ -171,23 +166,23 @@ with spanner.connect(
 ```
 
 In manual query transactions, `max:<duration>` and `min:<timestamp>` bounds become exact
-staleness and a fixed read timestamp respectively. Set `ConnectionOptions.READONLY` to
-`"true"` to reject DML, DDL, and ingest; rollback remains available.
+staleness and a fixed read timestamp. Set `ConnectionOptions.READONLY` to `"true"` to reject
+DML, DDL and ingest; rollback still works.
 
 ## Transactions
 
-DBAPI defaults to `autocommit=False`. A manual transaction accepts either queries or writes,
-chosen by its first query or write; mixing them raises `spanner.ProgrammingError` until
-commit or rollback. Queries share a snapshot. DML is buffered until `conn.commit()`, so queries
-cannot read buffered writes.
+DBAPI defaults to `autocommit=False`. The first statement of a manual transaction decides
+whether it runs queries or writes. Mixing the two raises `spanner.ProgrammingError` until you
+commit or roll back. Queries share a snapshot. DML is buffered until `conn.commit()`, so queries
+can't see buffered writes.
 
-Exiting `with spanner.connect(...)` closes the connection without committing. Call
-`conn.commit()` explicitly before leaving the block to keep buffered writes.
+Leaving a `with spanner.connect(...)` block closes the connection without committing. Call
+`conn.commit()` before the end of the block to keep buffered writes.
 
-DDL always executes immediately: rollback cannot undo it, and it runs before buffered DML.
-Use `autocommit=True` for immediately committed DML, including `THEN RETURN` statements.
-See [transactions](https://github.com/fornwall/spanner-adbc/blob/main/docs/transactions.md) for
-bulk-ingest and partitioned-DML behavior.
+DDL runs immediately: rollback can't undo it, and it runs before any buffered DML. Use
+`autocommit=True` to commit each DML statement immediately, which `THEN RETURN` requires. See
+[transactions](https://github.com/fornwall/spanner-adbc/blob/main/docs/transactions.md) for
+bulk ingest and partitioned DML.
 
 ```python
 import spanner_adbc.dbapi as spanner
@@ -212,10 +207,10 @@ with spanner.connect(
 
 ## Working with DataFrames
 
-The quickstart uses pandas. The examples below use the same `Singers` table with `SingerId` and
-`FirstName` columns. Install `polars` or `duckdb` separately for those examples.
+The quickstart uses pandas. The examples below use the same `Singers` table. Install `polars`
+or `duckdb` separately for those examples.
 
-**pyarrow — results as a native Arrow table:**
+Fetch a PyArrow table:
 
 ```python
 import spanner_adbc.dbapi as spanner
@@ -229,8 +224,8 @@ with spanner.connect(
         table = cur.fetch_arrow_table()      # -> pyarrow.Table
 ```
 
-`fetch_arrow_table()` and DataFrame helpers collect the complete result in memory. For large
-queries, consume record batches while the cursor and connection remain open:
+`fetch_arrow_table()` and the DataFrame helpers load the whole result into memory. For large
+results, iterate over record batches while the cursor and connection are open:
 
 ```python
 import spanner_adbc.dbapi as spanner
@@ -246,7 +241,7 @@ with spanner.connect(
                 print(batch.num_rows)  # process or write each batch here
 ```
 
-**polars — read straight from the connection:**
+Polars can read directly from the connection:
 
 ```python
 import polars as pl
@@ -262,7 +257,7 @@ with spanner.connect(
     )
 ```
 
-**DuckDB — query the fetched Arrow table in-process:**
+DuckDB can query a fetched Arrow table in-process:
 
 ```python
 import duckdb
@@ -283,7 +278,7 @@ top = duckdb.sql("SELECT COUNT(*) AS n, MIN(FirstName) AS first FROM singers").f
 ## Bulk insert a DataFrame
 
 `cur.adbc_ingest(table, data, mode=...)` inserts Arrow-compatible data in bulk. Convert pandas
-DataFrames to Arrow as shown here:
+DataFrames to Arrow first:
 
 ```python
 import pandas as pd
@@ -302,24 +297,24 @@ with spanner.connect(
         rows = cur.adbc_ingest("Singers", pa.Table.from_pandas(frame), mode="append")
 ```
 
-The `mode` selects how the target table is handled:
+`mode` says what to do with the target table:
 
-- `create` — create the table from the data's Arrow schema first, erroring if it already exists (the default).
-- `append` — insert into an existing table.
-- `create_append` — create the table only if it is absent, then insert.
-- `replace` — drop any existing table, recreate it from the schema, then insert.
+- `create` (the default): create the table from the data's Arrow schema, failing if it exists.
+- `append`: insert into an existing table.
+- `create_append`: create the table if it doesn't exist, then insert.
+- `replace`: drop any existing table, recreate it from the schema, then insert.
 
-Create modes omit a primary key, so Spanner supplies a [hidden `rowid` column][no-pk].
-For an explicit primary key, create the table with SQL first and use `mode="append"`.
-In manual mode, inserts need `conn.commit()`; table creation or replacement still happens immediately.
-Autocommit loads may commit in multiple chunks, so a failed load can leave rows written.
+Created tables have no declared primary key, so Spanner adds a [hidden `rowid` column][no-pk].
+To choose the key, create the table with SQL first and use `mode="append"`. In manual mode,
+inserts need `conn.commit()`, but creating or replacing the table happens immediately.
+Autocommit loads may commit in several chunks, so a failed load can leave some rows written.
 
 [no-pk]: https://cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys
 
 ## Partitioned reads and Data Boost
 
-A large scan can be split into independent partitions and read in parallel with the ADBC
-partitioned-execution extension (`adbc_execute_partitions` / `adbc_read_partition`):
+The ADBC partitioned execution extension (`adbc_execute_partitions` and `adbc_read_partition`)
+splits a large scan into partitions that can be read in parallel:
 
 ```python
 import spanner_adbc.dbapi as spanner
@@ -340,37 +335,37 @@ with spanner.connect(
             ...
 ```
 
-Cloud Spanner can run partitions on serverless [Data Boost] compute. Enable it on the producing
-cursor with `adbc_stmt_kwargs={StatementOptions.DATA_BOOST: "true"}` after importing
-`StatementOptions`. Spanner Omni does not support Data Boost.
+On Cloud Spanner, partitions can run on serverless [Data Boost] compute. Enable it on the cursor
+that creates the partitions with `adbc_stmt_kwargs={StatementOptions.DATA_BOOST: "true"}`.
+Spanner Omni doesn't support Data Boost.
 
-Spanner decides partitionability from the query plan. Simple scans are suitable; joins, ordering,
-and aggregation can prevent partitioning. See the [partitionability rules][parallel-reads].
+Spanner decides from the query plan whether a query can be partitioned. Simple scans work;
+joins, ordering and aggregation can prevent it. See the [partitioning rules][parallel-reads].
 
-Descriptors contain SQL and transaction identifiers and are unauthenticated. Only read descriptors
-from trusted sources: they execute using the receiving connection's credentials.
+Descriptors contain the SQL and transaction IDs and are not authenticated. They run with the
+reading connection's credentials, so only read descriptors from trusted sources.
 
 [Data Boost]: https://cloud.google.com/spanner/docs/databoost/databoost-overview
 [parallel-reads]: https://cloud.google.com/spanner/docs/reads#read_data_in_parallel
 
 ## Supported platforms
 
-`pip` selects a wheel matching the OS and architecture:
+`pip` picks the wheel for your OS and architecture:
 
-| Platform       | Wheel tag                | Minimum requirement                          |
-| -------------- | ------------------------ | -------------------------------------------- |
-| Linux x86-64   | `manylinux_2_35_x86_64`  | glibc >= 2.35 |
-| Linux aarch64  | `manylinux_2_35_aarch64` | glibc >= 2.35 |
-| Linux x86-64 musl | `musllinux_1_2_x86_64` | musl libc >= 1.2 |
-| Linux aarch64 musl | `musllinux_1_2_aarch64` | musl libc >= 1.2 |
-| macOS arm64    | `macosx_11_0_arm64`      | macOS >= 11.0                                |
-| macOS x86-64   | `macosx_10_15_x86_64`    | macOS >= 10.15                               |
-| Windows x86-64 | `win_amd64`              | 64-bit Windows                               |
-| Windows arm64  | `win_arm64`              | ARM64 Windows                                |
+| Platform | Wheel tag | Requires |
+| --- | --- | --- |
+| Linux x86-64 | `manylinux_2_35_x86_64` | glibc 2.35+ |
+| Linux aarch64 | `manylinux_2_35_aarch64` | glibc 2.35+ |
+| Linux x86-64 musl | `musllinux_1_2_x86_64` | musl libc 1.2+ |
+| Linux aarch64 musl | `musllinux_1_2_aarch64` | musl libc 1.2+ |
+| macOS arm64 | `macosx_11_0_arm64` | macOS 11.0+ |
+| macOS x86-64 | `macosx_10_15_x86_64` | macOS 10.15+ |
+| Windows x86-64 | `win_amd64` | 64-bit Windows |
+| Windows arm64 | `win_arm64` | ARM64 Windows |
 
-Building for an older OS requires a compatible native driver and Python dependencies.
-Source wheel builds require exactly one native driver library staged in `python/spanner_adbc/`;
-the Python build does not compile Rust. For example, on Linux:
+Older systems need a native driver and Python dependencies built for them. The Python build
+doesn't compile Rust: it packages exactly one native driver library staged in
+`python/spanner_adbc/`. To build from source on Linux:
 
 ```sh
 cargo build --release
@@ -378,4 +373,5 @@ cp target/release/libspanner_adbc.so python/spanner_adbc/
 pip install './python[dbapi]'
 ```
 
-For local builds and releases, see [CONTRIBUTING.md](https://github.com/fornwall/spanner-adbc/blob/main/CONTRIBUTING.md).
+See [CONTRIBUTING.md](https://github.com/fornwall/spanner-adbc/blob/main/CONTRIBUTING.md) for
+development and releases.
