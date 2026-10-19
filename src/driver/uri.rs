@@ -48,9 +48,10 @@ impl SpannerDatabase {
     }
 }
 
-/// Supply the transport scheme for a bare emulator `host:port` address.
+/// Supply the plaintext scheme for a bare `host:port` endpoint, which tonic cannot dial.
 pub(crate) fn ensure_scheme(host: &str) -> String {
-    if host.starts_with("http://") || host.starts_with("https://") {
+    let host = host.trim();
+    if host.is_empty() || host.contains("://") {
         host.to_string()
     } else {
         format!("http://{host}")
@@ -115,20 +116,27 @@ fn parse_connection_uri(remainder: &str) -> Result<ParsedConnectionUri> {
     }
     let endpoint = (!authority.is_empty()).then(|| authority.to_owned());
 
+    let bad_path = || {
+        invalid_argument(
+            "connection URI database path must be \
+             projects/<project>/instances/<instance>/databases/<database>; \
+             `spanner://projects/...` treats `projects` as a host authority, so use \
+             `spanner:///projects/...` (three slashes) when no endpoint host is intended",
+        )
+    };
     let database = match path.split('/').collect::<Vec<_>>().as_slice() {
-        ["projects", p, "instances", i, "databases", d]
-            if !p.is_empty() && !i.is_empty() && !d.is_empty() =>
-        {
-            path.to_owned()
+        ["projects", p, "instances", i, "databases", d] => {
+            // URI builders encode `:` in domain-scoped project IDs such as `example.com:p`.
+            let (p, i, d) = (percent_decode(p)?, percent_decode(i)?, percent_decode(d)?);
+            if [&p, &i, &d]
+                .iter()
+                .any(|id| id.is_empty() || id.contains('/'))
+            {
+                return Err(bad_path());
+            }
+            format!("projects/{p}/instances/{i}/databases/{d}")
         }
-        _ => {
-            return Err(invalid_argument(
-                "connection URI database path must be \
-                 projects/<project>/instances/<instance>/databases/<database>; \
-                 `spanner://projects/...` treats `projects` as a host authority, so use \
-                 `spanner:///projects/...` (three slashes) when no endpoint host is intended",
-            ));
-        }
+        _ => return Err(bad_path()),
     };
 
     let mut params = Vec::new();

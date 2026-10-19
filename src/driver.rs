@@ -198,10 +198,12 @@ impl SpannerDatabase {
             && !host.is_empty()
         {
             if endpoint.is_none() {
-                endpoint = Some(ensure_scheme(&host));
+                endpoint = Some(host);
             }
             emulator = true;
         }
+        // tonic cannot dial a bare `host:port`, such as a URI authority or the variable above.
+        let endpoint = endpoint.map(|endpoint| ensure_scheme(&endpoint));
 
         // Emulator mode uses anonymous plaintext credentials. Silently dropping explicitly
         // configured credentials would let a stray `SPANNER_EMULATOR_HOST` redirect real traffic,

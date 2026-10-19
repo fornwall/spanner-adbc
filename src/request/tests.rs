@@ -107,6 +107,24 @@ fn parses_max_commit_delay_with_units_and_enforces_the_500ms_cap() {
     }
 }
 
+#[test]
+fn max_commit_delay_errors_name_their_option() {
+    let mut config = RequestConfig::default();
+    for bad in ["abc", "-1ms", "1e30", "2s"] {
+        let error = config.set_max_commit_delay(s(bad)).unwrap_err();
+        assert!(
+            error.message.contains(crate::OPTION_MAX_COMMIT_DELAY),
+            "{bad}: {}",
+            error.message
+        );
+        assert!(
+            !error.message.contains(crate::OPTION_READ_STALENESS),
+            "{bad}: {}",
+            error.message
+        );
+    }
+}
+
 /// The duration conversion runs before the 500ms check, so it must reject overflow itself.
 #[test]
 fn rejects_oversized_max_commit_delay_instead_of_panicking() {

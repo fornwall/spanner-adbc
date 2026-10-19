@@ -305,3 +305,42 @@ fn every_database_a_driver_creates_shares_the_drivers_runtime() {
     let other = SpannerDriver::try_new().unwrap();
     assert!(!Arc::ptr_eq(&driver.runtime, &other.runtime));
 }
+
+#[test]
+fn ensure_scheme_keeps_any_explicit_scheme() {
+    assert_eq!(ensure_scheme(" localhost:9010 "), "http://localhost:9010");
+    assert_eq!(ensure_scheme("[::1]:9010"), "http://[::1]:9010");
+    assert_eq!(ensure_scheme("HTTPS://host:1"), "HTTPS://host:1");
+    assert_eq!(ensure_scheme(""), "");
+}
+
+/// tonic refuses to dial an endpoint without a scheme, so the documented
+/// `spanner://host:port/...` form must reach the host as plaintext.
+#[test]
+fn a_uri_host_authority_endpoint_is_dialed() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let mut db = new_database();
+    db.set_option(
+        OptionDatabase::Uri,
+        OptionValue::String(format!(
+            "spanner://127.0.0.1:{port}/projects/p/instances/i/databases/d?spanner.emulator=true"
+        )),
+    )
+    .unwrap();
+    // The listener speaks no gRPC, so the connect attempt never succeeds; leave it running.
+    let connecting = std::thread::spawn(move || db.connect().map(|_| ()));
+    let start = std::time::Instant::now();
+    while listener.accept().is_err() {
+        assert!(
+            !connecting.is_finished(),
+            "connect gave up without dialing the endpoint"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "the URI authority endpoint was never dialed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}

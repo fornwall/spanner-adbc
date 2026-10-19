@@ -53,7 +53,7 @@ connections keep theirs. Getters don't show values taken from the environment.
 | Option | Values | Default | Get | Effect |
 | --- | --- | --- | --- | --- |
 | `uri` | `spanner://` URI | required | set, verbatim | Database path plus optional endpoint and options; see [connection URIs](#connection-uris). Without it, creating a connection fails with `InvalidState`. |
-| `spanner.endpoint` | gRPC endpoint URL | production endpoint | set | Overrides the endpoint from `SPANNER_EMULATOR_HOST`. |
+| `spanner.endpoint` | gRPC endpoint URL | production endpoint | set | Overrides the endpoint from `SPANNER_EMULATOR_HOST`. A bare `host:port` uses plaintext `http://`. |
 | `spanner.emulator` | boolean | `false` | always | Uses anonymous credentials. A non-empty `SPANNER_EMULATOR_HOST` also enables this mode. |
 | `spanner.instance_type` | `cloud`, `omni` | `cloud` | always | Selects Cloud Spanner or Spanner Omni. Omni needs an explicit endpoint, ignores `SPANNER_EMULATOR_HOST` and can't be combined with `spanner.emulator=true`. Without explicit credentials, Omni connects anonymously. |
 | `spanner.auth.keyfile` | credential JSON file path | ADC | set | Supports `service_account`, `authorized_user`, `impersonated_service_account` and `external_account` JSON. |
@@ -79,8 +79,10 @@ spanner:///projects/<p>/instances/<i>/databases/<d>?spanner.emulator=true
 spanner://localhost:9010/projects/<p>/instances/<i>/databases/<d>
 ```
 
-The path names the database. A `host:port` authority sets `spanner.endpoint`; without one, use
-three slashes. An endpoint alone doesn't switch to anonymous credentials.
+The path names the database; its segments are percent-decoded. A `host:port` authority sets
+`spanner.endpoint` and connects over plaintext `http://`; without one, use three slashes. A
+plaintext endpoint without credential options connects anonymously, but only `spanner.emulator`
+or `SPANNER_EMULATOR_HOST` turn on emulator mode.
 
 Query parameters can set any database option except `uri`, `spanner.auth.keyfile_json` and
 `spanner.auth.access_token`. Unknown or forbidden keys return `InvalidArguments`. Values are
@@ -157,8 +159,8 @@ settings, but no request or transaction tags.
 | `adbc.statement.bind_by_name` | boolean | `false` | always | By default, columns bind to distinct parameters in SQL order. `true` matches column names to parameter names, case-insensitively as Spanner does; unknown names return `InvalidArguments`. |
 | `adbc.statement.exec.incremental` | boolean, only `false` supported | `false` | always | `true` returns `NotImplemented`; incremental partitioning is not supported. |
 | `adbc.ingest.target_table` | table name | unset | set | Selects bulk ingest and clears the SQL; setting SQL clears it. An empty name, or one containing a backtick, backslash or control character, returns `InvalidArguments`. |
-| `adbc.ingest.target_db_schema` | schema name; `""` for the default schema | default schema | set | Schema of the target table. |
-| `adbc.ingest.target_catalog` | connection's database ID | connection's catalog | set | Other values, including `""`, return `NotImplemented`. |
+| `adbc.ingest.target_db_schema` | schema name; `""` for the default schema | default schema | set | Schema of the target table. Setting SQL clears it. |
+| `adbc.ingest.target_catalog` | connection's database ID | connection's catalog | set | Other values, including `""`, return `NotImplemented`. Setting SQL clears it. |
 | `adbc.ingest.temporary` | boolean, only `false` supported | `false` | always | `true` returns `NotImplemented`; temporary tables are not supported. |
 | `adbc.ingest.mode` | `adbc.ingest.mode.append`, `create`, `create_append`, `replace` (each with the prefix; bare suffixes are also accepted) | `adbc.ingest.mode.create` | always, full constant | `append` needs an existing table; `create` needs it to be absent; `create_append` creates it if absent; `replace` drops and recreates it. All modes then insert the rows. |
 | `spanner.ingest.batch_write` | boolean; `""` resets | `false` | always | Uses non-atomic BatchWrite for autocommit ingest. Ignored in manual mode. |
@@ -289,7 +291,7 @@ configured values. Backoff is independent of the attempt and time limits.
   emulator mode and supplies the endpoint unless `spanner.endpoint` is set. Omni mode ignores it.
   A bare `host:port` gets `http://` prepended; point it at the emulator's gRPC port, normally
   `9010`. The driver uses gRPC for queries and schema changes on every backend.
-- Without explicit credentials, emulator mode or Omni mode, the driver uses
+- Without explicit credentials, emulator mode, Omni mode or a plaintext endpoint, the driver uses
   [Application Default Credentials](https://docs.cloud.google.com/docs/authentication/application-default-credentials),
   including `GOOGLE_APPLICATION_CREDENTIALS`, gcloud's local credentials and the metadata server.
 - `GOOGLE_CLOUD_QUOTA_PROJECT` overrides the quota project option when credentials come from ADC.

@@ -70,9 +70,10 @@ pub(crate) fn chain<'a>(
 ///
 /// A gRPC status maps to the closest [`Status`], and its numeric code is kept in `vendor_code` so
 /// callers can tell apart codes that share a status (for example `ABORTED` = 10). Errors without
-/// a status become [`Status::Internal`] with `vendor_code` 0. The C ABI's 1.1.0 error layout
-/// reserves `vendor_code`, so `src/ffi/error.rs` passes a non-zero code there as the detail
-/// `adbc.spanner.vendor_code` instead.
+/// a status have `vendor_code` 0 and become [`Status::Unauthenticated`] for credential failures,
+/// [`Status::Timeout`] for client deadlines and [`Status::Internal`] otherwise. The C ABI's 1.1.0
+/// error layout reserves `vendor_code`, so `src/ffi/error.rs` passes a non-zero code there as the
+/// detail `adbc.spanner.vendor_code` instead.
 ///
 /// # Structured error details
 ///
@@ -89,21 +90,22 @@ pub(crate) fn chain<'a>(
 /// `RetryInfo` on `ABORTED` is rare because the client's transaction runner consumes it. Without
 /// details, `details` is `None`, never `Some(vec![])`.
 pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
-    // The emulator's admin REST API returns a bare google.rpc.Status, while gax expects an
-    // {"error": ...} envelope.
-    let http_status = error
-        .http_payload()
-        .filter(|_| error.status().is_none())
-        .and_then(|payload| {
-            let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
-            let code = value.get("code")?.as_i64()?;
-            if !(1..=16).contains(&code) || !value.get("message")?.is_string() {
-                return None;
-            }
-            serde_json::from_value::<google_cloud_gax::error::rpc::Status>(value).ok()
-        });
-    let (status, vendor_code, details, code) = error.status().or(http_status.as_ref()).map_or(
-        (Status::Internal, 0, None, None),
+    // An exhausted retry policy wraps the last error instead of carrying its kind and status.
+    let client_errors = || {
+        std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {
+            e.source()
+        })
+        .filter_map(|e| e.downcast_ref::<google_cloud_spanner::Error>())
+    };
+    let without_status = if client_errors().any(google_cloud_spanner::Error::is_authentication) {
+        Status::Unauthenticated
+    } else if client_errors().any(google_cloud_spanner::Error::is_timeout) {
+        Status::Timeout
+    } else {
+        Status::Internal
+    };
+    let (status, vendor_code, details, code) = client_errors().find_map(|e| e.status()).map_or(
+        (without_status, 0, None, None),
         |status| {
             (
                 status_for_grpc_code(status.code),

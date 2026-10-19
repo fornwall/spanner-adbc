@@ -451,42 +451,66 @@ fn chain_walks_from_the_outermost_error_to_the_innermost() {
     assert_eq!(chain(&alone).count(), 1);
 }
 
+/// A retry loop that runs out of time returns `Error::exhausted(last_error)`.
 #[test]
-fn bare_http_rpc_status_preserves_code_message_and_details() {
-    for (code, expected) in [
-        (9, Status::InvalidState),
-        (7, Status::Unauthorized),
-        (16, Status::Unauthenticated),
-        (4, Status::Timeout),
-        (8, Status::Internal),
-        (14, Status::IO),
+fn an_exhausted_retry_keeps_the_wrapped_grpc_status() {
+    use google_cloud_gax::error::Error as GaxError;
+    use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
+
+    let service = || {
+        GaxError::service(
+            RpcStatus::default()
+                .set_code(Code::Unavailable)
+                .set_message("backend unavailable"),
+        )
+    };
+    for error in [
+        GaxError::exhausted(service()),
+        GaxError::exhausted(GaxError::exhausted(service())),
     ] {
-        let payload = serde_json::json!({
-            "code": code,
-            "message": "admin request failed",
-            "details": [{
-                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
-                "reason": "ADMIN_FAILURE",
-                "domain": "spanner.googleapis.com"
-            }]
-        });
-        let error = google_cloud_gax::error::Error::http(
-            400,
-            Default::default(),
-            serde_json::to_vec(&payload).unwrap().into(),
+        let adbc = from_spanner(error);
+        assert_eq!(adbc.status, Status::IO, "{}", adbc.message);
+        assert_eq!(adbc.vendor_code, Code::Unavailable as i32);
+        assert!(
+            adbc.message.contains("backend unavailable"),
+            "{}",
+            adbc.message
         );
-        let mapped = from_spanner(error);
-        assert_eq!(mapped.status, expected);
-        assert_eq!(mapped.vendor_code, code);
-        assert!(mapped.message.contains("admin request failed"));
-        assert!(mapped.details.as_ref().unwrap().iter().any(|(key, value)| {
-            key == "google.rpc.errorinfo"
-                && String::from_utf8_lossy(value).contains("ADMIN_FAILURE")
-        }));
-        if code == 7 {
-            assert!(mapped.message.contains("grant an IAM role"));
-        }
     }
+
+    let denied = GaxError::exhausted(GaxError::service(
+        RpcStatus::default()
+            .set_code(Code::PermissionDenied)
+            .set_message("spanner.sessions.create denied"),
+    ));
+    let adbc = from_spanner(denied);
+    assert_eq!(adbc.status, Status::Unauthorized);
+    assert!(
+        adbc.message.contains("grant an IAM role"),
+        "{}",
+        adbc.message
+    );
+
+    let adbc = from_spanner(GaxError::exhausted("no status anywhere"));
+    assert_eq!(adbc.status, Status::Internal);
+    assert_eq!(adbc.vendor_code, 0);
+}
+
+#[test]
+fn credential_and_client_deadline_failures_map_to_their_status() {
+    use google_cloud_gax::error::{CredentialsError, Error as GaxError};
+
+    let auth = || GaxError::authentication(CredentialsError::from_msg(false, "invalid_grant"));
+    for error in [auth(), GaxError::exhausted(auth())] {
+        let adbc = from_spanner(error);
+        assert_eq!(adbc.status, Status::Unauthenticated, "{}", adbc.message);
+        assert_eq!(adbc.vendor_code, 0);
+        assert!(adbc.message.contains("invalid_grant"), "{}", adbc.message);
+    }
+
+    let adbc = from_spanner(GaxError::timeout("attempt deadline"));
+    assert_eq!(adbc.status, Status::Timeout, "{}", adbc.message);
+    assert_eq!(adbc.vendor_code, 0);
 }
 
 #[test]

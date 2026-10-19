@@ -304,6 +304,9 @@ fn a_uri_with_a_bad_database_path_is_rejected() {
         "spanner:///projects/p",
         "spanner:///projects//instances/i/databases/d",
         "spanner:///databases/d/instances/i/projects/p",
+        "spanner:///projects/p/instances/i/databases/d/",
+        "spanner:///projects/p%2Fx/instances/i/databases/d",
+        "spanner:///projects/p/instances/i/databases/%2F",
     ] {
         let error = set_uri(&mut db, bad).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "uri: {bad}");
@@ -314,6 +317,18 @@ fn a_uri_with_a_bad_database_path_is_rejected() {
     assert_eq!(error.status, Status::InvalidArguments);
     assert!(error.message.contains("host authority"));
     assert!(error.message.contains("spanner:///projects/"));
+}
+
+#[test]
+fn database_path_segments_are_percent_decoded() {
+    let mut db = new_database();
+    let uri = "spanner:///projects/example.com%3Amy-project/instances/i/databases/d";
+    set_uri(&mut db, uri).unwrap();
+    assert_eq!(
+        db.database.as_deref(),
+        Some("projects/example.com:my-project/instances/i/databases/d")
+    );
+    assert_eq!(db.uri.as_deref(), Some(uri));
 }
 
 #[test]

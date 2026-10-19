@@ -15,7 +15,7 @@ use google_cloud_spanner::statement::StatementBuilder;
 
 use crate::error::invalid_argument;
 use crate::options::{RawParsed, bool_option_unsettable, non_empty_string_option};
-use crate::staleness::parse_duration;
+use crate::staleness::parse_duration_for;
 
 /// Spanner rejects larger values at commit; checking at set time gives a clearer error.
 const MAX_COMMIT_DELAY_CAP: Duration = Duration::from_millis(500);
@@ -236,10 +236,11 @@ impl CommitStats {
 
 /// Parse a `spanner.commit.max_delay` duration of at most 500ms.
 fn parse_max_commit_delay(value: &str) -> Result<Duration> {
-    let duration = parse_duration(value)?;
+    let duration = parse_duration_for(value, crate::OPTION_MAX_COMMIT_DELAY)?;
     if duration > MAX_COMMIT_DELAY_CAP {
         return Err(invalid_argument(format!(
-            "spanner.commit.max_delay {value:?} exceeds Spanner's maximum of 500ms"
+            "option {}: {value:?} exceeds Spanner's maximum of 500ms",
+            crate::OPTION_MAX_COMMIT_DELAY
         )));
     }
     Ok(duration)
