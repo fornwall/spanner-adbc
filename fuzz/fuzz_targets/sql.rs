@@ -2,16 +2,11 @@
 
 use libfuzzer_sys::fuzz_target;
 
-// Fuzz the SQL statement splitter and DDL detector with arbitrary text. These parse untrusted
-// query strings (byte/char handling, quotes, comments), so they must never panic and must uphold
-// their invariants.
+// Statement splitting and DDL / `THEN RETURN` detection on arbitrary SQL.
 fuzz_target!(|sql: String| {
     let statements = spanner_adbc::fuzzing::split_statements(&sql);
 
-    // Preservation invariant: every statement is non-empty, trimmed, and appears verbatim in the
-    // input at non-decreasing positions. Each is a contiguous slice of the input, so it must be
-    // findable in order — this catches any bug that drops, reorders, duplicates, or mangles bytes,
-    // not just outright panics.
+    // Statements are non-empty, trimmed slices of the input, in order.
     let mut cursor = 0;
     for statement in &statements {
         assert!(!statement.is_empty());
@@ -22,8 +17,6 @@ fuzz_target!(|sql: String| {
         }
     }
 
-    // DDL / `THEN RETURN` detection must not panic on the whole batch or any individual
-    // statement (`is_dml_returning` walks the same lexer with `CASE`/`END` depth tracking).
     let _ = spanner_adbc::fuzzing::is_ddl(&sql);
     let _ = spanner_adbc::fuzzing::is_dml_returning(&sql);
     for statement in &statements {

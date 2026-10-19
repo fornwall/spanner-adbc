@@ -1,4 +1,4 @@
-//! The [`SpannerDriver`] and [`SpannerDatabase`] — the two top levels of the ADBC hierarchy.
+//! [`SpannerDriver`] and [`SpannerDatabase`], the top two levels of the ADBC hierarchy.
 
 mod admin;
 mod credentials;
@@ -29,10 +29,10 @@ use crate::{
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 
-/// The Spanner ADBC driver — the entry point for creating [`SpannerDatabase`] instances.
+/// The Spanner ADBC driver, which creates [`SpannerDatabase`]s.
 ///
-/// The driver owns the shared Tokio runtime used to drive the asynchronous Spanner client, so a
-/// single driver instance should be reused for the lifetime of the application.
+/// The driver owns the Tokio runtime that drives the asynchronous Spanner client, so reuse one
+/// driver for the lifetime of the application.
 #[derive(Debug)]
 pub struct SpannerDriver {
     runtime: SharedRuntime,
@@ -76,28 +76,17 @@ impl Driver for SpannerDriver {
     }
 }
 
-/// A configured, but not yet connected, Spanner database.
+/// A configured Spanner database that creates [`SpannerConnection`]s.
 ///
-/// Holds the connection parameters (the database path and, optionally, an emulator endpoint) and
-/// mints [`SpannerConnection`]s from them.
+/// The client stack (gRPC channels, credentials and the [`DatabaseClient`] with its multiplexed
+/// session) is built lazily on the first connection and shared by every later one. Setting any
+/// database option discards it, so the next connection rebuilds it; `SPANNER_EMULATOR_HOST` is
+/// therefore read when the stack is built, not per connection.
 ///
-/// The underlying Spanner client stack — the gRPC channel pool, the resolved credentials, and the
-/// [`DatabaseClient`] with its multiplexed session — is built **once**, lazily, on the first
-/// connection and *shared* by every connection this database mints (a `DatabaseClient` is a
-/// long-lived, one-per-database object whose clones cheaply share the session and channels).
-/// Setting **any** database option invalidates the cached stack, so the next connection rebuilds it
-/// from the new configuration — which also means `SPANNER_EMULATOR_HOST` is consulted when the
-/// stack is *built*, not once per connection.
-///
-/// [`Debug`] is hand-written rather than derived so the three credential fields never render in
-/// cleartext: each shows as `Some("<redacted>")` / `None`, exposing presence only. `get_option`
-/// matches — the two secret-*holding* options (`keyfile_json`, `access_token`) are write-only and
-/// always report `NotFound`, and a connection URI may not carry them (`URI_SECRET_OPTIONS`), while
-/// `keyfile`, a path, both reads back normally and stays a legal query parameter.
+/// [`Debug`] shows only whether each credential field is set.
 pub struct SpannerDatabase {
     runtime: SharedRuntime,
-    /// The `uri` option exactly as the caller set it, returned verbatim by `get_option`. The
-    /// fields below hold what it expanded into; this is only the string itself.
+    /// The `uri` option as set, for `get_option`; the fields below hold what it expanded into.
     uri: Option<String>,
     database: Option<String>,
     endpoint: Option<String>,
@@ -105,35 +94,21 @@ pub struct SpannerDatabase {
     instance_type: InstanceType,
     keyfile: Option<String>,
     keyfile_json: Option<String>,
-    /// The service account to impersonate. When `Some`, impersonation is layered on top of the base
-    /// credentials (keyfile or ADC); when `None`, authentication is unchanged.
     impersonate_target_principal: Option<String>,
-    /// Optional delegation chain for impersonation (empty = none).
+    /// Empty means no delegation chain.
     impersonate_delegates: Vec<String>,
-    /// Optional OAuth scopes for the impersonated token (empty = the auth crate's cloud-platform default).
+    /// Empty means the auth crate's default `cloud-platform` scope.
     impersonate_scopes: Vec<String>,
-    /// Optional impersonated-token lifetime in seconds (`None` = [`credentials::DEFAULT_IMPERSONATION_LIFETIME_SECS`]).
     impersonate_lifetime_secs: Option<u64>,
-    /// A caller-supplied OAuth 2.0 access token. When `Some`, the driver authenticates with this
-    /// bearer token directly (no refresh); it is mutually exclusive with the keyfile/impersonation
-    /// options and with emulator mode.
     access_token: Option<String>,
-    /// The quota / billing project charged for API usage (`spanner.auth.quota_project`), sent as the
-    /// `x-goog-user-project` header. `None` = the credential's own project. Not a secret (a bare
-    /// project id), so it renders in `Debug` and round-trips through `get_option`. Composes with
-    /// every non-emulator credential path; refused in emulator mode.
+    /// `None` bills the credential's own project.
     quota_project: Option<String>,
-    /// The lazily-built client stack shared by every connection (see the struct docs). `None`
-    /// until the first successful [`Database::new_connection`]; reset to `None` by any
-    /// `set_option`. Rendered presence-only in `Debug` — the client's own `Debug` output is a
-    /// client-crate surface outside this crate's control, so it must not be interpolated here.
+    /// The shared client stack, built by the first connection and cleared by `set_option`.
     connected: Mutex<Option<Connected>>,
 }
 
 impl std::fmt::Debug for SpannerDatabase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Presence-only for the three credential fields; never the secret value (see the struct
-        // docs). Every other field renders normally.
         let redact = |value: &Option<String>| value.as_ref().map(|_| "<redacted>");
         f.debug_struct("SpannerDatabase")
             .field("runtime", &self.runtime)
@@ -153,8 +128,7 @@ impl std::fmt::Debug for SpannerDatabase {
             .field("impersonate_lifetime_secs", &self.impersonate_lifetime_secs)
             .field("access_token", &redact(&self.access_token))
             .field("quota_project", &self.quota_project)
-            // Presence-only, like the credential fields: never delegate to the cached client's
-            // own `Debug` (an external surface that could render endpoint/credential internals).
+            // The client types' own `Debug` could expose endpoint or credential internals.
             .field(
                 "connected",
                 &self
@@ -189,11 +163,10 @@ impl SpannerDatabase {
         }
     }
 
-    /// Resolve the effective configuration and establish a connection.
+    /// Build the client stack from the current options.
     ///
-    /// Emulator handling: if `SPANNER_EMULATOR_HOST` is set it supplies the endpoint (unless one was
-    /// given explicitly) and forces anonymous credentials. Combining emulator mode with explicitly
-    /// configured credentials is refused (see below) instead of silently downgrading them.
+    /// Outside Omni, a non-empty `SPANNER_EMULATOR_HOST` enables emulator mode and supplies the
+    /// endpoint unless one was set explicitly.
     pub(crate) fn connect(&self) -> Result<Connected> {
         let database = self.database.clone().ok_or_else(|| {
             invalid_state(
@@ -230,12 +203,10 @@ impl SpannerDatabase {
             emulator = true;
         }
 
-        // Emulator mode forces anonymous credentials over plaintext `http://`. Silently dropping
-        // credentials the user explicitly configured would be an environment-controlled security
-        // downgrade (a stray `SPANNER_EMULATOR_HOST` redirecting real-database traffic, sans auth,
-        // to an attacker-chosen endpoint), so the combination is refused instead. Ambient ADC does
-        // not trip this — only explicit driver options do. The quota (billing) project is refused
-        // on the same grounds: the emulator ignores it, so it would be silently dropped.
+        // Emulator mode uses anonymous plaintext credentials. Silently dropping explicitly
+        // configured credentials would let a stray `SPANNER_EMULATOR_HOST` redirect real traffic,
+        // unauthenticated, to another endpoint, so refuse the combination. Ambient ADC is not an
+        // explicit option and does not count. A quota project would also be silently ignored.
         if emulator {
             let cause = if self.emulator {
                 "the `spanner.emulator` option"
@@ -258,10 +229,8 @@ impl SpannerDatabase {
             }
         }
 
-        // An explicit access token is a complete credential on its own — it *is* the bearer token,
-        // not a way to obtain one — so it cannot be combined with a keyfile or impersonation, which
-        // describe a *different* credential source. Reject the combination (naming the conflicting
-        // option, in the emulator-guard style) rather than silently letting one path win.
+        // An access token is a complete credential, so a keyfile or impersonation target alongside
+        // it is ambiguous.
         if self.access_token.is_some()
             && let Some(conflict) = self.conflicting_credential_with_access_token()
         {
@@ -271,9 +240,7 @@ impl SpannerDatabase {
             )));
         }
 
-        // Read the key file, if any, before entering the runtime (blocking I/O). In emulator mode
-        // the guard above guarantees the credential options are unset, so this stays `None` and
-        // anonymous credentials win.
+        // Blocking file I/O, so read the key file before entering the runtime.
         let credentials_json = self.credentials_json()?;
 
         self.runtime.block_on(async move {
@@ -281,6 +248,8 @@ impl SpannerDatabase {
             if let Some(endpoint) = endpoint.clone() {
                 builder = builder.with_endpoint(endpoint);
             }
+            // With no configured credential, Omni and plaintext endpoints connect anonymously
+            // instead of through ADC.
             let credentials = self
                 .build_credentials(emulator, credentials_json)?
                 .or_else(|| {
@@ -316,16 +285,11 @@ impl SpannerDatabase {
         })
     }
 
-    /// Return the shared client stack, building it via [`Self::connect`] on first use.
-    ///
-    /// The expensive parts of `connect` are per-*database* costs, so the stack is cached here and
-    /// cheaply [`Clone`]d into every connection. `set_option` invalidates the cache, and a failed
-    /// build caches nothing, so the next connection attempt retries from scratch.
+    /// Return the shared client stack, building it on first use. A failed build is not cached.
     fn connect_shared(&self) -> Result<Connected> {
-        // Hold the lock across the build so two concurrent `new_connection` calls cannot build
-        // the stack twice. This cannot deadlock: the lock is only ever taken on caller (sync
-        // ADBC) threads — never by anything running *on* the shared runtime that `connect`'s
-        // `block_on` drives — so the losing thread simply parks until the winner finishes.
+        // Holding the lock across the build stops concurrent connections from building twice.
+        // It cannot deadlock: only caller threads take it, never tasks on the runtime that
+        // `connect` blocks on.
         let mut cached = self.connected.lock().unwrap();
         if let Some(connected) = cached.as_ref() {
             return Ok(connected.clone());
@@ -336,11 +300,8 @@ impl SpannerDatabase {
     }
 }
 
-/// The data-plane client, resolved database path, and shared lazy Database Admin client.
-///
-/// `Clone` is cheap by design — the client types share their channel pool and multiplexed session
-/// across clones — which is what lets [`SpannerDatabase`] cache one stack and clone it per
-/// connection.
+/// The data client, database path and lazily built admin client. Clones share channels and the
+/// session.
 #[derive(Clone, Debug)]
 pub(crate) struct Connected {
     pub(crate) client: DatabaseClient,
@@ -348,14 +309,9 @@ pub(crate) struct Connected {
     pub(crate) admin: SharedDatabaseAdmin,
 }
 
-/// The lazily-built [`DatabaseAdmin`] client (the DDL path — `UpdateDatabaseDdl`, including the
-/// `CREATE TABLE` a create-mode ingest issues), shared via `Arc` by every connection and statement
-/// minted from one cached [`Connected`] stack.
-///
-/// Built **once** on the first DDL statement — no admin connection is opened for workloads that
-/// never run DDL — and cheaply cloned thereafter. Living inside [`Connected`] ties its lifetime to
-/// the data-plane stack's, so a database option that invalidates the cached stack rebuilds the admin
-/// client from the new endpoint/credentials too. A failed build caches nothing (`get_or_try_init`).
+/// The [`DatabaseAdmin`] client for DDL, built on the first DDL statement so that workloads
+/// without DDL never open an admin connection. It lives in [`Connected`], so it is rebuilt along
+/// with the data client when database options change.
 pub(crate) type SharedDatabaseAdmin = Arc<DatabaseAdminState>;
 
 pub(crate) struct DatabaseAdminState {
@@ -387,9 +343,8 @@ impl Optionable for SpannerDatabase {
     type Option = OptionDatabase;
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
-        // Any database option can change the endpoint / credentials / database path the cached
-        // client stack was built from, so drop it up front (even if the set fails below — a
-        // spurious rebuild is harmless); the next connection rebuilds from the new configuration.
+        // Any option may change what the cached stack was built from. Dropping it even when the
+        // set fails below only costs a rebuild.
         *self.connected.get_mut().unwrap() = None;
         match &key {
             OptionDatabase::Uri => {
@@ -435,7 +390,6 @@ impl Optionable for SpannerDatabase {
                 self.access_token = Some(string_value(&key, value)?)
             }
             OptionDatabase::Other(name) if name == OPTION_QUOTA_PROJECT => {
-                // `""` unsets, back to the credential's own project (the house "" pattern).
                 let project = string_value(&key, value)?;
                 self.quota_project = (!project.is_empty()).then_some(project);
             }
@@ -447,9 +401,7 @@ impl Optionable for SpannerDatabase {
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
-        // The two secret-holding options are **write-only**: reading either back is always
-        // `NotFound` — set or not — so tooling that dumps connection options can never print a
-        // usable credential. `spanner.auth.keyfile` (a path, not a secret) stays readable.
+        // Secrets are write-only, so tools that dump options cannot print a credential.
         if let OptionDatabase::Other(name) = &key
             && (name == OPTION_KEYFILE_JSON || name == OPTION_ACCESS_TOKEN)
         {
@@ -459,8 +411,7 @@ impl Optionable for SpannerDatabase {
             ));
         }
         let value = match &key {
-            // adbc.h: `GetOption` serves *the option value*, so the URI comes back exactly as
-            // it was set; what it expanded into reads back under the expanded options' own keys.
+            // adbc.h: `GetOption` returns the option value, so the URI comes back as set.
             OptionDatabase::Uri => self.uri.clone(),
             OptionDatabase::Other(name) if name == OPTION_ENDPOINT => self.endpoint.clone(),
             OptionDatabase::Other(name) if name == OPTION_EMULATOR => {
@@ -525,8 +476,7 @@ fn string_value(key: &OptionDatabase, value: OptionValue) -> Result<String> {
     crate::options::string_option(value, &format!("option {}", key.as_ref()))
 }
 
-/// Split a comma-separated option value (delegates, scopes) into a list, trimming surrounding
-/// whitespace and dropping empty entries so a trailing comma or spaces are harmless.
+/// Split a comma-separated value, trimming entries and dropping empty ones.
 fn comma_separated(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -536,9 +486,7 @@ fn comma_separated(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Parse an option carrying a non-negative integer number of seconds (the impersonation lifetime).
-/// Accepts an integer option value directly or a numeric string; anything else is rejected with a
-/// clear `InvalidArguments` error.
+/// Parse a non-negative whole number of seconds, given as an integer or a numeric string.
 fn u64_seconds_value(key: &OptionDatabase, value: OptionValue) -> Result<u64> {
     match value {
         OptionValue::Int(seconds) if seconds >= 0 => Ok(seconds as u64),

@@ -5,29 +5,25 @@ use spanner_adbc::fuzzing::{
     first_keyword, is_ddl, is_dml, split_statements, strip_trailing_terminators,
 };
 
-// Fuzz the statement classifier (`first_keyword` — whose statement-hint skipping had a real bug)
-// and the trailing-terminator strip. Both lex arbitrary untrusted SQL, so beyond "never panics"
-// every result is checked against independent restatements of the documented contract.
+// Check statement classification and trailing-terminator stripping against independent
+// restatements of their contracts.
 fuzz_target!(|sql: String| {
     let keyword = first_keyword(&sql);
 
     if let Some(kw) = &keyword {
-        // Shape: a non-empty, all-uppercase ASCII-alphabetic word...
         assert!(!kw.is_empty(), "empty keyword for {sql:?}");
         assert!(
             kw.chars().all(|c| c.is_ascii_uppercase()),
             "keyword {kw:?} is not uppercase ASCII"
         );
-        // ...lifted verbatim (case-insensitively) from the input: the keyword is a slice of the
-        // input after hint/comment skipping, never synthesized.
+        // The keyword comes from the input, never synthesized.
         assert!(
             sql.to_ascii_uppercase().contains(kw.as_str()),
             "keyword {kw:?} does not occur in {sql:?}"
         );
     }
 
-    // Independent classification oracle: `is_ddl` / `is_dml` are exactly "the first keyword is in
-    // the DDL/DML list". The lists here are a deliberate second copy of the driver's.
+    // `is_ddl` and `is_dml` test the first keyword against these lists, copied from the driver.
     const DDL: &[&str] = &[
         "CREATE", "DROP", "ALTER", "RENAME", "GRANT", "REVOKE", "ANALYZE",
     ];
@@ -36,9 +32,7 @@ fuzz_target!(|sql: String| {
     assert_eq!(is_ddl(&sql), kw.is_some_and(|k| DDL.contains(&k)));
     assert_eq!(is_dml(&sql), kw.is_some_and(|k| DML.contains(&k)));
 
-    // Metamorphic oracle: leading whitespace, each comment form, and a well-formed statement hint
-    // are transparent to classification — the exact surface where the real bug lived (hinted DML
-    // misread as "no keyword" and routed to the wrong execution path).
+    // Leading whitespace, comments and statement hints do not change the keyword.
     for prefix in [
         " \t\n",
         "-- line comment\n",
@@ -54,10 +48,8 @@ fuzz_target!(|sql: String| {
         );
     }
 
-    // strip_trailing_terminators: the result is a verbatim substring of the input (never
-    // synthesized or reordered), stripping is idempotent, and it never changes what the
-    // GoogleSQL-aware splitter sees — so `SELECT ';'` keeps its literal and a genuine
-    // multi-statement batch is returned unchanged.
+    // Stripping returns a substring of the input, is idempotent, and never changes how the
+    // splitter divides the SQL (so `SELECT ';'` keeps its literal).
     let stripped = strip_trailing_terminators(&sql);
     assert!(
         sql.contains(&stripped),

@@ -94,7 +94,6 @@ fn debug_redacts_credential_fields() {
 
     let rendered = format!("{db:?}");
 
-    // The secret values never appear in cleartext.
     assert!(
         !rendered.contains("SUPER-SECRET-PRIVATE-KEY"),
         "keyfile_json leaked: {rendered}"
@@ -107,8 +106,6 @@ fn debug_redacts_credential_fields() {
         !rendered.contains("/etc/secret/key.json"),
         "keyfile leaked: {rendered}"
     );
-
-    // Presence is shown via the redaction placeholder, not the value.
     assert!(
         rendered.contains(r#"keyfile: Some("<redacted>")"#),
         "keyfile presence not shown: {rendered}"
@@ -121,8 +118,6 @@ fn debug_redacts_credential_fields() {
         rendered.contains(r#"access_token: Some("<redacted>")"#),
         "access_token presence not shown: {rendered}"
     );
-
-    // Non-secret fields render normally.
     assert!(
         rendered.contains("projects/p/instances/i/databases/d"),
         "database not shown: {rendered}"
@@ -145,19 +140,14 @@ fn debug_shows_none_for_absent_credentials() {
 
 #[test]
 fn debug_renders_the_client_stack_cache_presence_only() {
-    // The cached client stack must never delegate to the client types' own `Debug` (an
-    // external surface that could render endpoint/credential internals): unbuilt it renders
-    // as `connected: None`, and once built it renders as the fixed `<client stack>` marker
-    // (asserted end-to-end in tests/mock_spanner.rs, where a real stack exists). Redaction
-    // of the credential fields alongside it is covered by `debug_redacts_credential_fields`.
+    // A built stack renders as `<client stack>`; tests/mock_spanner.rs covers that case.
     let db = new_database();
     let rendered = format!("{db:?}");
     assert!(
         rendered.contains("connected: None"),
         "absent client stack not shown: {rendered}"
     );
-    // The cache must not cost `SpannerDatabase` its `Send + Sync` (the ADBC database is
-    // shared across threads by driver managers; the client handles are both).
+    // Driver managers share databases across threads.
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<SpannerDatabase>();
 }
@@ -166,14 +156,12 @@ fn debug_renders_the_client_stack_cache_presence_only() {
 fn typed_option_getters_distinguish_unset_from_non_integer() {
     let mut db = new_database();
 
-    // Genuinely unset: NotFound ("option not set"), same as get_option_string.
     let error = db
         .get_option_int(OptionDatabase::Other(OPTION_ENDPOINT.into()))
         .unwrap_err();
     assert_eq!(error.status, Status::NotFound);
     assert!(error.message.contains("is not set"), "{}", error.message);
 
-    // An integer-valued option is served by get_option_int (and as a double).
     db.set_option(
         OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into()),
         OptionValue::String("900".into()),
@@ -190,8 +178,7 @@ fn typed_option_getters_distinguish_unset_from_non_integer() {
         900.0
     );
 
-    // Set, but the value is not an integer: InvalidArguments, NOT NotFound (which must mean
-    // "option unset/unknown").
+    // A set value that is not an integer is InvalidArguments; NotFound means unset or unknown.
     db.set_option(
         OptionDatabase::Uri,
         OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
@@ -210,9 +197,7 @@ fn typed_option_getters_distinguish_unset_from_non_integer() {
 
 #[test]
 fn boolean_options_reject_int_typed_sets() {
-    // Boolean options take the strings "true"/"false", never OptionValue::Int — an
-    // int set would not round-trip through the getters (which serve the canonical string),
-    // and no surveyed ADBC driver accepts SetOptionInt for a boolean option.
+    // An int set would not round-trip through the getters, which return "true"/"false".
     let mut db = new_database();
     let emulator = || OptionDatabase::Other(OPTION_EMULATOR.into());
 
@@ -227,7 +212,6 @@ fn boolean_options_reject_int_typed_sets() {
         );
     }
 
-    // The string forms still work and read back canonically.
     db.set_option(emulator(), OptionValue::String("true".into()))
         .unwrap();
     assert_eq!(db.get_option_string(emulator()).unwrap(), "true");
@@ -254,9 +238,6 @@ fn a_non_string_uri_is_rejected() {
 
 #[test]
 fn keyfile_path_round_trips_but_inline_json_is_write_only() {
-    // `spanner.auth.keyfile` is a filesystem path (not a secret) and reads back
-    // verbatim; `spanner.auth.keyfile_json` holds a live private key, so `get_option` reports
-    // `NotFound` — never the key material — whether or not it is set.
     let mut db = new_database();
     db.set_option(
         OptionDatabase::Other(OPTION_KEYFILE.into()),
@@ -284,14 +265,13 @@ fn keyfile_path_round_trips_but_inline_json_is_write_only() {
         "keyfile_json leaked through get_option: {}",
         error.message
     );
-    // The stored key is still in effect — only reading it back is refused.
+    // Only reading it back is refused.
     assert_eq!(db.keyfile_json.as_deref(), Some(secret_json));
 }
 
 #[test]
 fn unknown_database_option_is_not_implemented() {
-    // ADBC: setting an unrecognised option reports NotImplemented (not InvalidArguments), so a
-    // driver manager can tell "I don't support this option" from "this value is wrong".
+    // ADBC distinguishes unknown options (NotImplemented) from invalid values.
     let mut db = new_database();
     let error = db
         .set_option(
@@ -302,10 +282,8 @@ fn unknown_database_option_is_not_implemented() {
     assert_eq!(error.status, Status::NotImplemented);
 }
 
-/// The driver owns the one Tokio runtime and hands it to everything it creates, so every database
-/// a driver produces drives its async Spanner client on that same runtime — never one of its own.
-/// (The other half of the guarantee, that a process only ever has one driver, is
-/// `every_database_is_initialized_through_one_shared_driver` in `src/ffi/database/tests.rs`.)
+/// Databases run on their driver's runtime. `src/ffi/database/tests.rs` checks that the C ABI
+/// uses one driver per process.
 #[test]
 fn every_database_a_driver_creates_shares_the_drivers_runtime() {
     let mut driver = SpannerDriver::try_new().unwrap();
@@ -323,8 +301,7 @@ fn every_database_a_driver_creates_shares_the_drivers_runtime() {
     );
     assert!(Arc::ptr_eq(&driver.runtime, &first.runtime));
 
-    // A second driver really does bring its own runtime, so the identity above is a genuine
-    // check rather than one every `Arc<Runtime>` would pass.
+    // Separate drivers have separate runtimes, so the checks above are meaningful.
     let other = SpannerDriver::try_new().unwrap();
     assert!(!Arc::ptr_eq(&driver.runtime, &other.runtime));
 }

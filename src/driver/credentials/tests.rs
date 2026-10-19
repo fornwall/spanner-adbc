@@ -6,11 +6,8 @@ use adbc_core::Optionable;
 use adbc_core::error::Status;
 use adbc_core::options::{OptionDatabase, OptionValue};
 
-// Emulator mode + explicitly configured credentials is refused at connect() time instead of
-// silently downgrading to anonymous plaintext credentials. The guard fires before any network
-// or runtime work, so these tests run offline. `spanner.emulator=true` is used to enter
-// emulator mode (env vars cannot be mutated safely in parallel tests); the
-// `SPANNER_EMULATOR_HOST` path resolves to the same `emulator` flag and hits the same guard.
+// The emulator tests set the `emulator` field because parallel tests cannot safely change
+// `SPANNER_EMULATOR_HOST`, which resolves to the same flag. The guards fire before any network I/O.
 #[test]
 fn emulator_mode_with_an_explicit_keyfile_is_refused() {
     let mut db = new_database();
@@ -48,8 +45,6 @@ fn emulator_mode_with_an_impersonation_target_is_refused() {
 
 #[test]
 fn emulator_mode_with_an_access_token_is_refused() {
-    // An explicit access token trips the same emulator guard as the keyfile options: emulator
-    // mode forces anonymous credentials, so silently dropping the token would be a downgrade.
     let mut db = new_database();
     db.database = Some("projects/p/instances/i/databases/d".into());
     db.emulator = true;
@@ -63,9 +58,6 @@ fn emulator_mode_with_an_access_token_is_refused() {
 
 #[test]
 fn access_token_is_write_only() {
-    // The token is a live bearer credential, so `get_option` reports `NotFound`
-    // whether the option is set or not — the token is never returned (matching the
-    // keyfile_json convention and the `Debug` redaction).
     let mut db = new_database();
     assert_eq!(
         db.get_option_string(OptionDatabase::Other(OPTION_ACCESS_TOKEN.into()))
@@ -93,25 +85,19 @@ fn access_token_is_write_only() {
         .get_option_bytes(OptionDatabase::Other(OPTION_ACCESS_TOKEN.into()))
         .unwrap_err();
     assert_eq!(error.status, Status::NotFound);
-    // The stored token is still in effect — only reading it back is refused.
+    // Only reading it back is refused.
     assert_eq!(db.access_token.as_deref(), Some("ya29.LIVE-BEARER-TOKEN"));
 }
 
 #[test]
 fn access_token_conflicts_with_other_credential_options() {
-    // An access token is a complete credential; combining it with a keyfile, inline keyfile
-    // JSON, or an impersonation target is a conflict that `connect()` refuses (InvalidState),
-    // naming the offender. The conflict is decided by `conflicting_credential_with_access_token`
-    // — we assert on it directly rather than through `connect()`, because CI sets
-    // `SPANNER_EMULATOR_HOST` (which the module note above explains cannot be unset in parallel
-    // tests), and its emulator guard fires first inside `connect()`, masking this branch.
-    // keyfile_json is checked first, so it wins when several are set.
+    // Not tested through `connect()`: CI sets `SPANNER_EMULATOR_HOST`, so the emulator guard
+    // would fire first.
     let base = || {
         let mut db = new_database();
         db.access_token = Some("ya29.test-token".into());
         db
     };
-    // An access token on its own is a complete credential, not a conflict.
     assert_eq!(base().conflicting_credential_with_access_token(), None);
     for (mutate, expected) in [
         (
@@ -145,9 +131,6 @@ fn access_token_conflicts_with_other_credential_options() {
 
 #[test]
 fn access_token_credentials_send_a_bearer_authorization_header() {
-    // The custom static-token credential emits `Authorization: Bearer <token>` verbatim, marks
-    // it sensitive, and reports "not modified" for a matching cache tag. Runs inside a runtime
-    // because `headers()` is async (though it does no I/O).
     let credentials = build_static_token_credentials("ya29.the-token", None).unwrap();
     let runtime = new_runtime().unwrap();
     runtime.block_on(async {
@@ -162,10 +145,9 @@ fn access_token_credentials_send_a_bearer_authorization_header() {
             value.is_sensitive(),
             "the bearer token must be marked sensitive"
         );
-        // No quota project was requested, so no billing header is attached.
         assert!(headers.get(QUOTA_PROJECT_HEADER).is_none());
 
-        // A request carrying the same entity tag is told the headers have not changed.
+        // A matching entity tag means the headers are unchanged.
         let mut extensions = Extensions::new();
         extensions.insert(tag);
         assert!(matches!(
@@ -177,8 +159,6 @@ fn access_token_credentials_send_a_bearer_authorization_header() {
 
 #[test]
 fn access_token_with_illegal_header_characters_is_rejected_without_leaking() {
-    // A token containing characters illegal in an HTTP header value (here a newline) is rejected
-    // up front, and the token material never appears in the error message.
     const TOKEN: &str = "bad\ntoken-SECRET-do-not-leak";
     let error = build_static_token_credentials(TOKEN, None).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
@@ -196,8 +176,6 @@ fn access_token_with_illegal_header_characters_is_rejected_without_leaking() {
 
 #[test]
 fn quota_project_option_round_trips_and_unsets() {
-    // The billing project is a bare project id (not a secret), so it round-trips verbatim; it is
-    // unset by default and `""` clears it, back to NotFound — the house "" pattern.
     let mut db = new_database();
     assert_eq!(
         db.get_option_string(OptionDatabase::Other(OPTION_QUOTA_PROJECT.into()))
@@ -215,7 +193,6 @@ fn quota_project_option_round_trips_and_unsets() {
             .unwrap(),
         "my-billing-project"
     );
-    // `""` unsets.
     db.set_option(
         OptionDatabase::Other(OPTION_QUOTA_PROJECT.into()),
         OptionValue::String(String::new()),
@@ -231,7 +208,6 @@ fn quota_project_option_round_trips_and_unsets() {
 
 #[test]
 fn quota_project_renders_in_debug_and_is_not_a_secret() {
-    // Unlike the credential fields, the billing project is not redacted (it is a project id).
     let mut db = new_database();
     db.quota_project = Some("my-billing-project".into());
     let rendered = format!("{db:?}");
@@ -243,8 +219,7 @@ fn quota_project_renders_in_debug_and_is_not_a_secret() {
 
 #[test]
 fn emulator_mode_with_a_quota_project_is_refused() {
-    // The emulator forces anonymous credentials and ignores billing, so a configured quota
-    // project would be silently dropped — refused at connect() like the credential options.
+    // The emulator ignores billing, so the project would be silently dropped.
     let mut db = new_database();
     db.database = Some("projects/p/instances/i/databases/d".into());
     db.emulator = true;
@@ -257,11 +232,8 @@ fn emulator_mode_with_a_quota_project_is_refused() {
 
 #[test]
 fn access_token_credentials_send_the_quota_project_header() {
-    // With a quota project, the static-token credential attaches `x-goog-user-project` alongside
-    // the bearer token — the actual on-the-wire billing header — and leaves it non-sensitive
-    // (a project id, not a secret). This is the strongest offline assertion of header emission;
-    // the builder paths (ADC/keyfile/impersonation) emit the identical header but only mint
-    // tokens over the network, so they cannot be exercised offline.
+    // The builder paths send the same header but only produce headers after a network token
+    // fetch, so this is the one offline check of it.
     let credentials =
         build_static_token_credentials("ya29.the-token", Some("my-billing-project")).unwrap();
     let runtime = new_runtime().unwrap();
@@ -279,7 +251,6 @@ fn access_token_credentials_send_the_quota_project_header() {
             !value.is_sensitive(),
             "the quota project is a project id, not a secret"
         );
-        // The bearer token is still present and sensitive.
         let auth = headers.get(AUTHORIZATION).expect("authorization header");
         assert_eq!(auth.to_str().unwrap(), "Bearer ya29.the-token");
         assert!(auth.is_sensitive());
@@ -288,8 +259,6 @@ fn access_token_credentials_send_the_quota_project_header() {
 
 #[test]
 fn quota_project_does_not_conflict_with_an_access_token() {
-    // The billing project composes with every credential path, including the access token — it
-    // is not a credential, so it is absent from the access-token conflict set.
     let mut db = new_database();
     db.access_token = Some("ya29.test-token".into());
     db.quota_project = Some("my-billing-project".into());
@@ -297,10 +266,6 @@ fn quota_project_does_not_conflict_with_an_access_token() {
     assert_eq!(db.explicit_credential_option(), Some(OPTION_ACCESS_TOKEN));
 }
 
-// Only explicit driver options count as credentials: a fresh database (which would fall back to
-// ambient ADC, e.g. GOOGLE_APPLICATION_CREDENTIALS) reports none, so plain emulator use — the
-// integration-test path — is not refused. Inert `spanner.auth.impersonate.*` options (no target
-// principal) do not count either.
 #[test]
 fn ambient_adc_and_inert_impersonation_options_do_not_trip_the_emulator_guard() {
     let mut db = new_database();
@@ -315,42 +280,30 @@ fn ambient_adc_and_inert_impersonation_options_do_not_trip_the_emulator_guard() 
 
 #[test]
 fn the_credential_ladder_selects_one_flow_in_precedence_order() {
-    // Nothing configured: ambient Application Default Credentials.
     let mut db = new_database();
     assert_eq!(db.credential_choice(false), CredentialChoice::Adc);
-    // A quota project does not select a flow — it rides on whichever one wins (here ADC,
-    // which `build_credentials` then builds explicitly to attach the header to).
+    // A quota project does not select a flow.
     db.quota_project = Some("billing-project".into());
     assert_eq!(db.credential_choice(false), CredentialChoice::Adc);
 
-    // A keyfile — by path, or inline JSON — selects the keyfile flow.
     db.keyfile = Some("/path/to/key.json".into());
     assert_eq!(db.credential_choice(false), CredentialChoice::Keyfile);
     db.keyfile = None;
     db.keyfile_json = Some("{\"type\":\"authorized_user\"}".into());
     assert_eq!(db.credential_choice(false), CredentialChoice::Keyfile);
 
-    // Impersonation outranks the keyfile rather than conflicting with it: the keyfile becomes
-    // the *source* credential that the impersonated one wraps.
+    // Impersonation uses the keyfile as its source credential.
     db.impersonate_target_principal = Some("target@p.iam.gserviceaccount.com".into());
     assert_eq!(db.credential_choice(false), CredentialChoice::Impersonate);
 
-    // An access token outranks both — though only nominally: `connect` refuses that
-    // combination up front (`access_token_conflicts_with_other_credential_options`).
+    // `connect` refuses the remaining combinations before consulting the ladder.
     db.access_token = Some("ya29.token".into());
     assert_eq!(db.credential_choice(false), CredentialChoice::AccessToken);
-
-    // Resolved emulator mode wins outright over everything configured above. `connect`'s guard
-    // refuses that combination first, so the ladder never silently drops a credential — but it
-    // must not silently *use* one either.
     assert_eq!(db.credential_choice(true), CredentialChoice::Anonymous);
 }
 
 #[test]
 fn the_credential_ladder_ignores_impersonation_options_without_a_target() {
-    // The `impersonate.*` knobs are inert without a target principal (as
-    // `explicit_credential_option` also holds), so the flow stays ADC — or the keyfile's, with
-    // no impersonation wrapped around it.
     let mut db = new_database();
     db.impersonate_delegates = vec!["delegate@p.iam.gserviceaccount.com".into()];
     db.impersonate_scopes = vec!["https://www.googleapis.com/auth/cloud-platform".into()];
@@ -411,10 +364,7 @@ fn credential_json_with_an_unknown_type_is_rejected() {
     assert!(error.message.contains("external_account"));
 }
 
-// An `authorized_user` (end-user ADC) keyfile with all required fields is accepted and routed to
-// the user-account flow — no service-account private key required, and no network is touched
-// (token exchange happens lazily on first use). The builder spawns a token-cache task, so it
-// must run inside a Tokio runtime — exactly as `connect()` does inside its `block_on`.
+// The builders spawn token-cache tasks and so need a runtime; tokens are fetched lazily.
 #[test]
 fn authorized_user_credential_json_is_accepted() {
     let json = r#"{
@@ -426,14 +376,11 @@ fn authorized_user_credential_json_is_accepted() {
     let runtime = new_runtime().unwrap();
     runtime.block_on(async {
         let credentials = build_credentials_from_json(json, None).unwrap();
-        // Which flow was taken is the whole point: an `authorized_user` key must reach the
-        // user-account provider, not the service-account one it has no private key for.
         let built = format!("{credentials:?}");
         assert!(built.contains("UserCredentials"), "{built}");
         assert!(!built.contains("ServiceAccount"), "{built}");
         assert!(built.contains("quota_project_id: None"), "{built}");
 
-        // A quota project reaches the same builder rather than being dropped on this path.
         let credentials = build_credentials_from_json(json, Some("billing-project")).unwrap();
         let built = format!("{credentials:?}");
         assert!(
@@ -443,9 +390,7 @@ fn authorized_user_credential_json_is_accepted() {
     });
 }
 
-// A `service_account` keyfile is still routed to the service-account flow. A key with an invalid
-// private key fails inside that builder — and, crucially, the error names the detected type,
-// proving the dispatch reached the service-account path rather than being rejected as unknown.
+// An invalid key fails inside the service-account builder; the error names the type it reached.
 #[test]
 fn service_account_credential_json_is_routed_to_the_service_account_flow() {
     let error = build_credentials_from_json(
@@ -461,12 +406,6 @@ fn service_account_credential_json_is_routed_to_the_service_account_flow() {
     );
 }
 
-// A credential-build failure must never echo the credential JSON body into the ADBC error
-// message: the auth crate's `Display` — never interpolated, see `scrub_credential_error` — can
-// carry `serde_json`-derived fragments of the input, and the input holds the private key. Here
-// a `service_account` key carries a recognizable fake secret but omits the required
-// `client_email`, so `.build()` fails; the surfaced message must name the detected type and a
-// safe category, and must not contain the secret material.
 #[test]
 fn credential_build_failure_never_leaks_key_material() {
     const SECRET: &str = "SUPER-SECRET-PRIVATE-KEY-DO-NOT-LEAK-abc123";
@@ -475,7 +414,6 @@ fn credential_build_failure_never_leaks_key_material() {
     );
     let error = build_credentials_from_json(&json, None).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
-    // The message names the detected credential type (safe, user-supplied config) ...
     assert!(
         error
             .message
@@ -483,7 +421,6 @@ fn credential_build_failure_never_leaks_key_material() {
         "message should name the detected type: {}",
         error.message
     );
-    // ... but never the secret key material carried in the credential JSON body.
     assert!(
         !error.message.contains(SECRET),
         "credential-build error leaked key material: {}",
@@ -491,15 +428,10 @@ fn credential_build_failure_never_leaks_key_material() {
     );
 }
 
-// The scrubber turns a raw `google-cloud-auth` builder error into a fixed, secret-free phrase.
-// We drive a real builder to produce a genuine `build_errors::Error` (its constructors are
-// crate-private, so this is the only way to obtain one), then confirm the scrubbed phrase is a
-// constant and carries none of the secret-bearing body the raw error was built from.
 #[test]
 fn scrub_credential_error_returns_fixed_phrase() {
     const SECRET: &str = "leak-me-if-you-can-9f8e7d";
-    // A `service_account` body carrying a fake secret but missing the required `client_email`:
-    // `.build()` fails deserializing it, yielding a real `build_errors::Error`.
+    // `build_errors::Error` has no public constructor, so get one from a failing builder.
     let raw = ServiceAccountCredentials::new(serde_json::json!({
         "type": "service_account",
         "private_key": SECRET,
@@ -522,8 +454,7 @@ fn impersonation_options_round_trip_and_split() {
         OptionValue::String("target@project.iam.gserviceaccount.com".into()),
     )
     .unwrap();
-    // Delegates and scopes are comma-separated; surrounding whitespace and a trailing comma are
-    // tolerated.
+    // Whitespace and a trailing comma are tolerated.
     db.set_option(
         OptionDatabase::Other(OPTION_IMPERSONATE_DELEGATES.into()),
         OptionValue::String("a@p.iam.gserviceaccount.com, b@p.iam.gserviceaccount.com,".into()),
@@ -562,7 +493,6 @@ fn impersonation_options_round_trip_and_split() {
     );
     assert_eq!(db.impersonate_lifetime_secs, Some(1800));
 
-    // Round-trips back out through get_option_string (delegates/scopes re-joined with commas).
     assert_eq!(
         db.get_option_string(OptionDatabase::Other(
             OPTION_IMPERSONATE_TARGET_PRINCIPAL.into()
@@ -590,8 +520,6 @@ fn impersonation_lifetime_defaults_to_one_hour_when_unset() {
         OptionValue::String("target@project.iam.gserviceaccount.com".into()),
     )
     .unwrap();
-    // With a target set but no explicit lifetime, the effective lifetime is the 3600s default —
-    // resolved exactly as `connect()` does.
     assert_eq!(db.impersonate_lifetime_secs, None);
     let effective = Duration::from_secs(
         db.impersonate_lifetime_secs
@@ -606,7 +534,6 @@ fn impersonation_target_is_disabled_by_default() {
     assert!(db.impersonate_target_principal.is_none());
     assert!(db.impersonate_delegates.is_empty());
     assert!(db.impersonate_scopes.is_empty());
-    // Unset options report "not set".
     assert_eq!(
         db.get_option_string(OptionDatabase::Other(
             OPTION_IMPERSONATE_TARGET_PRINCIPAL.into()
@@ -641,11 +568,7 @@ fn an_integer_impersonation_lifetime_is_accepted() {
     assert_eq!(db.impersonate_lifetime_secs, Some(900));
 }
 
-// Building impersonated credentials on top of a valid base credential succeeds without any
-// network I/O: the `impersonated` builder clones the source credential and constructs a lazy
-// token provider — the IAM `generateAccessToken` call only happens on first token use. We use an
-// `authorized_user` base (which also builds offline) and must run inside a
-// Tokio runtime because the builders spawn token-cache tasks, exactly as `connect()` does.
+// The IAM `generateAccessToken` call only happens on first token use.
 #[test]
 fn impersonated_credentials_build_without_network() {
     let source_json = r#"{
@@ -667,9 +590,7 @@ fn impersonated_credentials_build_without_network() {
         )
         .unwrap();
 
-        // Impersonation *layers* on the base credential rather than replacing it, so the result
-        // must be the impersonated provider wrapping the `authorized_user` source — and the
-        // impersonated builder's own quota project is the one that wins.
+        // The impersonated builder's quota project is the one that applies.
         let built = format!("{impersonated:?}");
         assert!(built.contains("ImpersonatedServiceAccount"), "{built}");
         assert!(

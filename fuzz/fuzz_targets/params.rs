@@ -10,11 +10,9 @@ use spanner_adbc::fuzzing::{
 fuzz_target!(|input: (String, Vec<String>, bool)| {
     let (sql, column_names, bind_by_name) = input;
 
-    // named_parameters: every extracted name is distinct *case-insensitively* (Spanner resolves
-    // parameters case-insensitively and rejects two spellings of one name), is non-empty, carries
-    // neither delimiter nor escape, and occurs verbatim in the SQL — never synthesized or mangled.
-    // The name is not required to sit adjacent to its `@`: `@ p`, `@/*c*/p` and ``@`p` `` are all
-    // references to `p`.
+    // Names are non-empty, distinct ignoring case (as Spanner resolves them), free of delimiters
+    // and escapes, and taken from the SQL. They need not follow the `@` directly: `@ p`,
+    // `@/*c*/p` and ``@`p` `` all name `p`.
     let params = named_parameters(&sql);
     for (i, name) in params.iter().enumerate() {
         assert!(
@@ -34,13 +32,9 @@ fuzz_target!(|input: (String, Vec<String>, bool)| {
         );
     }
 
-    // resolve_parameter_names against a batch with these column names must follow the documented
-    // contract exactly for the chosen mode (restated here):
-    // - by-name (bind_by_name = true): each column's matching parameter iff every column names one
-    //   (case-insensitively) and no two columns name the same parameter, else a clean
-    //   InvalidArguments rejection (asserted inside the wrapper);
-    // - positional (bind_by_name = false): the query's parameters iff the counts match, else that
-    //   same clean rejection.
+    // By name, binding succeeds iff every column names a distinct parameter (ignoring case).
+    // Positionally, it succeeds iff the counts match. The wrapper checks that rejections are
+    // InvalidArguments.
     let matching = |column: &String| {
         params
             .iter()
@@ -76,12 +70,9 @@ fuzz_target!(|input: (String, Vec<String>, bool)| {
         ),
     }
 
-    // quote_ident: either the identifier is rejected, or the result is backtick-delimited and its
-    // body carries no backtick and no backslash at all.
-    //
-    // Keep this check independent of the driver's lexer: Spanner's query parser honours
-    // `` \` `` inside backticks, while its DDL parser ends the identifier at the first backtick.
-    // A body without delimiters or escapes is safe under both grammars.
+    // An accepted identifier must have no backtick or backslash in its body. Spanner's query
+    // parser honors `` \` `` inside backticks but its DDL parser does not, so only such a body is
+    // safe under both.
     for ident in column_names
         .iter()
         .map(String::as_str)

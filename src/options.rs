@@ -1,14 +1,7 @@
-//! Option parsing and configuration shared by connections and statements.
+//! Option value parsing, and the configuration shared by connections and statements.
 //!
-//! The driver, connection and statement all accept the same handful of option shapes — booleans
-//! (as exactly the string `true`/`false`), plain strings, positive integers (as an integer or a
-//! numeric string), and `f64` seconds ([`f64_option`]). They live here so every level parses an
-//! option identically and returns the same `InvalidArguments` status on bad input.
-//!
-//! Each helper takes a `what` label naming the offending option, always its **full key** (e.g.
-//! `"option spanner.emulator"`): a caller reading the error needs the exact string they must fix.
-//! Callers whose key is an enum derive it — `format!("option {}", key.as_ref())`. [`f64_option`] is
-//! the exception: it takes the bare key and prefixes `option ` itself.
+//! The parsers take a `what` label for error messages, such as `"option spanner.emulator"`.
+//! [`f64_option`] instead takes the bare key and adds the `option ` prefix itself.
 
 use std::time::Duration;
 
@@ -28,13 +21,10 @@ use crate::retry::RetryConfig;
 use crate::staleness::ReadStaleness;
 use crate::timeout::RpcTimeouts;
 
-/// Parse a boolean option, accepted as exactly the string `true` or `false` (the ADBC canonical
-/// spellings; no case folding, no alternative spellings). Anything else — including an int-typed
-/// value — is rejected with `InvalidArguments`.
+/// Parse a boolean option from the string `true` or `false`.
 ///
-/// Int-typed sets are deliberately rejected rather than coerced: no surveyed ADBC driver accepts
-/// `SetOptionInt` for a boolean option, and accepting one would break the spec's set/get type
-/// symmetry, since the getters serve the canonical `"true"`/`"false"` string.
+/// Integers are rejected because the getters return the string form, so an int set would not
+/// round-trip.
 pub(crate) fn bool_option(value: OptionValue, what: &str) -> Result<bool> {
     match value {
         OptionValue::String(s) => match s.as_str() {
@@ -51,10 +41,7 @@ pub(crate) fn bool_option(value: OptionValue, what: &str) -> Result<bool> {
     }
 }
 
-/// Parse a boolean option whose empty (or whitespace-only) string **unsets** it, i.e. resets it to
-/// `false`; every other value goes through [`bool_option`]. The shape shared by the driver's
-/// unset-able boolean options (`spanner.commit_stats`,
-/// `spanner.transaction.exclude_from_change_streams`, …).
+/// Like [`bool_option`], but a blank string resets the option to `false`.
 pub(crate) fn bool_option_unsettable(value: OptionValue, what: &str) -> Result<bool> {
     match &value {
         OptionValue::String(s) if s.trim().is_empty() => Ok(false),
@@ -62,7 +49,7 @@ pub(crate) fn bool_option_unsettable(value: OptionValue, what: &str) -> Result<b
     }
 }
 
-/// Parse a plain string option; any other value kind is rejected with `InvalidArguments`.
+/// Parse a string option.
 pub(crate) fn string_option(value: OptionValue, what: &str) -> Result<String> {
     match value {
         OptionValue::String(s) => Ok(s),
@@ -70,17 +57,13 @@ pub(crate) fn string_option(value: OptionValue, what: &str) -> Result<String> {
     }
 }
 
-/// Parse a plain string option that spells "unset" as the empty string: `None` for `""`, `Some`
-/// otherwise (as [`string_option`] for any non-string value kind). The value is stored verbatim —
-/// callers whose grammar tolerates surrounding whitespace trim it themselves.
+/// Parse a string option where `""` means unset. The value is not trimmed.
 pub(crate) fn non_empty_string_option(value: OptionValue, what: &str) -> Result<Option<String>> {
     Ok(Some(string_option(value, what)?).filter(|s| !s.is_empty()))
 }
 
-/// A raw option string kept beside its parsed form: `get_option` round-trips exactly what was set
-/// while the driver works from the parsed value.
-///
-/// The two halves can only move together, through [`set`](Self::set).
+/// An option's string, kept for `get_option`, alongside its parsed value. Both change together
+/// through [`set`](Self::set).
 #[derive(Debug, Clone)]
 pub(crate) struct RawParsed<T> {
     raw: Option<String>,
@@ -97,9 +80,7 @@ impl<T> Default for RawParsed<T> {
 }
 
 impl<T> RawParsed<T> {
-    /// Handle a `set_option`: an empty (or whitespace-only) string unsets both halves, any other
-    /// value is trimmed, parsed by `parse` and stored with its raw text. A rejected value leaves
-    /// the previous state untouched. `what` names the option in the string-coercion error.
+    /// Trim and parse `value`; a blank string unsets. A rejected value leaves the state unchanged.
     pub(crate) fn set(
         &mut self,
         value: OptionValue,
@@ -118,41 +99,28 @@ impl<T> RawParsed<T> {
         Ok(())
     }
 
-    /// The raw (trimmed) value as set, for `get_option` round-trip.
     pub(crate) fn raw(&self) -> Option<&str> {
         self.raw.as_deref()
     }
 
-    /// The parsed value, when set.
     pub(crate) fn parsed(&self) -> Option<&T> {
         self.parsed.as_ref()
     }
 }
 
-/// The accepted range of an [`f64_option`], which also fixes the wording of its rejection.
-///
-/// The two `*Seconds` variants additionally require the value to be representable as a
-/// [`Duration`], so the sites that convert one with `Duration::from_secs_f64` can never fail: the
-/// (astronomically large) overflow is rejected at set time instead. [`PositiveFactor`] is a bare
-/// number, not a duration, so it carries no such bound.
-///
-/// [`PositiveFactor`]: F64Range::PositiveFactor
+/// The accepted range of an [`f64_option`]. The seconds variants must also fit in a [`Duration`],
+/// so later `Duration::from_secs_f64` conversions cannot panic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum F64Range {
-    /// Finite, strictly positive seconds: zero is rejected.
     PositiveSeconds,
-    /// Finite, non-negative seconds: zero is accepted (the RPC timeouts read it as "disabled").
+    /// Zero is accepted; the RPC timeouts treat it as disabled.
     NonNegativeSeconds,
-    /// A finite, strictly positive plain factor (no `Duration` bound, and the error says "number"
-    /// rather than "number of seconds").
+    /// A plain number rather than seconds.
     PositiveFactor,
 }
 
-/// Parse an `f64` option in `range` — the shape shared by every "seconds" knob in the driver
-/// (`spanner.rpc.timeout_seconds.*`, `spanner.retry.max_elapsed_seconds`,
-/// `spanner.retry.backoff.*`): a numeric string (trimmed; fractions allowed), an integer, or a
-/// double. An empty string yields `None` (unset); `NaN`, the infinities, out-of-range values,
-/// other value kinds and non-numeric input are rejected with `InvalidArguments`, naming `what`.
+/// Parse a finite number in `range` from a numeric string, an integer or a double. A blank string
+/// yields `None` (unset).
 pub(crate) fn f64_option(value: OptionValue, what: &str, range: F64Range) -> Result<Option<f64>> {
     let (bound, unit) = match range {
         F64Range::PositiveSeconds => ("strictly positive", " of seconds"),
@@ -189,8 +157,7 @@ pub(crate) fn f64_option(value: OptionValue, what: &str, range: F64Range) -> Res
     Ok(Some(n))
 }
 
-/// Parse a strictly-positive `i64` option, accepted as an integer or a numeric string. Zero,
-/// negatives, non-numeric strings and other value kinds are rejected with `InvalidArguments`.
+/// Parse a positive integer from an integer or a numeric string.
 pub(crate) fn positive_i64(value: OptionValue, what: &str) -> Result<i64> {
     let reject = || invalid_argument(format!("{what} must be a positive integer"));
     let n = match value {
@@ -201,21 +168,16 @@ pub(crate) fn positive_i64(value: OptionValue, what: &str) -> Result<i64> {
     if n > 0 { Ok(n) } else { Err(reject()) }
 }
 
-/// Parse a strictly-positive `usize` option (as [`positive_i64`], narrowed to `usize`).
+/// [`positive_i64`], narrowed to `usize`.
 pub(crate) fn positive_usize(value: OptionValue, what: &str) -> Result<usize> {
     let n = positive_i64(value, what)?;
-    usize::try_from(n)
-        .ok()
-        .filter(|&n| n > 0)
-        .ok_or_else(|| invalid_argument(format!("{what} must be a positive integer")))
+    usize::try_from(n).map_err(|_| invalid_argument(format!("{what} must be a positive integer")))
 }
 
-/// Reinterpret a `get_option_string` lookup as `get_option_int`.
+/// Parse a `get_option_string` result for `get_option_int`.
 ///
-/// Every gettable option has a canonical string form, so the typed getters at all three levels
-/// delegate to `get_option_string` and parse the result here. The string lookup's error is
-/// propagated **unchanged** — per ADBC, `NotFound` means "option unset/unknown", never "wrong
-/// type" — while a set-but-unrepresentable value is reported as `InvalidArguments`.
+/// Lookup errors pass through unchanged, since ADBC's `NotFound` means unset or unknown. A value
+/// that is not an integer is `InvalidArguments`.
 pub(crate) fn int_from_stored_string(stored: Result<String>, what: &str) -> Result<i64> {
     let value = stored?;
     value
@@ -223,8 +185,7 @@ pub(crate) fn int_from_stored_string(stored: Result<String>, what: &str) -> Resu
         .map_err(|_| invalid_argument(format!("{what} value {value:?} is not an integer")))
 }
 
-/// Reinterpret a `get_option_string` lookup as `get_option_double`; the same contract as
-/// [`int_from_stored_string`], parsing to `f64` (so integer-valued options are served as doubles).
+/// Parse a `get_option_string` result for `get_option_double`, as [`int_from_stored_string`].
 pub(crate) fn double_from_stored_string(stored: Result<String>, what: &str) -> Result<f64> {
     let value = stored?;
     value
@@ -232,16 +193,8 @@ pub(crate) fn double_from_stored_string(stored: Result<String>, what: &str) -> R
         .map_err(|_| invalid_argument(format!("{what} value {value:?} is not a double")))
 }
 
-/// Generate the three typed `Optionable` getters — `get_option_bytes`, `get_option_int` and
-/// `get_option_double` — that `SpannerDatabase`, `SpannerConnection` and `SpannerStatement` share
-/// verbatim.
-///
-/// Every gettable option has a canonical string form, so each level's typed getters are pure
-/// reinterpretations of its own `get_option_string`: bytes are its UTF-8, ints and doubles are it
-/// parsed by [`int_from_stored_string`] / [`double_from_stored_string`]. Only `get_option_string`
-/// differs per level; the key type is `Self::Option`, whose `AsRef<str>` names the key for the
-/// error message. Read-only keys like `spanner.commit_stats.mutation_count` live in
-/// `get_option_string` and need no special-casing here.
+/// Implement `get_option_bytes`, `get_option_int` and `get_option_double` in terms of
+/// `get_option_string`, since every readable option has a string form.
 macro_rules! impl_typed_option_getters {
     () => {
         fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
@@ -261,53 +214,25 @@ macro_rules! impl_typed_option_getters {
 }
 pub(crate) use impl_typed_option_getters;
 
-/// The configuration a [`SpannerConnection`](crate::connection::SpannerConnection) and every
-/// [`SpannerStatement`](crate::statement::SpannerStatement) it creates both carry: everything
-/// option-settable that is *not* a client handle.
-///
-/// A connection starts from [`Default`]; new statements [`inherit`](Self::inherit) its values
-/// and can override shared options through [`set_option`](Self::set_option).
+/// Option-settable configuration carried by a
+/// [`SpannerConnection`](crate::connection::SpannerConnection) and inherited by each
+/// [`SpannerStatement`](crate::statement::SpannerStatement) it creates.
 #[derive(Debug, Clone)]
 pub(crate) struct SharedConfig {
-    /// The standard `adbc.connection.readonly` flag: a connection that has it set rejects all
-    /// writes (DML/DDL/ingest fail with `InvalidState`; queries still run), including the *commit*
-    /// of already-buffered work. Behind an `Arc` and read at execution time rather than snapshotted
-    /// — see [`is_read_only`](Self::is_read_only).
+    /// `adbc.connection.readonly`: writes, including commits of buffered work, fail with
+    /// `InvalidState`. Shared so that toggling it on the connection reaches existing statements.
     pub(crate) read_only: Arc<AtomicBool>,
-    /// Isolation level applied to read/write transactions, via the standard
-    /// `adbc.connection.transaction.isolation_level` option; see
-    /// [`apply_isolation`](crate::connection::exec::apply_isolation). Connection-set only: a
-    /// statement inherits it but exposes no setter of its own.
+    /// Set only on the connection; statements inherit it.
     pub(crate) isolation: IsolationLevel,
-    /// Read bound for read-only queries (`spanner.read.staleness`). The default is a strong read.
     pub(crate) read_staleness: ReadStaleness,
-    /// Request priority and request/transaction tags, plus the commit knobs. Unset by default. A
-    /// statement may override the priority and request tag; the transaction tag is connection-level
-    /// only, but rides along for the read/write transaction runners a statement builds.
     pub(crate) request: RequestConfig,
-    /// Directed-read replica selection for read-only queries (`spanner.directed_read`). Unset by
-    /// default (Spanner's own routing).
     pub(crate) directed_read: DirectedRead,
-    /// Query optimizer options (`spanner.query.optimizer_version` /
-    /// `spanner.query.optimizer_statistics_package`). Unset by default; applied to every query
-    /// statement builder (via `SpannerStatement::sql_builder`).
     pub(crate) query_options: QueryOptionsConfig,
-    /// How `TIMESTAMP` columns map to Arrow (`spanner.max_timestamp_precision`), applied uniformly
-    /// to every result path, and on the connection also to `get_table_schema` and `read_partition`
-    /// (which have no statement).
     pub(crate) timestamp_precision: TimestampPrecision,
-    /// RPC timeouts (`spanner.rpc.timeout_seconds.{query,update,fetch}`). Unset by default (no
-    /// deadline); an expired deadline fails with `Status::Timeout`. The connection applies the
-    /// update timeout to its commit paths and the query/fetch timeouts to `read_partition`.
     pub(crate) timeouts: RpcTimeouts,
-    /// Retry-policy and backoff tuning (`spanner.retry.*`). Unset by default, leaving the client's
-    /// own policy; when set it bounds the client's retrying on every statement/DML/transaction
-    /// builder the owning object produces.
     pub(crate) retry: RetryConfig,
-    /// Mutation count captured from this object's most recent commit that requested commit
-    /// statistics (`spanner.commit_stats`), read back via `spanner.commit_stats.mutation_count`.
-    /// Per-object rather than inherited — a statement records its autocommit DML / bulk-ingest
-    /// commits here, a connection its manual-mode commit — so [`inherit`](Self::inherit) resets it.
+    /// Per object, not inherited: a statement records its autocommit commits, a connection its
+    /// manual-mode commit.
     pub(crate) commit_stats: CommitStats,
 }
 
@@ -315,8 +240,7 @@ impl Default for SharedConfig {
     fn default() -> Self {
         Self {
             read_only: Arc::new(AtomicBool::new(false)),
-            // `IsolationLevel` is a `#[non_exhaustive]` client enum with no `Default` impl, which
-            // is the only reason this whole impl is hand-written rather than derived.
+            // `IsolationLevel` has no `Default`, so this impl cannot be derived.
             isolation: IsolationLevel::Unspecified,
             read_staleness: ReadStaleness::default(),
             request: RequestConfig::default(),
@@ -331,11 +255,7 @@ impl Default for SharedConfig {
 }
 
 impl SharedConfig {
-    /// The config a statement created on this connection starts from.
-    ///
-    /// Everything is inherited except [`commit_stats`](Self::commit_stats), which is per-object.
-    /// Note the two `Arc` fields differ: `read_only` is deliberately *aliased* (a later toggle on
-    /// the connection reaches statements it has already created), `commit_stats` starts fresh.
+    /// The config for a new statement: a copy sharing `read_only`, with fresh `commit_stats`.
     pub(crate) fn inherit(&self) -> Self {
         Self {
             commit_stats: CommitStats::default(),
@@ -343,8 +263,7 @@ impl SharedConfig {
         }
     }
 
-    /// The *live* value of the `adbc.connection.readonly` flag. Loaded on each check, never cached,
-    /// so a toggle on the connection applies immediately to the statements it already created.
+    /// The current `adbc.connection.readonly` value.
     pub(crate) fn is_read_only(&self) -> bool {
         self.read_only.load(Ordering::Acquire)
     }

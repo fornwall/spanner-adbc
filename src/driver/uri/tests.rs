@@ -2,8 +2,6 @@ use super::*;
 use crate::driver::tests::new_database;
 use adbc_core::error::Status;
 
-// --- Connection URIs (`spanner:` scheme with query-parameter options) ---
-
 const DB_PATH: &str = "projects/p/instances/i/databases/d";
 
 fn set_uri(db: &mut SpannerDatabase, uri: &str) -> Result<()> {
@@ -60,7 +58,6 @@ fn uri_userinfo_is_rejected_without_storing_or_echoing_it() {
 
 #[test]
 fn a_scheme_uri_sets_the_database_path() {
-    // The accepted no-endpoint spelling is the three-slash `spanner:///` form (empty authority).
     for uri in [
         format!("spanner:///{DB_PATH}"),
         format!("Spanner:///{DB_PATH}"), // schemes are case-insensitive
@@ -73,20 +70,7 @@ fn a_scheme_uri_sets_the_database_path() {
 }
 
 #[test]
-fn the_documented_quickstart_uri_example_parses() {
-    // The exact `uri=` example string shown in the quickstart docs (src/ffi.rs module doc,
-    // docs/adbc.md, python/spanner_adbc/dbapi.py) must stay a form the driver accepts,
-    // so the docs can't silently rot into a rejected spelling again.
-    let mut db = new_database();
-    set_uri(&mut db, "spanner:///projects/p/instances/i/databases/d").unwrap();
-    assert_eq!(db.database.as_deref(), Some(DB_PATH));
-    assert_eq!(db.endpoint, None);
-}
-
-#[test]
 fn a_scheme_uri_without_two_slashes_is_rejected() {
-    // `spanner://` is required — the scheme-only (`spanner:path`) and single-slash
-    // (`spanner:/path`) spellings are rejected.
     for uri in [format!("spanner:{DB_PATH}"), format!("spanner:/{DB_PATH}")] {
         let mut db = new_database();
         let error = set_uri(&mut db, &uri).unwrap_err();
@@ -97,8 +81,7 @@ fn a_scheme_uri_without_two_slashes_is_rejected() {
 
 #[test]
 fn a_cloudspanner_scheme_is_not_recognised() {
-    // Only `spanner:` is a connection-URI scheme; `cloudspanner:` (the JDBC convention) is
-    // deliberately not supported. Not being a `spanner://` URI, it is rejected.
+    // The JDBC driver's scheme.
     let mut db = new_database();
     let uri = format!("cloudspanner:///{DB_PATH}?spanner.emulator=true");
     let error = set_uri(&mut db, &uri).unwrap_err();
@@ -107,8 +90,6 @@ fn a_cloudspanner_scheme_is_not_recognised() {
 
 #[test]
 fn a_host_authority_becomes_the_endpoint() {
-    // `spanner://host:port/projects/...` — the authority is the gRPC endpoint, taken verbatim
-    // (exactly as if passed as the `spanner.endpoint` option).
     let mut db = new_database();
     set_uri(&mut db, &format!("spanner://emu-host:9010/{DB_PATH}")).unwrap();
     assert_eq!(db.database.as_deref(), Some(DB_PATH));
@@ -147,9 +128,6 @@ fn every_non_secret_database_level_option_is_accepted_as_a_query_parameter() {
         ),
     )
     .unwrap();
-    // `spanner.auth.keyfile` is a path, not a secret, so — as with `get_option` — it stays a
-    // legal query parameter; the two secret-holding keys are covered by
-    // `secret_bearing_query_parameters_are_rejected`.
     assert_eq!(db.keyfile.as_deref(), Some("/path/key.json"));
     assert_eq!(db.quota_project.as_deref(), Some("billing-project"));
     assert_eq!(
@@ -199,8 +177,6 @@ fn a_uri_set_after_an_explicit_option_overwrites_only_what_it_carries() {
         OptionValue::String("true".into()),
     )
     .unwrap();
-    // The URI names an endpoint but says nothing about the emulator flag: the endpoint is
-    // overwritten, the emulator flag survives.
     set_uri(
         &mut db,
         &format!("spanner:///{DB_PATH}?spanner.endpoint=http://from-uri:9010"),
@@ -208,7 +184,6 @@ fn a_uri_set_after_an_explicit_option_overwrites_only_what_it_carries() {
     .unwrap();
     assert_eq!(db.endpoint.as_deref(), Some("http://from-uri:9010"));
     assert!(db.emulator);
-    // A URI with no query parameters at all leaves both untouched.
     set_uri(&mut db, "spanner:///projects/p2/instances/i2/databases/d2").unwrap();
     assert_eq!(
         db.database.as_deref(),
@@ -220,7 +195,6 @@ fn a_uri_set_after_an_explicit_option_overwrites_only_what_it_carries() {
 
 #[test]
 fn a_query_parameter_beats_the_host_authority() {
-    // Both name an endpoint; the query parameter applies after the authority, so it wins.
     let mut db = new_database();
     set_uri(
         &mut db,
@@ -240,8 +214,7 @@ fn an_unknown_query_parameter_is_rejected_by_name() {
     .unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     assert!(error.message.contains("spanner.databoost"));
-    // The database-path key is not a query parameter either — the URI path is the one way to
-    // name the database.
+    // The URI path is the only way to name the database.
     let error = set_uri(&mut db, &format!("spanner:///{DB_PATH}?uri=x")).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     assert!(error.message.contains("uri"));
@@ -249,10 +222,6 @@ fn an_unknown_query_parameter_is_rejected_by_name() {
 
 #[test]
 fn secret_bearing_query_parameters_are_rejected() {
-    // A URI is the most-logged config artifact there is (shell history, `ps`, tracing
-    // spans), so the two options whose value is a live secret cannot travel in one. They are
-    // rejected by name — not silently accepted, and not lumped in with unknown keys — and the
-    // error points at the option itself, which is the supported way to supply them.
     for (key, value) in [
         (
             OPTION_KEYFILE_JSON,
@@ -265,11 +234,10 @@ fn secret_bearing_query_parameters_are_rejected() {
         assert_eq!(error.status, Status::InvalidArguments, "key: {key}");
         assert!(error.message.contains(key), "{}", error.message);
         assert!(error.message.contains("secret"), "{}", error.message);
-        // Rejected, so nothing was stored — the URI never reaches the option fields.
         assert_eq!(db.keyfile_json, None, "key: {key}");
         assert_eq!(db.access_token, None, "key: {key}");
 
-        // The option itself still works: only the URI route is closed.
+        // The option itself still works.
         let decoded = percent_decode(value).unwrap();
         db.set_option(
             OptionDatabase::Other(key.into()),
@@ -295,13 +263,9 @@ fn a_rejected_uri_leaves_the_configuration_untouched() {
     .unwrap();
     for bad in [
         "spanner:///projects/p2/instances/i2/databases/d2?bogus.key=1".to_string(),
-        // A bad *value* for a known key must also leave everything untouched (it is validated
-        // against a scratch instance before any field is mutated).
         "spanner:///projects/p2/instances/i2/databases/d2?spanner.emulator=maybe".to_string(),
         "spanner://host:9010/projects/p2/instances/i2/databases/d2?spanner.auth.keyfile=%G1"
             .to_string(),
-        // A refused secret-holding key is no different: the whole URI is rejected
-        // before any field is mutated, authority included.
         format!(
             "spanner://host:9010/projects/p2/instances/i2/databases/d2?{OPTION_ACCESS_TOKEN}=ya29.x"
         ),
@@ -325,10 +289,8 @@ fn malformed_percent_encoding_is_rejected() {
         assert_eq!(error.status, Status::InvalidArguments, "input: {bad}");
         assert!(error.message.contains("percent-encoding"), "input: {bad}");
     }
-    // Percent-decoding is RFC 3986: `+` stays a literal plus (form-encoding would corrupt e.g.
-    // a keyfile path or an endpoint containing one).
+    // RFC 3986, not form encoding: `+` stays a literal plus.
     assert_eq!(percent_decode("a+b%20c%3D1").unwrap(), "a+b c=1");
-    // A decoded byte sequence that is not UTF-8 is rejected, not lossily replaced.
     let error = percent_decode("%FF%FE").unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     assert!(error.message.contains("UTF-8"));
@@ -347,7 +309,7 @@ fn a_uri_with_a_bad_database_path_is_rejected() {
         assert_eq!(error.status, Status::InvalidArguments, "uri: {bad}");
         assert!(error.message.contains("database path"), "uri: {bad}");
     }
-    // The classic trap: two slashes make `projects` a host authority. The error says so.
+    // Two slashes make `projects` the host authority.
     let error = set_uri(&mut db, &format!("spanner://{DB_PATH}")).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     assert!(error.message.contains("host authority"));
@@ -364,8 +326,7 @@ fn a_uri_fragment_is_rejected() {
 
 #[test]
 fn get_option_uri_returns_the_uri_verbatim() {
-    // adbc.h: `GetOption` serves the option *value*, so the URI comes back exactly as set —
-    // query parameters included — while what it expanded into reads back under its own keys.
+    // adbc.h: `GetOption` returns the option value as set.
     let uri = format!(
         "spanner:///{DB_PATH}?spanner.endpoint=http://localhost:9010&spanner.emulator=true"
     );
@@ -386,8 +347,6 @@ fn get_option_uri_returns_the_uri_verbatim() {
 
 #[test]
 fn get_option_uri_is_not_found_until_a_uri_is_set() {
-    // The database path has no other source, so an unset `uri` reports `NotFound` rather than
-    // some invented value.
     let db = new_database();
     let error = db.get_option_string(OptionDatabase::Uri).unwrap_err();
     assert_eq!(error.status, Status::NotFound);
@@ -408,8 +367,7 @@ fn the_last_uri_set_is_the_one_returned() {
 
 #[test]
 fn a_uri_survives_a_set_get_set_replay() {
-    // The property that makes profile dump-and-replay work: feeding `get_option("uri")` straight
-    // back into `set_option` is accepted and lands in the identical state.
+    // Dumping options and replaying them must reproduce the same state.
     let uri = format!(
         "spanner://authority:9010/{DB_PATH}\
          ?spanner.endpoint=http%3A%2F%2Flocalhost%3A9010\
@@ -435,8 +393,6 @@ fn a_uri_survives_a_set_get_set_replay() {
 
 #[test]
 fn a_rejected_uri_is_never_retrievable() {
-    // Validation happens before the URI is stored, so a refusal — a secret-bearing parameter
-    // above all — leaves nothing behind for a config dump to find.
     let mut db = new_database();
     for bad in [
         format!("spanner:///{DB_PATH}?{OPTION_ACCESS_TOKEN}=ya29.uri-token"),
@@ -450,7 +406,7 @@ fn a_rejected_uri_is_never_retrievable() {
         assert_eq!(error.status, Status::NotFound, "uri: {bad}");
     }
 
-    // ... and a rejected URI does not disturb an already-stored one either.
+    // Nor does a rejected URI replace a stored one.
     let good = format!("spanner:///{DB_PATH}");
     set_uri(&mut db, &good).unwrap();
     assert!(set_uri(&mut db, &format!("spanner:///{DB_PATH}?bogus.key=1")).is_err());
@@ -466,7 +422,7 @@ fn uri_query_parameter_values_are_percent_decoded() {
     )
     .unwrap();
     assert_eq!(db.endpoint.as_deref(), Some("http://localhost:9010"));
-    // Keys are decoded too, and empty `&&` segments are tolerated.
+    // Keys are decoded too, and empty segments are tolerated.
     set_uri(
         &mut db,
         &format!("spanner:///{DB_PATH}?&spanner%2Eemulator=true&"),

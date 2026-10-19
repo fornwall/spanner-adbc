@@ -31,7 +31,6 @@ fn parses_exact_and_max_staleness_with_units() {
 
 #[test]
 fn parses_read_and_min_timestamp() {
-    // Bare RFC 3339 is accepted as an exact read timestamp (equivalent to `read:`).
     assert_eq!(
         parse_read_bound("2026-07-07T00:00:00Z").unwrap(),
         ReadBound::ReadTimestamp(dt("2026-07-07T00:00:00Z"))
@@ -44,17 +43,12 @@ fn parses_read_and_min_timestamp() {
         parse_read_bound("min:2026-07-07T00:00:00+02:00").unwrap(),
         ReadBound::MinReadTimestamp(dt("2026-07-07T00:00:00+02:00"))
     );
-    // The absolute prefixes tolerate whitespace around the prefix, like ` exact : 1h ` — all
-    // four kinds share one grammar.
     assert_eq!(
         parse_read_bound("read : 2026-07-07T00:00:00Z").unwrap(),
         ReadBound::ReadTimestamp(dt("2026-07-07T00:00:00Z"))
     );
 }
 
-/// Prefixes are exact lowercase, like every other option value in the driver (and the ADBC
-/// ecosystem, which exact-matches option values): any case variant is rejected with the
-/// grammar error, uniformly across all four kinds.
 #[test]
 fn rejects_uppercase_and_mixed_case_prefixes() {
     for bad in [
@@ -71,7 +65,6 @@ fn rejects_uppercase_and_mixed_case_prefixes() {
     }
 }
 
-/// All four prefixes plus the bare form dispatch to the right kind through the one entry point.
 #[test]
 fn rejects_bad_read_bound() {
     for bad in [
@@ -80,7 +73,7 @@ fn rejects_bad_read_bound() {
         "exact:abc",  // non-numeric duration
         "exact:-5",   // negative duration
         "soon:10s",   // unknown duration kind
-        "exact:1x",   // unknown unit (parsed as number "1x" → error)
+        "exact:1x",   // unknown unit
         "not-a-time", // not a timestamp
         "read:",      // empty timestamp
         "2026-07-07", // date only, not a full RFC 3339 timestamp
@@ -90,9 +83,7 @@ fn rejects_bad_read_bound() {
     }
 }
 
-/// Durations too large for `std::time::Duration` (roughly above 1.8e19 seconds) must be
-/// rejected with `InvalidArguments`, not panic in `Duration::from_secs_f64`. The unit suffix
-/// multiplies before the conversion, so `1e19h` overflows even though `1e19` alone would not.
+/// The unit multiplies before the conversion, so `1e19h` overflows although `1e19` would not.
 #[test]
 fn rejects_oversized_duration_instead_of_panicking() {
     for bad in ["exact:1e20", "max:1e20", "exact:1e19h"] {
@@ -101,8 +92,6 @@ fn rejects_oversized_duration_instead_of_panicking() {
     }
 }
 
-/// A single option holds one bound at a time; setting a new value replaces the old, and an
-/// empty value clears it. All four kinds round-trip through the one `spanner.read.staleness` key.
 #[test]
 fn single_option_holds_one_bound_and_can_be_replaced() {
     let mut s = ReadStaleness::default();
@@ -113,21 +102,16 @@ fn single_option_holds_one_bound_and_can_be_replaced() {
     assert_eq!(s.staleness_string(), Some("exact:10s"));
     assert!(s.timestamp_bound().unwrap().is_some());
 
-    // Setting a timestamp value on the same key replaces the staleness bound (no conflict).
     s.set_staleness(OptionValue::String("read:2026-07-07T00:00:00Z".into()))
         .unwrap();
     assert_eq!(s.staleness_string(), Some("read:2026-07-07T00:00:00Z"));
     assert!(s.timestamp_bound().unwrap().is_some());
 
-    // An empty value clears the bound (a strong read again).
     s.set_staleness(OptionValue::String(String::new())).unwrap();
     assert_eq!(s.staleness_string(), None);
     assert!(s.timestamp_bound().unwrap().is_none());
 }
 
-/// Pinning for a multi-use read-only transaction: the exact kinds pass through unchanged,
-/// while the single-use-only bounded kinds are pinned to the most stale timestamp their window
-/// allows (`max:<d>` → exact staleness `<d>`, `min:<t>` → read timestamp `<t>`).
 #[test]
 fn multi_use_pins_bounded_staleness_kinds() {
     let d = Duration::from_secs(10);
@@ -149,8 +133,6 @@ fn multi_use_pins_bounded_staleness_kinds() {
         ReadBound::ReadTimestamp(t)
     );
 
-    // Through ReadStaleness: a strong (unset) bound stays None, a bounded kind still builds a
-    // client TimestampBound.
     let mut s = ReadStaleness::default();
     assert!(s.multi_use_timestamp_bound().unwrap().is_none());
     s.set_staleness(OptionValue::String("max:500ms".into()))
@@ -158,18 +140,15 @@ fn multi_use_pins_bounded_staleness_kinds() {
     assert!(s.multi_use_timestamp_bound().unwrap().is_some());
 }
 
-/// The absolute read bounds hand the client a [`SystemTime`], which has no signed representation
-/// of its own — pre-epoch instants are built by subtracting from the epoch, and the sub-second part
-/// is always a positive offset from the *floor* second. Getting that wrong shifts a pre-epoch
-/// timestamp by up to a second, which no `is_ok()` would notice, so the conversion is round-tripped
-/// back to a `DateTime` here.
+/// A pre-epoch conversion error would shift the timestamp by up to a second, which no `is_ok()`
+/// would notice.
 #[test]
 fn to_system_time_round_trips_every_timestamp_it_is_given() {
     for rfc3339 in [
         "2026-07-07T12:34:56.789Z",
         "1999-12-31T23:59:59Z",
         "1970-01-01T00:00:00Z",
-        // Pre-epoch, with a fractional part: the case the two-branch conversion exists for.
+        // Pre-epoch with a fractional part.
         "1969-12-31T23:59:59.250Z",
         "1901-12-13T20:45:52.123456789Z",
     ] {
@@ -178,9 +157,7 @@ fn to_system_time_round_trips_every_timestamp_it_is_given() {
         assert_eq!(round_tripped, original, "{rfc3339}");
     }
 
-    // The epoch itself is exactly `UNIX_EPOCH`, not an offset from it.
     assert_eq!(to_system_time(dt("1970-01-01T00:00:00Z")), UNIX_EPOCH);
-    // A quarter second before the epoch really is a quarter second before it.
     assert_eq!(
         UNIX_EPOCH
             .duration_since(to_system_time(dt("1969-12-31T23:59:59.750Z")))
@@ -188,7 +165,6 @@ fn to_system_time_round_trips_every_timestamp_it_is_given() {
         Duration::from_millis(250)
     );
 
-    // And the client accepts the conversion for both absolute bound kinds.
     ReadBound::ReadTimestamp(dt("2026-07-07T12:34:56.789Z"))
         .to_timestamp_bound()
         .unwrap();
@@ -197,8 +173,6 @@ fn to_system_time_round_trips_every_timestamp_it_is_given() {
         .unwrap();
 }
 
-/// A value with no recognised prefix must echo itself and enumerate the four forms — the mistake
-/// is the prefix, so a chrono complaint about text that was never a timestamp only misleads.
 #[test]
 fn grammar_rejection_echoes_the_value_and_omits_the_timestamp_parser_detail() {
     let error = parse_read_bound("stale:10s").unwrap_err();
@@ -217,8 +191,6 @@ fn grammar_rejection_echoes_the_value_and_omits_the_timestamp_parser_detail() {
     );
 }
 
-/// With an explicit `read:`/`min:` prefix the caller did mean a timestamp, so the parser's own
-/// diagnosis is the useful part and is forwarded alongside the grammar.
 #[test]
 fn timestamp_rejection_keeps_the_parser_detail() {
     for bad in ["read:nope", "min:12345"] {
@@ -239,8 +211,6 @@ fn timestamp_rejection_keeps_the_parser_detail() {
     }
 }
 
-/// The duration grammar is shared with `spanner.commit.max_delay`, so the rejection names the key
-/// the caller actually set and lists the accepted unit suffixes.
 #[test]
 fn duration_rejection_names_its_option_and_the_units() {
     let error = parse_duration_for("1x", crate::OPTION_MAX_COMMIT_DELAY).unwrap_err();
@@ -250,7 +220,6 @@ fn duration_rejection_names_its_option_and_the_units() {
         "option spanner.commit.max_delay: \"1x\" is not a valid duration; expected a number with \
          an optional unit suffix (s [default], ms, us/µs, ns, m, h), e.g. \"500ms\""
     );
-    // The staleness wrapper names the staleness key instead.
     assert!(
         parse_duration("1x")
             .unwrap_err()

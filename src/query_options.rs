@@ -1,37 +1,20 @@
-//! Per-query optimizer options.
-//!
-//! Spanner lets every query carry
-//! [`QueryOptions`](google_cloud_spanner::model::execute_sql_request::QueryOptions) selecting an
-//! **optimizer version** and an **optimizer statistics package**. This module parses the two driver
-//! options that expose them ([`OPTION_QUERY_OPTIMIZER_VERSION`](crate::OPTION_QUERY_OPTIMIZER_VERSION)
-//! and
-//! [`OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE`](crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE))
-//! and applies them onto the query statement builder. Both values are opaque strings passed through
-//! to Spanner unchanged; the driver validates only that the option is a string.
+//! Query optimizer options, passed to Spanner unchanged.
 
 use google_cloud_spanner::model::execute_sql_request::QueryOptions;
 use google_cloud_spanner::statement::StatementBuilder;
 
-/// The query optimizer options held by a connection or statement.
-///
-/// A connection's value is cloned into each statement it creates (which may then override either
-/// field independently), mirroring how [`RequestConfig`](crate::request::RequestConfig) and
-/// [`ReadStaleness`](crate::staleness::ReadStaleness) are inherited.
-///
-/// Both fields are set and read directly by
-/// [`SharedConfig`](crate::options::SharedConfig), which parses each
-/// with [`non_empty_string_option`](crate::options::non_empty_string_option).
+/// [`OPTION_QUERY_OPTIMIZER_VERSION`](crate::OPTION_QUERY_OPTIMIZER_VERSION) and
+/// [`OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE`](crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE),
+/// set through [`SharedConfig`](crate::options::SharedConfig).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct QueryOptionsConfig {
-    /// Raw `spanner.query.optimizer_version` value, when set.
     pub(crate) optimizer_version: Option<String>,
-    /// Raw `spanner.query.optimizer_statistics_package` value, when set.
     pub(crate) optimizer_statistics_package: Option<String>,
 }
 
 impl QueryOptionsConfig {
-    /// Apply the optimizer options to a query statement builder. A no-op when neither is set, so an
-    /// unset config leaves the request's query options empty (the service default optimizer).
+    /// Apply the options to a query. When neither is set the request carries no `QueryOptions`,
+    /// since an empty one is not the same as none.
     #[must_use]
     pub(crate) fn apply_to_statement(&self, builder: StatementBuilder) -> StatementBuilder {
         if self.optimizer_version.is_none() && self.optimizer_statistics_package.is_none() {

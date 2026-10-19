@@ -3,11 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 use spanner_adbc::fuzzing::{OptValue, ensure_scheme, exercise_database_options};
 
-// Fuzz the driver's option-handling boundary — the surface a C ABI driver manager pushes untrusted
-// option keys/values through before any connection is made. Feeds arbitrary (key, value) pairs to
-// `set_option` / `get_option_string` and normalizes arbitrary endpoint strings with `ensure_scheme`.
-// No network I/O: this exercises the string/bool/int coercions and the unknown-key error path only,
-// and must never panic.
+// Database options set through the C ABI are untrusted; setting and reading them must not panic.
 fuzz_target!(|input: (Vec<(String, OptValue)>, String)| {
     let (ops, endpoint) = input;
     let _ = ensure_scheme(&endpoint);

@@ -42,7 +42,6 @@ publish = false
 push = true
 
 [lib]
-# Loadable ADBC driver and native Rust library.
 crate-type = ["cdylib", "rlib"]
 
 [features]
@@ -53,7 +52,6 @@ ffi = []
 fuzzing = ["dep:arbitrary"]
 
 [[bench]]
-# Offline Spanner-to-Arrow conversion benchmarks.
 name = "conversion"
 harness = false
 
@@ -62,7 +60,7 @@ harness = false
 # ADBC main supplies InfoCode::Other, needed to omit unknown info codes.
 # The C ABI is implemented in src/ffi/; adbc_ffi is only a test dependency.
 adbc_core = { git = "https://github.com/apache/arrow-adbc", rev = "0a40cf30d0458867cea48d0fbc5283340b59b40f" }
-# Match adbc_core’s Arrow range so its public types unify with ours.
+# Match adbc_core's Arrow range so its public types unify with ours.
 # ffi supplies the Arrow C Data and Stream interfaces.
 arrow-array = { version = ">=58, <61", features = ["ffi"] }
 arrow-schema = ">=58, <61"
@@ -88,11 +86,10 @@ futures-util = "0.3"
 # Preserve floats exactly when partition descriptors are decoded and re-encoded.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 base64 = "0.23"
-# Static bearer-token headers; must match google-cloud-auth’s http major version.
+# Static bearer-token headers; must match google-cloud-auth's http major version.
 http = "1"
 # Parse and format DATE/TIMESTAMP values without clock or timezone dependencies.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-# Only enabled for fuzzing.
 arbitrary = { version = "1", features = ["derive"], optional = true }
 # Forward structured gRPC status details into ADBC errors.
 google-cloud-gax = { git = "https://github.com/googleapis/google-cloud-rust", rev = "415dbbb8ec607f4ba927ed0e38366194cb09530d" }
@@ -139,7 +136,6 @@ debug = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"] }
-# Property-based integration tests.
 proptest = "1"
 # Load the driver through the C ABI; keep the ADBC revision aligned with adbc_core.
 adbc_driver_manager = { git = "https://github.com/apache/arrow-adbc", rev = "0a40cf30d0458867cea48d0fbc5283340b59b40f" }
@@ -151,7 +147,7 @@ libloading = "0.9"
 google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "415dbbb8ec607f4ba927ed0e38366194cb09530d" }
 # Offline benchmarks without plotters/rayon.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
-# Offline gRPC fault injection using the pinned client’s own mock server.
+# Offline gRPC fault injection using the pinned client's own mock server.
 spanner-grpc-mock = { git = "https://github.com/googleapis/google-cloud-rust", rev = "415dbbb8ec607f4ba927ed0e38366194cb09530d" }
 # Wire messages and error details for the mock server; match the Google Cloud graph.
 tonic = "0.14"
@@ -160,7 +156,7 @@ bytes = "1"
 
 # Arrow 60.0.0 hides FFI_ArrowArrayStream fields; main adds the needed accessors
 # (apache/arrow-rs#11125). Patch all Arrow crates so adbc_core shares our types.
-# Remove once a release includes them; see CONTRIBUTING.md’s registry migration checklist.
+# Remove once a release includes them; see CONTRIBUTING.md's registry migration checklist.
 [patch.crates-io]
 arrow-array = { git = "https://github.com/apache/arrow-rs", rev = "6db2d4fd99c766ecd65a90419cea717ad5fbb619" }
 arrow-buffer = { git = "https://github.com/apache/arrow-rs", rev = "6db2d4fd99c766ecd65a90419cea717ad5fbb619" }

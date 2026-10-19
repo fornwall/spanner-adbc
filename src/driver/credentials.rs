@@ -1,6 +1,4 @@
-//! The credential ladder: which of the mutually exclusive auth flows a [`SpannerDatabase`]
-//! selects from its options, and how each one is built — keyfile JSON, impersonation, a static
-//! access token, or Application Default Credentials.
+//! Credential selection and construction for a [`SpannerDatabase`].
 
 use adbc_core::error::{Result, Status};
 use google_cloud_auth::credentials::Builder as AdcCredentials;
@@ -23,47 +21,34 @@ use crate::{
 };
 use std::time::Duration;
 
-/// The HTTP request header carrying the quota / billing project (`spanner.auth.quota_project`).
-/// Matches the `google-cloud-auth` `QUOTA_PROJECT_KEY` that its `with_quota_project_id` emits, so
-/// the credential-builder and the access-token paths attach the identical header.
+/// The header `google-cloud-auth` sends for `with_quota_project_id`; the access-token path adds it
+/// by hand.
 const QUOTA_PROJECT_HEADER: &str = "x-goog-user-project";
 
-/// The default lifetime, in seconds, of an impersonated access token when
-/// [`OPTION_IMPERSONATE_LIFETIME`](crate::OPTION_IMPERSONATE_LIFETIME) is left unset — one hour, matching the `google-cloud-auth`
-/// `impersonated` builder's own default (and gcloud's `--lifetime` default).
+/// Matches the default of the `google-cloud-auth` impersonated builder and gcloud's `--lifetime`.
 pub(super) const DEFAULT_IMPERSONATION_LIFETIME_SECS: u64 = 3600;
 
-/// Which of the five mutually exclusive credential flows a [`SpannerDatabase`] uses, as selected
-/// from its configured options by [`SpannerDatabase::credential_choice`] and built by
-/// [`SpannerDatabase::build_credentials`].
+/// The credential flow selected by [`SpannerDatabase::credential_choice`], in precedence order.
 ///
-/// Naming the choice splits the *ladder* — pure precedence rules, unit-tested offline — from
-/// building the credential it names, which reaches for the ambient environment. Deliberately
-/// payload-free: every variant's input is re-read from the database, so a bearer token never lands
-/// in a `Debug`-derived type.
+/// Separating selection from construction lets the precedence rules be tested offline. Variants
+/// carry no data, so a bearer token never ends up in a `Debug`-derived type.
 #[derive(Debug, PartialEq, Eq)]
 enum CredentialChoice {
-    /// Emulator mode: anonymous credentials over plaintext `http://`. Wins outright — the guards in
-    /// [`SpannerDatabase::connect`] refuse emulator mode combined with any credential option, so
-    /// nothing below it can be configured at the same time.
+    /// Emulator mode. `connect` refuses it alongside any credential option.
     Anonymous,
-    /// [`OPTION_ACCESS_TOKEN`]: the caller's own bearer token. Outranks the two below only
-    /// nominally — `connect` refuses that combination outright, so it is reachable alone.
+    /// [`OPTION_ACCESS_TOKEN`]. `connect` refuses it alongside the options below.
     AccessToken,
-    /// [`OPTION_IMPERSONATE_TARGET_PRINCIPAL`]: a keyfile-or-ADC base credential, wrapped to mint
-    /// short-lived tokens for the target principal. Outranks [`Keyfile`](Self::Keyfile), which it
-    /// *uses* as its base credential when both are set.
+    /// [`OPTION_IMPERSONATE_TARGET_PRINCIPAL`], using a keyfile or ADC as the source credential.
     Impersonate,
-    /// [`OPTION_KEYFILE_JSON`] / [`OPTION_KEYFILE`]: an explicit credential built from key JSON.
+    /// [`OPTION_KEYFILE_JSON`] or [`OPTION_KEYFILE`].
     Keyfile,
-    /// Application Default Credentials — no credential option was configured.
+    /// No credential option is set.
     Adc,
 }
 
 impl SpannerDatabase {
-    /// Resolve the inline credential JSON to use, reading the key file if a path was given. The
-    /// credential flow is auto-detected from the JSON's `"type"` field in [`build_credentials_from_json`].
-    /// Inline JSON ([`OPTION_KEYFILE_JSON`]) takes precedence over a file path ([`OPTION_KEYFILE`]).
+    /// The configured credential JSON: [`OPTION_KEYFILE_JSON`], else the contents of
+    /// [`OPTION_KEYFILE`].
     pub(super) fn credentials_json(&self) -> Result<Option<String>> {
         if let Some(json) = &self.keyfile_json {
             Ok(Some(json.clone()))
@@ -80,14 +65,10 @@ impl SpannerDatabase {
         }
     }
 
-    /// The name of the first explicitly-configured credential option, if any.
-    ///
-    /// Only *driver-level* credential configuration counts. Ambient Application Default Credentials
-    /// are deliberately *not* reported — they are the environment's business, not an explicit
-    /// option, and must not prevent emulator use. The ladder's order is load-bearing:
-    /// [`OPTION_ACCESS_TOKEN`] comes last so that
+    /// The first credential option that is set. Ambient ADC does not count, so it cannot block
+    /// emulator use. [`OPTION_ACCESS_TOKEN`] comes last so that
     /// [`conflicting_credential_with_access_token`](Self::conflicting_credential_with_access_token)
-    /// is this same ladder with the token filtered out.
+    /// can filter it out.
     pub(super) fn explicit_credential_option(&self) -> Option<&'static str> {
         if self.keyfile_json.is_some() {
             Some(OPTION_KEYFILE_JSON)
@@ -102,21 +83,13 @@ impl SpannerDatabase {
         }
     }
 
-    /// The name of the other explicit credential option that conflicts with an
-    /// [`OPTION_ACCESS_TOKEN`], if any: a keyfile (path or inline JSON) or an impersonation target.
-    /// An access token is a complete credential, so combining it with any of these is refused.
-    ///
-    /// This is [`explicit_credential_option`](Self::explicit_credential_option) minus the token
-    /// itself: that ladder reports [`OPTION_ACCESS_TOKEN`] *last*, hence only when no other
-    /// credential option is set, so any other name it yields is by definition a conflict.
+    /// A keyfile or impersonation option that conflicts with [`OPTION_ACCESS_TOKEN`].
     pub(super) fn conflicting_credential_with_access_token(&self) -> Option<&'static str> {
         self.explicit_credential_option()
             .filter(|option| *option != OPTION_ACCESS_TOKEN)
     }
 
-    /// Which credential flow this configuration selects; see [`CredentialChoice`]. `emulator` is
-    /// the **resolved** emulator mode — the [`OPTION_EMULATOR`](crate::OPTION_EMULATOR) option *or* `SPANNER_EMULATOR_HOST`
-    /// — not the raw option.
+    /// `emulator` is the resolved mode: the option or `SPANNER_EMULATOR_HOST`.
     fn credential_choice(&self, emulator: bool) -> CredentialChoice {
         if emulator {
             CredentialChoice::Anonymous
@@ -131,29 +104,18 @@ impl SpannerDatabase {
         }
     }
 
-    /// Build the credential [`credential_choice`](Self::credential_choice) selects — the *how* to
-    /// that ladder's *which* — or `None` to leave the client to resolve Application Default
-    /// Credentials itself. `credentials_json` is the already-read key JSON, whose flow is detected
-    /// from its `"type"` in [`build_credentials_from_json`].
+    /// Build the selected credential, or `None` to let the client resolve ADC itself.
     ///
-    /// Must run inside the Tokio runtime: the `google-cloud-auth` builders spawn token-cache tasks.
-    /// None of them does I/O here — the first token is only fetched on use.
+    /// Must run inside the Tokio runtime, since the auth builders spawn token-cache tasks. No
+    /// token is fetched until first use.
     pub(super) fn build_credentials(
         &self,
         emulator: bool,
         credentials_json: Option<String>,
     ) -> Result<Option<Credentials>> {
-        // The quota / billing project, attached to whichever non-emulator credential wins below via
-        // `with_quota_project_id` (ADC / keyfile / impersonation) or the `x-goog-user-project`
-        // header (access token). `None` leaves the credential's own project in charge.
         let quota_project = self.quota_project.as_deref();
         match self.credential_choice(emulator) {
-            // Anonymous over plaintext `http://`; `connect`'s guard has already refused every
-            // credential option, so nothing is dropped here.
             CredentialChoice::Anonymous => Ok(Some(AnonymousCredentials::new().build())),
-            // A caller-supplied OAuth2 bearer token, sent verbatim with no refresh (plus the
-            // quota-project header, if any). Mutual exclusion with the keyfile/impersonation
-            // options is checked in `connect`.
             CredentialChoice::AccessToken => self
                 .access_token
                 .as_deref()
@@ -163,10 +125,7 @@ impl SpannerDatabase {
                 .impersonate_target_principal
                 .as_deref()
                 .map(|target| {
-                    // Build the base credential exactly as the non-impersonated path does — an
-                    // explicit keyfile, or ADC when none is given — then wrap it so it is only used
-                    // to mint a short-lived token for `target` (optionally through a delegation
-                    // chain). The quota project rides on the impersonated builder, not the source.
+                    // The quota project goes on the impersonated credential, not the source.
                     let source = match &credentials_json {
                         Some(json) => build_credentials_from_json(json, None)?,
                         None => AdcCredentials::default().build().map_err(|e| {
@@ -196,9 +155,7 @@ impl SpannerDatabase {
             CredentialChoice::Keyfile => credentials_json
                 .map(|json| build_credentials_from_json(&json, quota_project))
                 .transpose(),
-            // With a quota (billing) project, Application Default Credentials must be built
-            // *explicitly* so `with_quota_project_id` can attach the `x-goog-user-project` header;
-            // without one, `None` lets the client resolve ADC itself, with nothing to attach.
+            // ADC is only built here when a quota project must be attached to it.
             CredentialChoice::Adc => quota_project
                 .map(|project| {
                     AdcCredentials::default()
@@ -220,24 +177,13 @@ impl SpannerDatabase {
     }
 }
 
-/// The credential `type` values we accept in a keyfile JSON, for use in error messages.
 const SUPPORTED_CREDENTIAL_TYPES: &str =
     "service_account, authorized_user, impersonated_service_account, external_account";
 
-/// Build Google credentials from an inline JSON key, auto-detecting the credential flow from the
-/// JSON's top-level `"type"` field, as Google's own auth libraries (and gcloud) do.
+/// Build credentials from JSON, choosing the flow from its `"type"` field as gcloud does.
 ///
-/// Standard Google credential JSON carries a `"type"` discriminator, each value mapping to a
-/// distinct auth flow with its own required fields: `service_account`, `authorized_user`,
-/// `impersonated_service_account` and `external_account`.
-///
-/// `google-cloud-auth`'s top-level `Builder` already dispatches on this field, but only for
-/// credentials it loads itself from the environment; it offers no entry point taking inline JSON,
-/// so the dispatch happens here — do **not** funnel every keyfile through the `service_account`
-/// builder instead: any other type then fails or misbehaves.
-///
-/// `quota_project`, when `Some`, is attached to whichever builder is selected, so the credentials
-/// send the `x-goog-user-project` billing header.
+/// `google-cloud-auth` only dispatches on `"type"` for credentials it loads from the environment,
+/// so inline JSON is dispatched here.
 fn build_credentials_from_json(json: &str, quota_project: Option<&str>) -> Result<Credentials> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
         err(
@@ -257,8 +203,7 @@ fn build_credentials_from_json(json: &str, quota_project: Option<&str>) -> Resul
         })?
         .to_owned();
 
-    // Each credential-type branch has a differently-typed builder, all sharing a
-    // `with_quota_project_id` method; this local macro applies the quota project uniformly.
+    // The builders share `with_quota_project_id` but no trait.
     macro_rules! with_quota_project {
         ($builder:expr) => {{
             let builder = $builder;
@@ -294,15 +239,10 @@ fn build_credentials_from_json(json: &str, quota_project: Option<&str>) -> Resul
     })
 }
 
-/// Reduce a `google-cloud-auth` credential-builder error to a fixed, secret-free category phrase.
+/// Describe a credential-builder error with a fixed phrase.
 ///
-/// The auth crate's `Display` (and the `#[source]` chain behind it) wraps the `serde_json` error
-/// from deserializing the credential JSON, which can echo fragments of it (potentially
-/// `private_key` or `refresh_token` material). So it is never interpolated into an ADBC error
-/// message; the failure is classified with the crate's own public predicates into one of a handful
-/// of fixed phrases instead, whatever that `Display` does now or later. The credential *type* and
-/// (on the keyfile path) the file *path* are still reported by the callers — user-supplied
-/// configuration, not secrets.
+/// The error's `Display` can include `serde_json` fragments of the credential JSON, such as a
+/// private key or refresh token, so it must never reach an ADBC error message.
 fn scrub_credential_error(error: &google_cloud_auth::build_errors::Error) -> &'static str {
     if error.is_missing_field() {
         "a required field is missing or has the wrong type"
@@ -319,13 +259,8 @@ fn scrub_credential_error(error: &google_cloud_auth::build_errors::Error) -> &'s
     }
 }
 
-/// Wrap a base credential with service-account impersonation using the `google-cloud-auth`
-/// `impersonated` builder.
-///
-/// The base credentials (from a keyfile or ADC) become the *source*: they call the IAM Credentials
-/// `generateAccessToken` API to mint a short-lived token for `target_principal`. `delegates` is an
-/// optional delegation chain, `scopes` overrides the default `cloud-platform` scope when non-empty,
-/// and `lifetime` bounds the minted token.
+/// Wrap `source` so it mints short-lived tokens for `target_principal`. Empty `delegates` or
+/// `scopes` keep the builder's defaults.
 fn build_impersonated_credentials(
     source: Credentials,
     target_principal: &str,
@@ -343,8 +278,7 @@ fn build_impersonated_credentials(
     if !scopes.is_empty() {
         builder = builder.with_scopes(scopes.iter().cloned());
     }
-    // The quota project belongs on the final (impersonated) credential; the auth crate gives the
-    // builder value precedence over any carried by the source.
+    // The auth crate prefers this over any quota project on the source.
     if let Some(project) = quota_project {
         builder = builder.with_quota_project_id(project);
     }
@@ -359,19 +293,11 @@ fn build_impersonated_credentials(
     })
 }
 
-/// A minimal `google-cloud-auth` [`Credentials`] backed by a fixed, caller-supplied OAuth 2.0
-/// bearer token.
-///
-/// The pinned auth crate ships no static-token credential builder, so we implement the public
-/// [`CredentialsProvider`] trait directly: every request gets the same pre-built
-/// `Authorization: Bearer <token>` header and there is no refresh. The header value is marked
-/// sensitive so it is redacted from any header logging the transport might do.
+/// Credentials for a fixed bearer token, which the pinned auth crate has no builder for.
 #[derive(Debug)]
 struct StaticTokenCredentials {
-    /// The pre-built headers (`Authorization: Bearer <token>`), returned verbatim on every call.
     headers: HeaderMap,
-    /// A stable cache tag so callers using the `EntityTag` fast-path see "not modified" — the token
-    /// never changes for the lifetime of these credentials.
+    /// Constant, since the token never changes.
     entity_tag: EntityTag,
 }
 
@@ -393,20 +319,13 @@ impl CredentialsProvider for StaticTokenCredentials {
     }
 
     async fn universe_domain(&self) -> Option<String> {
-        // `None` means the default `googleapis.com` universe.
+        // The default `googleapis.com` universe.
         None
     }
 }
 
-/// Build [`Credentials`] that authenticate with a fixed OAuth 2.0 bearer token.
-///
-/// The token is pre-formatted into an `Authorization: Bearer <token>` header once, here, so a
-/// malformed token is rejected up front with a clean `InvalidArguments` — and the token itself is
-/// never interpolated into the error (the `scrub_credential_error` discipline).
-///
-/// `quota_project`, when `Some`, adds the `x-goog-user-project` billing header, attached manually
-/// since the static-token provider uses no builder. It is a bare project id, not a secret, so it is
-/// not marked sensitive.
+/// Build credentials that send a fixed bearer token and optional quota project. An invalid token
+/// is rejected here, without echoing it in the error.
 fn build_static_token_credentials(token: &str, quota_project: Option<&str>) -> Result<Credentials> {
     let mut value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
         invalid_argument(format!(
@@ -414,6 +333,7 @@ fn build_static_token_credentials(token: &str, quota_project: Option<&str>) -> R
              Authorization header value"
         ))
     })?;
+    // Keeps the token out of `Debug` output and header logging.
     value.set_sensitive(true);
     let mut headers = HeaderMap::new();
     headers.insert(AUTHORIZATION, value);

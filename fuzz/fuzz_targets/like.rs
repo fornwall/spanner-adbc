@@ -3,21 +3,13 @@
 use libfuzzer_sys::fuzz_target;
 use regex::Regex;
 
-// Fuzz the LIKE matcher used by get_objects filtering with an arbitrary (pattern, value) pair.
-//
-// Two things are checked:
-//   1. It must never panic and must terminate quickly even for adversarial `%`-heavy patterns (the
-//      matcher is iterative, so no exponential blowup / stack overflow).
-//   2. Differential oracle: an independent regex translation of the same pattern must agree on the
-//      match result. The ADBC LIKE grammar has no escape character — only `%` (any run) and `_`
-//      (exactly one char) are special; every other char (including `\`) is a literal.
+// The get_objects LIKE matcher must finish quickly on `%`-heavy patterns and agree with a regex
+// translation. ADBC LIKE has no escape character: only `%` and `_` are special.
 fuzz_target!(|input: (String, String)| {
     let (pattern, value) = input;
     let got = spanner_adbc::fuzzing::like_match(&pattern, &value);
 
-    // Build an equivalent anchored regex: `%` -> `.*`, `_` -> `.`, everything else escaped.
-    // `(?s)` makes `.` match newlines too, matching LIKE's "any character" semantics, and
-    // `\A`/`\z` anchor the whole value (LIKE is a full match).
+    // `(?s)` lets `.` match newlines; LIKE matches the whole value.
     let mut re = String::from(r"(?s)\A");
     for ch in pattern.chars() {
         match ch {
@@ -28,9 +20,7 @@ fuzz_target!(|input: (String, String)| {
     }
     re.push_str(r"\z");
 
-    // The escaping above only ever produces a *syntactically* valid regex, but a large fuzz input
-    // can still exceed the compiler's size limit (`CompiledTooBig`, e.g. if `-max_len` is raised).
-    // The no-panic/termination property was already exercised above, so just skip the oracle then.
+    // A large pattern can exceed the regex size limit; skip the comparison then.
     let expected = match Regex::new(&re) {
         Ok(regex) => regex.is_match(&value),
         Err(_) => return,
