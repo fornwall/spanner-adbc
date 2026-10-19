@@ -9,6 +9,8 @@
 //! mockall matches expectations in FIFO order. [`MockServer::start`] serves `CreateSession` before
 //! the test's script and rejects every unscripted RPC with `UNIMPLEMENTED` after it: a mockall
 //! panic in the server task would reach the client as a retryable transport error and hang.
+//! Call counts such as `.times(n)` are only upper bounds: the mock is dropped with the aborted
+//! server task, which swallows unmet expectations, so tests count calls themselves.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1224,7 +1226,9 @@ fn execute_partitions_rejects_multiple_bound_rows_and_consumes_them() {
 #[test]
 fn empty_partitions_retain_the_planned_types_at_the_readers_timestamp_precision() {
     let _watchdog = watchdog!();
-    let server = MockServer::start(|mock| {
+    let partition_reads = Arc::new(AtomicUsize::new(0));
+    let reads_in_mock = partition_reads.clone();
+    let server = MockServer::start(move |mock| {
         serve_begin_transaction(mock);
         mock.expect_partition_query().once().returning(|request| {
             assert_eq!(
@@ -1240,7 +1244,7 @@ fn empty_partitions_retain_the_planned_types_at_the_readers_timestamp_precision(
         });
         mock.expect_execute_streaming_sql()
             .times(2)
-            .returning(|request| {
+            .returning(move |request| {
                 let request = request.into_inner();
                 let metadata = if request.partition_token.is_empty() {
                     assert_eq!(
@@ -1254,6 +1258,7 @@ fn empty_partitions_retain_the_planned_types_at_the_readers_timestamp_precision(
                     ]))
                 } else {
                     assert_eq!(request.partition_token, b"empty-partition");
+                    reads_in_mock.fetch_add(1, Ordering::SeqCst);
                     // Omni can omit the row type for a partition with no rows.
                     Some(v1::ResultSetMetadata::default())
                 };
@@ -1301,6 +1306,11 @@ fn empty_partitions_retain_the_planned_types_at_the_readers_timestamp_precision(
     );
     let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    assert_eq!(
+        partition_reads.load(Ordering::SeqCst),
+        1,
+        "the reader must fetch the partition that omits its row type"
+    );
 }
 
 #[test]

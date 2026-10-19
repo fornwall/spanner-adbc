@@ -65,6 +65,8 @@ fn begin() -> Option<(Toxiproxy, SerialGuard)> {
     };
     // After the skip check, so a plain multi-threaded `cargo test` still skips.
     let serial = SerialGuard::new();
+    // A test that panicked between adding and removing a toxic would otherwise leave it active.
+    toxi.reset();
     ensure_setup();
     Some((toxi, serial))
 }
@@ -107,6 +109,15 @@ impl Toxiproxy {
         assert!(
             (200..300).contains(&code),
             "adding toxic failed (HTTP {code}): {out}\nbody was: {body}"
+        );
+    }
+
+    /// Removes every toxic and re-enables the proxy. Panics on a non-2xx response.
+    fn reset(&self) {
+        let (code, out) = curl(&["-s", "-X", "POST", &format!("{}/reset", self.url)]);
+        assert!(
+            (200..300).contains(&code),
+            "resetting toxiproxy failed (HTTP {code}): {out}"
         );
     }
 
@@ -355,7 +366,7 @@ fn cancel_interrupts_in_flight_query() {
         let start = Instant::now();
         let result: Result<Vec<_>, _> = reader.collect();
         let elapsed = start.elapsed();
-        let _ = tx.send((result.is_err(), format!("{:?}", result.err()), elapsed));
+        let _ = tx.send((result.err(), elapsed));
     });
 
     // Let the worker drain the buffered rows and block on a throttled read. The cancel signal
@@ -365,7 +376,7 @@ fn cancel_interrupts_in_flight_query() {
     let cancel_at = Instant::now();
     statement.get_cancel_handle().try_cancel().expect("cancel");
 
-    let (is_err, err_debug, worker_elapsed) = rx
+    let (error, worker_elapsed) = rx
         .recv_timeout(Duration::from_secs(20))
         .expect("worker did not finish within 20s; cancel failed to interrupt the in-flight fetch");
     worker.join().ok();
@@ -374,12 +385,16 @@ fn cancel_interrupts_in_flight_query() {
     // Remove the fault before asserting so a failure doesn't leave the proxy broken.
     toxi.remove_toxic("resil_bandwidth");
 
-    assert!(
-        is_err,
-        "cancelled streaming query should yield an error, got Ok. worker elapsed {worker_elapsed:?}"
-    );
-    assert!(
-        err_debug.to_lowercase().contains("cancel"),
+    let error = error.unwrap_or_else(|| {
+        panic!(
+            "cancelled streaming query should yield an error, got Ok. worker elapsed \
+             {worker_elapsed:?}"
+        )
+    });
+    let err_debug = format!("{error:?}");
+    assert_eq!(
+        adbc_error_of(&error).status,
+        AdbcStatus::Cancelled,
         "error should be a cancellation, got: {err_debug}"
     );
     assert!(

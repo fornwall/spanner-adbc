@@ -409,7 +409,8 @@ fn hostile_identifiers_are_rejected_before_any_ddl_runs() {
 
     run(
         connection,
-        "DROP TABLE IF EXISTS AdbcInjChild; \
+        "DROP TABLE IF EXISTS AdbcInjOk; \
+         DROP TABLE IF EXISTS AdbcInjChild; \
          DROP TABLE IF EXISTS AdbcInjParent; \
          CREATE TABLE AdbcInjParent (Id INT64 NOT NULL) PRIMARY KEY (Id)",
     );
@@ -822,9 +823,12 @@ fn manual_transaction_buffers_commits_and_rolls_back() {
         "back in autocommit mode DML reports its count and applies immediately"
     );
     assert_eq!(count_rows(connection, "AdbcTxn"), 5);
-    assert!(
-        connection.commit().is_err(),
-        "commit without an active manual transaction must fail"
+    assert_eq!(
+        connection
+            .commit()
+            .expect_err("commit without an active manual transaction must fail")
+            .status,
+        Status::InvalidState
     );
 
     drop_tables(connection, &["AdbcTxn"]);
@@ -1124,6 +1128,7 @@ fn bulk_ingest_defaults_to_create_mode() {
     };
     let connection = &mut fx.connection;
 
+    run(connection, "DROP TABLE IF EXISTS AdbcDefaultMode");
     let default_mode_rows = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
         vec![Arc::new(Int64Array::from(vec![7, 8]))],
@@ -1176,6 +1181,32 @@ fn bulk_ingest_defaults_to_create_mode() {
         "default (create) ingest onto an existing table must be AlreadyExists, got: {dup_err:?}"
     );
     drop_tables(connection, &["AdbcDefaultMode"]);
+}
+
+/// Spanner resolves table names case-insensitively, so a create-mode ingest into a differently
+/// cased name of an existing table is `AlreadyExists`, not the raw duplicate-name DDL error.
+#[test]
+fn ingest_create_onto_a_differently_cased_table_is_already_exists() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
+
+    run(
+        connection,
+        "DROP TABLE IF EXISTS AdbcCaseProbe; \
+         CREATE TABLE AdbcCaseProbe (Id INT64, Label STRING(MAX)) PRIMARY KEY (Id)",
+    );
+    let error = ingest_labels(connection, "adbccaseprobe", "create")
+        .expect_err("create-mode ingest onto a differently cased existing table must fail");
+    assert_eq!(error.status, Status::AlreadyExists, "{error:?}");
+    assert!(
+        error.message.contains("adbccaseprobe"),
+        "the error must name the target table: {error:?}"
+    );
+    assert_eq!(count_rows(connection, "AdbcCaseProbe"), 0);
+
+    drop_tables(connection, &["AdbcCaseProbe"]);
 }
 
 /// A failed `append` reports `NotFound` for a missing table and `AlreadyExists` for an
@@ -2706,6 +2737,8 @@ fn bulk_ingest_edge_cases() {
     run(
         connection,
         "DROP TABLE IF EXISTS AdbcEdge; \
+         DROP TABLE IF EXISTS AdbcEdgeCreate; \
+         DROP TABLE IF EXISTS AdbcEdgeZero; \
          CREATE TABLE AdbcEdge (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
     );
 
@@ -3030,6 +3063,8 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
     run(
         connection,
         "DROP TABLE IF EXISTS AdbcEmptyHijack; \
+         DROP TABLE IF EXISTS AdbcStaleLeak; \
+         DROP TABLE IF EXISTS AdbcEmptyReadTxn; \
          CREATE TABLE AdbcEmptyHijack (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
     );
 
@@ -4602,6 +4637,17 @@ fn ingest_stmt(connection: &mut SpannerConnection, table: &str, mode: &str) -> S
     statement
 }
 
+/// The status of the driver error that a reader wraps in `ArrowError::ExternalError`.
+fn reader_error_status(error: &arrow_schema::ArrowError) -> Status {
+    let arrow_schema::ArrowError::ExternalError(source) = error else {
+        panic!("expected the reader to surface the driver error, got: {error}");
+    };
+    source
+        .downcast_ref::<adbc_core::error::Error>()
+        .unwrap_or_else(|| panic!("the reader error does not wrap an ADBC error: {error}"))
+        .status
+}
+
 /// Downcast a column, panicking with its actual data type on mismatch.
 fn col<T: Array + 'static>(column: &dyn Array) -> &T {
     column.as_any().downcast_ref::<T>().unwrap_or_else(|| {
@@ -4799,6 +4845,7 @@ fn json_and_float32_round_trip() {
     run(
         connection,
         "DROP TABLE IF EXISTS AdbcJson; \
+         DROP TABLE IF EXISTS AdbcJsonIngest; \
          CREATE TABLE AdbcJson (Id INT64, Doc JSON, Ratio FLOAT32, Docs ARRAY<JSON>) \
          PRIMARY KEY (Id)",
     );
@@ -5218,10 +5265,7 @@ fn cancel_between_stream_chunks_cancels_the_next_fetch() {
         .next()
         .expect("the cancelled fetch yields an item")
         .expect_err("the fetch after cancel must fail");
-    assert!(
-        error.to_string().to_lowercase().contains("cancel"),
-        "expected a cancellation error, got: {error}"
-    );
+    assert_eq!(reader_error_status(&error), Status::Cancelled, "{error}");
 
     let batches = query
         .execute()
@@ -6043,10 +6087,7 @@ fn connection_cancel_is_sticky_until_the_next_operation() {
         .next()
         .expect("the cancelled fetch yields an item")
         .expect_err("the fetch after cancel must fail");
-    assert!(
-        error.to_string().to_lowercase().contains("cancel"),
-        "expected a cancellation error, got: {error}"
-    );
+    assert_eq!(reader_error_status(&error), Status::Cancelled, "{error}");
 
     // Statements have their own cancel signal.
     assert_eq!(count_rows(connection, "AdbcConnCancel"), 200);
@@ -6536,8 +6577,9 @@ fn rpc_timeouts() {
     .expect("set a microsecond query deadline");
     tiny.set_sql_query("SELECT Id FROM AdbcRpcTimeout ORDER BY Id")
         .unwrap();
-    // The query deadline covers the first chunk, so `execute` itself fails.
-    let Err(error) = tiny.execute() else {
+    // The query deadline covers the first chunk, so `execute` itself fails. The deadline fires
+    // on the next ~1ms timer tick, which a fast backend occasionally beats, so allow retries.
+    let Some(error) = (0..5).find_map(|_| tiny.execute().err()) else {
         panic!("a microsecond query deadline must expire");
     };
     assert_eq!(error.status, Status::Timeout, "{error:?}");
