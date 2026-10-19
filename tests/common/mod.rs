@@ -71,22 +71,29 @@ pub(crate) fn test_target() -> Option<TestTarget> {
             omni_endpoint: None,
         })
     } else {
-        env("SPANNER_GCP_DATABASE").map(|spec| {
-            let [project, instance, database] = spec.split('.').collect::<Vec<_>>()[..] else {
-                panic!("SPANNER_GCP_DATABASE must use project.instance.database, got {spec:?}");
-            };
-            TestTarget {
-                project: project.into(),
-                instance: instance.into(),
-                database: database.into(),
-                is_emulator: false,
-                omni_endpoint: None,
-            }
-        })
+        gcp_target()
     };
     assert!(
         target.is_some() || !require_target(),
-        "ADBC_TEST_REQUIRE_TARGET is set: configure SPANNER_EMULATOR_HOST, SPANNER_OMNI_ENDPOINT or SPANNER_GCP_DATABASE"
+        "ADBC_TEST_REQUIRE_TARGET is set: configure SPANNER_EMULATOR_HOST, \
+         SPANNER_OMNI_ENDPOINT or SPANNER_GCP_DATABASE"
     );
     target
+}
+
+/// The Cloud Spanner database named by `SPANNER_GCP_DATABASE`, ignoring the local backends.
+pub(crate) fn gcp_target() -> Option<TestTarget> {
+    let spec = std::env::var("SPANNER_GCP_DATABASE")
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    let [project, instance, database] = spec.split('.').collect::<Vec<_>>()[..] else {
+        panic!("SPANNER_GCP_DATABASE must use project.instance.database, got {spec:?}");
+    };
+    Some(TestTarget {
+        project: project.into(),
+        instance: instance.into(),
+        database: database.into(),
+        is_emulator: false,
+        omni_endpoint: None,
+    })
 }
