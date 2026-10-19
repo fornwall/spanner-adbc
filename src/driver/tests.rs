@@ -344,3 +344,28 @@ fn a_uri_host_authority_endpoint_is_dialed() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
+
+/// `""` used to be dialed as an endpoint, failing with `Internal` and hiding
+/// `SPANNER_EMULATOR_HOST`.
+#[test]
+fn a_blank_endpoint_unsets_it() {
+    let mut db = new_database();
+    db.set_option(
+        OptionDatabase::Uri,
+        OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
+    )
+    .unwrap();
+    let key = || OptionDatabase::Other(OPTION_ENDPOINT.into());
+    db.set_option(key(), "http://127.0.0.1:1".into()).unwrap();
+    for blank in ["", "  "] {
+        db.set_option(key(), blank.into()).unwrap();
+        assert_eq!(
+            db.get_option_string(key()).unwrap_err().status,
+            Status::NotFound
+        );
+        let target = db.resolve_target(Some("localhost:9010")).unwrap();
+        assert_eq!(target.endpoint.as_deref(), Some("http://localhost:9010"));
+        assert!(target.emulator);
+        assert_eq!(db.resolve_target(None).unwrap().endpoint, None);
+    }
+}

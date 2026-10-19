@@ -281,25 +281,40 @@ fn ambient_adc_and_inert_impersonation_options_do_not_trip_the_emulator_guard() 
 #[test]
 fn the_credential_ladder_selects_one_flow_in_precedence_order() {
     let mut db = new_database();
-    assert_eq!(db.credential_choice(false), CredentialChoice::Adc);
+    assert_eq!(db.credential_choice(false, false), CredentialChoice::Adc);
     // A quota project does not select a flow.
     db.quota_project = Some("billing-project".into());
-    assert_eq!(db.credential_choice(false), CredentialChoice::Adc);
+    assert_eq!(db.credential_choice(false, false), CredentialChoice::Adc);
 
     db.keyfile = Some("/path/to/key.json".into());
-    assert_eq!(db.credential_choice(false), CredentialChoice::Keyfile);
+    assert_eq!(
+        db.credential_choice(false, false),
+        CredentialChoice::Keyfile
+    );
     db.keyfile = None;
     db.keyfile_json = Some("{\"type\":\"authorized_user\"}".into());
-    assert_eq!(db.credential_choice(false), CredentialChoice::Keyfile);
+    assert_eq!(
+        db.credential_choice(false, false),
+        CredentialChoice::Keyfile
+    );
 
     // Impersonation uses the keyfile as its source credential.
     db.impersonate_target_principal = Some("target@p.iam.gserviceaccount.com".into());
-    assert_eq!(db.credential_choice(false), CredentialChoice::Impersonate);
+    assert_eq!(
+        db.credential_choice(false, false),
+        CredentialChoice::Impersonate
+    );
 
     // `connect` refuses the remaining combinations before consulting the ladder.
     db.access_token = Some("ya29.token".into());
-    assert_eq!(db.credential_choice(false), CredentialChoice::AccessToken);
-    assert_eq!(db.credential_choice(true), CredentialChoice::Anonymous);
+    assert_eq!(
+        db.credential_choice(false, false),
+        CredentialChoice::AccessToken
+    );
+    assert_eq!(
+        db.credential_choice(true, false),
+        CredentialChoice::Anonymous
+    );
 }
 
 #[test]
@@ -308,9 +323,171 @@ fn the_credential_ladder_ignores_impersonation_options_without_a_target() {
     db.impersonate_delegates = vec!["delegate@p.iam.gserviceaccount.com".into()];
     db.impersonate_scopes = vec!["https://www.googleapis.com/auth/cloud-platform".into()];
     db.impersonate_lifetime_secs = Some(900);
-    assert_eq!(db.credential_choice(false), CredentialChoice::Adc);
+    assert_eq!(db.credential_choice(false, false), CredentialChoice::Adc);
     db.keyfile = Some("/path/to/key.json".into());
-    assert_eq!(db.credential_choice(false), CredentialChoice::Keyfile);
+    assert_eq!(
+        db.credential_choice(false, false),
+        CredentialChoice::Keyfile
+    );
+}
+
+/// Omni and plaintext endpoints replace ADC, and so ambient ADC and `GOOGLE_CLOUD_QUOTA_PROJECT`,
+/// with anonymous credentials, while explicit options still win.
+#[test]
+fn anonymous_default_replaces_only_adc() {
+    let mut db = new_database();
+    assert_eq!(
+        db.credential_choice(false, true),
+        CredentialChoice::Anonymous
+    );
+    db.impersonate_delegates = vec!["delegate@p.iam.gserviceaccount.com".into()];
+    assert_eq!(
+        db.credential_choice(false, true),
+        CredentialChoice::Anonymous
+    );
+    db.keyfile = Some("/path/to/key.json".into());
+    assert_eq!(db.credential_choice(false, true), CredentialChoice::Keyfile);
+    db.impersonate_target_principal = Some("target@p.iam.gserviceaccount.com".into());
+    assert_eq!(
+        db.credential_choice(false, true),
+        CredentialChoice::Impersonate
+    );
+    db.keyfile = None;
+    db.impersonate_target_principal = None;
+    db.access_token = Some("ya29.token".into());
+    assert_eq!(
+        db.credential_choice(false, true),
+        CredentialChoice::AccessToken
+    );
+}
+
+fn omni_database(endpoint: &str) -> SpannerDatabase {
+    let mut db = new_database();
+    db.database = Some("projects/p/instances/i/databases/d".into());
+    db.instance_type = google_cloud_spanner::omni::InstanceType::Omni;
+    db.endpoint = Some(endpoint.into());
+    db
+}
+
+/// Without explicit credentials, a quota project used to switch anonymous Omni to ADC and send
+/// Google tokens to the Omni host.
+#[test]
+fn anonymous_omni_refuses_a_quota_project() {
+    for endpoint in [
+        "http://omni.internal:15000",
+        "omni:15000",
+        "https://omni.internal",
+    ] {
+        let mut db = omni_database(endpoint);
+        db.quota_project = Some("my-billing-project".into());
+        // Omni ignores `SPANNER_EMULATOR_HOST`, so `connect` fails the same way in CI.
+        for error in [
+            db.resolve_target(None).unwrap_err(),
+            db.resolve_target(Some("localhost:9010")).unwrap_err(),
+            db.connect().unwrap_err(),
+        ] {
+            assert_eq!(error.status, Status::InvalidState, "{endpoint}");
+            assert!(error.message.contains("Spanner Omni"), "{}", error.message);
+            assert!(
+                error.message.contains(OPTION_QUOTA_PROJECT),
+                "{}",
+                error.message
+            );
+            assert!(error.message.contains("anonymously"), "{}", error.message);
+        }
+
+        // Explicit credentials carry the quota project.
+        db.access_token = Some("ya29.token".into());
+        let target = db.resolve_target(None).unwrap();
+        assert!(target.anonymous_default && !target.emulator);
+        assert_eq!(
+            db.credential_choice(target.emulator, target.anonymous_default),
+            CredentialChoice::AccessToken
+        );
+    }
+}
+
+#[test]
+fn a_plaintext_endpoint_without_credentials_refuses_a_quota_project() {
+    // A scheme other than https is dialed without TLS too, so it counts as plaintext.
+    for endpoint in [
+        "http://10.0.0.5:9010",
+        "HTTP://10.0.0.5:9010",
+        "10.0.0.5:9010",
+        "grpc://10.0.0.5:9010",
+    ] {
+        let mut db = new_database();
+        db.database = Some("projects/p/instances/i/databases/d".into());
+        db.endpoint = Some(endpoint.into());
+        let target = db.resolve_target(None).unwrap();
+        assert!(target.anonymous_default, "{endpoint}");
+        assert_eq!(
+            db.credential_choice(target.emulator, target.anonymous_default),
+            CredentialChoice::Anonymous,
+            "{endpoint}"
+        );
+
+        db.quota_project = Some("my-billing-project".into());
+        let error = db.resolve_target(None).unwrap_err();
+        assert_eq!(error.status, Status::InvalidState, "{endpoint}");
+        assert!(error.message.contains("plaintext"), "{}", error.message);
+        assert!(
+            error.message.contains(OPTION_QUOTA_PROJECT),
+            "{}",
+            error.message
+        );
+
+        db.keyfile = Some("/path/to/key.json".into());
+        let target = db.resolve_target(None).unwrap();
+        assert_eq!(
+            db.credential_choice(target.emulator, target.anonymous_default),
+            CredentialChoice::Keyfile
+        );
+    }
+}
+
+#[test]
+fn a_tls_cloud_endpoint_keeps_adc_and_the_quota_project() {
+    for endpoint in [
+        None,
+        Some("https://spanner.example.com"),
+        Some("HTTPS://h:443"),
+    ] {
+        let mut db = new_database();
+        db.database = Some("projects/p/instances/i/databases/d".into());
+        db.endpoint = endpoint.map(str::to_owned);
+        db.quota_project = Some("my-billing-project".into());
+        let target = db.resolve_target(None).unwrap();
+        assert!(!target.anonymous_default, "{endpoint:?}");
+        assert_eq!(
+            db.credential_choice(target.emulator, target.anonymous_default),
+            CredentialChoice::Adc
+        );
+    }
+}
+
+/// A missing `GOOGLE_APPLICATION_CREDENTIALS` file failed with `Internal` when the client loaded
+/// ADC, but with `InvalidArguments` when the driver did.
+#[test]
+fn client_adc_failures_match_the_drivers_adc_failures() {
+    const SECRET: &str = "leak-me-if-you-can-4c3b2a";
+    let raw = ServiceAccountCredentials::new(serde_json::json!({
+        "type": "service_account",
+        "private_key": SECRET,
+    }))
+    .build()
+    .unwrap_err();
+    let error = from_client_builder(google_cloud_gax::client_builder::Error::cred(raw));
+    assert_eq!(error.status, Status::InvalidArguments);
+    assert!(
+        error.message.contains("Application Default Credentials"),
+        "{}",
+        error.message
+    );
+    assert!(!error.message.contains(SECRET), "{}", error.message);
+
+    let error = from_client_builder(google_cloud_gax::client_builder::Error::transport("bad"));
+    assert_eq!(error.status, Status::Internal);
 }
 
 #[test]

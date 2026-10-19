@@ -4,7 +4,9 @@ mod admin;
 mod credentials;
 mod uri;
 
+use credentials::from_client_builder;
 pub(crate) use uri::ensure_scheme;
+use uri::is_plaintext_endpoint;
 
 use adbc_core::error::{Result, Status};
 use adbc_core::options::{OptionDatabase, OptionValue};
@@ -16,8 +18,7 @@ use google_cloud_spanner::omni::{InstanceType, SpannerBuilderExt};
 
 use crate::connection::SpannerConnection;
 use crate::error::{
-    err, from_builder, from_spanner, invalid_argument, invalid_state, option_not_set,
-    unknown_option,
+    err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option,
 };
 use crate::options::impl_typed_option_getters;
 use crate::runtime::{SharedRuntime, new_runtime};
@@ -168,6 +169,52 @@ impl SpannerDatabase {
     /// Outside Omni, a non-empty `SPANNER_EMULATOR_HOST` enables emulator mode and supplies the
     /// endpoint unless one was set explicitly.
     pub(crate) fn connect(&self) -> Result<Connected> {
+        let emulator_host = std::env::var("SPANNER_EMULATOR_HOST").ok();
+        let Target {
+            database,
+            endpoint,
+            emulator,
+            anonymous_default,
+        } = self.resolve_target(emulator_host.as_deref())?;
+
+        // Blocking file I/O, so read the key file before entering the runtime.
+        let credentials_json = self.credentials_json()?;
+
+        self.runtime.block_on(async move {
+            let mut builder = Spanner::builder().with_instance_type(self.instance_type);
+            if let Some(endpoint) = endpoint.clone() {
+                builder = builder.with_endpoint(endpoint);
+            }
+            // `None` selects ADC. Other modes pass explicit credentials, so the admin client
+            // cannot fall back to ADC either.
+            let credentials =
+                self.build_credentials(emulator, anonymous_default, credentials_json)?;
+            if let Some(credentials) = &credentials {
+                builder = builder.with_credentials(credentials.clone());
+            }
+            let mut admin_config = ClientConfig::default();
+            admin_config.endpoint = endpoint;
+            admin_config.cred = credentials;
+            let spanner = builder.build().await.map_err(from_client_builder)?;
+            let client = spanner
+                .database_client(database.clone())
+                .build()
+                .await
+                .map_err(from_spanner)?;
+            Ok(Connected {
+                client,
+                database,
+                admin: Arc::new(DatabaseAdminState {
+                    client: OnceCell::new(),
+                    config: admin_config,
+                }),
+            })
+        })
+    }
+
+    /// Validate the options and resolve the endpoint and credential mode. `emulator_host` is the
+    /// value of `SPANNER_EMULATOR_HOST`.
+    fn resolve_target(&self, emulator_host: Option<&str>) -> Result<Target> {
         let database = self.database.clone().ok_or_else(|| {
             invalid_state(
                 "Spanner database path is not set; provide the `uri` option \
@@ -175,7 +222,10 @@ impl SpannerDatabase {
             )
         })?;
 
-        let mut endpoint = self.endpoint.clone();
+        let mut endpoint = self
+            .endpoint
+            .clone()
+            .filter(|endpoint| !endpoint.trim().is_empty());
         let mut emulator = self.emulator;
         let omni = self.instance_type == InstanceType::Omni;
         if omni {
@@ -184,21 +234,15 @@ impl SpannerDatabase {
                     "spanner.instance_type=omni cannot be combined with spanner.emulator=true",
                 ));
             }
-            if endpoint
-                .as_ref()
-                .is_none_or(|endpoint| endpoint.trim().is_empty())
-            {
+            if endpoint.is_none() {
                 return Err(invalid_state(
                     "spanner.instance_type=omni requires an explicit spanner.endpoint URL",
                 ));
             }
         }
-        if !omni
-            && let Ok(host) = std::env::var("SPANNER_EMULATOR_HOST")
-            && !host.is_empty()
-        {
+        if !omni && let Some(host) = emulator_host.filter(|host| !host.is_empty()) {
             if endpoint.is_none() {
-                endpoint = Some(host);
+                endpoint = Some(host.to_owned());
             }
             emulator = true;
         }
@@ -231,6 +275,27 @@ impl SpannerDatabase {
             }
         }
 
+        // Without a credential option, Omni and plaintext endpoints connect anonymously instead
+        // of through ADC. Building ADC just to carry a quota project would send Google tokens to
+        // a non-Google or unencrypted host, so refuse the quota project there as well.
+        let anonymous_default = omni || endpoint.as_deref().is_some_and(is_plaintext_endpoint);
+        if !emulator
+            && anonymous_default
+            && self.explicit_credential_option().is_none()
+            && self.quota_project.is_some()
+        {
+            let mode = if omni {
+                "Spanner Omni (`spanner.instance_type=omni`)"
+            } else {
+                "a plaintext (non-https) endpoint"
+            };
+            return Err(invalid_state(format!(
+                "{mode} without explicit credentials connects anonymously and would silently \
+                 ignore the configured `{OPTION_QUOTA_PROJECT}` option; unset it or configure \
+                 explicit credentials"
+            )));
+        }
+
         // An access token is a complete credential, so a keyfile or impersonation target alongside
         // it is ambiguous.
         if self.access_token.is_some()
@@ -242,48 +307,11 @@ impl SpannerDatabase {
             )));
         }
 
-        // Blocking file I/O, so read the key file before entering the runtime.
-        let credentials_json = self.credentials_json()?;
-
-        self.runtime.block_on(async move {
-            let mut builder = Spanner::builder().with_instance_type(self.instance_type);
-            if let Some(endpoint) = endpoint.clone() {
-                builder = builder.with_endpoint(endpoint);
-            }
-            // With no configured credential, Omni and plaintext endpoints connect anonymously
-            // instead of through ADC.
-            let credentials = self
-                .build_credentials(emulator, credentials_json)?
-                .or_else(|| {
-                    (omni
-                        || endpoint.as_deref().is_some_and(|value| {
-                            value
-                                .trim()
-                                .get(..7)
-                                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
-                        }))
-                    .then(|| google_cloud_auth::credentials::anonymous::Builder::new().build())
-                });
-            if let Some(credentials) = &credentials {
-                builder = builder.with_credentials(credentials.clone());
-            }
-            let mut admin_config = ClientConfig::default();
-            admin_config.endpoint = endpoint;
-            admin_config.cred = credentials;
-            let spanner = builder.build().await.map_err(from_builder)?;
-            let client = spanner
-                .database_client(database.clone())
-                .build()
-                .await
-                .map_err(from_spanner)?;
-            Ok(Connected {
-                client,
-                database,
-                admin: Arc::new(DatabaseAdminState {
-                    client: OnceCell::new(),
-                    config: admin_config,
-                }),
-            })
+        Ok(Target {
+            database,
+            endpoint,
+            emulator,
+            anonymous_default,
         })
     }
 
@@ -300,6 +328,17 @@ impl SpannerDatabase {
         *cached = Some(connected.clone());
         Ok(connected)
     }
+}
+
+/// What [`SpannerDatabase::connect`] builds from.
+#[derive(Debug)]
+struct Target {
+    database: String,
+    endpoint: Option<String>,
+    /// From the option or `SPANNER_EMULATOR_HOST`.
+    emulator: bool,
+    /// Omni or a plaintext endpoint, where no credential option means anonymous instead of ADC.
+    anonymous_default: bool,
 }
 
 /// The data client, database path and lazily built admin client. Clones share channels and the
@@ -335,7 +374,7 @@ impl DatabaseAdminState {
             .get_or_try_init(|| async {
                 admin::database_admin(self.config.clone())
                     .await
-                    .map_err(from_builder)
+                    .map_err(from_client_builder)
             })
             .await
     }
@@ -354,7 +393,8 @@ impl Optionable for SpannerDatabase {
                 self.set_uri_option(value)?
             }
             OptionDatabase::Other(name) if name == OPTION_ENDPOINT => {
-                self.endpoint = Some(string_value(&key, value)?)
+                let endpoint = string_value(&key, value)?;
+                self.endpoint = (!endpoint.trim().is_empty()).then_some(endpoint);
             }
             OptionDatabase::Other(name) if name == OPTION_EMULATOR => {
                 self.emulator = bool_value(&key, value)?

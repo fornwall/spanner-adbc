@@ -58,6 +58,15 @@ pub(crate) fn ensure_scheme(host: &str) -> String {
     }
 }
 
+/// tonic dials every scheme except `https` without TLS, and the client crate treats such
+/// endpoints as plaintext too, so anything else counts as plaintext.
+pub(super) fn is_plaintext_endpoint(endpoint: &str) -> bool {
+    !endpoint
+        .trim()
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+}
+
 /// Database options allowed in URI query parameters; the URI path supplies the database.
 const URI_QUERY_OPTIONS: [&str; 9] = [
     OPTION_ENDPOINT,

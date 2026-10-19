@@ -53,21 +53,36 @@ connections keep theirs. Getters don't show values taken from the environment.
 | Option | Values | Default | Get | Effect |
 | --- | --- | --- | --- | --- |
 | `uri` | `spanner://` URI | required | set, verbatim | Database path plus optional endpoint and options; see [connection URIs](#connection-uris). Without it, creating a connection fails with `InvalidState`. |
-| `spanner.endpoint` | gRPC endpoint URL | production endpoint | set | Overrides the endpoint from `SPANNER_EMULATOR_HOST`. A bare `host:port` uses plaintext `http://`. |
+| `spanner.endpoint` | gRPC endpoint URL; `""` unsets | production endpoint | set | Overrides the endpoint from `SPANNER_EMULATOR_HOST`. A bare `host:port` uses `http://`. Only `https://` uses TLS; other schemes are plaintext. |
 | `spanner.emulator` | boolean | `false` | always | Uses anonymous credentials. A non-empty `SPANNER_EMULATOR_HOST` also enables this mode. |
-| `spanner.instance_type` | `cloud`, `omni` | `cloud` | always | Selects Cloud Spanner or Spanner Omni. Omni needs an explicit endpoint, ignores `SPANNER_EMULATOR_HOST` and can't be combined with `spanner.emulator=true`. Without explicit credentials, Omni connects anonymously. |
+| `spanner.instance_type` | `cloud`, `omni` | `cloud` | always | Selects Cloud Spanner or Spanner Omni. Omni needs an explicit endpoint, ignores `SPANNER_EMULATOR_HOST` and can't be combined with `spanner.emulator=true`. Without explicit credentials, Omni connects anonymously; see [anonymous connections](#anonymous-connections). |
 | `spanner.auth.keyfile` | credential JSON file path | ADC | set | Supports `service_account`, `authorized_user`, `impersonated_service_account` and `external_account` JSON. |
 | `spanner.auth.keyfile_json` | inline credential JSON | ADC | write-only | Same formats as `keyfile`, and takes precedence over it. Not allowed in URIs. |
 | `spanner.auth.impersonate.target_principal` | service account email | unset | set | Impersonates this account, using the keyfile or ADC as base credentials. |
-| `spanner.auth.impersonate.delegates` | comma-separated service account emails | no delegates | nonempty | Delegation chain. Entries are trimmed and empty entries dropped. Needs a target principal. |
-| `spanner.auth.impersonate.scopes` | comma-separated OAuth scopes | `cloud-platform` | nonempty | Scopes for the impersonated token, normalized like delegates. Needs a target principal. |
-| `spanner.auth.impersonate.lifetime` | non-negative integer seconds | `3600` | explicitly set only | Lifetime of the impersonated token. Accepts an integer or integer string. |
+| `spanner.auth.impersonate.delegates` | comma-separated service account emails | no delegates | nonempty | Delegation chain. Entries are trimmed and empty entries dropped. Ignored without a target principal. |
+| `spanner.auth.impersonate.scopes` | comma-separated OAuth scopes | `cloud-platform` | nonempty | Scopes for the impersonated token, normalized like delegates. Ignored without a target principal. |
+| `spanner.auth.impersonate.lifetime` | non-negative integer seconds | `3600` | explicitly set only | Lifetime of the impersonated token. Accepts an integer or integer string. Ignored without a target principal. |
 | `spanner.auth.access_token` | OAuth bearer token | ADC | write-only | Sent as is and never refreshed. Not allowed in URIs. |
-| `spanner.auth.quota_project` | project ID; `""` unsets | credential default | set | Sends `x-goog-user-project`; the caller needs `serviceusage.services.use`. With ADC, `GOOGLE_CLOUD_QUOTA_PROJECT` takes precedence. |
+| `spanner.auth.quota_project` | project ID; `""` unsets | credential default | set | Sends `x-goog-user-project`; the caller needs `serviceusage.services.use`. With ADC, `GOOGLE_CLOUD_QUOTA_PROJECT` takes precedence. Rejected in emulator mode and [anonymous connections](#anonymous-connections). |
 
 In emulator mode, creating the client stack fails with `InvalidState` if a keyfile, inline JSON,
 access token, impersonation target or quota project is set. Ambient ADC doesn't count. An access
 token can't be combined with a keyfile, inline JSON or an impersonation target.
+
+A keyfile, inline JSON or ADC that can't be read or parsed, for example because
+`GOOGLE_APPLICATION_CREDENTIALS` names a missing file, fails with `InvalidArguments` when the
+client stack is built. A token that can't be fetched or is rejected surfaces as `Unauthenticated`.
+
+### Anonymous connections
+
+Omni and plaintext endpoints connect anonymously unless a keyfile, inline JSON, access token or
+impersonation target is set. They never use ambient ADC or `GOOGLE_CLOUD_QUOTA_PROJECT`, so
+Google credentials aren't sent to a non-Google or unencrypted host by default. A quota project
+would need ADC there, so without one of those options creating the client stack fails with
+`InvalidState`.
+
+Explicit credentials are always sent. Over a plaintext endpoint, their bearer tokens travel
+unencrypted, so use `https://` unless the host is local or on a trusted network.
 
 ### Connection URIs
 
@@ -81,8 +96,8 @@ spanner://localhost:9010/projects/<p>/instances/<i>/databases/<d>
 
 The path names the database; its segments are percent-decoded. A `host:port` authority sets
 `spanner.endpoint` and connects over plaintext `http://`; without one, use three slashes. A
-plaintext endpoint without credential options connects anonymously, but only `spanner.emulator`
-or `SPANNER_EMULATOR_HOST` turn on emulator mode.
+plaintext endpoint without credential options [connects anonymously](#anonymous-connections), but
+only `spanner.emulator` or `SPANNER_EMULATOR_HOST` turn on emulator mode.
 
 Query parameters can set any database option except `uri`, `spanner.auth.keyfile_json` and
 `spanner.auth.access_token`. Unknown or forbidden keys return `InvalidArguments`. Values are
@@ -297,3 +312,4 @@ configured values. Backoff is independent of the attempt and time limits.
 - `GOOGLE_CLOUD_QUOTA_PROJECT` overrides the quota project option when credentials come from ADC.
   Keyfile, impersonated and access token credentials use the option instead, though an ADC source
   used as the base for impersonation can still apply the environment value to its own requests.
+  Emulator mode and anonymous connections ignore it.

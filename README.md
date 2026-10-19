@@ -121,7 +121,12 @@ unless you configure something else:
 - `spanner.auth.quota_project` sets the project billed for quota.
 
 For the emulator, set `SPANNER_EMULATOR_HOST` or `spanner.emulator=true`. The driver then
-connects without credentials and rejects explicit credential options.
+connects without credentials and rejects explicit credential options and a quota project.
+
+Spanner Omni and plaintext endpoints (`http://` or a bare `host:port`) also connect without
+credentials unless you set a keyfile, access token or impersonation target, and they reject a
+quota project without one. Explicit credentials sent to a plaintext endpoint are unencrypted, so
+use `https://` for remote hosts. See [anonymous connections](docs/options.md#anonymous-connections).
 
 Keep secrets out of URIs: the driver rejects `keyfile_json` and `access_token` as URI query
 parameters. See [database options](docs/options.md#database-options) for precedence rules.

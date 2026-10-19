@@ -14,7 +14,7 @@ use http::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use http::{Extensions, HeaderMap};
 
 use super::SpannerDatabase;
-use crate::error::{err, invalid_argument};
+use crate::error::{err, from_builder, invalid_argument};
 use crate::{
     OPTION_ACCESS_TOKEN, OPTION_IMPERSONATE_TARGET_PRINCIPAL, OPTION_KEYFILE, OPTION_KEYFILE_JSON,
     OPTION_QUOTA_PROJECT,
@@ -34,7 +34,9 @@ pub(super) const DEFAULT_IMPERSONATION_LIFETIME_SECS: u64 = 3600;
 /// carry no data, so a bearer token never ends up in a `Debug`-derived type.
 #[derive(Debug, PartialEq, Eq)]
 enum CredentialChoice {
-    /// Emulator mode. `connect` refuses it alongside any credential option.
+    /// Emulator mode, or Omni or a plaintext endpoint without a credential option. `connect`
+    /// refuses emulator mode alongside any credential option, and every anonymous mode alongside
+    /// a quota project.
     Anonymous,
     /// [`OPTION_ACCESS_TOKEN`]. `connect` refuses it alongside the options below.
     AccessToken,
@@ -42,7 +44,7 @@ enum CredentialChoice {
     Impersonate,
     /// [`OPTION_KEYFILE_JSON`] or [`OPTION_KEYFILE`].
     Keyfile,
-    /// No credential option is set.
+    /// No credential option is set, on Cloud Spanner over TLS.
     Adc,
 }
 
@@ -90,7 +92,8 @@ impl SpannerDatabase {
     }
 
     /// `emulator` is the resolved mode: the option or `SPANNER_EMULATOR_HOST`.
-    fn credential_choice(&self, emulator: bool) -> CredentialChoice {
+    /// `anonymous_default` replaces ADC for Omni and plaintext endpoints.
+    fn credential_choice(&self, emulator: bool, anonymous_default: bool) -> CredentialChoice {
         if emulator {
             CredentialChoice::Anonymous
         } else if self.access_token.is_some() {
@@ -99,6 +102,8 @@ impl SpannerDatabase {
             CredentialChoice::Impersonate
         } else if self.keyfile_json.is_some() || self.keyfile.is_some() {
             CredentialChoice::Keyfile
+        } else if anonymous_default {
+            CredentialChoice::Anonymous
         } else {
             CredentialChoice::Adc
         }
@@ -111,10 +116,11 @@ impl SpannerDatabase {
     pub(super) fn build_credentials(
         &self,
         emulator: bool,
+        anonymous_default: bool,
         credentials_json: Option<String>,
     ) -> Result<Option<Credentials>> {
         let quota_project = self.quota_project.as_deref();
-        match self.credential_choice(emulator) {
+        match self.credential_choice(emulator, anonymous_default) {
             CredentialChoice::Anonymous => Ok(Some(AnonymousCredentials::new().build())),
             CredentialChoice::AccessToken => self
                 .access_token
@@ -237,6 +243,24 @@ fn build_credentials_from_json(json: &str, quota_project: Option<&str>) -> Resul
             Status::InvalidArguments,
         )
     })
+}
+
+/// Translate a client builder error. A client that cannot load ADC, for example from a missing
+/// `GOOGLE_APPLICATION_CREDENTIALS` file, gets the status of the driver's own ADC builds above
+/// instead of `Internal`.
+pub(super) fn from_client_builder(
+    error: google_cloud_gax::client_builder::Error,
+) -> adbc_core::error::Error {
+    if !error.is_default_credentials() {
+        return from_builder(error);
+    }
+    let detail = std::error::Error::source(&error)
+        .and_then(|source| source.downcast_ref::<google_cloud_auth::build_errors::Error>())
+        .map_or("the credentials could not be built", scrub_credential_error);
+    err(
+        format!("failed to build Application Default Credentials: {detail}"),
+        Status::InvalidArguments,
+    )
 }
 
 /// Describe a credential-builder error with a fixed phrase.

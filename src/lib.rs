@@ -407,7 +407,8 @@ pub mod bench_support {
 }
 
 /// Database option: an explicit gRPC endpoint, such as an emulator's `http://localhost:9010`.
-/// When unset, the client connects to the production service.
+/// A bare `host:port` connects over plaintext. When unset or `""`, the client connects to the
+/// production service.
 pub const OPTION_ENDPOINT: &str = "spanner.endpoint";
 
 /// Database option: when `true`, connect with anonymous credentials, as the Spanner emulator
@@ -464,9 +465,10 @@ pub const OPTION_ACCESS_TOKEN: &str = "spanner.auth.access_token";
 
 /// Database option: the quota (billing) project charged for Spanner API usage, sent as the
 /// `x-goog-user-project` header, like gcloud's `--billing-project`. The caller needs
-/// `serviceusage.services.use` on it. Works with every credential source but is rejected in
-/// emulator mode. `""` unsets it. `GOOGLE_CLOUD_QUOTA_PROJECT` takes precedence over it in the
-/// auth library.
+/// `serviceusage.services.use` on it. Works with every credential source, but is rejected in
+/// emulator mode and on Omni or plaintext endpoints without explicit credentials, which connect
+/// anonymously. `""` unsets it. `GOOGLE_CLOUD_QUOTA_PROJECT` takes precedence over it in the auth
+/// library.
 pub const OPTION_QUOTA_PROJECT: &str = "spanner.auth.quota_project";
 
 /// Statement option: the number of rows in each Arrow [`RecordBatch`](arrow_array::RecordBatch)
