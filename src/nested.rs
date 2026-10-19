@@ -1,11 +1,8 @@
-//! Shared helpers for assembling the nested list/struct/union result batches of the metadata
-//! methods ([`get_objects`](adbc_core::Connection::get_objects),
-//! [`get_statistics`](adbc_core::Connection::get_statistics),
-//! [`get_info`](adbc_core::Connection::get_info)).
+//! Helpers for building the nested list, struct and union batches returned by `get_objects`,
+//! `get_statistics` and `get_info`.
 //!
-//! The result schemas are `adbc_core` constants, so the shape lookups here cannot fail in
-//! practice — but this crate is loaded as a cdylib, so a mismatch must surface as a
-//! `Status::Internal` error rather than a panic unwinding into the C ABI.
+//! The result schemas are `adbc_core` constants, so shape lookups cannot fail in practice. They
+//! still return `Status::Internal` errors because a panic must not unwind into the C ABI.
 
 use std::sync::Arc;
 
@@ -16,7 +13,6 @@ use arrow_schema::{ArrowError, DataType, FieldRef, Fields, UnionFields};
 
 use crate::error::err;
 
-/// An `Internal` error for a metadata result batch that failed to assemble.
 pub(crate) fn arrow_err(e: ArrowError) -> Error {
     err(
         format!("failed to build metadata result batch: {e}"),
@@ -24,7 +20,6 @@ pub(crate) fn arrow_err(e: ArrowError) -> Error {
     )
 }
 
-/// An `Internal` error for a metadata result schema without the expected shape.
 pub(crate) fn shape_err(expected: &str) -> Error {
     err(
         format!("unexpected ADBC result schema shape: expected {expected}"),
@@ -32,7 +27,6 @@ pub(crate) fn shape_err(expected: &str) -> Error {
     )
 }
 
-/// The `Field` for a named field within `fields`.
 pub(crate) fn field(fields: &Fields, name: &str) -> Result<FieldRef> {
     fields
         .find(name)
@@ -40,7 +34,6 @@ pub(crate) fn field(fields: &Fields, name: &str) -> Result<FieldRef> {
         .ok_or_else(|| shape_err(&format!("field `{name}`")))
 }
 
-/// The item field of a `List` field.
 pub(crate) fn list_item(list_field: &FieldRef) -> Result<FieldRef> {
     match list_field.data_type() {
         DataType::List(item) => Ok(item.clone()),
@@ -48,7 +41,6 @@ pub(crate) fn list_item(list_field: &FieldRef) -> Result<FieldRef> {
     }
 }
 
-/// The `Fields` of a `Struct` field (e.g. a list item).
 pub(crate) fn struct_fields(struct_field: &FieldRef) -> Result<Fields> {
     match struct_field.data_type() {
         DataType::Struct(fs) => Ok(fs.clone()),
@@ -59,15 +51,12 @@ pub(crate) fn struct_fields(struct_field: &FieldRef) -> Result<Fields> {
     }
 }
 
-/// Wrap `child` (one entry per element) into a `ListArray` grouping elements by `lengths`, one
-/// non-null list per parent.
+/// Group `child` into non-null lists of the given `lengths`.
 pub(crate) fn list_of(item: FieldRef, lengths: &[usize], child: ArrayRef) -> Result<ArrayRef> {
     list_of_nullable(item, lengths, child, None)
 }
 
-/// Like [`list_of`], but marks selected list entries null via `nulls` (a validity mask, one bool
-/// per entry — `false` = SQL NULL). A null entry still has a zero-length slice, so its `lengths`
-/// value must be 0.
+/// Like [`list_of`], with `nulls` marking null entries. A null entry's length must be 0.
 pub(crate) fn list_of_nullable(
     item: FieldRef,
     lengths: &[usize],
@@ -99,11 +88,8 @@ pub(crate) fn list_of_nullable(
     Ok(Arc::new(list))
 }
 
-/// Assemble a dense [`UnionArray`] matching `fields` exactly. `populated` supplies the child array
-/// for each branch this caller actually uses (keyed by its type id); every other branch is filled
-/// with an empty array of the right type, so the union type still matches its schema even though no
-/// row references those branches. `type_ids` / `offsets` select, per row, which branch and slot the
-/// value lives in.
+/// Assemble a dense union of `fields`. `populated` supplies the children in use by type id; the
+/// other branches get empty arrays so the union type still matches the schema.
 pub(crate) fn dense_union(
     fields: &UnionFields,
     populated: &[(i8, ArrayRef)],

@@ -27,7 +27,7 @@ fn parses_attempts_from_strings_ints_and_whole_doubles() {
         .set_option(MAX_ATTEMPTS, OptionValue::Double(2.0))
         .unwrap();
     assert_eq!(config.option_string(MAX_ATTEMPTS).unwrap(), "2");
-    // 1 is valid: one attempt, no retries.
+    // One attempt, no retries.
     config.set_option(MAX_ATTEMPTS, s("1")).unwrap();
     assert_eq!(config.option_string(MAX_ATTEMPTS).unwrap(), "1");
 }
@@ -90,13 +90,11 @@ fn rejects_bad_attempts() {
         OptionValue::Double(f64::NAN),
         s("abc"),
         OptionValue::Bytes(vec![1]),
-        // Above u32::MAX.
         OptionValue::Int(i64::from(u32::MAX) + 1),
     ];
     for value in bad {
         let error = config.set_option(MAX_ATTEMPTS, value.clone()).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "value {value:?}");
-        // The stored value is left untouched.
         assert_eq!(config.option_string(MAX_ATTEMPTS).unwrap(), "3");
     }
 }
@@ -137,12 +135,10 @@ fn retry_policy_arg_is_none_until_configured() {
     assert!(config.retry.retry_policy_arg().is_none());
     config.set_option(MAX_ELAPSED_SECONDS, s("10")).unwrap();
     assert!(config.retry.retry_policy_arg().is_some());
-    // Both set: still a policy (the loop stops at whichever limit fires first).
     config.set_option(MAX_ATTEMPTS, s("5")).unwrap();
     assert!(config.retry.retry_policy_arg().is_some());
 }
 
-/// Statement options inherit connection values, then override them independently.
 #[test]
 fn statement_inherits_then_overrides_independently() {
     let mut connection = SharedConfig::default();
@@ -163,7 +159,6 @@ fn statement_inherits_then_overrides_independently() {
             .status,
         Status::NotFound
     );
-    // The connection is unaffected by statement-level overrides.
     assert_eq!(connection.option_string(MAX_ATTEMPTS).unwrap(), "10");
     assert_eq!(connection.option_string(MAX_ELAPSED_SECONDS).unwrap(), "20");
 }
@@ -266,10 +261,9 @@ fn rejects_bad_backoff_multiplier() {
             .set_option(BACKOFF_MULTIPLIER, value.clone())
             .unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "value {value:?}");
-        // The stored value is left untouched.
         assert_eq!(config.option_string(BACKOFF_MULTIPLIER).unwrap(), "2");
     }
-    // Sub-1.0 multipliers are accepted (floored to 1.0 at build time), not rejected.
+    // Multipliers below 1.0 are accepted and clamped when building the policy.
     config
         .set_option(BACKOFF_MULTIPLIER, OptionValue::Double(0.5))
         .unwrap();
@@ -280,11 +274,9 @@ fn rejects_bad_backoff_multiplier() {
 fn backoff_policy_arg_is_none_until_configured() {
     let mut config = SharedConfig::default();
     assert!(config.retry.backoff_policy_arg().is_none());
-    // The attempt / elapsed-time limits alone do not produce a backoff policy.
     config.set_option(MAX_ATTEMPTS, s("3")).unwrap();
     config.set_option(MAX_ELAPSED_SECONDS, s("10")).unwrap();
     assert!(config.retry.backoff_policy_arg().is_none());
-    // Each backoff knob on its own is enough.
     config
         .set_option(BACKOFF_INITIAL_SECONDS, s("0.25"))
         .unwrap();
@@ -299,8 +291,6 @@ fn backoff_policy_arg_is_none_until_configured() {
     assert!(config.retry.backoff_policy_arg().is_some());
 }
 
-/// A backoff-only configuration builds a policy but leaves the retry (attempt/elapsed) policy
-/// untouched, and vice versa — the two families are independent.
 #[test]
 fn retry_and_backoff_are_independent() {
     let mut backoff_only = SharedConfig::default();
@@ -314,8 +304,6 @@ fn retry_and_backoff_are_independent() {
     assert!(retry_only.retry.backoff_policy_arg().is_none());
 }
 
-/// Backoff knobs inherit into a copied (statement) config and override independently, mirroring
-/// the attempt / elapsed-time inheritance test above.
 #[test]
 fn statement_inherits_then_overrides_backoff_independently() {
     let mut connection = SharedConfig::default();
@@ -343,21 +331,18 @@ fn statement_inherits_then_overrides_backoff_independently() {
         Status::NotFound
     );
     assert_eq!(statement.option_string(BACKOFF_MULTIPLIER).unwrap(), "2");
-    // The connection is unaffected by statement-level overrides.
     assert_eq!(connection.option_string(BACKOFF_MAX_SECONDS).unwrap(), "40");
     assert_eq!(connection.option_string(BACKOFF_MULTIPLIER).unwrap(), "3");
 }
 
-/// The three backoff knobs are opaque `f64`s at the option layer, so out-of-range values reach
-/// the gax builder; [`ExponentialBackoffBuilder::clamp`] is what keeps building the policy
-/// infallible. Nothing pinned that, and a switch to `build()` would turn a value the option
-/// layer accepts into a failure (or a panic) at the first retried RPC.
+/// Out-of-range backoff values pass option validation. Using `build()` instead of `clamp()` would
+/// make them fail at the first retried RPC.
 #[test]
 fn backoff_knobs_are_clamped_into_the_gax_recommended_ranges() {
     let rendered =
         |config: &SharedConfig| format!("{:?}", config.retry.backoff_policy_arg().unwrap());
 
-    // Everything below the floor: initial delay >= 1ms, maximum delay >= 1s, multiplier >= 1.0.
+    // Floors: initial delay 1ms, maximum delay 1s, multiplier 1.0.
     let mut low = SharedConfig::default();
     low.set_option(BACKOFF_INITIAL_SECONDS, s("0.0005"))
         .unwrap();
@@ -370,7 +355,7 @@ fn backoff_knobs_are_clamped_into_the_gax_recommended_ranges() {
          scaling: 1.0 })"
     );
 
-    // Everything above the ceiling: maximum delay <= 24h, multiplier <= 32.0.
+    // Ceilings: maximum delay 24h, multiplier 32.0.
     let mut high = SharedConfig::default();
     high.set_option(BACKOFF_MAX_SECONDS, s("200000")).unwrap();
     high.set_option(BACKOFF_MULTIPLIER, s("100")).unwrap();
@@ -380,8 +365,7 @@ fn backoff_knobs_are_clamped_into_the_gax_recommended_ranges() {
          scaling: 32.0 })"
     );
 
-    // An initial delay past the maximum is an empty range, which `build()` rejects outright;
-    // clamping collapses it onto the maximum instead.
+    // An initial delay past the maximum is clamped to it.
     let mut inverted = SharedConfig::default();
     inverted
         .set_option(BACKOFF_INITIAL_SECONDS, s("30"))
@@ -393,7 +377,7 @@ fn backoff_knobs_are_clamped_into_the_gax_recommended_ranges() {
          scaling: 2.0 })"
     );
 
-    // Setting one knob leaves the other two at the client's own defaults (1s / 60s / x2).
+    // Unset values keep the client defaults.
     let mut one = SharedConfig::default();
     one.set_option(BACKOFF_MULTIPLIER, s("3")).unwrap();
     assert_eq!(

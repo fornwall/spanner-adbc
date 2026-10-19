@@ -12,7 +12,7 @@ const DDL_KEYWORDS: &[&str] = &[
     "CREATE", "DROP", "ALTER", "RENAME", "GRANT", "REVOKE", "ANALYZE",
 ];
 
-/// Leading keywords that identify a Spanner DML statement (data modification).
+/// Leading keywords that identify a Spanner DML statement.
 const DML_KEYWORDS: &[&str] = &["INSERT", "UPDATE", "DELETE"];
 
 /// Whether the first nonempty statement is DDL, ignoring comments and statement hints.
@@ -25,17 +25,10 @@ pub(crate) fn is_dml(sql: &str) -> bool {
     first_keyword(sql).is_some_and(|kw| DML_KEYWORDS.iter().any(|k| kw.eq_ignore_ascii_case(k)))
 }
 
-/// Return `true` if `sql` contains a top-level `THEN RETURN` clause — DML that returns rows
-/// (`INSERT`/`UPDATE`/`DELETE ... THEN RETURN <columns>`).
+/// Whether `sql` contains a top-level `THEN RETURN` clause, making it DML that returns rows.
 ///
-/// Scans word tokens outside literals and comments — via the shared [`Lexer`] — for `THEN`
-/// immediately followed by `RETURN`, case-insensitively, but only at `CASE` nesting depth zero.
-/// GoogleSQL's `THEN RETURN` clause appears only at the top level, at the end of a DML statement; a
-/// `THEN` inside `CASE WHEN … THEN … END` belongs to the CASE, so a branch expression that is a
-/// column literally named `return` (`RETURN` is not a reserved keyword) must not match. `CASE`/`END`
-/// are tracked as a nesting depth (`END` only closes `CASE` in GoogleSQL expressions); quoted
-/// identifiers and literals never affect it, and an unbalanced `END` (invalid SQL) saturates at zero
-/// rather than underflowing.
+/// `RETURN` is not reserved, so in `CASE WHEN c THEN return END` it may be a column; `THEN` only
+/// counts outside `CASE ... END`. An unbalanced `END` saturates the depth at zero.
 pub(crate) fn is_dml_returning(sql: &str) -> bool {
     let mut previous_was_then = false;
     let mut case_depth = 0usize;
@@ -52,9 +45,7 @@ pub(crate) fn is_dml_returning(sql: &str) -> bool {
                     case_depth = case_depth.saturating_sub(1);
                 }
             }
-            // A quoted literal/identifier resets the keyword window, so `THEN 'x' RETURN` is not a
-            // clause. Comments and punctuation between the two keywords are transparent (they carry
-            // no word), matching `THEN /* keep */ RETURN` and `THEN\n  RETURN`.
+            // A literal between the keywords breaks the clause; comments and punctuation don't.
             Lexeme::Quoted(_) => previous_was_then = false,
             Lexeme::Comment(_) | Lexeme::Other(_) => {}
         }
@@ -62,27 +53,17 @@ pub(crate) fn is_dml_returning(sql: &str) -> bool {
     false
 }
 
-/// Consume a string/bytes literal or quoted identifier whose opening `quote` has just been read,
-/// feeding every consumed character (excluding the already-read opening quote) to `sink`.
+/// Consume a literal or quoted identifier whose opening `quote` has been read, passing each
+/// consumed character to `sink`. Handles triple-quoted strings and backslash escapes.
 ///
-/// Handles the GoogleSQL lexical structure:
-/// - **triple-quoted** strings (`'''…'''` / `"""…"""`), which may contain unescaped quotes and
-///   newlines and close only on three consecutive quote characters;
-/// - backslash escapes, both in ordinary literals and inside quoted identifiers
-///   (`` ` ``, which are never triple-quoted).
+/// A backslash escapes the next character in raw literals too: the `r` prefix changes how the
+/// contents are interpreted, not where the literal ends ("a raw string cannot end with an odd
+/// number of backslashes"). So `r'x\'; DROP TABLE t'` is one string. Treating `\` as inert would
+/// let a value ending in a backslash close early and inject a statement boundary.
 ///
-/// A backslash binds the following character in **every** literal, raw ones (`r'…'`, `rb'…'`,
-/// `br'…'`) included: the `r` prefix changes how the bytes are *interpreted*, not where the
-/// literal *ends*, and this lexer only ever looks for the end. GoogleSQL agrees — "a raw string
-/// cannot end with an odd number of backslashes" — so `r'x\'` is unterminated rather than
-/// complete, and `r'x\'; DROP TABLE t'` is one string, not a statement followed by a `DROP`.
-/// Treating `\` as inert here would let a value ending in a backslash (a Windows path, a regex)
-/// close its literal early and smuggle statement boundaries past [`split_statements`].
-///
-/// One deliberate divergence: GoogleSQL ends a non-triple literal at an unescaped newline, while
-/// this scan runs on to end of input. Such SQL is invalid either way and Spanner rejects it; the
-/// lenient scan merely errs toward *fewer* statement boundaries, never more, which is the safe
-/// direction for a splitter that feeds `UpdateDatabaseDdl`/`ExecuteBatchDml`.
+/// GoogleSQL ends a non-triple literal at an unescaped newline, but this scan continues to end of
+/// input. Such SQL is invalid anyway, and the lenient scan can only yield fewer statement
+/// boundaries, never more.
 fn consume_quoted(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     quote: char,
@@ -121,27 +102,22 @@ fn consume_quoted(
     }
 }
 
-/// A GoogleSQL token. Tokens partition the input with no gaps or overlaps; splitting and
-/// classification share the same quote/comment boundaries.
+/// A GoogleSQL token. Tokens partition the input with no gaps or overlaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lexeme<'a> {
-    /// A maximal run of identifier characters (`[A-Za-z0-9_]`): a keyword, identifier or number.
+    /// A run of `[A-Za-z0-9_]`: a keyword, identifier or number.
     Word(&'a str),
-    /// A string/bytes literal or quoted identifier, delimiters included — triple-quoted and
-    /// backslash-escaped forms handled per [`consume_quoted`], so an embedded quote / `;` /
-    /// comment marker never ends it early.
+    /// A literal or quoted identifier, delimiters included.
     Quoted(&'a str),
-    /// A `--`/`#` line comment (through its terminating newline, or end of input) or a `/* … */`
-    /// block comment, delimiters included. An unterminated comment runs to end of input.
+    /// A line comment through its newline, or a block comment. Unterminated comments run to end
+    /// of input.
     Comment(&'a str),
-    /// Any other single character — whitespace, punctuation, an operator, `;`, `@`, ….
+    /// Any other single character.
     Other(char),
 }
 
-/// Tokenize `sql` into [`Lexeme`]s under GoogleSQL's lexical rules (the string/comment structure
-/// shared by DDL/DML batch splitting, statement classification, `THEN RETURN` detection and
-/// `@name` extraction). A literal's prefix (`r`/`rb`/`br`/`b`) lexes as an ordinary [`Lexeme::Word`]
-/// because it does not change where the literal ends; see [`consume_quoted`].
+/// Tokenize `sql`. A literal prefix (`r`, `b`, `rb`, `br`) lexes as a separate [`Lexeme::Word`]
+/// because it does not change where the literal ends.
 fn lex(sql: &str) -> Lexer<'_> {
     Lexer {
         input: sql,
@@ -150,11 +126,10 @@ fn lex(sql: &str) -> Lexer<'_> {
     }
 }
 
-/// The iterator behind [`lex`]. See [`Lexeme`] for the guarantees each item carries.
 struct Lexer<'a> {
     input: &'a str,
     chars: std::iter::Peekable<std::str::Chars<'a>>,
-    /// Byte offset of the next character `chars` will yield — used to slice `input`.
+    /// Byte offset of the next character in `input`.
     pos: usize,
 }
 
@@ -165,8 +140,7 @@ impl Lexer<'_> {
         Some(c)
     }
 
-    /// Consume a `--`/`#` line comment through its terminating newline (inclusive) or end of input.
-    /// The introducer (`#`, or the first `-`) has already been consumed.
+    /// Consume a line comment through its newline. The introducer has already been consumed.
     fn consume_line_comment(&mut self) {
         while let Some(ch) = self.bump() {
             if ch == '\n' {
@@ -188,7 +162,6 @@ impl<'a> Iterator for Lexer<'a> {
         let c = self.bump()?;
         let lexeme = match c {
             '\'' | '"' | '`' => {
-                // The opening quote is already consumed; advance `pos` past the rest of the literal.
                 let mut consumed = 0usize;
                 consume_quoted(&mut self.chars, c, |ch| consumed += ch.len_utf8());
                 self.pos += consumed;
@@ -225,13 +198,10 @@ impl<'a> Iterator for Lexer<'a> {
     }
 }
 
-/// The lexemes of `sql` that can carry meaning for a classifier, with comments and whitespace
-/// dropped and one lexeme of lookahead.
+/// Lexemes other than comments and whitespace, with one lexeme of lookahead.
 ///
-/// GoogleSQL lexes `@`, `{` and a parameter's name as separate tokens, so whitespace and comments
-/// are legal *between* them: `@ {HINT=1} UPDATE …` and `@/*c*/p` are both accepted by Spanner.
-/// Filtering the transparent lexemes out up front lets [`first_keyword`] and [`named_parameters`]
-/// match those two-token shapes without each re-implementing the skipping.
+/// GoogleSQL lexes `@`, `{` and a parameter name as separate tokens, so Spanner accepts
+/// `@ {HINT=1} UPDATE ...` and `@/*c*/p`.
 fn significant_lexemes(sql: &str) -> std::iter::Peekable<impl Iterator<Item = Lexeme<'_>>> {
     lex(sql)
         .filter(|lexeme| {
@@ -241,18 +211,12 @@ fn significant_lexemes(sql: &str) -> std::iter::Peekable<impl Iterator<Item = Le
         .peekable()
 }
 
-/// Split a (possibly multi-statement) SQL string into individual, trimmed, non-empty statements.
+/// Split SQL into trimmed statements on top-level `;`, ignoring semicolons in literals, quoted
+/// identifiers and comments.
 ///
-/// Segments carrying no statement — pure whitespace, or only comments — are dropped rather than
-/// emitted as empty statements. Callers depend on the resulting count:
-/// it decides the all-DML batch check, the partitioned-DML and `THEN RETURN` single-statement
-/// guards, and whether [`strip_trailing_terminators`] treats the input as one query.
-///
-/// Splits on top-level `;`, ignoring semicolons inside string/bytes literals and quoted
-/// identifiers — including triple-quoted (`'''…'''`/`"""…"""`) and raw (`r'…'`, `rb'…'`, …) forms,
-/// see [`consume_quoted`] — and comments (`-- …`, `# …`, `/* … */`). Both are handled by the
-/// shared [`lex`] tokenizer; byte offsets retain each statement verbatim. This is shared by DDL
-/// batching (`UpdateDatabaseDdl`) and multi-statement DML batching (`ExecuteBatchDml`).
+/// Segments with only whitespace or comments are dropped. Callers depend on the count: it drives
+/// the all-DML batch check, the single-statement guards for partitioned DML and `THEN RETURN`,
+/// and [`strip_trailing_terminators`].
 pub(crate) fn split_statements(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut lexer = lex(sql);
@@ -278,22 +242,12 @@ pub(crate) fn split_statements(sql: &str) -> Vec<String> {
     statements
 }
 
-/// Strip top-level `;` terminators, plus surrounding whitespace, from a **single** query, so
-/// `SELECT current_date;;;` becomes `SELECT current_date`.
+/// Strip top-level `;` terminators from a single statement: `SELECT 1;;` becomes `SELECT 1`.
 ///
-/// Leading and interior terminators go the same way (`"; SELECT 1"` becomes `SELECT 1`), because
-/// the statement is recovered from the splitter rather than trimmed off the end; a trailing
-/// comment-only segment is dropped with them (`"SELECT 1;\n-- tail\n;"` becomes `SELECT 1`), while
-/// a comment attached to the statement itself is kept (`"SELECT 1 -- tail"` is unchanged).
-///
-/// Spanner's single-use query API rejects a trailing `;` ("Expected end of input but got `;`"), yet
-/// many clients and conformance suites append one. This reuses the GoogleSQL-aware
-/// [`split_statements`] scanner, so a `;` inside a string literal, quoted identifier or comment is
-/// preserved (`SELECT ';'` is unchanged) rather than being mistaken for a terminator.
-///
-/// Only a single statement is stripped: if the SQL parses to more than one top-level statement it is
-/// returned unchanged, so a genuine multi-statement query keeps reaching Spanner (which rejects it)
-/// rather than being silently reduced to its first statement.
+/// Spanner's query API rejects a trailing `;`, which many clients and conformance suites send.
+/// The statement comes from [`split_statements`], so leading semicolons and trailing comment-only
+/// segments go too, while comments attached to the statement stay. Input that is not exactly one
+/// statement is returned unchanged for Spanner to reject.
 pub(crate) fn strip_trailing_terminators(sql: &str) -> String {
     let mut statements = split_statements(sql);
     if statements.len() == 1 {
@@ -303,18 +257,16 @@ pub(crate) fn strip_trailing_terminators(sql: &str) -> String {
     }
 }
 
-/// Borrow the first keyword, skipping empty statements, comments, whitespace and `@{…}` hints.
-/// A quoted `}` does not close a hint; an unterminated hint consumes the remaining input.
-/// Other leading punctuation or quoted text yields no keyword. The keyword is the first word's
-/// ASCII-alphabetic prefix, in its original case; invalid words such as `CREATE2` route as `CREATE`.
+/// The first keyword, skipping empty statements, comments and `@{...}` hints. A quoted `}` does
+/// not close a hint, and an unterminated hint consumes the rest. Leading punctuation or quoted
+/// text yields `None`. Returns the word's leading ASCII letters in their original case, so
+/// `CREATE2` routes as `CREATE`.
 pub(crate) fn first_keyword(sql: &str) -> Option<&str> {
     let mut lexemes = significant_lexemes(sql);
     while let Some(lexeme) = lexemes.next() {
         match lexeme {
             Lexeme::Comment(_) | Lexeme::Other(';') => {}
-            // A statement hint `@{…}`: skip through its closing `}`. GoogleSQL lexes `@` and `{`
-            // as separate tokens, so `@ {…}` and `@/*c*/{…}` are hints too (Spanner accepts both)
-            // — `significant_lexemes` has already dropped whatever sat between them.
+            // A statement hint. `significant_lexemes` dropped anything between `@` and `{`.
             Lexeme::Other('@') if lexemes.peek() == Some(&Lexeme::Other('{')) => {
                 for hint_lexeme in lexemes.by_ref() {
                     if hint_lexeme == Lexeme::Other('}') {
@@ -334,26 +286,15 @@ pub(crate) fn first_keyword(sql: &str) -> Option<&str> {
     None
 }
 
-/// Extract the distinct named parameters (`@name`) referenced by `sql`, in order of first
-/// appearance.
+/// Distinct `@name` parameters in order of first appearance, for `get_parameter_schema` before
+/// anything is bound.
 ///
-/// Skips `@name` occurrences inside string / bytes literals and quoted identifiers — including
-/// triple-quoted (`'''…'''`/`"""…"""`) and raw (`r'…'`, `rb'…'`, …) forms — and comments
-/// (`-- …`, `# …`, `/* … */`), and does not treat statement hints (`@{…}`) or system variables
-/// (`@@var`) as parameters: the shared [`lex`] tokenizer folds those into their own lexeme, so a
-/// `@name` is only a parameter when the `@` stands as its own token. Used by
-/// `get_parameter_schema` when no parameter data has been bound yet.
+/// Literals, comments, hints (`@{...}`) and system variables (`@@var`) are skipped. Spanner allows
+/// whitespace or a comment after `@`, and backtick-quoted names: `@ p`, `@/*c*/p` and `` @`p` ``
+/// all name `p`. A quoted name containing a backslash escape is skipped rather than guessed at.
 ///
-/// The name may be a bare identifier run or a backtick-quoted identifier, and whitespace or a
-/// comment may sit between the `@` and it — Spanner accepts `` @`p` ``, `@ p` and `@/*c*/p` as
-/// references to the same parameter `p`. A backtick-quoted name containing a backslash escape is
-/// skipped rather than guessed at: decoding it wrongly would name a parameter that does not exist,
-/// which is worse than the omission (such names do not occur in practice).
-///
-/// Names are deduplicated case-insensitively, keeping the first spelling seen. Spanner resolves
-/// parameters case-insensitively — `@p` binds from `P` — and rejects a request that supplies two
-/// spellings of one name with "Duplicate parameter name", so reporting `@v` and `@V` separately
-/// would make the driver build exactly that rejected request.
+/// Spanner matches names case-insensitively and rejects two spellings of one name as "Duplicate
+/// parameter name", so names are deduplicated case-insensitively, keeping the first spelling.
 pub(crate) fn named_parameters(sql: &str) -> Vec<String> {
     let mut params: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -364,23 +305,20 @@ pub(crate) fn named_parameters(sql: &str) -> Vec<String> {
         }
         // `.copied()` releases the peek borrow so the matched arm can advance `lexemes`.
         let name = match lexemes.peek().copied() {
-            // `@@var` (system variable) or `@{…}` (statement hint): not a bind parameter — consume
-            // the second marker character and keep scanning (a hint body is lexed normally).
+            // `@@var` or `@{...}`: skip the second marker. A hint body is scanned normally.
             Some(Lexeme::Other('@')) | Some(Lexeme::Other('{')) => {
                 lexemes.next();
                 continue;
             }
-            // `@name`: the name is an identifier run, which must start with a letter or underscore
-            // — a word run may also start with a digit (`@1` is not a parameter).
+            // A word may start with a digit, but `@1` is not a parameter.
             Some(Lexeme::Word(name))
                 if name.starts_with(|ch: char| ch == '_' || ch.is_ascii_alphabetic()) =>
             {
                 lexemes.next();
                 name
             }
-            // ``@`name` ``: a backtick-quoted identifier, delimiters stripped. `strip_suffix`
-            // rather than a byte slice: an *unterminated* `` ` `` literal runs to end of input and
-            // has no closing delimiter to remove, and its last byte may sit mid-character.
+            // An unterminated quoted name lacks a closing backtick and may end mid-character, so
+            // use `strip_suffix` instead of slicing.
             Some(Lexeme::Quoted(quoted)) => {
                 lexemes.next();
                 let Some(inner) = quoted
@@ -403,29 +341,16 @@ pub(crate) fn named_parameters(sql: &str) -> Vec<String> {
     params
 }
 
-/// Backtick-quote a Spanner identifier, rejecting any name that backticks cannot safely contain.
+/// Backtick-quote a Spanner identifier, rejecting names backticks cannot safely contain.
 ///
-/// This is the identifier-injection boundary: caller-supplied table, schema and column names reach
-/// generated SQL through here, so the emitted token must be inert under **both** of Spanner's
-/// parsers. They do not agree on escaping:
+/// Caller-supplied table, schema and column names reach generated SQL through here. Spanner's
+/// query parser honours backslash escapes inside backticks, but its DDL parser ends the identifier
+/// at the first backtick and treats `\` literally. No escaping is safe under both: on the DDL path
+/// the rest of a name could add clauses such as `INTERLEAVE IN PARENT ... ON DELETE CASCADE` to a
+/// generated `CREATE TABLE`, and rollback cannot undo DDL.
 ///
-/// - the **query** parser (`ExecuteSql`) honours backslash escapes inside backticks, so
-///   `` `a\`b` `` is one identifier named ``a`b``;
-/// - the **Database Admin DDL** parser (`UpdateDatabaseDdl`) does **not** — it ends the identifier
-///   at the first backtick, escaped or not, and treats the backslash as an ordinary character.
-///
-/// So no escaping scheme can make a backtick safe everywhere: on the DDL path a name containing one
-/// closes the identifier early and the rest of the name is parsed as SQL. Spanner accepts a *column*
-/// named `` c\ ``, so the truncated remainder need not even be rejected downstream — an ingest
-/// column name could append columns, a `PRIMARY KEY`, or `INTERLEAVE IN PARENT … ON DELETE CASCADE`
-/// to a generated `CREATE TABLE`, and DDL is not transactional, so the change would stick.
-///
-/// Validating instead of escaping sidesteps the disagreement: reject the characters Spanner cannot
-/// represent in an identifier anyway — a backtick, a backslash, or a control character — plus the
-/// empty name (`` `` `` is "Syntax error: Invalid empty identifier"). What remains is guaranteed to
-/// contain no delimiter and no escape, so it is one opaque token under either grammar. Everything
-/// Spanner genuinely supports still quotes: spaces, non-ASCII letters and reserved words
-/// (`create`, `index`, …) all round-trip.
+/// Names containing a backtick, backslash or control character are therefore rejected, as is the
+/// empty name, which Spanner rejects too. Spaces, non-ASCII letters and reserved words still work.
 pub(crate) fn quote_ident(ident: &str) -> Result<String> {
     if ident.is_empty() {
         return Err(invalid_argument(
@@ -443,20 +368,11 @@ pub(crate) fn quote_ident(ident: &str) -> Result<String> {
              remainder of the name as SQL"
         )));
     }
-    let mut out = String::with_capacity(ident.len() + 2);
-    out.push('`');
-    out.push_str(ident);
-    out.push('`');
-    Ok(out)
+    Ok(format!("`{ident}`"))
 }
 
-/// Backtick-quote a table name, optionally qualified by a (named) schema, validating both parts
-/// through [`quote_ident`] so a hostile or mistyped name cannot leak into the surrounding SQL. An
-/// empty schema (Spanner's default, unnamed schema) qualifies to the bare table.
-///
-/// A schema is one identifier, not a path: `Some("a.b")` quotes to `` `a.b` `` — a single name
-/// containing a dot — because Spanner's named schemas are single-level. That is also what keeps a
-/// dotted schema from injecting an extra qualification level.
+/// Quote a table name, qualified by `db_schema` unless it is empty (Spanner's default schema).
+/// Named schemas are single-level, so `a.b` quotes to one identifier, `` `a.b` ``.
 pub(crate) fn qualified_table(db_schema: Option<&str>, table_name: &str) -> Result<String> {
     match db_schema.filter(|s| !s.is_empty()) {
         Some(schema) => Ok(format!(

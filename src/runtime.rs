@@ -13,7 +13,6 @@ use tokio::task::JoinHandle;
 
 use crate::error::err;
 
-/// A reference-counted handle to the driver's Tokio runtime.
 pub(crate) type SharedRuntime = Arc<Runtime>;
 
 /// A latched cancellation signal shared by an operation and its streamed readers.
@@ -32,9 +31,9 @@ impl std::fmt::Debug for CancelSignal {
 }
 
 struct CancelInner {
-    /// Latched cancellation state; `true` from `signal()` on, forever (never cleared).
+    /// Set by `signal()` and never cleared.
     cancelled: AtomicBool,
-    /// Wakes an operation currently parked in [`block_on_cancellable`].
+    /// Wakes tasks waiting in [`CancelSignal::cancelled`].
     notify: Notify,
 }
 
@@ -46,9 +45,9 @@ impl CancelSignal {
         }))
     }
 
-    /// Latch cancellation and wake all waiters, including future fetches on this signal.
+    /// Latch cancellation and wake current waiters.
     pub(crate) fn signal(&self) {
-        // Order matters: latch the flag before waking, so a woken waiter always observes it.
+        // Set the flag before waking so woken waiters observe it.
         self.0.cancelled.store(true, Ordering::Release);
         self.0.notify.notify_waiters();
     }
@@ -61,9 +60,8 @@ impl CancelSignal {
             }
             let notified = self.0.notify.notified();
             tokio::pin!(notified);
-            // Register the waiter, then re-check the flag: a `signal()` that lands between the
-            // check above and this registration would otherwise be missed (`notify_waiters` only
-            // wakes already-registered waiters).
+            // Re-check after registering: `notify_waiters` only wakes registered waiters, so a
+            // `signal()` since the first check would otherwise be missed.
             notified.as_mut().enable();
             if self.0.cancelled.load(Ordering::Acquire) {
                 return;
@@ -94,7 +92,7 @@ impl CancelSlot {
         self.0.lock().unwrap().clone()
     }
 
-    /// Forward a cancel to the current operation's signal, latching it forever.
+    /// Cancel the current operation.
     pub(crate) fn signal(&self) {
         self.0.lock().unwrap().signal();
     }
@@ -102,10 +100,10 @@ impl CancelSlot {
 
 /// A long-lived ADBC cancel handle that always targets the current operation.
 ///
-/// Idle cancellation succeeds, deviating from adbc.h's `InvalidState` requirement. Operation
-/// lifetimes extend through their readers, and materialized metadata readers carry no signal to
-/// track. Accepting cancellation also satisfies the C++ `MetadataGetObjectsCancel` test.
-/// The next operation replaces the idle signal, so it cannot inherit that cancellation.
+/// Cancelling while idle succeeds, although adbc.h asks for `InvalidState`: operations live on in
+/// their readers, and materialized metadata readers carry no signal, so idle cannot be detected.
+/// The C++ `MetadataGetObjectsCancel` test also expects success. The next operation replaces the
+/// signal, so it does not inherit an idle cancel.
 #[derive(Debug)]
 pub(crate) struct SlotCancelHandle(Arc<CancelSlot>);
 
@@ -122,7 +120,6 @@ impl CancelHandle for SlotCancelHandle {
     }
 }
 
-/// Shared diagnostic for synchronous waits and background fetches.
 fn cancelled_err() -> Error {
     err(
         "operation cancelled by the ADBC cancel handle for this connection or statement",
@@ -149,18 +146,14 @@ pub(crate) fn block_on_cancellable<T>(
     })
 }
 
-/// A pull-based source of row chunks that a background prefetch task ([`spawn_prefetch`]) can own
-/// and drain. An **empty** chunk means the source is exhausted.
+/// A source of row chunks for [`spawn_prefetch`]. An empty chunk ends the stream.
 pub(crate) trait ChunkSource: Send + 'static {
-    /// The row type carried by each chunk.
     type Row: Send + 'static;
 
-    /// Pull the next chunk of rows; an empty chunk signals the end of the source.
     fn next_chunk(&mut self) -> impl Future<Output = Result<Vec<Self::Row>>> + Send;
 }
 
-/// The receiving end of a [`spawn_prefetch`] channel: each item is a prefetched chunk of rows, or
-/// the error that ended the stream.
+/// Receives prefetched chunks, or the error that ended the stream.
 pub(crate) type ChunkReceiver<T> = mpsc::Receiver<Result<Vec<T>>>;
 
 /// Prefetch chunks while the consumer processes earlier rows. The channel holds one chunk;
@@ -180,7 +173,6 @@ pub(crate) fn spawn_prefetch<S: ChunkSource>(
     (rx, task)
 }
 
-/// The body of the [`spawn_prefetch`] task. See there for the termination conditions.
 async fn prefetch_loop<S: ChunkSource>(
     mut source: S,
     tx: mpsc::Sender<Result<Vec<S::Row>>>,
@@ -188,12 +180,10 @@ async fn prefetch_loop<S: ChunkSource>(
 ) {
     loop {
         let chunk = tokio::select! {
-            // Check the (sticky) signal before polling the fetch, mirroring `block_on_cancellable`.
             biased;
             _ = cancel.cancelled() => {
-                // Cancelled mid-fetch: drop the in-flight pull and surface the cancellation.
-                // Best-effort — if the channel is full the consumer hits the latched signal itself
-                // on its next cancel-aware `recv`, before it would ever see the buffered chunk.
+                // Best effort: with a full channel, the consumer's cancel-aware `recv` sees the
+                // latched signal before the buffered chunk.
                 let _ = tx.try_send(Err(cancelled_err()));
                 return;
             }

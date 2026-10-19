@@ -60,48 +60,33 @@ macro_rules! apply_to_request_builder {
     };
 }
 
-/// The retry-tuning configuration held by a connection or statement
-/// (`spanner.retry.max_attempts` / `spanner.retry.max_elapsed_seconds` and the backoff knobs
-/// `spanner.retry.backoff.{initial_seconds,max_seconds,multiplier}`).
-///
-/// A connection's value is cloned into each statement it creates (which may then override either
-/// knob). Values are stored exactly as configured so `get_option` / `get_option_int` /
-/// `get_option_double` round-trip them; [`retry_policy_arg`](Self::retry_policy_arg) turns them into
-/// a gax [`RetryPolicyArg`] (or `None`, leaving the client's default policy) at apply time.
+/// The `spanner.retry.*` settings of a connection or statement. Values are stored as configured
+/// so `get_option` round-trips them; unset values keep the client defaults.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RetryConfig {
-    /// `spanner.retry.max_attempts`, when set: the maximum number of attempts (>= 1).
+    /// Total attempts, including the first.
     pub(crate) max_attempts: Option<u32>,
-    /// `spanner.retry.max_elapsed_seconds`, when set: the total wall-clock retry budget, in seconds.
     pub(crate) max_elapsed_seconds: Option<f64>,
-    /// `spanner.retry.backoff.initial_seconds`, when set: the first inter-attempt delay, in seconds.
     pub(crate) backoff_initial_seconds: Option<f64>,
-    /// `spanner.retry.backoff.max_seconds`, when set: the ceiling on the inter-attempt delay, in
-    /// seconds.
     pub(crate) backoff_max_seconds: Option<f64>,
-    /// `spanner.retry.backoff.multiplier`, when set: the per-attempt growth factor for the delay.
     pub(crate) backoff_multiplier: Option<f64>,
 }
 
 impl RetryConfig {
-    /// Handle a `set_option` for `spanner.retry.max_attempts`. An empty string unsets it. The one
-    /// option here whose parse is more than a coercion, so the dispatch goes through this setter
-    /// rather than assigning the field itself.
+    /// Set `spanner.retry.max_attempts`; an empty string unsets it.
     pub(crate) fn set_max_attempts(&mut self, value: OptionValue) -> Result<()> {
         self.max_attempts = parse_max_attempts(value)?;
         Ok(())
     }
 
-    /// The effective total retry budget as a [`Duration`] (`None` when unset). Conversion cannot
-    /// fail — [`f64_option`](crate::options::f64_option) validated it at set time.
+    /// The retry time budget. The value was validated when set, so conversion cannot fail.
     fn max_elapsed_duration(&self) -> Option<Duration> {
         self.max_elapsed_seconds
             .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
     }
 
-    /// The gax retry policy for this configuration, or `None` when neither knob is set (leaving the
-    /// client's default [`SpannerRetryPolicy`] in place). When either is set that same policy is
-    /// re-applied explicitly, bounded by the configured attempt / elapsed-time limits.
+    /// The client's default [`SpannerRetryPolicy`] bounded by the configured limits, or `None`
+    /// when no limit is set.
     fn retry_policy_arg(&self) -> Option<RetryPolicyArg> {
         match (self.max_attempts, self.max_elapsed_duration()) {
             (None, None) => None,
@@ -122,12 +107,9 @@ impl RetryConfig {
         }
     }
 
-    /// The gax backoff policy for this configuration, or `None` when none of the three backoff knobs
-    /// is set (leaving the client's default exponential backoff in place). Unset knobs fall back to
-    /// the client's defaults (1s, 60s, ×2.0) and the combination is clamped via
-    /// [`ExponentialBackoffBuilder::clamp`] — initial delay ≥ 1ms, maximum in `[1s, 24h]` and ≥ the
-    /// initial, multiplier in `[1.0, 32.0]` — so building it can never fail. Independent of
-    /// [`retry_policy_arg`](Self::retry_policy_arg).
+    /// The configured exponential backoff, or `None` when no backoff option is set. Unset values
+    /// use the client defaults (1s, 60s, x2.0). [`ExponentialBackoffBuilder::clamp`] forces the
+    /// combination into the valid ranges, so building cannot fail.
     fn backoff_policy_arg(&self) -> Option<BackoffPolicyArg> {
         if self.backoff_initial_seconds.is_none()
             && self.backoff_max_seconds.is_none()
@@ -137,7 +119,7 @@ impl RetryConfig {
         }
         let mut builder = ExponentialBackoffBuilder::new();
         if let Some(initial) = self.backoff_initial_seconds {
-            // `f64_option` validated Duration-representability, so this cannot fail.
+            // Validated as a representable Duration when set, so this cannot panic.
             builder = builder.with_initial_delay(Duration::from_secs_f64(initial));
         }
         if let Some(maximum) = self.backoff_max_seconds {
@@ -150,12 +132,12 @@ impl RetryConfig {
     }
 
     apply_to_request_builder! {
-        /// Apply the retry and backoff policies to a statement builder (queries and DML alike).
+        /// Apply the policies to a query or DML statement.
         apply_to_statement(StatementBuilder)
     }
 
     apply_to_request_builder! {
-        /// Apply the retry and backoff policies to an `ExecuteBatchDml` batch builder.
+        /// Apply the policies to an `ExecuteBatchDml` request.
         apply_to_batch_dml(BatchDmlBuilder)
     }
 
@@ -165,23 +147,19 @@ impl RetryConfig {
     }
 
     apply_to_commit_builder! {
-        /// Apply the retry and backoff policies to a read/write transaction runner builder (its
-        /// Begin and Commit RPCs). The transaction-level abort retry (Spanner's
-        /// optimistic-concurrency re-run) is a separate policy left at the client default.
+        /// Apply the policies to a read/write transaction's Begin and Commit RPCs. Retrying
+        /// aborted transactions is a separate policy left at the client default.
         apply_to_runner(TransactionRunnerBuilder)
     }
 
     apply_to_commit_builder! {
-        /// Apply the retry and backoff policies to a write-only transaction builder (the bulk-ingest
-        /// commit path): its Begin and Commit RPCs.
+        /// Apply the policies to the Begin and Commit RPCs of a bulk-ingest write-only transaction.
         apply_to_write_only(WriteOnlyTransactionBuilder)
     }
 }
 
-/// Parse a `spanner.retry.max_attempts` value: a positive integer (the first attempt plus retries;
-/// `1` disables retrying), accepted as an integer, a whole-valued double, or a numeric string.
-/// Zero, negatives, fractions, values above [`u32::MAX`] and non-numeric input are rejected with
-/// `InvalidArguments`; an empty string yields `None` (unset).
+/// Parse `spanner.retry.max_attempts` from an integer, a whole double or a numeric string. `1`
+/// disables retries; an empty string unsets it.
 fn parse_max_attempts(value: OptionValue) -> Result<Option<u32>> {
     let reject = || {
         invalid_argument(format!(

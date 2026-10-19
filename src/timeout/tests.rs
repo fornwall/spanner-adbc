@@ -17,21 +17,18 @@ fn s(v: &str) -> OptionValue {
 #[test]
 fn parses_numeric_strings_ints_and_doubles() {
     let mut config = SharedConfig::default();
-    // Numeric strings (trimmed, fractions allowed).
     config.set_option(QUERY, s(" 2.5 ")).unwrap();
     assert_eq!(config.option_string(QUERY).unwrap(), "2.5");
     assert_eq!(
         config.timeouts.query_timeout(),
         Some(Duration::from_millis(2500))
     );
-    // Integers.
     config.set_option(UPDATE, OptionValue::Int(30)).unwrap();
     assert_eq!(config.option_string(UPDATE).unwrap(), "30");
     assert_eq!(
         config.timeouts.update_timeout(),
         Some(Duration::from_secs(30))
     );
-    // Doubles (the `get_option_double` / `set_option_double` shape).
     config.set_option(FETCH, OptionValue::Double(0.05)).unwrap();
     assert_eq!(config.option_string(FETCH).unwrap(), "0.05");
     assert_eq!(
@@ -45,9 +42,7 @@ fn zero_disables_but_still_round_trips() {
     let mut config = SharedConfig::default();
     for value in [s("0"), OptionValue::Int(0), OptionValue::Double(0.0)] {
         config.set_option(QUERY, value).unwrap();
-        // The stored value reports back...
         assert_eq!(config.option_string(QUERY).unwrap(), "0");
-        // ...but no deadline is enforced.
         assert_eq!(config.timeouts.query_timeout(), None);
     }
 }
@@ -63,7 +58,7 @@ fn empty_string_unsets() {
         Status::NotFound
     );
     assert_eq!(config.timeouts.fetch_timeout(), None);
-    // Whitespace-only counts as empty too (values are trimmed).
+    // Whitespace-only counts as empty too.
     config.set_option(FETCH, s("2")).unwrap();
     config.set_option(FETCH, s("  ")).unwrap();
     assert_eq!(
@@ -82,21 +77,18 @@ fn rejects_nan_infinities_negatives_and_garbage() {
         OptionValue::Double(f64::NEG_INFINITY),
         OptionValue::Double(-1.0),
         OptionValue::Int(-1),
-        s("NaN"), /* parses as f64::NAN, still rejected */
+        s("NaN"),
         s("inf"),
         s("-2"),
         s("abc"),
         s("1s"),
-        // Finite but too large for a Duration: rejected at set time, not at execution.
-        OptionValue::Double(1e300),
-        // Non-numeric value kinds.
+        OptionValue::Double(1e300), // too large for Duration
         OptionValue::Bytes(vec![1, 2, 3]),
     ];
     for value in bad_values {
         let error = config.set_option(QUERY, value.clone()).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "value {value:?}");
         assert!(error.message.contains(QUERY), "{}", error.message);
-        // A rejected value leaves the stored one untouched.
         assert_eq!(
             config.option_string(QUERY).ok().as_deref(),
             Some("5"),
@@ -120,7 +112,6 @@ fn the_three_timeouts_are_independent() {
     assert_eq!(config.option_string(FETCH).unwrap(), "3");
 }
 
-/// Statement options inherit connection values, then override them independently.
 #[test]
 fn statement_inherits_then_overrides_independently() {
     let mut connection = SharedConfig::default();
@@ -138,7 +129,6 @@ fn statement_inherits_then_overrides_independently() {
         statement.option_string(FETCH).unwrap_err().status,
         Status::NotFound
     );
-    // The connection is unaffected by statement-level overrides.
     assert_eq!(connection.option_string(QUERY).unwrap(), "10");
     assert_eq!(connection.option_string(FETCH).unwrap(), "20");
 }
@@ -147,7 +137,6 @@ fn statement_inherits_then_overrides_independently() {
 fn with_timeout_passes_a_completing_future_through() {
     let runtime = new_runtime().unwrap();
     let cancel = CancelSignal::new();
-    // Bounded and unbounded alike.
     for limit in [None, Some(Duration::from_secs(30))] {
         let result: Result<i32> = block_on_cancellable(
             &runtime,
@@ -158,8 +147,6 @@ fn with_timeout_passes_a_completing_future_through() {
     }
 }
 
-/// An operation that never resolves (a hung RPC) must fail with
-/// `Status::Timeout` — naming the responsible option — instead of blocking `block_on` forever.
 #[test]
 fn with_timeout_fails_a_hung_operation_with_timeout_status() {
     let runtime = new_runtime().unwrap();
@@ -179,8 +166,7 @@ fn with_timeout_fails_a_hung_operation_with_timeout_status() {
     assert!(error.message.contains("0.05s"), "{}", error.message);
 }
 
-/// A [`ChunkSource`] whose every fetch hangs forever, bounded by the fetch timeout exactly the
-/// way `ResultSetChunks` bounds `pull_chunk` — for driving the prefetch task offline.
+/// A source whose fetches hang, bounded by the fetch timeout like `ResultSetChunks`.
 struct StallingSource {
     timeout: Option<Duration>,
 }
@@ -197,9 +183,6 @@ impl ChunkSource for StallingSource {
     }
 }
 
-/// The fetch timeout bounds each chunk fetch *inside* the background prefetch task: a stalled
-/// stream surfaces `Status::Timeout` on the consumer's next receive and ends the task, instead
-/// of leaving the prefetcher parked forever.
 #[test]
 fn fetch_timeout_fires_inside_the_prefetch_task() {
     let runtime = new_runtime().unwrap();
@@ -213,7 +196,6 @@ fn fetch_timeout_fires_inside_the_prefetch_task() {
     let error = rx.blocking_recv().unwrap().unwrap_err();
     assert_eq!(error.status, Status::Timeout);
     assert!(error.message.contains(FETCH), "{}", error.message);
-    // The errored source closes the channel and the task ends.
     assert!(rx.blocking_recv().is_none());
     runtime.block_on(task).unwrap();
 }

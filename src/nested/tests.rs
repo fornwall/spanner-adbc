@@ -11,9 +11,6 @@ fn list_of_offset_overflow_is_an_error_not_a_panic() {
     assert_eq!(error.status, Status::Internal);
 }
 
-/// The shape lookups the metadata builders navigate `adbc_core`'s result schemas with. They
-/// cannot fail against those constants, but this crate is loaded as a cdylib, so a mismatch must
-/// come back as an `Internal` error naming what was expected — never a panic unwinding into C.
 #[test]
 fn shape_lookups_find_their_target_or_name_what_was_missing() {
     let item = Arc::new(Field::new(
@@ -38,7 +35,6 @@ fn shape_lookups_find_their_target_or_name_what_was_missing() {
     assert_eq!(inner.len(), 1);
     assert_eq!(inner[0].name(), "x");
 
-    // A field of the wrong kind names itself, so the message says which lookup failed.
     let name = field(&fields, "name").unwrap();
     let error = list_item(&name).unwrap_err();
     assert_eq!(error.status, Status::Internal);
@@ -48,10 +44,8 @@ fn shape_lookups_find_their_target_or_name_what_was_missing() {
     assert!(error.message.contains("`name` to be a struct"), "{error}");
 }
 
-/// `list_of_nullable` is how a metadata builder says "this list is SQL NULL" rather than "this
-/// list is empty" — the distinction `get_objects` needs for, say, a primary key's absent
-/// `constraint_column_usage`. A null entry contributes no elements, so the surrounding entries
-/// must keep their own slices.
+/// `get_objects` needs NULL lists as distinct from empty ones, e.g. a primary key's absent
+/// `constraint_column_usage`.
 #[test]
 fn list_of_nullable_nulls_an_entry_without_shifting_its_neighbours() {
     let item = Arc::new(Field::new("item", DataType::Int64, true));
@@ -81,16 +75,13 @@ fn list_of_nullable_nulls_an_entry_without_shifting_its_neighbours() {
         "the entry after the NULL kept its slice"
     );
 
-    // Without a mask every entry is non-null, so a zero length is an empty list rather than NULL.
+    // Without a mask, a zero length is an empty list.
     let list = list_of(item, &lengths, child).unwrap();
     let list = list.as_any().downcast_ref::<ListArray>().unwrap();
     assert!((0..3).all(|row| list.is_valid(row)));
     assert_eq!(list.value(1).len(), 0);
 }
 
-/// A dense union must match its schema's branches exactly, even though the driver only ever
-/// populates one of them: the unused branches are filled with an *empty array of the right type*
-/// so the union's own type still equals the declared one.
 #[test]
 fn dense_union_fills_every_unused_branch_with_an_empty_array_of_its_type() {
     let fields = UnionFields::try_new(
@@ -125,8 +116,7 @@ fn dense_union_fills_every_unused_branch_with_an_empty_array_of_its_type() {
         assert_eq!(child.len(), 0, "branch {type_id} must be empty, not padded");
     }
 
-    // A malformed union (an offset past the end of its branch) is an `Internal` error rather than
-    // a panic, like every other failure here.
+    // An offset past the end of its branch.
     let populated: ArrayRef = Arc::new(Int64Array::from(vec![7]));
     let error = dense_union(&fields, &[(0, populated)], vec![0, 0], vec![0, 1]).unwrap_err();
     assert_eq!(error.status, Status::Internal);

@@ -1,11 +1,8 @@
-//! Criterion benchmarks for the driver's hottest path: decoding Spanner wire values into Arrow
-//! arrays (`src/conversion.rs`), reached through the `#[doc(hidden)]` `bench_support` module.
+//! Benchmarks for decoding synthetic Spanner wire values into Arrow arrays, through the hidden
+//! `bench_support` module.
 //!
-//! Uses synthetic wire values without a network or emulator.
-//!
-//! Run with `cargo bench` (or `cargo bench -- --test` for a single-pass check). Each
-//! benchmark converts one default-size streaming chunk (`spanner.rows_per_batch` = 8192 rows), so
-//! results read as "time to convert one chunk"; throughput is reported in rows/second.
+//! Run with `cargo bench`, or `cargo bench -- --test` for a single pass. Each benchmark converts
+//! one default-size chunk of 8192 rows.
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -15,20 +12,19 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use google_cloud_spanner::value::{ToValue, Value};
 use spanner_adbc::bench_support::build_array;
 
-/// Rows per benchmarked chunk — the driver's default `spanner.rows_per_batch`.
+/// The default `spanner.rows_per_batch`.
 const ROWS: usize = 8192;
 
-/// Build one column of `ROWS` wire values.
 fn column(f: impl Fn(usize) -> Value) -> Vec<Value> {
     (0..ROWS).map(f).collect()
 }
 
-/// Borrow a column the way `build_batch` hands slices to `build_array`.
+/// Borrow a column the way `build_batch` passes it to `build_array`.
 fn refs(column: &[Value]) -> Vec<Option<&Value>> {
     column.iter().map(Some).collect()
 }
 
-/// Convert every column of a prepared batch, as `build_batch` does once per streamed chunk.
+/// Convert every column, as `build_batch` does once per chunk.
 fn convert(columns: &[(DataType, Vec<Option<&Value>>)]) {
     for (data_type, values) in columns {
         black_box(build_array(data_type, values).expect("benchmark values must decode"));
@@ -37,12 +33,9 @@ fn convert(columns: &[(DataType, Vec<Option<&Value>>)]) {
 
 fn bench_conversion(c: &mut Criterion) {
     let mut group = c.benchmark_group("row_to_arrow");
-    // Rows per iteration, so criterion reports rows/second per chunk conversion.
     group.throughput(Throughput::Elements(ROWS as u64));
 
-    // Scalar-heavy chunk: INT64 + FLOAT64 + STRING + BOOL, the common flat result shape. INT64
-    // arrives as a decimal string (parsed), FLOAT64/BOOL natively, STRING copied verbatim. A
-    // null INT64 every 16 rows exercises null handling.
+    // The common flat shape. INT64 arrives as a string, FLOAT64 and BOOL natively.
     {
         let ints = column(|i| {
             if i % 16 == 0 {
@@ -65,9 +58,7 @@ fn bench_conversion(c: &mut Criterion) {
         });
     }
 
-    // String-parsed temporal/decimal chunk: DATE ("YYYY-MM-DD" → Date32 days), TIMESTAMP
-    // (RFC 3339 → epoch nanoseconds) and NUMERIC (decimal string → unscaled i128 at scale 9) —
-    // the per-value parsing arms with real work in them.
+    // Types parsed from strings.
     {
         let dates = column(|i| format!("2024-{:02}-{:02}", 1 + i % 12, 1 + i % 28).to_value());
         let timestamps = column(|i| {
@@ -93,7 +84,6 @@ fn bench_conversion(c: &mut Criterion) {
         });
     }
 
-    // Isolate DATE parsing from the combined temporal benchmark, including nulls.
     {
         let dates = column(|i| {
             if i % 16 == 0 {
@@ -106,7 +96,7 @@ fn bench_conversion(c: &mut Criterion) {
         group.bench_function("dates_date32", |b| b.iter(|| convert(&columns)));
     }
 
-    // Base64 decoding with 48 decoded bytes per cell, including nulls.
+    // 48 decoded bytes per cell.
     {
         use base64::Engine as _;
         let bytes = column(|i| {
@@ -123,8 +113,7 @@ fn bench_conversion(c: &mut Criterion) {
         group.bench_function("bytes_binary", |b| b.iter(|| convert(&columns)));
     }
 
-    // Nested chunk: ARRAY<INT64> (8 elements per row) and STRUCT<id INT64, name STRING> (encoded
-    // positionally, as on the wire) — the recursive list/struct assembly paths.
+    // Eight elements per array; structs are positional lists, as on the wire.
     {
         let lists = column(|i| {
             (0..8)

@@ -9,63 +9,39 @@ use adbc_core::error::{Result, Status};
 
 use crate::error::err;
 
-/// The RPC timeout configuration held by a connection or statement
-/// (`spanner.rpc.timeout_seconds.{query,update,fetch}`).
-///
-/// A connection's value is cloned into each statement it creates (which may then override any of
-/// the three), mirroring how [`ReadStaleness`](crate::staleness::ReadStaleness) is inherited.
-///
-/// Values are stored as the `f64` seconds the caller set, so `get_option` /
-/// `get_option_double` round-trip exactly what was configured; the `*_timeout()` accessors yield
-/// the effective [`Duration`] (`None` when unset **or** set to `0`, both meaning "no timeout").
-///
-/// The three fields are set and read directly by
-/// [`SharedConfig`](crate::options::SharedConfig), which parses each
-/// with [`f64_option`](crate::options::f64_option) in the
-/// [`NonNegativeSeconds`](crate::options::F64Range::NonNegativeSeconds) range.
+/// The `spanner.rpc.timeout_seconds.*` settings of a connection or statement, in seconds. Values
+/// are stored as configured so `get_option` round-trips them; the accessors return `None` for
+/// unset or `0`, both meaning no timeout.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RpcTimeouts {
-    /// `spanner.rpc.timeout_seconds.query`, in seconds, when set.
     pub(crate) query: Option<f64>,
-    /// `spanner.rpc.timeout_seconds.update`, in seconds, when set.
     pub(crate) update: Option<f64>,
-    /// `spanner.rpc.timeout_seconds.fetch`, in seconds, when set.
     pub(crate) fetch: Option<f64>,
 }
 
 impl RpcTimeouts {
-    /// The effective query timeout (`None` when unset or `0`).
     pub(crate) fn query_timeout(&self) -> Option<Duration> {
         as_duration(self.query)
     }
 
-    /// The effective update timeout (`None` when unset or `0`).
     pub(crate) fn update_timeout(&self) -> Option<Duration> {
         as_duration(self.update)
     }
 
-    /// The effective fetch timeout (`None` when unset or `0`).
     pub(crate) fn fetch_timeout(&self) -> Option<Duration> {
         as_duration(self.fetch)
     }
 }
 
-/// The effective [`Duration`] of a stored seconds value: `None` when unset or `0` (both meaning
-/// "no timeout"). Conversion cannot fail — [`f64_option`](crate::options::f64_option) validated it
-/// at set time.
+/// Values were validated when set, so conversion cannot fail.
 fn as_duration(seconds: Option<f64>) -> Option<Duration> {
-    let seconds = seconds?;
-    if seconds > 0.0 {
-        Duration::try_from_secs_f64(seconds).ok()
-    } else {
-        None
-    }
+    seconds
+        .filter(|&seconds| seconds > 0.0)
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
 }
 
-/// Run `future` under an optional overall deadline, mapping expiry to [`Status::Timeout`].
-///
-/// `option` names the `spanner.rpc.timeout_seconds.*` option that imposed the deadline, so the
-/// error tells the caller which knob fired. With `limit = None` the future runs unbounded.
+/// Run `future` under an optional deadline. The timeout error names `option`, the setting that
+/// imposed the deadline.
 pub(crate) async fn with_timeout<T>(
     limit: Option<Duration>,
     option: &'static str,
