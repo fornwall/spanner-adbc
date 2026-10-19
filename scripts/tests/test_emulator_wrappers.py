@@ -22,8 +22,8 @@ class BackendWrappers(unittest.TestCase):
         self.log = self.root / "calls.jsonl"
         self.env = dict(os.environ, PATH=f"{self.root}{os.pathsep}{os.environ['PATH']}")
         self.env.update(WRAPPER_LOG=str(self.log), TMPDIR=str(self.root))
-        self.env.pop("FAIL_CONTAINER", None)
-        self.env.pop("FAIL_AFTER_CREATE", None)
+        for key in ("FAIL_CONTAINER", "FAIL_AFTER_CREATE", "DOCKER_HOST", "DOCKER_CONTEXT"):
+            self.env.pop(key, None)
         self.env.update(
             SPANNER_EMULATOR_CONTAINER="existing-emulator",
             SPANNER_EMULATOR_GRPC_PORT="9010",
@@ -36,6 +36,11 @@ import json, os, pathlib, sys
 args = sys.argv[1:]
 with open(os.environ["WRAPPER_LOG"], "a") as log:
     log.write(json.dumps(["docker", *args]) + "\\n")
+if args[:2] == ["context", "inspect"]:
+    print(os.environ.get("FAKE_CONTEXT_HOST", ""))
+    sys.exit(0)
+if os.environ.get("EXPECT_DOCKER_HOST", os.environ.get("DOCKER_HOST")) != os.environ.get("DOCKER_HOST"):
+    sys.exit(99)
 if args[0] == "run":
     name = args[args.index("--name") + 1]
     fail = name == os.environ.get("FAIL_CONTAINER")
@@ -189,6 +194,85 @@ print("200", end="")
         self.assertNotIn("--network", proxy)
         self.assertIn("127.0.0.1:8475:8475", proxy)
         self.assertIn("127.0.0.1:8666:8666", proxy)
+
+    def test_wrappers_keep_the_active_docker_context_endpoint(self):
+        # The temporary DOCKER_CONFIG has no contexts, so pass the endpoint through DOCKER_HOST.
+        self.env.update(
+            DOCKER_CONTEXT="colima",
+            FAKE_CONTEXT_HOST="unix:///colima.sock",
+            EXPECT_DOCKER_HOST="unix:///colima.sock",
+        )
+        for wrapper in ("with-emulator.sh", "with-omni.sh", "with-toxiproxy.sh"):
+            with self.subTest(wrapper=wrapper):
+                result = self.run_wrapper(wrapper, command=["env"])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = result.stdout.splitlines()
+                self.assertIn("DOCKER_HOST=unix:///colima.sock", lines)
+                self.assertFalse(any(line.startswith("DOCKER_CONTEXT=") for line in lines))
+
+    def test_wrappers_keep_an_explicit_docker_host(self):
+        self.env.update(
+            DOCKER_HOST="tcp://docker.example:2375",
+            FAKE_CONTEXT_HOST="unix:///ignored.sock",
+            EXPECT_DOCKER_HOST="tcp://docker.example:2375",
+        )
+        result = self.run_wrapper("with-emulator.sh", command=["env"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("DOCKER_HOST=tcp://docker.example:2375", result.stdout.splitlines())
+
+    def run_runner(self, script, **env):
+        """Run a validation runner from outside the repository via a relative path."""
+        self.tool("cargo", '''
+import json, os, sys
+with open(os.environ["WRAPPER_LOG"], "a") as log:
+    log.write(json.dumps(["cargo", *sys.argv[1:]]) + "\\n")
+sys.exit(int(os.environ.get("CARGO_EXIT", "0")))
+''')
+        self.tool("rustc", 'print("host: x86_64-unknown-linux-gnu")')
+        for key in ("SPANNER_EMULATOR_HOST", "SPANNER_OMNI_ENDPOINT", "SPANNER_GCP_DATABASE"):
+            self.env.pop(key, None)
+        self.env.update(env)
+        result = subprocess.run(
+            ["bash", os.path.relpath(SCRIPTS / script, self.root)],
+            cwd=self.root, env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        return result
+
+    def test_adbc_runner_reenters_under_the_emulator_from_any_directory(self):
+        # The fake cargo stops the re-entered run at its first build.
+        result = self.run_runner("run-adbc-validation.sh", CARGO_EXIT="3")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn(["cargo", "build"], self.calls)
+        self.assertEqual(self.removed_ids(), ["owned-existing-emulator"])
+
+    def test_foundry_runner_reenters_with_a_relative_python(self):
+        self.tool("fake-python", '''
+import json, os, sys
+if sys.argv[1:4] == ["-m", "pip", "freeze"]:
+    print("adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@"
+          "68242ee13524e8f2b36038764e2f439d4cb49f33")
+    sys.exit(0)
+with open(os.environ["WRAPPER_LOG"], "a") as log:
+    log.write(json.dumps(["python", os.getcwd(), *sys.argv[1:]]) + "\\n")
+''')
+        result = self.run_runner("run-foundry-validation.sh", PYTHON="./fake-python")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pytest = [call for call in self.calls if call[0] == "python"]
+        self.assertEqual(len(pytest), 1)
+        self.assertEqual(pytest[0][1], str(SCRIPTS.parent / "foundry-validation"))
+        self.assertEqual(pytest[0][2:4], ["-m", "pytest"])
+        self.assertEqual(self.removed_ids(), ["owned-existing-emulator"])
+
+    def test_foundry_runner_reports_a_missing_pip(self):
+        self.tool("fake-python", '''
+import sys
+print(f"{sys.argv[0]}: No module named pip", file=sys.stderr)
+sys.exit(1)
+''')
+        result = self.run_runner("run-foundry-validation.sh", PYTHON="./fake-python")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("No module named pip", result.stderr)
 
 
 if __name__ == "__main__":

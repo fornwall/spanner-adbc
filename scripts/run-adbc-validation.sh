@@ -232,7 +232,7 @@ fi
 
 # No target configured: run under a throwaway emulator, then re-enter this script.
 if [ -z "${SPANNER_EMULATOR_HOST:-}" ] && [ -z "${SPANNER_OMNI_ENDPOINT:-}" ] && [ -z "${SPANNER_GCP_DATABASE:-}" ]; then
-  exec "$REPO_ROOT/scripts/with-emulator.sh" "$0" "$@"
+  exec "$REPO_ROOT/scripts/with-emulator.sh" "$REPO_ROOT/scripts/run-adbc-validation.sh" "$@"
 fi
 
 build_harness

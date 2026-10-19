@@ -14,19 +14,24 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON="${PYTHON:-python3}"
+# Anchor a relative interpreter path before changing directories; keep venv symlinks.
+case "$PYTHON" in
+  */*) PYTHON="$(cd "$(dirname "$PYTHON")" && pwd)/$(basename "$PYTHON")" ;;
+esac
 cd "$REPO_ROOT"
 
 # Pin the upstream query corpus and test behavior for reproducible runs.
 VALIDATION_REF="${ADBC_VALIDATION_REF:-68242ee13524e8f2b36038764e2f439d4cb49f33}"
 VALIDATION_REPO="${ADBC_VALIDATION_REPO:-adbc-drivers/validation}"
-PYTHON="${PYTHON:-python3}"
 
 echo ">> building the spanner-adbc cdylib"
 cargo build
 
 # pip freeze includes the resolved git commit from direct_url metadata.
+# Tolerate a missing pip here; the install below reports it.
 installed_ref="$("$PYTHON" -m pip freeze 2>/dev/null \
-  | sed -n 's/^adbc[-_]drivers[-_]validation @ git+.*@//p' | head -n 1)"
+  | sed -n 's/^adbc[-_]drivers[-_]validation @ git+.*@//p' | head -n 1 || true)"
 if [ "$installed_ref" != "$VALIDATION_REF" ]; then
   echo ">> installing the validation suite at pinned $VALIDATION_REF (installed: ${installed_ref:-none})"
   "$PYTHON" -m pip install \
@@ -40,7 +45,7 @@ fi
 
 # Start the server after builds and dependency installation to keep memory available.
 if [ -z "${SPANNER_EMULATOR_HOST:-}" ] && [ -z "${SPANNER_OMNI_ENDPOINT:-}" ] && [ -z "${SPANNER_GCP_DATABASE:-}" ]; then
-  exec "$REPO_ROOT/scripts/with-emulator.sh" "$0" "$@"
+  exec "$REPO_ROOT/scripts/with-emulator.sh" "$REPO_ROOT/scripts/run-foundry-validation.sh" "$@"
 fi
 
 source "$REPO_ROOT/scripts/validation-target.sh"
