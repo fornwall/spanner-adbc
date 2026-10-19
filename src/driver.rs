@@ -20,15 +20,21 @@ use crate::connection::SpannerConnection;
 use crate::error::{
     err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option,
 };
-use crate::options::impl_typed_option_getters;
+use crate::options::{F64Range, f64_option, impl_typed_option_getters};
 use crate::runtime::{SharedRuntime, new_runtime};
 use crate::{
     OPTION_ACCESS_TOKEN, OPTION_EMULATOR, OPTION_ENDPOINT, OPTION_IMPERSONATE_DELEGATES,
     OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES, OPTION_IMPERSONATE_TARGET_PRINCIPAL,
     OPTION_INSTANCE_TYPE, OPTION_KEYFILE, OPTION_KEYFILE_JSON, OPTION_QUOTA_PROJECT,
+    OPTION_RPC_TIMEOUT_CONNECT,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::time::Duration;
 use tokio::sync::OnceCell;
+
+/// The [`OPTION_RPC_TIMEOUT_CONNECT`] default. A healthy connect takes well under a second; this
+/// leaves room for a slow first token fetch and several retries of a transient failure.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The Spanner ADBC driver, which creates [`SpannerDatabase`]s.
 ///
@@ -104,6 +110,8 @@ pub struct SpannerDatabase {
     access_token: Option<String>,
     /// `None` bills the credential's own project.
     quota_project: Option<String>,
+    /// [`OPTION_RPC_TIMEOUT_CONNECT`] as set; `None` means the default and `0` no deadline.
+    connect_timeout_secs: Option<f64>,
     /// The shared client stack, built by the first connection and cleared by `set_option`.
     connected: Mutex<Option<Connected>>,
 }
@@ -129,15 +137,16 @@ impl std::fmt::Debug for SpannerDatabase {
             .field("impersonate_lifetime_secs", &self.impersonate_lifetime_secs)
             .field("access_token", &redact(&self.access_token))
             .field("quota_project", &self.quota_project)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
             // The client types' own `Debug` could expose endpoint or credential internals.
             .field(
                 "connected",
-                &self
-                    .connected
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|_| "<client stack>"),
+                // `connect_shared` holds the lock while connecting; don't wait for it.
+                &match self.connected.try_lock() {
+                    Ok(cached) => cached.as_ref().map(|_| "<client stack>"),
+                    Err(TryLockError::WouldBlock) => Some("<connecting>"),
+                    Err(TryLockError::Poisoned(_)) => Some("<poisoned>"),
+                },
             )
             .finish()
     }
@@ -160,11 +169,12 @@ impl SpannerDatabase {
             impersonate_lifetime_secs: None,
             access_token: None,
             quota_project: None,
+            connect_timeout_secs: None,
             connected: Mutex::new(None),
         }
     }
 
-    /// Build the client stack from the current options.
+    /// Build the client stack from the current options, within [`OPTION_RPC_TIMEOUT_CONNECT`].
     ///
     /// Outside Omni, a non-empty `SPANNER_EMULATOR_HOST` enables emulator mode and supplies the
     /// endpoint unless one was set explicitly.
@@ -173,6 +183,7 @@ impl SpannerDatabase {
         let Target {
             database,
             endpoint,
+            endpoint_from_env,
             emulator,
             anonymous_default,
         } = self.resolve_target(emulator_host.as_deref())?;
@@ -180,7 +191,16 @@ impl SpannerDatabase {
         // Blocking file I/O, so read the key file before entering the runtime.
         let credentials_json = self.credentials_json()?;
 
-        self.runtime.block_on(async move {
+        // Named in the timeout error, since a stray `SPANNER_EMULATOR_HOST` is a common cause.
+        let target = match &endpoint {
+            Some(endpoint) if endpoint_from_env => {
+                format!("{database} at {endpoint} (from SPANNER_EMULATOR_HOST)")
+            }
+            Some(endpoint) => format!("{database} at {endpoint}"),
+            None => format!("{database} at the default Spanner endpoint"),
+        };
+
+        let build = async move {
             let mut builder = Spanner::builder().with_instance_type(self.instance_type);
             if let Some(endpoint) = endpoint.clone() {
                 builder = builder.with_endpoint(endpoint);
@@ -209,7 +229,37 @@ impl SpannerDatabase {
                     config: admin_config,
                 }),
             })
-        })
+        };
+        // The client retries session creation without limit while the endpoint is unreachable,
+        // so only this deadline ends such a connect. Expiry drops, and so cancels, the build.
+        let Some(limit) = self.connect_timeout() else {
+            return self.runtime.block_on(build);
+        };
+        // The timer must be created inside the runtime.
+        self.runtime
+            .block_on(async { tokio::time::timeout(limit, build).await })
+            .unwrap_or_else(|_| {
+                Err(err(
+                    format!(
+                        "connecting to {target} timed out after {}s \
+                         ({OPTION_RPC_TIMEOUT_CONNECT}); check that the endpoint is reachable \
+                         and serves Spanner, or raise the timeout",
+                        limit.as_secs_f64()
+                    ),
+                    Status::Timeout,
+                ))
+            })
+    }
+
+    /// The [`OPTION_RPC_TIMEOUT_CONNECT`] deadline; `None` when disabled with `0`.
+    fn connect_timeout(&self) -> Option<Duration> {
+        match self.connect_timeout_secs {
+            None => Some(DEFAULT_CONNECT_TIMEOUT),
+            // Validated when set, so the conversion cannot fail.
+            Some(secs) => (secs > 0.0)
+                .then(|| Duration::try_from_secs_f64(secs).ok())
+                .flatten(),
+        }
     }
 
     /// Validate the options and resolve the endpoint and credential mode. `emulator_host` is the
@@ -227,6 +277,7 @@ impl SpannerDatabase {
             .clone()
             .filter(|endpoint| !endpoint.trim().is_empty());
         let mut emulator = self.emulator;
+        let mut endpoint_from_env = false;
         let omni = self.instance_type == InstanceType::Omni;
         if omni {
             if emulator {
@@ -243,6 +294,7 @@ impl SpannerDatabase {
         if !omni && let Some(host) = emulator_host.filter(|host| !host.is_empty()) {
             if endpoint.is_none() {
                 endpoint = Some(host.to_owned());
+                endpoint_from_env = true;
             }
             emulator = true;
         }
@@ -318,6 +370,7 @@ impl SpannerDatabase {
         Ok(Target {
             database,
             endpoint,
+            endpoint_from_env,
             emulator,
             anonymous_default,
         })
@@ -327,7 +380,7 @@ impl SpannerDatabase {
     fn connect_shared(&self) -> Result<Connected> {
         // Holding the lock across the build stops concurrent connections from building twice.
         // It cannot deadlock: only caller threads take it, never tasks on the runtime that
-        // `connect` blocks on.
+        // `connect` blocks on. The connect deadline bounds how long others wait.
         let mut cached = self.connected.lock().unwrap();
         if let Some(connected) = cached.as_ref() {
             return Ok(connected.clone());
@@ -343,6 +396,8 @@ impl SpannerDatabase {
 struct Target {
     database: String,
     endpoint: Option<String>,
+    /// The endpoint came from `SPANNER_EMULATOR_HOST`.
+    endpoint_from_env: bool,
     /// From the option or `SPANNER_EMULATOR_HOST`.
     emulator: bool,
     /// Omni or a plaintext endpoint, where no credential option means anonymous instead of ADC.
@@ -443,6 +498,9 @@ impl Optionable for SpannerDatabase {
                 let project = string_value(&key, value)?;
                 self.quota_project = (!project.is_empty()).then_some(project);
             }
+            OptionDatabase::Other(name) if name == OPTION_RPC_TIMEOUT_CONNECT => {
+                self.connect_timeout_secs = f64_option(value, name, F64Range::NonNegativeSeconds)?
+            }
             other => {
                 return Err(unknown_option("database", other.as_ref()));
             }
@@ -491,6 +549,9 @@ impl Optionable for SpannerDatabase {
             }
             OptionDatabase::Other(name) if name == OPTION_QUOTA_PROJECT => {
                 self.quota_project.clone()
+            }
+            OptionDatabase::Other(name) if name == OPTION_RPC_TIMEOUT_CONNECT => {
+                self.connect_timeout_secs.map(|secs| secs.to_string())
             }
             _ => None,
         };

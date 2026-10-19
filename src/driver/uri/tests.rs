@@ -124,11 +124,13 @@ fn every_non_secret_database_level_option_is_accepted_as_a_query_parameter() {
              &spanner.auth.impersonate.delegates=a%40p.iam.gserviceaccount.com,b%40p.iam.gserviceaccount.com\
              &spanner.auth.impersonate.scopes=https://www.googleapis.com/auth/cloud-platform\
              &spanner.auth.impersonate.lifetime=900\
-             &spanner.auth.quota_project=billing-project"
+             &spanner.auth.quota_project=billing-project\
+             &spanner.rpc.timeout_seconds.connect=2.5"
         ),
     )
     .unwrap();
     assert_eq!(db.keyfile.as_deref(), Some("/path/key.json"));
+    assert_eq!(db.connect_timeout_secs, Some(2.5));
     assert_eq!(db.quota_project.as_deref(), Some("billing-project"));
     assert_eq!(
         db.impersonate_target_principal.as_deref(),

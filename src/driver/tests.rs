@@ -1,5 +1,5 @@
 use super::*;
-use adbc_core::error::Status;
+use adbc_core::error::{Error, Status};
 
 pub(super) fn new_database() -> SpannerDatabase {
     SpannerDatabase::new(new_runtime().unwrap())
@@ -396,4 +396,176 @@ fn emulator_mode_without_an_endpoint_is_rejected() {
     )
     .unwrap();
     assert!(db.resolve_target(None).unwrap().emulator);
+}
+
+fn connect_timeout_key() -> OptionDatabase {
+    OptionDatabase::Other(OPTION_RPC_TIMEOUT_CONNECT.into())
+}
+
+#[test]
+fn connect_timeout_option_round_trips() {
+    let mut db = new_database();
+    let not_found = |db: &SpannerDatabase| {
+        db.get_option_string(connect_timeout_key())
+            .unwrap_err()
+            .status
+    };
+    assert_eq!(not_found(&db), Status::NotFound);
+    assert_eq!(db.connect_timeout(), Some(DEFAULT_CONNECT_TIMEOUT));
+
+    db.set_option(connect_timeout_key(), " 2.5 ".into())
+        .unwrap();
+    assert_eq!(db.get_option_string(connect_timeout_key()).unwrap(), "2.5");
+    assert_eq!(db.get_option_double(connect_timeout_key()).unwrap(), 2.5);
+    assert_eq!(db.connect_timeout(), Some(Duration::from_millis(2500)));
+
+    db.set_option(connect_timeout_key(), OptionValue::Int(0))
+        .unwrap();
+    assert_eq!(db.get_option_string(connect_timeout_key()).unwrap(), "0");
+    assert_eq!(db.connect_timeout(), None, "0 disables the deadline");
+
+    db.set_option(connect_timeout_key(), OptionValue::Double(7.0))
+        .unwrap();
+    assert_eq!(db.get_option_int(connect_timeout_key()).unwrap(), 7);
+    for invalid in ["-1", "abc", "inf", "NaN", "1e300"] {
+        let error = db
+            .set_option(connect_timeout_key(), invalid.into())
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments, "{invalid}");
+    }
+    assert_eq!(
+        db.get_option_string(connect_timeout_key()).unwrap(),
+        "7",
+        "a rejected value keeps the previous one"
+    );
+
+    db.set_option(connect_timeout_key(), "".into()).unwrap();
+    assert_eq!(not_found(&db), Status::NotFound);
+    assert_eq!(db.connect_timeout(), Some(DEFAULT_CONNECT_TIMEOUT));
+}
+
+/// Connect on another thread, so a connect without a deadline fails the test instead of hanging
+/// it. Returns the error and how long the attempt took.
+fn connect_in_background(db: Arc<SpannerDatabase>) -> std::sync::mpsc::Receiver<(Error, Duration)> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let error = db
+            .new_connection()
+            .expect_err("nothing serves Spanner, so connecting must fail");
+        let _ = sender.send((error, start.elapsed()));
+    });
+    receiver
+}
+
+fn database_with_connect_timeout(endpoint_port: u16, seconds: &str) -> SpannerDatabase {
+    let mut db = new_database();
+    db.set_option(
+        OptionDatabase::Uri,
+        OptionValue::String(format!(
+            "spanner://127.0.0.1:{endpoint_port}/projects/p/instances/i/databases/d\
+             ?spanner.emulator=true"
+        )),
+    )
+    .unwrap();
+    db.set_option(connect_timeout_key(), seconds.into())
+        .unwrap();
+    db
+}
+
+fn assert_connect_timed_out(db: &SpannerDatabase, port: u16, error: &Error, elapsed: Duration) {
+    assert_eq!(error.status, Status::Timeout, "{}", error.message);
+    for needle in [
+        format!("http://127.0.0.1:{port}"),
+        "projects/p/instances/i/databases/d".to_owned(),
+        OPTION_RPC_TIMEOUT_CONNECT.to_owned(),
+    ] {
+        assert!(error.message.contains(&needle), "{}", error.message);
+    }
+    assert!(
+        !error.message.contains("SPANNER_EMULATOR_HOST"),
+        "the endpoint was explicit: {}",
+        error.message
+    );
+    assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
+    assert!(
+        db.connected.lock().unwrap().is_none(),
+        "a timed-out connect must not be cached"
+    );
+}
+
+/// The client retries a refused connection without limit; the connect timeout ends it.
+#[test]
+fn connecting_to_a_closed_port_times_out() {
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let db = Arc::new(database_with_connect_timeout(port, "0.5"));
+    let (error, elapsed) = connect_in_background(db.clone())
+        .recv_timeout(Duration::from_secs(20))
+        .expect("connecting to a closed port must end at the connect timeout");
+    assert_connect_timed_out(&db, port, &error, elapsed);
+}
+
+/// A listener that accepts but never answers stalls the session RPC, not just the dial.
+#[test]
+fn connecting_to_a_silent_listener_times_out_without_blocking_debug() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let db = Arc::new(database_with_connect_timeout(port, "1.5"));
+    let result = connect_in_background(db.clone());
+
+    // Hold the accepted socket open without replying.
+    let start = std::time::Instant::now();
+    let _socket = loop {
+        match listener.accept() {
+            Ok((socket, _)) => break socket,
+            Err(_) => {
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "the endpoint was never dialed"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    // The connecting thread holds the cache lock now; `Debug` must not wait for it.
+    let rendered = format!("{db:?}");
+    assert!(
+        rendered.contains("connected: Some(\"<connecting>\")"),
+        "{rendered}"
+    );
+
+    let (error, elapsed) = result
+        .recv_timeout(Duration::from_secs(20))
+        .expect("a silent endpoint must end at the connect timeout");
+    assert_connect_timed_out(&db, port, &error, elapsed);
+    assert!(format!("{db:?}").contains("connected: None"));
+}
+
+#[test]
+fn the_timeout_error_can_tell_an_endpoint_from_the_environment() {
+    let mut db = new_database();
+    db.set_option(
+        OptionDatabase::Uri,
+        OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
+    )
+    .unwrap();
+    assert!(
+        db.resolve_target(Some("localhost:9010"))
+            .unwrap()
+            .endpoint_from_env
+    );
+    db.set_option(
+        OptionDatabase::Other(OPTION_ENDPOINT.into()),
+        "localhost:9010".into(),
+    )
+    .unwrap();
+    assert!(
+        !db.resolve_target(Some("localhost:9010"))
+            .unwrap()
+            .endpoint_from_env
+    );
 }

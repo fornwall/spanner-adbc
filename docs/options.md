@@ -65,6 +65,7 @@ connections keep theirs. Getters don't show values taken from the environment.
 | `spanner.auth.impersonate.lifetime` | non-negative integer seconds | `3600` | explicitly set only | Lifetime of the impersonated token. Accepts an integer or integer string. Ignored without a target principal. |
 | `spanner.auth.access_token` | OAuth bearer token | ADC | write-only | Sent as is and never refreshed. Not allowed in URIs. |
 | `spanner.auth.quota_project` | project ID; `""` unsets | credential default | set | Sends `x-goog-user-project`; the caller needs `serviceusage.services.use`. With ADC, `GOOGLE_CLOUD_QUOTA_PROJECT` takes precedence. Rejected in emulator mode and [anonymous connections](#anonymous-connections). |
+| `spanner.rpc.timeout_seconds.connect` | non-negative fractional seconds | `30` | explicitly set only | Deadline for building the client stack, including session creation and its retries; see [connect timeout](#connect-timeout). |
 
 In emulator mode, creating the client stack fails with `InvalidState` if a keyfile, inline JSON,
 access token, impersonation target or quota project is set. Ambient ADC doesn't count. An access
@@ -268,8 +269,25 @@ still have been applied.
 | `update` | DML transactions including replays after `ABORTED`, manual commits, each ingest chunk, BatchWrite, partitioned DML, and DDL submission plus polling, under one deadline. |
 | `fetch` | Each later result chunk, including the later per-row runs of a query bound to several rows. |
 
-Creating the client stack and maintaining the session fall outside these deadlines. Starting a
-manual read-only transaction sends no RPC, so it needs none.
+Creating the client stack falls under the [connect timeout](#connect-timeout) instead, and
+background session maintenance has no deadline. Starting a manual read-only transaction sends no
+RPC, so it needs none.
+
+### Connect timeout
+
+`spanner.rpc.timeout_seconds.connect` is a database option that bounds building the client
+stack: the gRPC client, credentials and the multiplexed session, including the client's retries.
+Without it, an unreachable endpoint, such as a stopped emulator named by `SPANNER_EMULATOR_HOST`,
+would be retried indefinitely. The 30-second default leaves room for a slow first token fetch and
+several retries of a transient failure.
+
+When the deadline expires, creating the connection returns `Timeout` with a message naming the
+database and endpoint. Nothing is cached, so the next connection tries again. `0` disables the
+deadline and `""` restores the default.
+
+Connecting can't be interrupted: `AdbcConnectionCancel` only applies after `Init`, and Python
+handles Ctrl+C only once the call returns. Other connections on the same database wait while the
+first builds the client stack, so the deadline bounds them too.
 
 ## Retry tuning
 

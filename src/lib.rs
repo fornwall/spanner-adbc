@@ -472,6 +472,18 @@ pub const OPTION_ACCESS_TOKEN: &str = "spanner.auth.access_token";
 /// library.
 pub const OPTION_QUOTA_PROJECT: &str = "spanner.auth.quota_project";
 
+/// Database option: the connect timeout in seconds, a deadline for building the client stack
+/// when a database creates its first connection. It covers the gRPC client, credentials and the
+/// multiplexed session, including the client's retries, which otherwise continue without limit
+/// while the endpoint is unreachable. On expiry, creating the connection fails with
+/// [`Status::Timeout`](adbc_core::error::Status::Timeout), naming the endpoint, and the next
+/// connection tries again.
+///
+/// A finite, non-negative number of seconds (fractions allowed), set as a numeric string, an
+/// integer or a double. Defaults to 30; `0` disables the deadline and `""` restores the default.
+/// `get_option` and `get_option_double` return only an explicitly set value.
+pub const OPTION_RPC_TIMEOUT_CONNECT: &str = "spanner.rpc.timeout_seconds.connect";
+
 /// Statement option: the maximum number of rows in each Arrow
 /// [`RecordBatch`](arrow_array::RecordBatch) returned by
 /// [`Statement::execute`](adbc_core::Statement::execute), including `THEN RETURN` rows. Streamed
@@ -777,6 +789,7 @@ mod options_doc_tests {
             crate::OPTION_COMMIT_STATS_MUTATION_COUNT,
             crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS,
             crate::OPTION_MAX_TIMESTAMP_PRECISION,
+            crate::OPTION_RPC_TIMEOUT_CONNECT,
             crate::OPTION_RPC_TIMEOUT_QUERY,
             crate::OPTION_RPC_TIMEOUT_UPDATE,
             crate::OPTION_RPC_TIMEOUT_FETCH,

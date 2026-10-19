@@ -10,6 +10,7 @@ use crate::{
     OPTION_ACCESS_TOKEN, OPTION_EMULATOR, OPTION_ENDPOINT, OPTION_IMPERSONATE_DELEGATES,
     OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES, OPTION_IMPERSONATE_TARGET_PRINCIPAL,
     OPTION_INSTANCE_TYPE, OPTION_KEYFILE, OPTION_KEYFILE_JSON, OPTION_QUOTA_PROJECT,
+    OPTION_RPC_TIMEOUT_CONNECT,
 };
 
 impl SpannerDatabase {
@@ -68,7 +69,7 @@ pub(super) fn is_plaintext_endpoint(endpoint: &str) -> bool {
 }
 
 /// Database options allowed in URI query parameters; the URI path supplies the database.
-const URI_QUERY_OPTIONS: [&str; 9] = [
+const URI_QUERY_OPTIONS: [&str; 10] = [
     OPTION_ENDPOINT,
     OPTION_EMULATOR,
     OPTION_INSTANCE_TYPE,
@@ -78,6 +79,7 @@ const URI_QUERY_OPTIONS: [&str; 9] = [
     OPTION_IMPERSONATE_SCOPES,
     OPTION_IMPERSONATE_LIFETIME,
     OPTION_QUOTA_PROJECT,
+    OPTION_RPC_TIMEOUT_CONNECT,
 ];
 
 /// Secret values must use dedicated, write-only options, since URIs are commonly logged.

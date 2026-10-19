@@ -38,6 +38,9 @@ class DatabaseOptions(enum.StrEnum):
     IMPERSONATE_LIFETIME = "spanner.auth.impersonate.lifetime"
     #: Project billed for API quota (``x-goog-user-project``). ``""`` unsets.
     QUOTA_PROJECT = "spanner.auth.quota_project"
+    #: Deadline (seconds) for building the client stack on the first connect, including
+    #: session creation and its retries (default ``30``); ``0`` disables.
+    RPC_TIMEOUT_CONNECT = "spanner.rpc.timeout_seconds.connect"
 
 
 class ConnectionOptions(enum.StrEnum):
