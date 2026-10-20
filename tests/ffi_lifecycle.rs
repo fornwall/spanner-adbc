@@ -153,15 +153,11 @@ fn setup(test: &str) -> Option<TestTarget> {
 
 /// Like [`setup`], but also requires the built cdylib.
 fn ffi_setup(test: &str) -> Option<(TestTarget, PathBuf)> {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set; skipping {test}");
-        return None;
-    };
+    let target = setup(test)?;
     let Some(cdylib) = required_cdylib_path() else {
         eprintln!("cdylib not built; skipping {test} (run `cargo build` first)");
         return None;
     };
-    ensure_database_once(&target);
     Some((target, cdylib))
 }
 
