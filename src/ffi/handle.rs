@@ -9,7 +9,6 @@
 //! the state alive until cancellation returns.
 
 use std::ffi::c_void;
-use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use adbc_core::CancelHandle;
@@ -163,14 +162,15 @@ unsafe fn borrowed<'a, S>(slot: *mut c_void, kind: &str) -> Result<&'a Exported<
 /// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
 /// been released.
 unsafe fn strong<S>(slot: *mut c_void, kind: &str) -> Result<Arc<Exported<S>>> {
-    let pointer: *const Exported<S> = slot.cast_const().cast::<Exported<S>>();
+    let pointer = slot.cast_const().cast::<Exported<S>>();
     if pointer.is_null() {
         return Err(uninitialized(kind));
     }
-    // The handle keeps its own reference; this reconstructs it only to clone from, so it must not
-    // be dropped.
-    let handle = ManuallyDrop::new(unsafe { Arc::from_raw(pointer) });
-    Ok(Arc::clone(&handle))
+    // The handle keeps its own count; this adds one for the returned `Arc`.
+    unsafe {
+        Arc::increment_strong_count(pointer);
+        Ok(Arc::from_raw(pointer))
+    }
 }
 
 /// Run `f` against the object behind `slot`, containing panics and reporting errors through
