@@ -217,10 +217,9 @@ Durations are non-negative numbers, in seconds unless followed by a unit: `s`, `
 are lowercase, and surrounding whitespace is trimmed. Durations above 10,000 years and timestamps
 before year 1 are rejected when the option is set.
 
-Spanner only accepts `max:` and `min:` for single-use reads. Manual query transactions and
-queries bound to several rows convert them to the stalest equivalent exact bound: `max:<d>`
-becomes `exact:<d>` and `min:<t>` becomes `read:<t>`. `execute_partitions` passes the bound
-through unchanged to a multi-use transaction, so use a strong, `exact:` or `read:` bound there.
+Spanner only accepts `max:` and `min:` for single-use reads. Manual query transactions, queries
+bound to several rows, metadata snapshots and `execute_partitions` convert them to the stalest
+equivalent exact bound: `max:<d>` becomes `exact:<d>` and `min:<t>` becomes `read:<t>`.
 
 ## Directed reads
 

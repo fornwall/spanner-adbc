@@ -541,10 +541,12 @@ pub const OPTION_DML_PARTITIONED: &str = "spanner.dml.partitioned";
 /// The value takes one of four forms:
 ///
 /// - `exact:<duration>`: read at exactly `<duration>` in the past.
-/// - `max:<duration>`: read at a timestamp within `<duration>` of now chosen by Spanner (bounded
-///   staleness; single-use reads only).
+/// - `max:<duration>`: read at a timestamp within `<duration>` of now chosen by Spanner.
 /// - `read:<rfc3339>`, or a bare `<rfc3339>`: read at exactly that timestamp.
-/// - `min:<rfc3339>`: read at that timestamp or later (bounded staleness; single-use reads only).
+/// - `min:<rfc3339>`: read at that timestamp or later.
+///
+/// Spanner allows `max:` and `min:` only on single-use reads, so reads that share a transaction
+/// use `exact:<duration>` and `read:<rfc3339>` instead.
 ///
 /// `<duration>` is a non-negative number with an optional unit suffix: `s` (seconds, the default),
 /// `ms`, `us`/`µs`, `ns`, `m` (minutes) or `h` (hours). Examples: `exact:10`, `exact:2.5s`,

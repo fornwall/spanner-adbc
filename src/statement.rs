@@ -513,7 +513,7 @@ impl SpannerStatement {
         // so the two connections should use the same setting.
         let precision = self.config.timestamp_precision;
         // Baked into the batch transaction, so every partition reads at this bound.
-        let bound = self.config.read_staleness.timestamp_bound();
+        let bound = self.config.read_staleness.multi_use_timestamp_bound();
 
         let partition_op = async move {
             let plan_rs = crate::staleness::single_use(&client, bound.clone())

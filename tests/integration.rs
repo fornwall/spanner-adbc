@@ -5745,6 +5745,17 @@ fn execute_partitions_round_trip() {
     assert_eq!(*seen.iter().next().unwrap(), 1);
     assert_eq!(*seen.iter().next_back().unwrap(), 200);
 
+    // Spanner begins batch transactions only with exact bounds, so `max:` is pinned.
+    statement
+        .set_option(
+            OptionStatement::Other(spanner_adbc::OPTION_READ_STALENESS.into()),
+            "max:0s".into(),
+        )
+        .unwrap();
+    statement
+        .execute_partitions()
+        .expect("execute_partitions with a bounded staleness");
+
     // Partitioning accepts exactly one bound parameter row.
     let mut bound_stmt = connection.new_statement().expect("new statement");
     bound_stmt
