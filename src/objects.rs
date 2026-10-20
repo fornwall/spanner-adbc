@@ -120,15 +120,17 @@ const CONSTRAINTS_SQL: &str = "SELECT tc.TABLE_SCHEMA, tc.TABLE_NAME, tc.CONSTRA
       AND rk.CONSTRAINT_NAME = r.UNIQUE_CONSTRAINT_NAME \
       AND rk.ORDINAL_POSITION = k.POSITION_IN_UNIQUE_CONSTRAINT";
 
-/// Keeps the constraint types the ADBC spec defines, which leaves out placement keys, and drops
-/// constraints on hidden columns, so no constraint names a column `get_objects` omits.
+/// Keeps the constraint types the ADBC spec defines, which leaves out placement keys. Drops the
+/// check Spanner lists for each NOT NULL column, which `xdbc_nullable` already reports; DDL can't
+/// use its `CK_IS_NOT_NULL_` prefix. Also drops constraints on hidden columns, so no constraint
+/// names a column `get_objects` omits.
 ///
-/// A table without a primary key gets a `PK_<table>` primary key and a
-/// `CK_IS_NOT_NULL_<table>_rowid` check on its `rowid`. `CONSTRAINT_COLUMN_USAGE` covers both;
-/// `KEY_COLUMN_USAGE` would miss the check. For a foreign key it names the referenced columns,
+/// A table without a primary key gets a `PK_<table>` primary key on its hidden `rowid`.
+/// `CONSTRAINT_COLUMN_USAGE` names that column, and for a foreign key the referenced columns,
 /// which are never hidden.
 const CONSTRAINTS_PREDICATE: &str = "tc.CONSTRAINT_TYPE IN \
      ('CHECK', 'FOREIGN KEY', 'PRIMARY KEY', 'UNIQUE') \
+     AND NOT STARTS_WITH(tc.CONSTRAINT_NAME, 'CK_IS_NOT_NULL_') \
      AND NOT EXISTS ( \
      SELECT 1 FROM INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS cu \
      JOIN INFORMATION_SCHEMA.COLUMNS AS c \

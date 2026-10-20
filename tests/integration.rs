@@ -1089,15 +1089,11 @@ fn ingest_create_modes_and_the_implicit_hidden_key() {
         vec!["Id", "Label"],
         "get_objects must not list the implicit hidden key column"
     );
-    // The ingested fields are non-nullable, and Spanner reports NOT NULL columns as CHECK
-    // constraints. The implicit key's own constraints stay hidden.
-    assert_eq!(
-        objects_constraints,
-        vec![
-            "CK_IS_NOT_NULL_AdbcCreate_Id",
-            "CK_IS_NOT_NULL_AdbcCreate_Label"
-        ],
-        "get_objects must not list the implicit key's own constraints"
+    // Neither the implicit key nor the checks Spanner keeps for the non-nullable ingested
+    // fields are listed.
+    assert!(
+        objects_constraints.is_empty(),
+        "get_objects must list no constraint the user didn't declare: {objects_constraints:?}"
     );
     let created_ids = col::<Int64Array>(created[0].column(0));
     let created_labels = col::<StringArray>(created[0].column(1));
@@ -1892,8 +1888,8 @@ fn get_objects_reports_catalog_schema_table_columns() {
     let type_names: Vec<&str> = (0..type_name.len()).map(|i| type_name.value(i)).collect();
     assert_eq!(type_names, ["INT64", "STRING(MAX)", "BOOL", "FLOAT64"]);
 
-    // The primary key, and the check Spanner keeps for `SingerId NOT NULL`, both name their
-    // columns.
+    // The primary key names its column. The check Spanner keeps for `SingerId NOT NULL` is left
+    // out.
     let constraints = col::<ListArray>(tables.column(3));
     let constraints = constraints.value(0);
     let constraints = col::<StructArray>(&constraints);
@@ -1910,10 +1906,7 @@ fn get_objects_reports_catalog_schema_table_columns() {
     seen.sort();
     assert_eq!(
         seen,
-        [
-            ("CHECK".to_string(), vec!["SingerId".to_string()]),
-            ("PRIMARY KEY".to_string(), vec!["SingerId".to_string()]),
-        ]
+        [("PRIMARY KEY".to_string(), vec!["SingerId".to_string()])]
     );
 }
 
