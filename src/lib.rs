@@ -36,16 +36,8 @@
 //!
 //! ## Transactions
 //!
-//! Connections start in autocommit mode. With `adbc.connection.autocommit` set to `false`, a
-//! transaction holds either read-only queries sharing one snapshot or DML, depending on its first
-//! statement; a statement of the other kind fails with `InvalidState` until `commit` or
-//! `rollback`. DML and bulk-ingest mutations are buffered until `commit`, so a DML transaction
-//! cannot read its own writes and reports unknown (`None`) row counts. DDL is not transactional
-//! and always executes immediately.
-//!
-//! See [`SpannerConnection`] and
-//! [docs/transactions.md](https://github.com/fornwall/spanner-adbc/blob/main/docs/transactions.md)
-//! for details.
+//! Connections start in autocommit mode. [`SpannerConnection`] describes manual transactions,
+//! which hold either queries or buffered writes.
 //!
 //! ## Example
 //!
