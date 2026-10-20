@@ -6059,6 +6059,15 @@ fn change_stream_via_plain_sql() {
     };
     let connection = &mut fx.connection;
 
+    // A stream left by a failed run blocks dropping the table it tracks, and DDL has no
+    // `DROP CHANGE STREAM IF EXISTS`.
+    if count_rows(
+        connection,
+        "INFORMATION_SCHEMA.CHANGE_STREAMS WHERE CHANGE_STREAM_NAME = 'AdbcChangeStreamCs'",
+    ) > 0
+    {
+        run(connection, "DROP CHANGE STREAM AdbcChangeStreamCs");
+    }
     run(
         connection,
         "DROP TABLE IF EXISTS AdbcChangeStream; \
