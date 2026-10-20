@@ -129,6 +129,17 @@ jobs:
       - name: End-to-end tests
         run: scripts/with-${{ matrix.backend }}.sh python -m pytest python/tests -v
 
+      # Discovery by driver name needs a newer driver manager than the minimum, as
+      # python/README.md documents.
+      - name: End-to-end tests with the minimum adbc-driver-manager
+        if: matrix.python-version == '3.11' && matrix.backend == 'emulator'
+        run: |
+          set -euo pipefail
+          minimum="$(python -c 'import re, tomllib; deps = tomllib.load(open("python/pyproject.toml", "rb"))["project"]["dependencies"]; print(next(m[1] for d in deps if (m := re.fullmatch(r"adbc-driver-manager>=([0-9.]+)", d))))')"
+          python -m pip install "adbc-driver-manager==${minimum}"
+          scripts/with-emulator.sh python -m pytest python/tests -v \
+            -k "not test_manifest_makes_the_driver_discoverable_by_name"
+
   # The image includes shellcheck and pyflakes to lint embedded scripts too.
   actionlint:
     name: actionlint
