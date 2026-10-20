@@ -267,22 +267,6 @@ impl GatedEndpoint {
 // PartialResultSet scripting helpers
 // ---------------------------------------------------------------------------
 
-/// Result metadata for a single STRING column `c`.
-fn string_column_metadata() -> v1::ResultSetMetadata {
-    v1::ResultSetMetadata {
-        row_type: Some(v1::StructType {
-            fields: vec![v1::struct_type::Field {
-                name: "c".to_string(),
-                r#type: Some(v1::Type {
-                    code: v1::TypeCode::String as i32,
-                    ..Default::default()
-                }),
-            }],
-        }),
-        ..Default::default()
-    }
-}
-
 fn result_metadata(fields: &[(&str, v1::TypeCode)]) -> v1::ResultSetMetadata {
     v1::ResultSetMetadata {
         row_type: Some(v1::StructType {
@@ -307,7 +291,8 @@ fn string_value(s: &str) -> prost_types::Value {
     }
 }
 
-/// A `PartialResultSet` of STRING values. Only the first message of a stream carries metadata.
+/// A `PartialResultSet` of values for a single STRING column `c`. Only the first message of a
+/// stream carries metadata.
 fn partial_result_set(
     with_metadata: bool,
     values: &[&str],
@@ -315,7 +300,7 @@ fn partial_result_set(
     last: bool,
 ) -> v1::PartialResultSet {
     v1::PartialResultSet {
-        metadata: with_metadata.then(string_column_metadata),
+        metadata: with_metadata.then(|| result_metadata(&[("c", v1::TypeCode::String)])),
         values: values.iter().map(|s| string_value(s)).collect(),
         resume_token: resume_token.to_vec(),
         last,
