@@ -311,9 +311,9 @@ fn partial_result_set(
 type PartialResultSetSender = tokio::sync::mpsc::Sender<tonic::Result<v1::PartialResultSet>>;
 
 /// A finished response stream carrying the given items.
-fn stream_of(
-    items: Vec<tonic::Result<v1::PartialResultSet>>,
-) -> tonic::Response<tokio::sync::mpsc::Receiver<tonic::Result<v1::PartialResultSet>>> {
+fn stream_of<T>(
+    items: Vec<tonic::Result<T>>,
+) -> tonic::Response<tokio::sync::mpsc::Receiver<tonic::Result<T>>> {
     let (tx, rx) = tokio::sync::mpsc::channel(items.len().max(1));
     for item in items {
         tx.try_send(item)
@@ -2158,10 +2158,7 @@ fn batch_write_group_failure_forwards_status_details() {
     let server = MockServer::start(move |mock| {
         mock.expect_batch_write().returning(move |_| {
             writes_in_mock.fetch_add(1, Ordering::SeqCst);
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
-            tx.try_send(Ok(batch_write_group_already_exists(0)))
-                .expect("scripted stream channel sized to fit");
-            Ok(tonic::Response::new(rx))
+            Ok(stream_of(vec![Ok(batch_write_group_already_exists(0))]))
         });
     });
 
@@ -2227,12 +2224,10 @@ fn batch_write_folds_same_chunk_applied_rows_into_committed_count() {
     let _watchdog = watchdog!();
     let server = MockServer::start(move |mock| {
         mock.expect_batch_write().returning(move |_| {
-            let (tx, rx) = tokio::sync::mpsc::channel(2);
-            tx.try_send(Ok(batch_write_groups_ok(vec![0, 1])))
-                .expect("scripted stream channel sized to fit");
-            tx.try_send(Ok(batch_write_group_already_exists(2)))
-                .expect("scripted stream channel sized to fit");
-            Ok(tonic::Response::new(rx))
+            Ok(stream_of(vec![
+                Ok(batch_write_groups_ok(vec![0, 1])),
+                Ok(batch_write_group_already_exists(2)),
+            ]))
         });
     });
 
@@ -3408,8 +3403,7 @@ fn batch_write_carries_the_request_options_and_change_stream_exclusion() {
     let server = MockServer::start(move |mock| {
         mock.expect_batch_write().returning(move |request| {
             record.lock().unwrap().push(request.into_inner());
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
-            tx.try_send(Ok(v1::BatchWriteResponse {
+            Ok(stream_of(vec![Ok(v1::BatchWriteResponse {
                 indexes: vec![0],
                 status: Some(spanner_grpc_mock::google::rpc::Status {
                     code: 0,
@@ -3417,9 +3411,7 @@ fn batch_write_carries_the_request_options_and_change_stream_exclusion() {
                     details: vec![],
                 }),
                 ..Default::default()
-            }))
-            .expect("scripted stream channel sized to fit");
-            Ok(tonic::Response::new(rx))
+            })]))
         });
     });
 
@@ -4173,9 +4165,7 @@ fn ingest_operational_errors_keep_status_and_details_without_metadata_probes() {
                 let status = response.status.as_mut().unwrap();
                 status.code = code as i32;
                 status.message = "injected operational failure".into();
-                let (tx, rx) = tokio::sync::mpsc::channel(1);
-                tx.try_send(Ok(response)).unwrap();
-                Ok(tonic::Response::new(rx))
+                Ok(stream_of(vec![Ok(response)]))
             });
             // An existence probe must not replace an operational error with AlreadyExists
             // or discard its vendor code and structured details.
