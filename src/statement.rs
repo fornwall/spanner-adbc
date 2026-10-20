@@ -964,7 +964,7 @@ impl Statement for SpannerStatement {
 
     fn set_substrait_plan(&mut self, _plan: impl AsRef<[u8]>) -> Result<()> {
         Err(unsupported(
-            "setting a Substrait plan: use set_sql_query with GoogleSQL text instead",
+            "Substrait plans are not supported: use set_sql_query with GoogleSQL text instead",
         ))
     }
 

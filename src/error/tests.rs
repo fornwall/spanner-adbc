@@ -352,10 +352,6 @@ fn unsupported_keeps_the_message_verbatim() {
         error.message,
         "Substrait plans: Spanner executes GoogleSQL text, not Substrait"
     );
-    assert_eq!(
-        not_implemented("Substrait plans").message,
-        "Substrait plans is not supported by the Spanner ADBC driver"
-    );
 }
 
 #[test]

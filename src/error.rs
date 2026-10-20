@@ -8,15 +8,6 @@ pub(crate) fn err(message: impl Into<String>, status: Status) -> Error {
     Error::with_message_and_status(message, status)
 }
 
-/// A `NotImplemented` error for a noun phrase, such as `not_implemented("ingest mode \"upsert\"")`.
-/// Use [`unsupported`] for a complete sentence.
-pub(crate) fn not_implemented(what: &str) -> Error {
-    err(
-        format!("{what} is not supported by the Spanner ADBC driver"),
-        Status::NotImplemented,
-    )
-}
-
 /// A `NotImplemented` error with `message` as is.
 pub(crate) fn unsupported(message: impl Into<String>) -> Error {
     err(message, Status::NotImplemented)

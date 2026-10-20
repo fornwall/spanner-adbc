@@ -11,7 +11,7 @@ use google_cloud_spanner::transaction::{BeginTransactionOption, ReadWriteTransac
 use super::{SpannerStatement, check_partitioned_dml, is_mutation_limit_exceeded};
 use crate::bind;
 use crate::connection::{lock_txn, runner_builder};
-use crate::error::{annotate, from_spanner, invalid_argument, invalid_state, not_implemented};
+use crate::error::{annotate, from_spanner, invalid_argument, invalid_state, unsupported};
 use crate::runtime::block_on_cancellable;
 use crate::timeout::with_timeout;
 
@@ -190,8 +190,9 @@ impl SpannerStatement {
         let statements = if self.bound.is_empty() {
             let parts = crate::sql::split_statements(sql);
             if parts.len() > 1 {
-                return Err(not_implemented(
-                    "THEN RETURN in a multi-statement (`;`-separated) DML batch",
+                return Err(unsupported(
+                    "THEN RETURN is not supported in a `;`-separated DML batch, whose statements' \
+                     rows can't share one result: execute each statement separately",
                 ));
             }
             parts
