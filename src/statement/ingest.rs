@@ -152,7 +152,7 @@ impl SpannerStatement {
         }
         if let Some(ddl) = ingest_ddl {
             self.run_ddl(ddl)
-                .map_err(|error| self.remap_ingest_create_error(table, error))?;
+                .map_err(|error| self.remap_ingest_ddl_error(table, error))?;
         }
         // No insert reports a missing table at execution when there are no rows, or when the
         // inserts are buffered until commit.
@@ -182,7 +182,27 @@ impl SpannerStatement {
     /// Map a failed `create`-mode DDL onto `AlreadyExists`, as ADBC requires, when the table
     /// exists. Spanner reports it as a generic schema error ("Duplicate name in schema"), so
     /// confirm with a probe. If the table is absent or the probe fails, the DDL error stands.
-    fn remap_ingest_create_error(&self, table: &str, error: Error) -> Error {
+    ///
+    /// In `replace` mode, explain Spanner's refusal to drop a table that other schema objects
+    /// depend on.
+    fn remap_ingest_ddl_error(&self, table: &str, error: Error) -> Error {
+        if self.ingest_mode == Some(IngestMode::Replace) {
+            if error.status != Status::InvalidState
+                || !error
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("cannot drop table")
+            {
+                return error;
+            }
+            return annotate(error, |message| {
+                format!(
+                    "bulk ingest replace of table {table:?} failed: {message} Replace mode drops \
+                     and recreates only the table, so first drop the indexes, interleaved tables, \
+                     foreign keys or views that depend on it, or ingest with mode append"
+                )
+            });
+        }
         if !matches!(self.ingest_mode, None | Some(IngestMode::Create)) {
             return error;
         }

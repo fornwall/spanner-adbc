@@ -1660,6 +1660,40 @@ fn bulk_ingest_replace_rejects_unbindable_schema_before_dropping_table() {
     drop_tables(connection, &[table]);
 }
 
+/// Spanner refuses to drop a table with dependent schema objects; the error says what to do.
+#[test]
+fn bulk_ingest_replace_of_an_indexed_table_names_the_remedy() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
+    let table = "AdbcIndexedReplace";
+    run(
+        connection,
+        &format!(
+            "DROP INDEX IF EXISTS {table}ByName; DROP TABLE IF EXISTS {table}; \
+             CREATE TABLE {table} (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id); \
+             CREATE INDEX {table}ByName ON {table} (Name)"
+        ),
+    );
+    let schema = Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, true)]));
+    let mut replace = ingest_stmt(connection, table, "replace");
+    replace.bind(RecordBatch::new_empty(schema)).unwrap();
+    let error = replace.execute_update().unwrap_err();
+    assert_eq!(error.status, Status::InvalidState, "{error}");
+    for needle in [
+        &format!("{table}ByName"),
+        "Replace mode drops",
+        "mode append",
+    ] {
+        assert!(error.message.contains(needle), "{error}");
+    }
+    run(
+        connection,
+        &format!("DROP INDEX {table}ByName; DROP TABLE {table}"),
+    );
+}
+
 /// `ARRAY<scalar>` columns map to an Arrow `List` of the element type.
 #[test]
 fn array_columns_map_to_native_arrow_lists() {
