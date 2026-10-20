@@ -67,6 +67,7 @@ A manual read transaction takes its snapshot from the first query's staleness bo
 `max:` and `min:` bounds to exact ones, and ignores the bounds of later queries. If the first
 query fails, for example with a syntax error, the transaction hasn't begun and the next query
 starts it again.
+
 `execute_partitions` always creates its own batch snapshot and fails inside a manual write
 transaction. It passes the staleness bound through unchanged, and Spanner rejects bounded
 staleness for that transaction type, so use a strong, exact staleness or exact timestamp bound.
@@ -111,12 +112,11 @@ The driver doesn't use unary `ExecuteSql`, the key-based `Read`, `StreamingRead`
 
 ### Sessions and transaction begin
 
-All connections from a database object share one cached client stack, though each has its own
-transaction state. The client keeps a single multiplexed session, checks its age hourly and
-replaces it after seven days; there is no session pool. Setting a database option discards the
-cache for new connections, and existing connections keep their stack. The admin client is built
-on the first DDL operation and shared by the same stack. Cloud Spanner, the emulator and Omni
-are all reached over gRPC, for queries and schema changes alike.
+Connections from one database object share its [client stack](adbc.md#objects-and-loading),
+though each has its own transaction state. The client keeps a single multiplexed session, checks
+its age hourly and replaces it after seven days; there is no session pool. The admin client is
+built on the first DDL operation. Cloud Spanner, the emulator and Omni are all reached over gRPC,
+for queries and schema changes alike.
 
 Read/write and manual read-only transactions begin inline with their first request, so creating
 a manual read-only transaction sends no RPC. Write-only, partitioned DML and batch read-only
@@ -154,26 +154,23 @@ uses `ExecuteStreamingSql` instead, and reads the returned rows inside the trans
 ### Partitioned queries
 
 `execute_partitions` creates a batch read-only transaction, calls `PartitionQuery`, and gets the
-Arrow schema from a separate PLAN probe. It accepts at most one row of bound parameters. A
-descriptor carries the query and the original session and transaction IDs, which
-`read_partition` uses even on another connection. Descriptors can be executed by anyone who
-holds them and are not authenticated, so only accept them from trusted sources.
+Arrow schema from a separate PLAN probe. A descriptor carries the query and the original session
+and transaction IDs, which `read_partition` uses even on another connection; see
+[partitioning](adbc.md#partitioning-and-cancellation) for the security implications.
 
 The driver has no setting for partition size or count because Spanner ignores both
 [PartitionOptions](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/PartitionOptions) hints.
 
 ### BatchWrite and partitioned DML
 
-With `spanner.ingest.batch_write=true`, each row is its own mutation group. Groups commit
-independently, so even one ingest chunk can partially succeed, and there is no replay
-protection. Manual mode ignores the option and buffers mutations for an atomic commit. Stream
-retries respect the attempt limit but not the elapsed-time limit, so use the `update` timeout as
-a deadline.
+With `spanner.ingest.batch_write=true`, autocommit ingest sends each row as its own mutation
+group. Groups commit independently, so even one ingest chunk can partially succeed, and there
+is no replay protection.
 
-`spanner.dml.partitioned=true` runs an idempotent `UPDATE` or `DELETE` as partitioned DML. It is
-not atomic and reports a lower bound on affected rows. See
-[statement options](options.md#statement-only-options) for the restrictions and which settings
-apply to both paths.
+`spanner.dml.partitioned=true` runs an idempotent `UPDATE` or `DELETE` as partitioned DML, whose
+partitions commit independently. It is not atomic and reports a lower bound on affected rows.
+See [statement options](options.md#statement-only-options) for the restrictions and which
+settings apply to both paths.
 
 ## Limits and ingest chunks
 
