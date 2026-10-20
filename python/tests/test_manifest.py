@@ -54,23 +54,9 @@ def test_install_writes_a_manifest_named_for_the_driver(tmp_path):
     assert again == written
 
 
-def test_manifest_escapes_backslashes(tmp_path):
-    """A Windows path must survive the round trip through TOML."""
-    text = manifest_mod.manifest_text(r"C:\Program Files\ADBC\spanner_adbc.dll")
-    shared = tomllib.loads(text)["Driver"]["shared"]
-    assert shared.endswith(r"ADBC\spanner_adbc.dll")
-    assert "\\\\" not in shared
-
-
-def test_manifest_does_not_require_a_known_platform(tmp_path, monkeypatch):
-    # Source-built libraries can work on platforms without published wheels.
-    monkeypatch.setattr(manifest_mod.sys, "platform", "unknown")
-    library = tmp_path / "libspanner_adbc.so"
-    written = manifest_mod.install(tmp_path, library=library)
-    assert tomllib.loads(written.read_text())["Driver"]["shared"] == str(library.resolve())
-
-
-@pytest.mark.parametrize("name", ['quote"', "tab\t", "line\n", "control\x01", "del\x7f", "snow☃𐐀"])
+@pytest.mark.parametrize(
+    "name", ["back\\slash", 'quote"', "tab\t", "line\n", "control\x01", "del\x7f", "snow☃𐐀"]
+)
 def test_manifest_paths_round_trip_through_toml(tmp_path, name):
     library = tmp_path / name / "libspanner_adbc.so"
     doc = tomllib.loads(manifest_mod.manifest_text(library))

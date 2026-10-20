@@ -12,9 +12,20 @@ commit each DML statement immediately.
 from collections.abc import Mapping
 
 import adbc_driver_manager.dbapi
-from adbc_driver_manager import (
+
+# Spanner has no TIME type, so `Time` values can't be bound.
+from adbc_driver_manager.dbapi import (
+    BINARY,
+    DATETIME,
+    NUMBER,
+    ROWID,
+    STRING,
+    Connection,
+    Cursor,
     DataError,
     DatabaseError,
+    Date,
+    DateFromTicks,
     Error,
     IntegrityError,
     InterfaceError,
@@ -22,22 +33,11 @@ from adbc_driver_manager import (
     NotSupportedError,
     OperationalError,
     ProgrammingError,
-    Warning,
-)
-
-# PEP 249 type objects and constructors. Spanner has no TIME type, so `Time` values can't be bound.
-from adbc_driver_manager.dbapi import (
-    BINARY,
-    DATETIME,
-    NUMBER,
-    ROWID,
-    STRING,
-    Date,
-    DateFromTicks,
     Time,
     TimeFromTicks,
     Timestamp,
     TimestampFromTicks,
+    Warning,
     apilevel,
     threadsafety,
 )
@@ -50,9 +50,6 @@ from . import (
     _db_kwargs,
     _driver_path,
 )
-
-Connection = adbc_driver_manager.dbapi.Connection
-Cursor = adbc_driver_manager.dbapi.Cursor
 
 # GoogleSQL marks parameters as `@name`; `?` is rejected. A mapping binds by name and a sequence
 # binds in order of first appearance. "named" is the closest PEP 249 style, but its `:name`

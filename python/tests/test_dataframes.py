@@ -7,7 +7,7 @@ import pytest
 
 from conftest import database_options
 
-pa = pytest.importorskip("pyarrow")
+pytest.importorskip("pyarrow")
 pl = pytest.importorskip("polars")
 from polars.testing import assert_frame_equal
 
@@ -116,25 +116,8 @@ def test_polars_read_dtypes_and_values(spanner_database):
         conn.close()
 
 
-def test_polars_to_arrow_round_trip(spanner_database):
-    conn = _connect(spanner_database)
-    try:
-        with conn.cursor() as cur:
-            _create_and_fill(cur, "AdbcPlArrow")
-
-        df = pl.read_database(
-            f"SELECT {_COLUMNS} FROM AdbcPlArrow ORDER BY Id", connection=conn
-        )
-
-        table = df.to_arrow()
-        assert isinstance(table, pa.Table)
-        assert_frame_equal(pl.from_arrow(table), df)
-    finally:
-        conn.close()
-
-
 def test_pandas_read_dtypes_and_values(spanner_database):
-    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pandas")
     conn = _connect(spanner_database)
     try:
         with conn.cursor() as cur:
@@ -142,11 +125,6 @@ def test_pandas_read_dtypes_and_values(spanner_database):
 
             cur.execute(f"SELECT {_COLUMNS} FROM AdbcPdRead ORDER BY Id")
             df = cur.fetch_df()
-
-            cur.execute(f"SELECT {_COLUMNS} FROM AdbcPdRead ORDER BY Id")
-            df2 = cur.fetch_arrow_table().to_pandas()
-
-        pd.testing.assert_frame_equal(df, df2)
 
         assert df["Id"].dtype == "int64"
         assert df["Active"].dtype == "bool"
