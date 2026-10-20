@@ -230,8 +230,8 @@ mod table_schema_probe {
         pub(super) requests: Requests,
     }
 
-    /// Serves sessions, answers the schema query per `schema_query`, and answers any
-    /// `INFORMATION_SCHEMA` probe with no rows: the table does not exist.
+    /// Serves sessions, answers the schema query per `schema_query`, and answers the
+    /// `INFORMATION_SCHEMA` lookup with no rows: the table does not exist.
     fn start(schema_query: SchemaQuery) -> MockServer {
         let requests = Requests::default();
         let silent: Arc<Mutex<Vec<Sender>>> = Arc::default();
@@ -247,13 +247,15 @@ mod table_schema_probe {
                     tx.try_send(Ok(v1::PartialResultSet {
                         metadata: Some(v1::ResultSetMetadata {
                             row_type: Some(v1::StructType {
-                                fields: vec![v1::struct_type::Field {
-                                    name: "TABLE_NAME".into(),
-                                    r#type: Some(v1::Type {
-                                        code: v1::TypeCode::String as i32,
-                                        ..Default::default()
-                                    }),
-                                }],
+                                fields: ["COLUMN_NAME", "IS_NULLABLE"]
+                                    .map(|name| v1::struct_type::Field {
+                                        name: name.into(),
+                                        r#type: Some(v1::Type {
+                                            code: v1::TypeCode::String as i32,
+                                            ..Default::default()
+                                        }),
+                                    })
+                                    .into(),
                             }),
                             ..Default::default()
                         }),
@@ -302,10 +304,21 @@ mod table_schema_probe {
         read_only.timestamp_bound
     }
 
-    /// A table created after a stale read's timestamp is missing at that timestamp, so the probe
+    /// The schema query and the `INFORMATION_SCHEMA` lookup, which the driver sends
+    /// concurrently.
+    fn query_and_lookup(requests: &[v1::ExecuteSqlRequest]) -> [&v1::ExecuteSqlRequest; 2] {
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        let lookup = requests[0].sql.contains("INFORMATION_SCHEMA");
+        [
+            &requests[usize::from(lookup)],
+            &requests[usize::from(!lookup)],
+        ]
+    }
+
+    /// A table created after a stale read's timestamp is missing at that timestamp, so the lookup
     /// must read at the same bound and report NotFound.
     #[test]
-    fn probe_reads_at_the_connections_staleness() {
+    fn lookup_reads_at_the_connections_staleness() {
         use v1::transaction_options::read_only::TimestampBound as WireBound;
 
         let server = start(SchemaQuery::Fails(tonic::Code::InvalidArgument));
@@ -322,21 +335,20 @@ mod table_schema_probe {
         assert_eq!(error.status, Status::NotFound, "{}", error.message);
 
         let requests = server.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2, "the schema query and one probe");
         let expected = Some(WireBound::ExactStaleness(prost_types::Duration {
             seconds: 10,
             nanos: 0,
         }));
-        assert_eq!(single_use_bound(&requests[0]), expected);
-        assert!(requests[1].sql.contains("INFORMATION_SCHEMA"));
-        assert_eq!(single_use_bound(&requests[1]), expected);
+        for request in query_and_lookup(&requests) {
+            assert_eq!(single_use_bound(request), expected);
+        }
     }
 
     /// Spanner resolves names case-insensitively, but `INFORMATION_SCHEMA` keeps the declared
-    /// case, so the probe must lowercase both sides; otherwise it would report `singers` missing
-    /// while `Singers` exists. The mock can't evaluate SQL, so check the probe's text.
+    /// case, so the lookup must lowercase both sides; otherwise it would report `singers` missing
+    /// while `Singers` exists. The mock can't evaluate SQL, so check the lookup's text.
     #[test]
-    fn probe_compares_names_case_insensitively() {
+    fn lookup_compares_names_case_insensitively() {
         let server = start(SchemaQuery::Fails(tonic::Code::InvalidArgument));
         let error = connect(&server)
             .get_table_schema(None, Some("App"), "singers")
@@ -349,14 +361,14 @@ mod table_schema_probe {
         );
 
         let requests = server.requests.lock().unwrap();
-        let probe = &requests[1];
+        let [_, lookup] = query_and_lookup(&requests);
         for comparison in [
-            "LOWER(TABLE_SCHEMA) = LOWER(@schema)",
-            "LOWER(TABLE_NAME) = LOWER(@table)",
+            "LOWER(t.TABLE_SCHEMA) = LOWER(@schema)",
+            "LOWER(t.TABLE_NAME) = LOWER(@table)",
         ] {
-            assert!(probe.sql.contains(comparison), "{}", probe.sql);
+            assert!(lookup.sql.contains(comparison), "{}", lookup.sql);
         }
-        let params = &probe.params.as_ref().expect("bound names").fields;
+        let params = &lookup.params.as_ref().expect("bound names").fields;
         for (name, value) in [("schema", "App"), ("table", "singers")] {
             assert_eq!(
                 params[name].kind,
@@ -366,16 +378,15 @@ mod table_schema_probe {
         }
     }
 
-    /// Only a missing-table status is refined. Probing after a timeout would add a second query
-    /// deadline, and after a permission error the probe cannot see the table.
+    /// Only a missing-table status becomes NotFound. After a permission error, the lookup can't
+    /// see the table either, and a timeout ends both reads.
     #[test]
-    fn probe_is_skipped_for_other_failures() {
+    fn other_failures_keep_their_status() {
         let server = start(SchemaQuery::Fails(tonic::Code::PermissionDenied));
         let error = connect(&server)
             .get_table_schema(None, None, "Hidden")
             .unwrap_err();
         assert_eq!(error.status, Status::Unauthorized, "{}", error.message);
-        assert_eq!(server.requests.lock().unwrap().len(), 1, "no probe");
 
         let server = start(SchemaQuery::Silent);
         let mut connection = connect(&server);
@@ -387,7 +398,6 @@ mod table_schema_probe {
             .unwrap();
         let error = connection.get_table_schema(None, None, "Slow").unwrap_err();
         assert_eq!(error.status, Status::Timeout, "{}", error.message);
-        assert_eq!(server.requests.lock().unwrap().len(), 1, "no probe");
     }
 }
 

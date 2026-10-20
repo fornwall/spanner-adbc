@@ -435,6 +435,15 @@ fn get_table_schema_reports_column_types() {
     assert_eq!(singers_schema.field(1).data_type(), &DataType::Utf8);
     assert_eq!(singers_schema.field(2).data_type(), &DataType::Boolean);
     assert_eq!(singers_schema.field(3).data_type(), &DataType::Float64);
+    // `SingerId` is declared NOT NULL, which only INFORMATION_SCHEMA reports.
+    assert_eq!(
+        singers_schema
+            .fields()
+            .iter()
+            .map(|f| f.is_nullable())
+            .collect::<Vec<_>>(),
+        [false, true, true, true]
+    );
 
     // Backticks cannot be escaped for every Spanner parser, so such names are rejected.
     let hostile = connection
@@ -1110,12 +1119,9 @@ fn ingest_create_modes_and_the_implicit_hidden_key() {
         .get_table_schema(None, None, "AdbcCreate")
         .expect("get_table_schema for the ingest-created table");
     assert_eq!(
-        created_schema
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect::<Vec<_>>(),
-        vec!["Id", "Label"]
+        created_schema.fields(),
+        ingest_label_rows().schema().fields(),
+        "get_table_schema must return the ingested names, types and nullability"
     );
     let (objects_columns, objects_constraints) =
         table_columns_and_constraints(connection, "AdbcCreate");

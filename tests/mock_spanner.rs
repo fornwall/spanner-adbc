@@ -3587,7 +3587,25 @@ fn request_priority_reaches_metadata_reads_but_tags_do_not() {
     let (rec_q, rec_b, rec_c) = (queries.clone(), batch_dml.clone(), commits.clone());
     let server = MockServer::start(move |mock| {
         serve_begin_transaction(mock);
-        serve_streaming_sql_begin_aware(mock, &["v"], Some(rec_q));
+        mock.expect_execute_streaming_sql()
+            .returning(move |request| {
+                let request = request.into_inner();
+                // get_table_schema's INFORMATION_SCHEMA lookup reads names and nullability.
+                let result = if request.sql.contains("INFORMATION_SCHEMA") {
+                    v1::PartialResultSet {
+                        metadata: Some(result_metadata(&[
+                            ("COLUMN_NAME", v1::TypeCode::String),
+                            ("IS_NULLABLE", v1::TypeCode::String),
+                        ])),
+                        last: true,
+                        ..Default::default()
+                    }
+                } else {
+                    partial_result_set(true, &["v"], b"r-1", true)
+                };
+                rec_q.lock().unwrap().push(request);
+                Ok(stream_of(vec![Ok(result)]))
+            });
         serve_batch_dml(mock, rec_b.clone());
         mock.expect_commit().returning(move |request| {
             rec_c.lock().unwrap().push(request.into_inner());
@@ -3644,23 +3662,27 @@ fn request_priority_reaches_metadata_reads_but_tags_do_not() {
         "spanner.request.tag must reach the query's ExecuteStreamingSql RequestOptions"
     );
 
-    let metadata = queries
-        .iter()
-        .find(|q| q.sql != USER_QUERY)
-        .expect("get_table_schema issued a metadata ExecuteStreamingSql");
-    let metadata_options = metadata.request_options.clone().unwrap_or_default();
+    let metadata: Vec<_> = queries.iter().filter(|q| q.sql != USER_QUERY).collect();
     assert_eq!(
-        metadata_options.priority, high,
-        "spanner.request.priority must reach a driver-internal metadata read"
+        metadata.len(),
+        2,
+        "get_table_schema issues its query and an INFORMATION_SCHEMA lookup"
     );
-    assert_eq!(
-        metadata_options.request_tag, "",
-        "spanner.request.tag must NOT leak onto a driver-internal metadata read"
-    );
-    assert_eq!(
-        metadata_options.transaction_tag, "",
-        "spanner.transaction.tag must NOT leak onto a driver-internal metadata read"
-    );
+    for read in metadata {
+        let metadata_options = read.request_options.clone().unwrap_or_default();
+        assert_eq!(
+            metadata_options.priority, high,
+            "spanner.request.priority must reach a driver-internal metadata read"
+        );
+        assert_eq!(
+            metadata_options.request_tag, "",
+            "spanner.request.tag must NOT leak onto a driver-internal metadata read"
+        );
+        assert_eq!(
+            metadata_options.transaction_tag, "",
+            "spanner.transaction.tag must NOT leak onto a driver-internal metadata read"
+        );
+    }
 
     let batch_dml = batch_dml.lock().unwrap();
     assert_eq!(

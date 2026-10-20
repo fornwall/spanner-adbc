@@ -11,12 +11,12 @@ use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
 use adbc_core::{CancelHandle, Connection, Optionable};
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
-use arrow_schema::Schema;
+use arrow_schema::{Fields, Schema};
 use google_cloud_spanner::batch::Partition;
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::model::StructType;
 
-use crate::conversion::{TimestampPrecision, result_set_to_batch};
+use crate::conversion::TimestampPrecision;
 use crate::driver::{Connected, SharedDatabaseAdmin};
 use crate::error::{
     annotate, err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option,
@@ -34,7 +34,10 @@ use crate::timeout::with_timeout;
 mod exec;
 mod txn;
 
-use crate::metadata::{check_lookup_catalog, like_match, metadata_sql_builder, table_exists_at};
+use crate::metadata::{
+    check_lookup_catalog, like_match, metadata_sql_builder, query_single_use, str_cols,
+    table_columns_query,
+};
 use exec::{isolation_to_adbc_string, parse_isolation_level};
 pub(crate) use exec::{run_batch_txn, runner_builder, write_mutations_txn};
 use txn::{ManualTxn, check_commit_writable};
@@ -309,52 +312,46 @@ impl Connection for SpannerConnection {
         self.cancel.begin_operation();
         check_lookup_catalog(catalog, self.catalog())?;
         let table = qualified_table(db_schema, table_name)?;
-        let sql = format!("SELECT * FROM {table} LIMIT 0");
-        let client = self.client.clone();
+        let select =
+            metadata_sql_builder(&self.config, format!("SELECT * FROM {table} LIMIT 0")).build();
+        let lookup = table_columns_query(&self.config, db_schema.unwrap_or(""), table_name);
         let bound = self.config.read_staleness.timestamp_bound();
-        // Use the connection's precision so the schema matches what its queries stream.
-        let precision = self.config.timestamp_precision;
-        let statement = metadata_sql_builder(&self.config, sql).build();
-        let probe_bound = bound.clone();
-        let result = block_on_cancellable(
+        // The query's result metadata has the types, at the precision the connection's queries
+        // stream, and INFORMATION_SCHEMA the NOT NULL columns. Both read at the same bound.
+        let (selected, columns) = block_on_cancellable(
             &self.runtime,
             &self.cancel.current(),
             with_timeout(
                 self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
-                async move {
-                    let transaction = crate::staleness::single_use(&client, bound);
-                    let result_set = transaction
-                        .execute_query(statement)
-                        .await
-                        .map_err(from_spanner)?;
-                    result_set_to_batch(result_set, precision).await
+                async {
+                    Ok(futures_util::join!(
+                        query_single_use(
+                            &self.client,
+                            bound.clone(),
+                            select,
+                            self.config.timestamp_precision
+                        ),
+                        query_single_use(
+                            &self.client,
+                            bound,
+                            lookup,
+                            TimestampPrecision::default()
+                        ),
+                    ))
                 },
             ),
-        );
-        match result {
-            Ok((schema, _batch)) => Ok((*schema).clone()),
+        )?;
+        match selected {
+            Ok((schema, _batch)) => with_declared_nullability(&schema, &columns?.1),
             // A missing table is INVALID_ARGUMENT ("Table not found") from the query analyzer, but
-            // ADBC wants NotFound. Probe INFORMATION_SCHEMA only on failure, so the common case
-            // stays one query. Other statuses skip the probe: after a timeout it would add a
-            // second deadline, and INFORMATION_SCHEMA hides tables a role cannot read, which
-            // would turn a permission error into NotFound.
-            Err(error) if matches!(error.status, Status::InvalidArguments | Status::NotFound) => {
-                // At the query's bound, so a table created after a stale read is still missing.
-                let exists = table_exists_at(
-                    &self.runtime,
-                    &self.client,
-                    &self.cancel.current(),
-                    &self.config,
-                    probe_bound,
-                    db_schema.unwrap_or(""),
-                    table_name,
-                );
-                match exists {
-                    Ok(false) => Err(err(format!("table {table} not found"), Status::NotFound)),
-                    // The query failed for another reason, or the probe failed too.
-                    Ok(true) | Err(_) => Err(error),
-                }
+            // ADBC wants NotFound. Other statuses keep their error: INFORMATION_SCHEMA hides
+            // tables a role cannot read, which would turn a permission error into NotFound.
+            Err(error)
+                if matches!(error.status, Status::InvalidArguments | Status::NotFound)
+                    && columns.is_ok_and(|(_, columns)| columns.num_rows() == 0) =>
+            {
+                Err(err(format!("table {table} not found"), Status::NotFound))
             }
             Err(error) => Err(error),
         }
@@ -580,6 +577,29 @@ pub(crate) fn decode_partition(descriptor: &[u8]) -> Result<PartitionDescriptor>
         partition,
         row_type,
     })
+}
+
+/// Mark the fields of `schema` that a [`table_columns_query`] result declares NOT NULL as
+/// non-nullable.
+fn with_declared_nullability(schema: &Schema, columns: &RecordBatch) -> Result<Schema> {
+    let [names, nullable] = str_cols(columns)?;
+    let not_null: HashSet<&str> = names
+        .iter()
+        .zip(nullable)
+        .filter_map(|(name, nullable)| name.filter(|_| nullable == Some("NO")))
+        .collect();
+    let fields: Fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if not_null.contains(field.name().as_str()) {
+                Arc::new(field.as_ref().clone().with_nullable(false))
+            } else {
+                field.clone()
+            }
+        })
+        .collect();
+    Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
 /// Explain the two manual-commit failures whose remedy isn't obvious. A commit whose outcome is

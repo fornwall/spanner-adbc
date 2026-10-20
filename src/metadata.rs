@@ -1,8 +1,9 @@
 //! Shared metadata helpers: the statement builders for internal reads, table and catalog
 //! lookups, and the ADBC `LIKE` matcher.
 
-use adbc_core::error::{Error, Result, Status};
+use adbc_core::error::{Result, Status};
 use arrow_array::{RecordBatch, StringArray};
+use arrow_schema::SchemaRef;
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::{Statement as SpannerSql, StatementBuilder};
 use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, TimestampBound};
@@ -35,10 +36,26 @@ pub(crate) fn check_lookup_catalog(catalog: Option<&str>, reported: &str) -> Res
     }
 }
 
-/// The [`table_exists_at`] probe. Spanner resolves schema and table names case-insensitively, but
+/// One row per column of a table, or one row with null columns for a table without any, and no
+/// rows when it doesn't exist. Spanner resolves schema and table names case-insensitively, but
 /// `INFORMATION_SCHEMA` keeps their declared case.
-const TABLE_EXISTS_SQL: &str = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
-     WHERE LOWER(TABLE_SCHEMA) = LOWER(@schema) AND LOWER(TABLE_NAME) = LOWER(@table)";
+const TABLE_COLUMNS_SQL: &str = "SELECT c.COLUMN_NAME, c.IS_NULLABLE \
+     FROM INFORMATION_SCHEMA.TABLES AS t \
+     LEFT JOIN INFORMATION_SCHEMA.COLUMNS AS c \
+       ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME \
+     WHERE LOWER(t.TABLE_SCHEMA) = LOWER(@schema) AND LOWER(t.TABLE_NAME) = LOWER(@table)";
+
+/// The [`TABLE_COLUMNS_SQL`] lookup of a table. The default schema is `""` in Spanner.
+pub(crate) fn table_columns_query(
+    config: &SharedConfig,
+    db_schema: &str,
+    table_name: &str,
+) -> SpannerSql {
+    metadata_sql_builder(config, TABLE_COLUMNS_SQL)
+        .add_param("schema", db_schema)
+        .add_param("table", table_name)
+        .build()
+}
 
 /// Whether a table exists now, read strongly as writes see it. The default schema is `""` in
 /// Spanner.
@@ -55,44 +72,34 @@ pub(crate) fn table_exists(
     db_schema: &str,
     table_name: &str,
 ) -> Result<bool> {
-    table_exists_at(runtime, client, cancel, config, None, db_schema, table_name)
-}
-
-/// [`table_exists`] at a read `bound`, so a probe that refines a failed read sees the same
-/// snapshot as that read. `None` is a strong read.
-pub(crate) fn table_exists_at(
-    runtime: &SharedRuntime,
-    client: &DatabaseClient,
-    cancel: &CancelSignal,
-    config: &SharedConfig,
-    bound: Option<TimestampBound>,
-    db_schema: &str,
-    table_name: &str,
-) -> Result<bool> {
-    let client = client.clone();
-    let (schema, table) = (db_schema.to_string(), table_name.to_string());
+    let lookup = table_columns_query(config, db_schema, table_name);
     block_on_cancellable(
         runtime,
         cancel,
         with_timeout(
             config.timeouts.query_timeout(),
             crate::OPTION_RPC_TIMEOUT_QUERY,
-            async move {
-                let statement = metadata_sql_builder(config, TABLE_EXISTS_SQL)
-                    .add_param("schema", &schema)
-                    .add_param("table", &table)
-                    .build();
-                let transaction = crate::staleness::single_use(&client, bound);
-                let result_set = transaction
-                    .execute_query(statement)
-                    .await
-                    .map_err(from_spanner)?;
-                let (_schema, batch) =
-                    result_set_to_batch(result_set, TimestampPrecision::default()).await?;
-                Ok::<bool, Error>(batch.num_rows() > 0)
+            async {
+                let (_schema, columns) =
+                    query_single_use(client, None, lookup, TimestampPrecision::default()).await?;
+                Ok(columns.num_rows() > 0)
             },
         ),
     )
+}
+
+/// Run a statement as one single-use read at `bound`, where `None` is a strong read.
+pub(crate) async fn query_single_use(
+    client: &DatabaseClient,
+    bound: Option<TimestampBound>,
+    statement: SpannerSql,
+    precision: TimestampPrecision,
+) -> Result<(SchemaRef, RecordBatch)> {
+    let result_set = crate::staleness::single_use(client, bound)
+        .execute_query(statement)
+        .await
+        .map_err(from_spanner)?;
+    result_set_to_batch(result_set, precision).await
 }
 
 /// Statement builder for driver-internal metadata reads: `INFORMATION_SCHEMA` queries and
