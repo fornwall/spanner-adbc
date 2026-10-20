@@ -69,17 +69,16 @@ A manual read transaction takes its snapshot from the first query's staleness bo
 query fails, for example with a syntax error, the transaction hasn't begun and the next query
 starts it again.
 
-`execute_partitions` always creates its own batch snapshot and fails inside a manual write
-transaction. It passes the staleness bound through unchanged, and Spanner rejects bounded
-staleness for that transaction type, so use a strong, exact staleness or exact timestamp bound.
+`execute_partitions` always creates its own batch snapshot, converting `max:` and `min:` bounds
+the same way, and fails inside a manual write transaction.
 
 At commit, buffered DML runs as one `ExecuteBatchDml`, followed by the buffered mutations. All
 mutations therefore apply after all DML, whatever order the ingests and DML were issued in.
 Mutation-only work uses the write-only path, which is protected against replay. If the commit
-fails, the buffer is kept. A commit that was cancelled or timed out may still have been applied,
-so committing the kept work again could apply it twice; roll back to discard it. If the commit
-succeeds, only the applied work is removed, so work buffered concurrently survives. Turning
-autocommit back on also commits pending work.
+fails, the buffer is kept. A commit that was cancelled, timed out or lost its connection may
+still have been applied, and its error says so; committing the kept work again could apply it
+twice, so roll back to discard it. If the commit succeeds, only the applied work is removed, so
+work buffered concurrently survives. Turning autocommit back on also commits pending work.
 
 With `adbc.connection.readonly=true`, new writes and commits of pending writes fail with
 `InvalidState`, but rollback and commits of read-only or empty transactions still work.
@@ -105,7 +104,7 @@ The implementation is in [connection.rs](../src/connection.rs),
 | `Rollback` | Sent by the client to clean up a read/write transaction with a known ID when its body fails with an error other than `ABORTED`, or when a cancel or timeout drops it. |
 | `PartitionQuery` | Descriptors for `execute_partitions`. |
 | `BatchWrite` | Opt-in autocommit ingest. |
-| `UpdateDatabaseDdl` | Schema changes through the gRPC Database Admin API, followed by operation polling. |
+| `UpdateDatabaseDdl` | Schema changes through the gRPC Database Admin API, followed by polling the operation at most every 10 seconds. |
 
 The driver doesn't use unary `ExecuteSql`, the key-based `Read`, `StreamingRead` and
 `PartitionRead`, or the session pool RPCs (`BatchCreateSessions`, `GetSession`, `ListSessions`,
@@ -195,5 +194,8 @@ not just on the number of rows. Spanner publishes no limit on the number of stat
 The driver splits autocommit ingest into chunks of at most 20,000 estimated mutations and 4 MiB
 of estimated row data, leaving headroom for indexes. If Spanner rejects a write-only chunk for
 having too many mutations, the driver splits it in half and retries, down to single rows. A
-chunk can still exceed other server limits. Manual transactions are not split.
-See [statement/ingest.rs](../src/statement/ingest.rs).
+chunk can still exceed other server limits. See [statement/ingest.rs](../src/statement/ingest.rs).
+
+A manual transaction applies all its buffered work in one commit, so it fails at commit above
+80,000 mutations however often it is retried. DB-API connections start in manual mode, so use
+autocommit for large pandas or Polars writes.

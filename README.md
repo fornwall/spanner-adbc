@@ -118,7 +118,8 @@ which a plaintext endpoint sends unencrypted. See [anonymous connections](docs/o
   multi-statement DDL batch is not atomic: if it fails partway, earlier statements can stay applied.
 - A batch can't mix queries, DML and DDL. `THEN RETURN` needs autocommit and a single statement.
 - Large autocommit ingests commit in chunks, so a failed ingest can leave rows behind.
-  BatchWrite ingest can partially succeed even within a chunk.
+  BatchWrite ingest can partially succeed even within a chunk. A manual transaction commits all
+  its writes at once, so it is capped at Spanner's 80,000 mutations per commit.
 - `bind_stream()` reads all input into memory before executing. For large loads, ingest
   bounded batches with separate calls in append mode.
 - Tables created by ingest get Spanner's

@@ -37,9 +37,8 @@ parameters are passed as a mapping.
 | `SpannerConnection` | Owns transaction state and metadata operations. Connections from one database share its client stack. | [connection.rs](../src/connection.rs) |
 | `SpannerStatement` | Configures SQL or bulk ingest, binds data and executes work. | [statement.rs](../src/statement.rs) |
 
-Rust callers start with `SpannerDriver::try_new()`. The synchronous ADBC methods run the async
-Spanner client on the driver's runtime, so don't call them directly from an async task; see
-[synchronous calls from Tokio](limitations.md#synchronous-calls-from-tokio).
+Rust callers start with `SpannerDriver::try_new()`. The ADBC methods are synchronous; for async
+callers, see [synchronous calls from Tokio](limitations.md#synchronous-calls-from-tokio).
 
 Other languages load the shared library through an ADBC driver manager. The C ABI shares one
 driver and runtime across the process, and once a driver is initialized the library stays loaded
@@ -125,7 +124,9 @@ chunks, so a large ingest is not atomic; in a manual transaction all mutations w
 commit. Creating or replacing the table is DDL and happens immediately, and makes non-nullable
 fields `NOT NULL` columns. The driver converts every bound value first, so a bad value fails
 before the DDL runs or any chunk commits, as does a null in a non-nullable field of a table the
-ingest creates.
+ingest creates. In manual mode, an append checks the table and its columns before buffering, so
+a missing table returns `NotFound` and an unknown column `AlreadyExists` at execution rather
+than at commit.
 
 The driver checks table, schema and column names before sending anything. It rejects names
 containing a backtick, a backslash or a control character, because Spanner's DDL parser doesn't
@@ -146,8 +147,8 @@ Parameters and ingested columns keep their Arrow type:
   a time of day.
 - `Decimal128` values with a negative scale keep their value (`99` at scale `-2` is `9900`).
   Spanner checks the `NUMERIC` range, and values read back with scale 9.
-- Timestamps of any unit keep their precision; `spanner.max_timestamp_precision` only affects
-  reads.
+- Timestamps of any unit keep their precision, and a timestamp without a time zone is taken as
+  UTC. `spanner.max_timestamp_precision` only affects reads.
 - Strings tagged with the `arrow.json` extension bind and ingest as `JSON`. For an untagged
   string, write `PARSE_JSON(@p)` in the SQL.
 - `ENUM`, `PROTO`, `INTERVAL` and `UUID` have no Arrow extension type, so parameters bind as their
@@ -163,7 +164,7 @@ bytes with your own descriptors.
 | --- | --- |
 | `get_info` | Driver and vendor metadata. Codes without a value, such as the vendor version, are null; unknown codes are omitted. |
 | `get_objects` | Catalogs, schemas, tables, columns and constraints from `INFORMATION_SCHEMA`, without the checks Spanner lists for NOT NULL columns. The `xdbc_*` column fields carry the Spanner type, nullability, `DEFAULT` expression and whether the column is generated or an identity column. |
-| `get_table_schema` | A table's columns as Arrow fields. A missing table returns `NotFound`. |
+| `get_table_schema` | A table's columns as Arrow fields, non-nullable for `NOT NULL` columns. A missing table returns `NotFound`. |
 | `get_table_types` | `BASE TABLE`, `SYNONYM` and `VIEW`. |
 | `get_statistics` | Exact row, distinct and null counts from one aggregate scan per table, even when approximate statistics are requested. |
 | `get_statistic_names` | An empty, typed result: the driver defines no statistics of its own. |
@@ -185,8 +186,9 @@ returns `NotImplemented`.
 
 `execute_partitions` returns descriptors for a root-partitionable query, and `read_partition`
 runs one and streams its rows. Partitioning accepts at most one row of bound parameters and
-always uses its own batch read-only transaction. Set the reading connection's timestamp
-precision to match the producing statement.
+always uses its own batch read-only transaction. `read_partition` takes the timestamp precision,
+retry settings and query and fetch timeouts from the reading connection, so match its precision
+to the producing statement's.
 
 Descriptors contain the SQL and the session and transaction IDs, and are not authenticated.
 Only accept them from trusted sources.
