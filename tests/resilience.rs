@@ -1,16 +1,15 @@
 //! Transport fault tests against a Spanner emulator behind Toxiproxy.
 //!
 //! ```sh
-//! scripts/with-toxiproxy.sh cargo test --test resilience -- --test-threads=1
+//! scripts/with-toxiproxy.sh cargo test --test resilience
 //! ```
 //!
 //! Tests skip unless `TOXIPROXY_URL` and `SPANNER_EMULATOR_HOST` are set. See
 //! `tests/RESILIENCE.md` for coverage and limitations.
 
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use adbc_core::error::{Error as AdbcError, Result as AdbcResult, Status as AdbcStatus};
@@ -52,7 +51,7 @@ fn require_target() -> bool {
 
 /// Claims the shared proxy and creates fixtures, or returns `None` when the suite is not
 /// configured. Panics instead of skipping under `ADBC_TEST_REQUIRE_TARGET`.
-fn begin() -> Option<(Toxiproxy, SerialGuard)> {
+fn begin() -> Option<(Toxiproxy, MutexGuard<'static, ()>)> {
     let Some(toxi) = toxi() else {
         if require_target() {
             panic!(
@@ -63,8 +62,9 @@ fn begin() -> Option<(Toxiproxy, SerialGuard)> {
         eprintln!("TOXIPROXY_URL / SPANNER_EMULATOR_HOST not set; skipping resilience tests");
         return None;
     };
-    // After the skip check, so a plain multi-threaded `cargo test` still skips.
-    let serial = SerialGuard::new();
+    // Every test changes faults on the same proxy. A failed test must not block the rest.
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     // A test that panicked between adding and removing a toxic would otherwise leave it active.
     toxi.reset();
     ensure_setup();
@@ -162,29 +162,6 @@ fn curl(args: &[&str]) -> (u16, String) {
         None => (text, 0),
     };
     (code, body)
-}
-
-static ACTIVE_TESTS: AtomicUsize = AtomicUsize::new(0);
-
-/// Fails a test that overlaps another, since all tests change faults on the same proxy.
-struct SerialGuard;
-
-impl SerialGuard {
-    fn new() -> Self {
-        let previous = ACTIVE_TESTS.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(
-            previous, 0,
-            "resilience tests share one proxy and must run serially; re-run with \
-             `--test-threads=1`"
-        );
-        SerialGuard
-    }
-}
-
-impl Drop for SerialGuard {
-    fn drop(&mut self) {
-        ACTIVE_TESTS.fetch_sub(1, Ordering::SeqCst);
-    }
 }
 
 /// Creates the instance, database and tables through the emulator's admin port, bypassing the

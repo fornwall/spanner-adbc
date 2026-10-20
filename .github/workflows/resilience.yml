@@ -43,7 +43,7 @@ jobs:
       - name: Run the resilience harness
         run: |
           scripts/with-toxiproxy.sh \
-            cargo test --test resilience -- --nocapture --test-threads=1
+            cargo test --test resilience -- --nocapture
 
   # Keep scheduled failures visible in one tracking issue.
   report-failure:

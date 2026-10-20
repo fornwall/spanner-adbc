@@ -39,7 +39,7 @@ and run commands from the repository root.
   tests skip; `ADBC_TEST_REQUIRE_TARGET=1` makes a missing target fail instead.
 - Cloud and auth tests are opt-in and need a dedicated test database, because fixtures modify
   tables.
-- Fault injection: `scripts/with-toxiproxy.sh cargo test --test resilience -- --test-threads=1`.
+- Fault injection: `scripts/with-toxiproxy.sh cargo test --test resilience`.
 - CI lists target-dependent test binaries explicitly. Register new ones in
   `.github/workflows/ci.yml`.
 

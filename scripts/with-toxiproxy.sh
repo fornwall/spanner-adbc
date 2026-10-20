@@ -2,7 +2,7 @@
 # Run transport-fault tests through Toxiproxy; schema setup bypasses the proxy.
 # The emulator uses its bridge IP to preserve :9010 -> :9020 admin-port mapping.
 # Requires a Docker host reachable by bridge IP (normally Linux).
-# Usage: scripts/with-toxiproxy.sh cargo test --test resilience -- --test-threads=1
+# Usage: scripts/with-toxiproxy.sh cargo test --test resilience
 set -euo pipefail
 
 EMULATOR_IMAGE="${SPANNER_EMULATOR_IMAGE:-gcr.io/cloud-spanner-emulator/emulator}"

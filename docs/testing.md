@@ -11,7 +11,7 @@ instead.
 | Emulator integration | `scripts/with-emulator.sh cargo test` | [below](#backends) |
 | Omni integration | `scripts/with-omni.sh cargo test` | [below](#backends) |
 | Python package | see [below](#python-package) | [Python README](../python/README.md) |
-| Transport faults | `scripts/with-toxiproxy.sh cargo test --test resilience -- --test-threads=1` | [RESILIENCE.md](../tests/RESILIENCE.md) |
+| Transport faults | `scripts/with-toxiproxy.sh cargo test --test resilience` | [RESILIENCE.md](../tests/RESILIENCE.md) |
 | Backend scripts | `python3 -m unittest discover -s scripts/tests -v` | No Docker needed |
 | ADBC C++ conformance | `scripts/run-adbc-validation.sh` | [harness](../adbc-validation/README.md) |
 | Foundry type and feature suite | `scripts/run-foundry-validation.sh` | [harness](../foundry-validation/README.md) |

@@ -7,12 +7,12 @@
 ## Run
 
 ```sh
-scripts/with-toxiproxy.sh cargo test --test resilience -- --nocapture --test-threads=1
+scripts/with-toxiproxy.sh cargo test --test resilience -- --nocapture
 ```
 
 The helper starts both containers and removes them afterwards. It needs Docker with a container
-bridge IP reachable from the host, as on Linux CI. Tests must run serially because they share one
-proxy, and each test removes leftover faults before it starts. Without `TOXIPROXY_URL` and
+bridge IP reachable from the host, as on Linux CI. Tests take turns because they share one proxy,
+and each test removes leftover faults before it starts. Without `TOXIPROXY_URL` and
 `SPANNER_EMULATOR_HOST` the tests skip; `ADBC_TEST_REQUIRE_TARGET=1` makes them fail instead.
 
 The [workflow](../.github/workflows/resilience.yml) runs on pushes to `main`, pull requests,
