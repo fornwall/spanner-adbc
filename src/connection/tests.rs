@@ -74,27 +74,41 @@ fn isolation_levels_map_to_the_effective_spanner_level() {
 
 #[test]
 fn setting_current_catalog_or_schema_accepts_only_the_reported_value() {
+    use adbc_core::constants::{
+        ADBC_CONNECTION_OPTION_CURRENT_CATALOG, ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
+    };
     let set = |s: &str| {
         check_fixed_catalog_or_schema(
             OptionValue::String(s.to_string()),
-            "current catalog",
+            ADBC_CONNECTION_OPTION_CURRENT_CATALOG,
             "adbc-test",
         )
     };
     assert!(set("adbc-test").is_ok());
     assert!(
-        check_fixed_catalog_or_schema(OptionValue::String(String::new()), "current schema", "")
-            .is_ok()
+        check_fixed_catalog_or_schema(
+            OptionValue::String(String::new()),
+            ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
+            ""
+        )
+        .is_ok()
     );
     let err = set("foo").unwrap_err();
     assert_eq!(err.status, Status::NotImplemented);
     assert!(err.message.contains("\"foo\""), "{}", err.message);
     assert!(err.message.contains("\"adbc-test\""), "{}", err.message);
-    assert_eq!(
-        check_fixed_catalog_or_schema(OptionValue::Int(1), "current schema", "")
-            .unwrap_err()
-            .status,
-        Status::InvalidArguments
+    let err = check_fixed_catalog_or_schema(
+        OptionValue::Int(1),
+        ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
+        "",
+    )
+    .unwrap_err();
+    assert_eq!(err.status, Status::InvalidArguments);
+    assert!(
+        err.message
+            .contains(ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA),
+        "{}",
+        err.message
     );
 }
 

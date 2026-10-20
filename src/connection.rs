@@ -189,10 +189,10 @@ impl Optionable for SpannerConnection {
             }
             // Fixed in Spanner: a connection reaches one database and has no session schema.
             OptionConnection::CurrentCatalog => {
-                check_fixed_catalog_or_schema(value, "current catalog", self.catalog())?;
+                check_fixed_catalog_or_schema(value, key.as_ref(), self.catalog())?;
             }
             OptionConnection::CurrentSchema => {
-                check_fixed_catalog_or_schema(value, "current schema", "")?;
+                check_fixed_catalog_or_schema(value, key.as_ref(), "")?;
             }
             other => {
                 return Err(unknown_option("connection", other.as_ref()));
@@ -601,15 +601,14 @@ fn note_commit_failure(error: Error) -> Error {
 
 /// Accept setting the current catalog or schema to its `fixed` value as a no-op. Other values are
 /// `NotImplemented`, as in the C++ PostgreSQL driver.
-fn check_fixed_catalog_or_schema(value: OptionValue, what: &str, fixed: &str) -> Result<()> {
-    let OptionValue::String(s) = value else {
-        return Err(invalid_argument(format!("expected a string {what} value")));
-    };
-    if s == fixed {
+fn check_fixed_catalog_or_schema(value: OptionValue, key: &str, fixed: &str) -> Result<()> {
+    let value = crate::options::string_option(value, key)?;
+    if value == fixed {
         Ok(())
     } else {
         Err(unsupported(format!(
-            "setting the {what} to {s:?}: Spanner has no settable {what}; only {fixed:?} is valid"
+            "option {key} accepts only {fixed:?}, since a Spanner connection's catalog and \
+             schema are fixed; got {value:?}"
         )))
     }
 }
