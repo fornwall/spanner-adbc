@@ -1,68 +1,13 @@
 """Shared targets for the same end-to-end tests against the emulator and Omni."""
 
-import json
 import os
-import time
-import urllib.error
-import urllib.request
 from urllib.parse import urlsplit
 
 import pytest
 
 from spanner_adbc import DatabaseOptions
 
-PROJECT = "test-project"
-INSTANCE = "test-instance"
 DATABASE = "adbc-test"
-
-
-def _rest_base():
-    """REST admin API on the gRPC host, port ``SPANNER_EMULATOR_REST_PORT`` (9020)."""
-    grpc = os.environ["SPANNER_EMULATOR_HOST"]
-    host = grpc.rsplit(":", 1)[0] or "localhost"
-    port = os.environ.get("SPANNER_EMULATOR_REST_PORT", "9020")
-    return f"http://{host}:{port}"
-
-
-def _post(url, body):
-    """POST JSON; treat 409 (already exists) as success so setup is idempotent."""
-    data = json.dumps(body).encode()
-    req = urllib.request.Request(
-        url, data=data, method="POST", headers={"Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read() or b"{}")
-    except urllib.error.HTTPError as exc:
-        if exc.code == 409:
-            return None
-        raise
-
-
-def _await_operation(op):
-    """Poll a long-running operation to completion."""
-    if op is None:  # Resource already exists (HTTP 409).
-        return
-    name = op.get("name")
-    deadline = time.monotonic() + 60
-    while True:
-        if "error" in op:
-            raise RuntimeError(f"operation {name or '<unnamed>'} failed: {op['error']}")
-        if op.get("done"):
-            return
-        if not name:
-            raise RuntimeError(f"emulator returned an incomplete operation without a name: {op}")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise RuntimeError(f"operation {name} did not complete within 60s")
-        with urllib.request.urlopen(f"{_rest_base()}/v1/{name}", timeout=min(30, remaining)) as resp:
-            op = json.loads(resp.read() or b"{}")
-        if not op.get("done") and "error" not in op:
-            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
-
-
-def _require_target():
-    return os.environ.get("ADBC_TEST_REQUIRE_TARGET", "").lower() in ("1", "true", "yes")
 
 
 def database_options(database):
@@ -76,6 +21,7 @@ def database_options(database):
 
 
 def official_client(project):
+    """A google-cloud-spanner client for the configured target."""
     from google.cloud import spanner
 
     if endpoint := os.environ.get("SPANNER_OMNI_ENDPOINT"):
@@ -88,50 +34,42 @@ def official_client(project):
             client_options={"api_endpoint": parsed.netloc},
             use_plain_text=parsed.scheme == "http",
         )
+    # The client connects anonymously to SPANNER_EMULATOR_HOST.
     return spanner.Client(project=project)
 
 
 @pytest.fixture(scope="session")
 def spanner_database():
     """Create the test instance and database if needed and return the database path."""
-    if os.environ.get("SPANNER_OMNI_ENDPOINT"):
-        if os.environ.get("SPANNER_EMULATOR_HOST"):
-            pytest.fail("Configure only one of SPANNER_OMNI_ENDPOINT and SPANNER_EMULATOR_HOST")
-        from google.api_core.exceptions import AlreadyExists
-
-        database = official_client("default").instance("default").database(DATABASE)
-        try:
-            database.create().result(timeout=60)
-        except AlreadyExists:
-            pass
-        return f"projects/default/instances/default/databases/{DATABASE}"
-
-    if not os.environ.get("SPANNER_EMULATOR_HOST"):
-        if _require_target():
+    omni = os.environ.get("SPANNER_OMNI_ENDPOINT")
+    emulator = os.environ.get("SPANNER_EMULATOR_HOST")
+    if omni and emulator:
+        pytest.fail("Configure only one of SPANNER_OMNI_ENDPOINT and SPANNER_EMULATOR_HOST")
+    if not omni and not emulator:
+        if os.environ.get("ADBC_TEST_REQUIRE_TARGET", "").lower() in ("1", "true", "yes"):
             pytest.fail(
                 "ADBC_TEST_REQUIRE_TARGET is set but no Spanner target is configured; "
                 "set SPANNER_EMULATOR_HOST or SPANNER_OMNI_ENDPOINT."
             )
         pytest.skip("set SPANNER_EMULATOR_HOST or SPANNER_OMNI_ENDPOINT for integration tests")
 
-    base = _rest_base()
-    _await_operation(
-        _post(
-            f"{base}/v1/projects/{PROJECT}/instances",
-            {
-                "instanceId": INSTANCE,
-                "instance": {
-                    "config": f"projects/{PROJECT}/instanceConfigs/emulator-config",
-                    "displayName": "ADBC Python test instance",
-                    "nodeCount": 1,
-                },
-            },
+    from google.api_core.exceptions import AlreadyExists
+
+    if omni:
+        instance = official_client("default").instance("default")
+    else:
+        instance = official_client("test-project").instance(
+            "test-instance",
+            configuration_name="projects/test-project/instanceConfigs/emulator-config",
+            node_count=1,
         )
-    )
-    _await_operation(
-        _post(
-            f"{base}/v1/projects/{PROJECT}/instances/{INSTANCE}/databases",
-            {"createStatement": f"CREATE DATABASE `{DATABASE}`"},
-        )
-    )
-    return f"projects/{PROJECT}/instances/{INSTANCE}/databases/{DATABASE}"
+        try:
+            instance.create().result(timeout=60)
+        except AlreadyExists:
+            pass
+    database = instance.database(DATABASE)
+    try:
+        database.create().result(timeout=60)
+    except AlreadyExists:
+        pass
+    return database.name
