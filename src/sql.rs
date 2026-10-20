@@ -275,8 +275,8 @@ pub(crate) fn first_keyword(sql: &str) -> Option<&str> {
     None
 }
 
-/// Distinct `@name` parameters in order of first appearance, for `get_parameter_schema` before
-/// anything is bound.
+/// Distinct `@name` parameters in order of first appearance, which binding and
+/// `get_parameter_schema` follow.
 ///
 /// Literals, comments, hints (`@{...}`) and system variables (`@@var`) are skipped. Spanner allows
 /// whitespace or a comment after `@`, and backtick-quoted names: `@ p`, `@/*c*/p` and `` @`p` ``
