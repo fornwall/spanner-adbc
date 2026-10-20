@@ -42,8 +42,10 @@ Spanner client on the driver's runtime, so don't call them directly from an asyn
 [synchronous calls from Tokio](limitations.md#synchronous-calls-from-tokio).
 
 Other languages load the shared library through an ADBC driver manager. The C ABI shares one
-driver and runtime across the process. It lives in [src/ffi/](../src/ffi), which holds all of the
-crate's `unsafe` code; building with `--no-default-features` leaves it out.
+driver and runtime across the process, and once a driver is initialized the library stays loaded
+until the process exits, so its runtime threads and open streams never outlive its code. It lives
+in [src/ffi/](../src/ffi), which holds all of the crate's `unsafe` code; building with
+`--no-default-features` leaves it out.
 
 ```python
 import adbc_driver_manager

@@ -36,6 +36,7 @@ mod test_support;
 mod tests;
 
 use std::ffi::{c_int, c_void};
+use std::sync::Once;
 
 use adbc_core::error::{Error, Status};
 
@@ -159,11 +160,47 @@ unsafe fn init(version: c_int, driver: *mut c_void, error: *mut AdbcError) -> Ad
             return unsafe { finish(Err(failure), error) };
         }
     };
+    pin_library();
     let table = vtable();
     unsafe {
         std::ptr::copy_nonoverlapping((&raw const table).cast::<u8>(), driver.cast::<u8>(), size);
     }
     ADBC_STATUS_OK
+}
+
+/// Keep this library loaded until the process exits. The shared runtime's worker threads, and
+/// streams or errors that outlive the driver, still run its code after a driver manager would
+/// unload it. On failure the library stays unloadable, as without the pin.
+fn pin_library() {
+    static PINNED: Once = Once::new();
+    PINNED.call_once(|| unsafe { pin_module_containing((&raw const PINNED).cast()) });
+}
+
+/// # Safety
+/// `address` must lie inside this library.
+#[cfg(unix)]
+unsafe fn pin_module_containing(address: *const c_void) {
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    if unsafe { libc::dladdr(address, &raw mut info) } != 0 && !info.dli_fname.is_null() {
+        // The handle is deliberately never closed.
+        let flags = libc::RTLD_NOW | libc::RTLD_NOLOAD | libc::RTLD_NODELETE;
+        unsafe { libc::dlopen(info.dli_fname, flags) };
+    }
+}
+
+/// # Safety
+/// `address` must lie inside this library.
+#[cfg(windows)]
+unsafe fn pin_module_containing(address: *const c_void) {
+    const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 0x1;
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x4;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut *mut c_void) -> i32;
+    }
+    let mut module = std::ptr::null_mut();
+    let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN;
+    unsafe { GetModuleHandleExW(flags, address.cast(), &raw mut module) };
 }
 
 /// The driver's own entry point, for callers that name it.

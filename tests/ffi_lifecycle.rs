@@ -105,9 +105,9 @@ fn drain_rows(reader: Box<dyn RecordBatchReader + Send>) -> usize {
         .sum()
 }
 
-/// TestResultIndependence: a result stream keeps working after its statement, connection and
-/// database are released. The exported reader holds the runtime and client, so releasing the
-/// handles must not shut down the runtime it blocks on.
+/// TestResultIndependence: a result stream keeps working after its statement, connection,
+/// database and driver are released. The exported reader holds the runtime and client, and
+/// `AdbcDriverInit` pins the library that dropping the last `ManagedDriver` would unload.
 #[test]
 fn ffi_stream_survives_statement_connection_database_release() {
     let test = "ffi_stream_survives_statement_connection_database_release";
@@ -121,20 +121,16 @@ fn ffi_stream_survives_statement_connection_database_release() {
     let first = reader.next().expect("first batch").expect("first batch ok");
     assert_eq!(first.num_rows(), 100);
 
-    // The driver must outlive the stream: dropping the last `ManagedDriver` unloads the library
-    // the stream's callbacks live in. The C driver manager likewise keeps the library loaded
-    // until `AdbcDriverRelease`.
     drop(statement);
     drop(connection);
     drop(database);
+    drop(driver);
 
     let rest = drain_rows(reader);
     assert_eq!(first.num_rows() + rest, 1000);
-    drop(driver);
 }
 
 /// The native Rust variant of [`ffi_stream_survives_statement_connection_database_release`].
-/// With no library to keep loaded, the driver can be dropped too.
 #[test]
 fn stream_survives_statement_connection_database_release() {
     let Some(target) = setup("stream_survives_statement_connection_database_release") else {
@@ -456,4 +452,60 @@ fn ffi_double_release_and_error_struct_reuse() {
         "double driver release must error, not crash"
     );
     release_error_twice(&mut error);
+}
+
+/// A driver manager may unload the library while the shared runtime's threads or an open stream
+/// still run its code, so `AdbcDriverInit` pins it. Runs in a child process, where nothing else has
+/// loaded the library.
+#[cfg(all(target_os = "linux", feature = "ffi"))]
+#[test]
+fn driver_init_keeps_the_library_loaded_after_dlclose() {
+    use std::os::raw::c_void;
+
+    use adbc_core::constants::{ADBC_STATUS_OK, ADBC_VERSION_1_1_0};
+    use adbc_ffi::{FFI_AdbcDriver, FFI_AdbcDriverInitFunc, FFI_AdbcError};
+
+    const TEST: &str = "driver_init_keeps_the_library_loaded_after_dlclose";
+    let Some(cdylib) = cdylib_path() else {
+        eprintln!("cdylib not built; skipping {TEST} (run `cargo build` first)");
+        return;
+    };
+    if std::env::var_os("SPANNER_ADBC_PIN_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([TEST, "--exact", "--nocapture"])
+            .env("SPANNER_ADBC_PIN_CHILD", "1")
+            .output()
+            .expect("run the test in a child process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{stderr}"
+        );
+        return;
+    }
+
+    let mapped = || {
+        std::fs::read_to_string("/proc/self/maps")
+            .unwrap()
+            .contains(cdylib.to_str().unwrap())
+    };
+    assert!(!mapped(), "nothing else may have loaded the library");
+    let library = unsafe { libloading::Library::new(&cdylib) }.expect("load cdylib");
+    let init: libloading::Symbol<FFI_AdbcDriverInitFunc> =
+        unsafe { library.get(b"AdbcDriverInit") }.expect("resolve AdbcDriverInit");
+    let mut driver = FFI_AdbcDriver::default();
+    let mut error = FFI_AdbcError::default();
+    let status = unsafe {
+        init(
+            ADBC_VERSION_1_1_0,
+            (&raw mut driver).cast::<c_void>(),
+            &mut error,
+        )
+    };
+    assert_eq!(status, ADBC_STATUS_OK);
+    // Releases the driver through the library, so it must go first.
+    drop(driver);
+    drop(library);
+    assert!(mapped(), "dlclose unloaded the library");
 }
