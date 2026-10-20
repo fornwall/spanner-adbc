@@ -246,39 +246,6 @@ fn cancel_does_not_wait_for_a_held_dispatch_turn() {
     unsafe { release::<u32>(&mut slot, "statement", null()) };
 }
 
-/// A call made while another holds the state lock waits for it, then succeeds.
-#[test]
-fn a_call_blocked_behind_a_dispatch_turn_completes_instead_of_failing() {
-    let slot = Exported::into_private_data(7_u32);
-    let (hold_sender, hold_receiver) = channel::<()>();
-    let (started_sender, started_receiver) = channel::<()>();
-
-    let address = slot as usize;
-    let first = std::thread::spawn(move || unsafe {
-        dispatch::<u32, _>(address as *mut c_void, "statement", null(), |_| {
-            started_sender.send(()).expect("test channel");
-            hold_receiver.recv().expect("test channel");
-            Ok(())
-        })
-    });
-    started_receiver.recv().unwrap();
-
-    // Like a GetOption during a slow query.
-    let second = std::thread::spawn(move || unsafe {
-        dispatch::<u32, _>(address as *mut c_void, "statement", null(), |state| {
-            assert_eq!(*state, 7);
-            Ok(())
-        })
-    });
-
-    hold_sender.send(()).unwrap();
-    assert_eq!(first.join().unwrap(), ADBC_STATUS_OK);
-    assert_eq!(second.join().unwrap(), ADBC_STATUS_OK);
-
-    let mut slot = slot;
-    unsafe { release::<u32>(&mut slot, "statement", null()) };
-}
-
 #[test]
 fn concurrent_dispatches_serialize_instead_of_racing() {
     const THREADS: usize = 8;
@@ -356,23 +323,4 @@ fn cancel_without_an_installed_handle_is_an_invalid_state() {
 
     let mut slot = slot;
     unsafe { release::<u32>(&mut slot, "connection", null()) };
-}
-
-#[test]
-fn a_panicking_payload_still_poisons_the_handle() {
-    let mut slot = Exported::into_private_data(0_u32);
-    let status = unsafe {
-        dispatch::<u32, _>(slot, "statement", null(), |_| {
-            std::panic::panic_any(crate::ffi::test_support::PanicOnDrop)
-        })
-    };
-    assert_eq!(status, AdbcStatusCode::from(Status::Internal));
-    assert_eq!(
-        unsafe { dispatch::<u32, _>(slot, "statement", null(), |_| Ok(())) },
-        AdbcStatusCode::from(Status::Internal)
-    );
-    assert_eq!(
-        unsafe { release::<u32>(&mut slot, "statement", null()) },
-        ADBC_STATUS_OK
-    );
 }

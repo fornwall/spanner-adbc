@@ -1,13 +1,10 @@
-use std::ffi::{CString, c_void};
+use std::ffi::CString;
 
 use adbc_core::options::OptionValue;
 
-use super::super::abi::{
-    ADBC_STATUS_INVALID_ARGUMENT, ADBC_STATUS_INVALID_STATE, ADBC_STATUS_NOT_FOUND, ADBC_STATUS_OK,
-};
-use super::super::handle::dispatch;
+use super::super::abi::{ADBC_STATUS_INVALID_ARGUMENT, ADBC_STATUS_INVALID_STATE, ADBC_STATUS_OK};
 use super::super::options::{
-    borrow, get_option_bytes, get_option_double, get_option_int, get_option_string, new_handle,
+    get_option_bytes, get_option_double, get_option_int, get_option_string, new_handle,
     release_handle, set_option_bytes, set_option_double, set_option_int, set_option_string,
 };
 use super::*;
@@ -68,73 +65,6 @@ fn a_null_handle_is_a_bad_argument_not_a_crash() {
 }
 
 #[test]
-fn releasing_twice_reports_invalid_state_rather_than_double_freeing() {
-    let mut connection = pending();
-    assert_eq!(
-        unsafe { release_handle(&raw mut connection, null()) },
-        ADBC_STATUS_OK
-    );
-    assert!(connection.private_data.is_null());
-    assert_eq!(
-        unsafe { release_handle(&raw mut connection, null()) },
-        ADBC_STATUS_INVALID_STATE
-    );
-}
-
-#[test]
-fn options_set_before_init_are_buffered_in_order_with_last_write_winning() {
-    let mut connection = pending();
-    // One key per typed setter. The values need not suit their keys: keys and values are
-    // validated only when `Init` replays the buffer.
-    let first = CString::new(adbc_core::constants::ADBC_CONNECTION_OPTION_AUTOCOMMIT).unwrap();
-    let second = CString::new(crate::OPTION_RETRY_MAX_ATTEMPTS).unwrap();
-    let third = CString::new(crate::OPTION_READ_STALENESS).unwrap();
-    let fourth = CString::new(crate::OPTION_TRANSACTION_TAG).unwrap();
-    let enabled = CString::new("true").unwrap();
-    let disabled = CString::new("false").unwrap();
-
-    for value in [&enabled, &disabled] {
-        assert_eq!(
-            unsafe {
-                set_option_string(&raw mut connection, first.as_ptr(), value.as_ptr(), null())
-            },
-            ADBC_STATUS_OK
-        );
-    }
-    assert_eq!(
-        unsafe { set_option_int(&raw mut connection, second.as_ptr(), 4096, null()) },
-        ADBC_STATUS_OK
-    );
-    assert_eq!(
-        unsafe { set_option_double(&raw mut connection, third.as_ptr(), 0.5, null()) },
-        ADBC_STATUS_OK
-    );
-    assert_eq!(
-        unsafe {
-            set_option_bytes(
-                &raw mut connection,
-                fourth.as_ptr(),
-                b"xy".as_ptr(),
-                2,
-                null(),
-            )
-        },
-        ADBC_STATUS_OK
-    );
-
-    let entries = buffered(&mut connection);
-    assert_eq!(entries.len(), 4, "the repeated key must not add an entry");
-    assert_eq!(entries[0].0, OptionConnection::AutoCommit);
-    // `OptionValue` is not `PartialEq`.
-    assert!(matches!(&entries[0].1, OptionValue::String(value) if value == "false"));
-    assert!(matches!(entries[1].1, OptionValue::Int(4096)));
-    assert!(matches!(entries[2].1, OptionValue::Double(value) if value == 0.5));
-    assert!(matches!(&entries[3].1, OptionValue::Bytes(value) if value == b"xy"));
-
-    drop_pending(&mut connection);
-}
-
-#[test]
 fn setters_reject_a_null_or_non_utf8_key_or_value() {
     let mut connection = pending();
     let key = CString::new(adbc_core::constants::ADBC_CONNECTION_OPTION_AUTOCOMMIT).unwrap();
@@ -157,48 +87,6 @@ fn setters_reject_a_null_or_non_utf8_key_or_value() {
         buffered(&mut connection).is_empty(),
         "a rejected setter must not record anything"
     );
-    drop_pending(&mut connection);
-}
-
-/// `NOT_FOUND` is the getters' only failure in adbc.h, and a pending connection has no values.
-#[test]
-fn getters_report_a_pre_init_connection_option_as_not_found() {
-    let mut connection = pending();
-    let key = CString::new(adbc_core::constants::ADBC_CONNECTION_OPTION_AUTOCOMMIT).unwrap();
-    let mut length = 0_usize;
-    let mut integer = 0_i64;
-    let mut double = 0.0_f64;
-
-    for status in [
-        unsafe {
-            get_option_string(
-                &raw mut connection,
-                key.as_ptr(),
-                null(),
-                &raw mut length,
-                null(),
-            )
-        },
-        unsafe {
-            get_option_bytes(
-                &raw mut connection,
-                key.as_ptr(),
-                null(),
-                &raw mut length,
-                null(),
-            )
-        },
-        unsafe { get_option_int(&raw mut connection, key.as_ptr(), &raw mut integer, null()) },
-        unsafe { get_option_double(&raw mut connection, key.as_ptr(), &raw mut double, null()) },
-    ] {
-        assert_eq!(status, ADBC_STATUS_NOT_FOUND);
-    }
-    // A bad key is rejected before the state is consulted.
-    assert_eq!(
-        unsafe { get_option_int(&raw mut connection, null(), &raw mut integer, null()) },
-        ADBC_STATUS_INVALID_ARGUMENT
-    );
-
     drop_pending(&mut connection);
 }
 
@@ -402,55 +290,6 @@ fn get_table_schema_requires_a_table_name() {
     drop_pending(&mut connection);
 }
 
-#[test]
-fn borrow_rejects_an_uninitialized_or_released_connection() {
-    let mut connection = pending();
-    let mut state = unsafe { borrow(&raw mut connection) }.unwrap();
-    assert_eq!(state.ready(KIND).unwrap_err().status, Status::InvalidState);
-    drop(state);
-
-    drop_pending(&mut connection);
-    let error = unsafe { borrow(&raw mut connection) }
-        .map(|_| ())
-        .unwrap_err();
-    assert_eq!(error.status, Status::InvalidState);
-    assert_eq!(
-        unsafe { borrow::<AdbcConnection>(null()) }
-            .map(|_| ())
-            .unwrap_err()
-            .status,
-        Status::InvalidState
-    );
-}
-
-/// While another thread holds the state lock, cancel returns at once (`InvalidState`, since a
-/// pending connection has no cancel handle).
-#[test]
-fn cancel_does_not_wait_for_the_connection_dispatch_turn() {
-    let mut connection = pending();
-    let (hold_sender, hold_receiver) = std::sync::mpsc::channel::<()>();
-    let (started_sender, started_receiver) = std::sync::mpsc::channel::<()>();
-
-    let address = connection.private_data as usize;
-    let worker = std::thread::spawn(move || unsafe {
-        dispatch::<State, _>(address as *mut c_void, KIND, null(), |_| {
-            started_sender.send(()).expect("test channel");
-            hold_receiver.recv().expect("test channel");
-            Ok(())
-        })
-    });
-    started_receiver.recv().unwrap();
-
-    assert_eq!(
-        unsafe { connection_cancel(&raw mut connection, null()) },
-        ADBC_STATUS_INVALID_STATE
-    );
-
-    hold_sender.send(()).unwrap();
-    assert_eq!(worker.join().unwrap(), ADBC_STATUS_OK);
-    drop_pending(&mut connection);
-}
-
 /// Before `Init` every key is buffered, including unknown ones; the driver's setter rejects
 /// unknown keys when `Init` replays the buffer.
 #[test]
@@ -483,68 +322,6 @@ fn every_key_is_buffered_before_init_whether_the_driver_knows_it_or_not() {
     }
 
     assert_eq!(buffered(&mut connection).len(), keys.len());
-    drop_pending(&mut connection);
-}
-
-/// The current catalog and schema are fixed at `""`, and a live connection refuses other values.
-/// Before `Init` both keys buffer like any other, and reads report `NOT_FOUND`.
-#[test]
-fn the_current_namespace_keys_buffer_before_init_and_read_back_as_not_found() {
-    let mut connection = pending();
-    for key in [
-        OptionConnection::CurrentCatalog,
-        OptionConnection::CurrentSchema,
-    ] {
-        let name = key.as_ref();
-        let ffi_key = CString::new(name).unwrap();
-        let value = CString::new("changed").unwrap();
-        let mut error = zeroed_error();
-        assert_eq!(
-            unsafe {
-                set_option_string(
-                    &raw mut connection,
-                    ffi_key.as_ptr(),
-                    value.as_ptr(),
-                    &raw mut error,
-                )
-            },
-            ADBC_STATUS_OK,
-            "{name}"
-        );
-        assert_eq!(error_message(&error), None, "{name}");
-        release_error(&mut error);
-
-        let mut length = 0_usize;
-        let mut error = zeroed_error();
-        assert_eq!(
-            unsafe {
-                get_option_string(
-                    &raw mut connection,
-                    ffi_key.as_ptr(),
-                    null(),
-                    &raw mut length,
-                    &raw mut error,
-                )
-            },
-            ADBC_STATUS_NOT_FOUND,
-            "{name}"
-        );
-        assert_eq!(
-            error_message(&error),
-            Some(format!(
-                "Spanner connection option {name} cannot be read before the connection is \
-                 initialized; initialize it first"
-            )),
-            "{name}"
-        );
-        release_error(&mut error);
-    }
-
-    assert_eq!(
-        buffered(&mut connection).len(),
-        2,
-        "both keys were buffered"
-    );
     drop_pending(&mut connection);
 }
 

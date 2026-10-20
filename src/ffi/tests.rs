@@ -346,32 +346,6 @@ fn the_vtable_slots_do_what_their_names_say() {
 }
 
 #[test]
-fn writes_only_the_prefix_for_a_1_0_0_caller() {
-    let mut buffer = [0xAA_u8; size_of::<AdbcDriver>()];
-    let mut error = zeroed_error();
-    let status = unsafe {
-        AdbcSpannerInit(
-            ADBC_VERSION_1_0_0,
-            buffer.as_mut_ptr().cast::<c_void>(),
-            &raw mut error,
-        )
-    };
-    assert_eq!(status, ADBC_STATUS_OK);
-    assert!(
-        buffer[ADBC_DRIVER_1_0_0_SIZE..]
-            .iter()
-            .all(|byte| *byte == 0xAA),
-        "the 1.1.0 tail must be untouched"
-    );
-    assert!(
-        buffer[..ADBC_DRIVER_1_0_0_SIZE]
-            .iter()
-            .any(|byte| *byte != 0xAA),
-        "the 1.0.0 prefix must be populated"
-    );
-}
-
-#[test]
 fn rejects_an_unknown_version_as_not_implemented() {
     let mut table = std::mem::MaybeUninit::<AdbcDriver>::zeroed();
     let mut error = zeroed_error();

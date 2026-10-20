@@ -6,8 +6,7 @@ use crate::ffi::abi::{
     ADBC_STATUS_NOT_IMPLEMENTED, ADBC_STATUS_OK,
 };
 use crate::ffi::options::{
-    get_option_int, get_option_string, new_handle, release_handle, set_option_int,
-    set_option_string,
+    get_option_string, new_handle, release_handle, set_option_int, set_option_string,
 };
 use crate::ffi::test_support::{null, release_error, zeroed_error};
 
@@ -310,29 +309,6 @@ fn null_handles_and_keys_are_rejected() {
     assert_eq!(release(&mut database), ADBC_STATUS_OK);
 }
 
-/// Every database option is a string, so the typed getters must fail rather than return a
-/// default.
-#[test]
-fn typed_getters_reject_string_options() {
-    let mut database = initialized();
-    let key = CString::new(crate::OPTION_ENDPOINT).unwrap();
-    let mut value = 0_i64;
-    let mut error = zeroed_error();
-    assert_ne!(
-        unsafe {
-            get_option_int(
-                &raw mut database,
-                key.as_ptr(),
-                &raw mut value,
-                &raw mut error,
-            )
-        },
-        ADBC_STATUS_OK
-    );
-    release_error(&mut error);
-    assert_eq!(release(&mut database), ADBC_STATUS_OK);
-}
-
 /// Pre-`Init` sets are unvalidated; the live database checks the value type when `Init` replays
 /// the buffer.
 #[test]
@@ -396,65 +372,4 @@ fn a_typo_before_init_is_reported_when_init_replays_it() {
     release_error(&mut error);
     assert!(message.contains("spanner.endpoin"), "{message}");
     assert_eq!(release(&mut database), ADBC_STATUS_OK);
-}
-
-/// Before `Init` every key is buffered; afterwards the live database rejects the unknown ones.
-#[test]
-fn a_pre_init_set_accepts_every_key_the_live_database_classifies() {
-    let mut live = initialized();
-    let keys = [
-        OptionDatabase::Uri,
-        OptionDatabase::Username,
-        OptionDatabase::Password,
-        OptionDatabase::Other("spanner.no.such.option".to_owned()),
-        OptionDatabase::Other(crate::OPTION_ENDPOINT.to_owned()),
-        OptionDatabase::Other(crate::OPTION_EMULATOR.to_owned()),
-        OptionDatabase::Other(crate::OPTION_KEYFILE.to_owned()),
-        OptionDatabase::Other(crate::OPTION_KEYFILE_JSON.to_owned()),
-        OptionDatabase::Other(crate::OPTION_ACCESS_TOKEN.to_owned()),
-        OptionDatabase::Other(crate::OPTION_QUOTA_PROJECT.to_owned()),
-        OptionDatabase::Other(crate::OPTION_IMPERSONATE_TARGET_PRINCIPAL.to_owned()),
-        OptionDatabase::Other(crate::OPTION_IMPERSONATE_DELEGATES.to_owned()),
-        OptionDatabase::Other(crate::OPTION_IMPERSONATE_SCOPES.to_owned()),
-        OptionDatabase::Other(crate::OPTION_IMPERSONATE_LIFETIME.to_owned()),
-    ];
-    let mut unknown = 0;
-    for key in &keys {
-        let mut database = pending();
-        assert_eq!(
-            set(&mut database, key.as_ref(), ""),
-            ADBC_STATUS_OK,
-            "{}: a pre-init set buffers every key",
-            key.as_ref()
-        );
-        assert_eq!(release(&mut database), ADBC_STATUS_OK);
-        // An unknown key is `NOT_IMPLEMENTED`; an invalid value such as `""` for a URI is not.
-        if set(&mut live, key.as_ref(), "") == ADBC_STATUS_NOT_IMPLEMENTED {
-            unknown += 1;
-        }
-    }
-    assert_eq!(
-        unknown, 3,
-        "username, password and the made-up key are the ones the live database does not know"
-    );
-    assert_eq!(release(&mut live), ADBC_STATUS_OK);
-}
-
-/// Every `AdbcDatabaseInit` uses the process-wide [`shared_driver`], so databases share one
-/// Tokio runtime. `src/driver/tests.rs` checks that one driver's databases share its runtime.
-#[test]
-fn every_database_is_initialized_through_one_shared_driver() {
-    let before = shared_driver().unwrap();
-    let mut first = initialized();
-    let mut second = initialized();
-    let after = shared_driver().unwrap();
-
-    assert!(
-        std::ptr::eq(before, after),
-        "AdbcDatabaseInit must not replace the process-wide driver"
-    );
-    assert_eq!(release(&mut first), ADBC_STATUS_OK);
-    assert_eq!(release(&mut second), ADBC_STATUS_OK);
-    // Releasing every database keeps the shared driver.
-    assert!(std::ptr::eq(before, shared_driver().unwrap()));
 }

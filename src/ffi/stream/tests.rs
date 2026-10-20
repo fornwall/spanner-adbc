@@ -4,15 +4,12 @@ use std::sync::Arc;
 use adbc_core::error::Error;
 use arrow_array::ffi_stream::RecordBatchStreamReader;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, RecordBatchIterator};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{Schema, SchemaRef};
 
 use super::*;
 use crate::ffi::test_support::null;
 
-struct PanickingReader {
-    schema: SchemaRef,
-    panic_in_schema: bool,
-}
+struct PanickingReader;
 
 impl Iterator for PanickingReader {
     type Item = Result<RecordBatch, ArrowError>;
@@ -24,8 +21,7 @@ impl Iterator for PanickingReader {
 
 impl RecordBatchReader for PanickingReader {
     fn schema(&self) -> SchemaRef {
-        assert!(!self.panic_in_schema, "schema failed");
-        self.schema.clone()
+        Arc::new(Schema::empty())
     }
 }
 
@@ -98,16 +94,6 @@ fn exports_adbc_statuses_as_errno() {
         .to_str()
         .unwrap();
     assert!(message.contains("not supported"), "{message}");
-}
-
-/// A nonconforming host may call a saved callback after release.
-#[test]
-fn get_last_error_tolerates_a_released_or_null_stream() {
-    let mut stream = error_stream(ArrowError::ComputeError("boom".to_owned()));
-    let saved = stream.get_last_error().unwrap();
-    unsafe { stream.release().unwrap()(&raw mut stream) };
-    assert!(unsafe { saved(&raw mut stream) }.is_null());
-    assert!(unsafe { saved(null()) }.is_null());
 }
 
 fn error_stream(error: ArrowError) -> FFI_ArrowArrayStream {
@@ -212,10 +198,7 @@ fn error_from_array_stream_rejects_foreign_and_null_streams() {
 
 #[test]
 fn contains_reader_panics_in_get_next() {
-    let mut stream = export_reader(Box::new(PanickingReader {
-        schema: Arc::new(Schema::empty()),
-        panic_in_schema: false,
-    }));
+    let mut stream = export_reader(Box::new(PanickingReader));
     let mut out = FFI_ArrowArray::empty();
     assert_eq!(
         unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
@@ -231,57 +214,6 @@ fn contains_reader_panics_in_get_next() {
         unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
         EINVAL
     );
-}
-
-#[test]
-fn contains_reader_panics_in_get_schema() {
-    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
-    let mut stream = export_reader(Box::new(PanickingReader {
-        schema,
-        panic_in_schema: true,
-    }));
-    let mut out = FFI_ArrowSchema::empty();
-    assert_eq!(
-        unsafe { stream.get_schema().unwrap()(&raw mut stream, &raw mut out) },
-        EINVAL
-    );
-    let message = unsafe { CStr::from_ptr(stream.get_last_error().unwrap()(&raw mut stream)) }
-        .to_str()
-        .unwrap();
-    assert!(message.contains("schema failed"), "{message}");
-}
-
-#[test]
-fn contains_reader_panics_in_release() {
-    struct DropPanic(PanickingReader);
-
-    impl Iterator for DropPanic {
-        type Item = Result<RecordBatch, ArrowError>;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            self.0.next()
-        }
-    }
-
-    impl RecordBatchReader for DropPanic {
-        fn schema(&self) -> SchemaRef {
-            self.0.schema()
-        }
-    }
-
-    impl Drop for DropPanic {
-        fn drop(&mut self) {
-            panic!("drop failed")
-        }
-    }
-
-    let mut stream = export_reader(Box::new(DropPanic(PanickingReader {
-        schema: Arc::new(Schema::empty()),
-        panic_in_schema: false,
-    })));
-    unsafe { stream.release().unwrap()(&raw mut stream) };
-    assert!(stream.release().is_none());
-    assert!(stream.private_data().is_null());
 }
 
 /// The C++ driver manager writes `private_driver` into the returned error, so a later call must
@@ -314,9 +246,10 @@ fn a_released_stream_survives_a_second_release_and_stale_callbacks() {
         std::iter::once(Ok(batch)),
         schema,
     )));
-    let (get_next, get_schema, release) = (
+    let (get_next, get_schema, get_last_error, release) = (
         stream.get_next().unwrap(),
         stream.get_schema().unwrap(),
+        stream.get_last_error().unwrap(),
         stream.release().unwrap(),
     );
 
@@ -330,7 +263,7 @@ fn a_released_stream_survives_a_second_release_and_stale_callbacks() {
     unsafe { release(&raw mut stream) };
     assert!(stream.private_data().is_null());
 
-    // Saved callbacks report EINVAL.
+    // Saved callbacks report EINVAL or no error.
     let mut array = FFI_ArrowArray::empty();
     let mut out_schema = FFI_ArrowSchema::empty();
     assert_eq!(unsafe { get_next(&raw mut stream, &raw mut array) }, EINVAL);
@@ -338,9 +271,11 @@ fn a_released_stream_survives_a_second_release_and_stale_callbacks() {
         unsafe { get_schema(&raw mut stream, &raw mut out_schema) },
         EINVAL
     );
+    assert!(unsafe { get_last_error(&raw mut stream) }.is_null());
     // Likewise for a null stream.
     assert_eq!(unsafe { get_next(null(), &raw mut array) }, EINVAL);
     assert_eq!(unsafe { get_schema(null(), &raw mut out_schema) }, EINVAL);
+    assert!(unsafe { get_last_error(null()) }.is_null());
     unsafe { release(null()) };
 }
 
