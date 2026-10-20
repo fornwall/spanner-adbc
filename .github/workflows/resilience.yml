@@ -38,7 +38,7 @@ jobs:
 
       # Build before starting the disposable emulator and proxy containers.
       - name: Build
-        run: cargo build --tests
+        run: cargo test --test resilience --no-run
 
       - name: Run the resilience harness
         run: |
