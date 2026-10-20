@@ -1,10 +1,10 @@
 //! [`SpannerStatement`]: an ADBC statement that runs SQL against Spanner and returns Arrow.
 //!
-//! [`Statement::execute`] streams query results from a single-use read-only transaction.
-//! [`Statement::execute_update`] runs DML in a read/write transaction and DDL through the admin
-//! API. A query passed to `execute_update` runs like `execute` with its rows discarded, since
+//! [`Statement::execute`] and [`Statement::execute_update`] accept any statement. Queries stream
+//! from a read-only transaction, DML runs in a read/write transaction or is buffered in a manual
+//! one, and DDL goes through the admin API. `execute_update` discards a query's rows, since
 //! `adbc.h` allows executing any statement without a result set. `THEN RETURN` DML runs through
-//! `ExecuteSql`, because `ExecuteBatchDml` cannot return rows.
+//! `ExecuteStreamingSql`, because `ExecuteBatchDml` cannot return rows.
 
 mod dml;
 mod ingest;
@@ -586,7 +586,7 @@ impl SpannerStatement {
         &self,
         sql: &str,
     ) -> Result<BTreeMap<String, google_cloud_spanner::value::Type>> {
-        // ExecuteSql rejects a trailing `;`.
+        // Spanner rejects a trailing `;` in a query.
         let sql = crate::sql::strip_trailing_terminators(sql);
         if crate::sql::is_ddl(&sql) {
             return Ok(BTreeMap::new());
@@ -874,7 +874,7 @@ impl Statement for SpannerStatement {
             "execute_schema",
             "planned in a read-only schema probe",
         )?;
-        // ExecuteSql rejects a trailing `;`.
+        // Spanner rejects a trailing `;` in a query.
         let sql = crate::sql::strip_trailing_terminators(&sql);
         Ok((*self.plan_query_schema(&sql)?).clone())
     }

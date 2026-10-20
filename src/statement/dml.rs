@@ -89,7 +89,7 @@ impl SpannerStatement {
         Ok(Some(count))
     }
 
-    /// Execute `THEN RETURN` through `ExecuteSql`; `ExecuteBatchDml` cannot return rows.
+    /// Execute `THEN RETURN` through `ExecuteStreamingSql`; `ExecuteBatchDml` cannot return rows.
     /// Drain results before commit and preserve client errors so transaction aborts retry.
     fn execute_returning_dml(
         &self,
