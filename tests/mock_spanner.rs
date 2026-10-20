@@ -708,20 +708,21 @@ fn bound_dml_returning_and_partitioned_preserve_parameters() {
 #[test]
 fn bound_returning_dml_commits_with_the_explicit_transaction_id() {
     let _watchdog = watchdog!();
+    let begins = Arc::new(Mutex::new(Vec::new()));
     let requests = Arc::new(Mutex::new(Vec::new()));
     let commits = Arc::new(Mutex::new(Vec::new()));
-    let (record_requests, record_commits) = (requests.clone(), commits.clone());
+    let (record_begins, record_requests, record_commits) =
+        (begins.clone(), requests.clone(), commits.clone());
     let server = MockServer::start(move |mock| {
-        mock.expect_begin_transaction().once().returning(|request| {
-            assert!(matches!(
-                request.into_inner().options.unwrap().mode,
-                Some(v1::transaction_options::Mode::ReadWrite(_))
-            ));
-            Ok(tonic::Response::new(v1::Transaction {
-                id: b"original-txn".to_vec(),
-                ..Default::default()
-            }))
-        });
+        mock.expect_begin_transaction()
+            .once()
+            .returning(move |request| {
+                record_begins.lock().unwrap().push(request.into_inner());
+                Ok(tonic::Response::new(v1::Transaction {
+                    id: b"original-txn".to_vec(),
+                    ..Default::default()
+                }))
+            });
         mock.expect_execute_streaming_sql()
             .times(2)
             .returning(move |request| {
@@ -760,6 +761,12 @@ fn bound_returning_dml_commits_with_the_explicit_transaction_id() {
             format!("v{index}")
         );
     }
+    let begins = begins.lock().unwrap();
+    assert_eq!(begins.len(), 1);
+    assert!(matches!(
+        begins[0].options.as_ref().unwrap().mode,
+        Some(v1::transaction_options::Mode::ReadWrite(_))
+    ));
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     for (index, request) in requests.iter().enumerate() {
@@ -1209,42 +1216,40 @@ fn execute_partitions_rejects_multiple_bound_rows_and_consumes_them() {
 #[test]
 fn empty_partitions_retain_the_planned_types_at_the_readers_timestamp_precision() {
     let _watchdog = watchdog!();
-    let partition_reads = Arc::new(AtomicUsize::new(0));
-    let reads_in_mock = partition_reads.clone();
+    let partition_queries = Arc::new(Mutex::new(Vec::new()));
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let (record_partition_queries, record_queries) = (partition_queries.clone(), queries.clone());
     let server = MockServer::start(move |mock| {
         serve_begin_transaction(mock);
-        mock.expect_partition_query().once().returning(|request| {
-            assert_eq!(
-                request.into_inner().sql,
-                "SELECT Id, Ts, Doc FROM MockTable"
-            );
-            Ok(tonic::Response::new(v1::PartitionResponse {
-                partitions: vec![v1::Partition {
-                    partition_token: b"empty-partition".to_vec(),
-                }],
-                ..Default::default()
-            }))
-        });
+        mock.expect_partition_query()
+            .once()
+            .returning(move |request| {
+                record_partition_queries
+                    .lock()
+                    .unwrap()
+                    .push(request.into_inner().sql);
+                Ok(tonic::Response::new(v1::PartitionResponse {
+                    partitions: vec![v1::Partition {
+                        partition_token: b"empty-partition".to_vec(),
+                    }],
+                    ..Default::default()
+                }))
+            });
         mock.expect_execute_streaming_sql()
             .times(2)
             .returning(move |request| {
                 let request = request.into_inner();
                 let metadata = if request.partition_token.is_empty() {
-                    assert_eq!(
-                        request.query_mode,
-                        v1::execute_sql_request::QueryMode::Plan as i32
-                    );
                     Some(result_metadata(&[
                         ("Id", v1::TypeCode::Int64),
                         ("Ts", v1::TypeCode::Timestamp),
                         ("Doc", v1::TypeCode::Json),
                     ]))
                 } else {
-                    assert_eq!(request.partition_token, b"empty-partition");
-                    reads_in_mock.fetch_add(1, Ordering::SeqCst);
                     // Omni can omit the row type for a partition with no rows.
                     Some(v1::ResultSetMetadata::default())
                 };
+                record_queries.lock().unwrap().push(request);
                 Ok(stream_of(vec![Ok(v1::PartialResultSet {
                     metadata,
                     last: true,
@@ -1290,9 +1295,23 @@ fn empty_partitions_retain_the_planned_types_at_the_readers_timestamp_precision(
     let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
     assert_eq!(
-        partition_reads.load(Ordering::SeqCst),
-        1,
-        "the reader must fetch the partition that omits its row type"
+        *partition_queries.lock().unwrap(),
+        ["SELECT Id, Ts, Doc FROM MockTable"]
+    );
+    let queries = queries.lock().unwrap();
+    assert_eq!(
+        queries
+            .iter()
+            .map(|q| (q.query_mode, q.partition_token.as_slice()))
+            .collect::<Vec<_>>(),
+        [
+            (v1::execute_sql_request::QueryMode::Plan as i32, &b""[..]),
+            (
+                v1::execute_sql_request::QueryMode::Normal as i32,
+                &b"empty-partition"[..]
+            ),
+        ],
+        "a PLAN for the schema, then a fetch of the partition that omits its row type"
     );
 }
 
@@ -3821,10 +3840,11 @@ fn exec_incremental_spec_default_is_a_no_op() {
 /// Attempts a probe serves before failing permanently, so an inert limit cannot hang the test.
 const RETRY_PROBE_CAP: usize = 20;
 
-/// A constant 10 ms backoff instead of the default 1 s doubling.
+/// A constant 50 ms backoff instead of the default 1 s doubling. With full jitter, the probe cap
+/// takes about half a second to reach, well beyond the elapsed budgets tested below.
 fn set_constant_backoff(statement: &mut impl Statement) {
     for (key, value) in [
-        (spanner_adbc::OPTION_RETRY_BACKOFF_INITIAL_SECONDS, 0.01),
+        (spanner_adbc::OPTION_RETRY_BACKOFF_INITIAL_SECONDS, 0.05),
         (spanner_adbc::OPTION_RETRY_BACKOFF_MULTIPLIER, 1.0),
     ] {
         statement
@@ -3950,8 +3970,8 @@ fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_pat
         "with no elapsed budget the unary retry loop must run until the mock's cap ends it"
     );
 
-    // With full jitter on the 10 ms backoff, the count depends on RPC latency. At least two
-    // attempts shows the budget is not so small that it stops at the first failure.
+    // With full jitter the count varies. At least two attempts shows the budget is not so small
+    // that it stops at the first failure.
     let unary = unary_attempts(
         spanner_adbc::OPTION_RETRY_MAX_ELAPSED_SECONDS,
         OptionValue::Double(0.15),
@@ -4275,7 +4295,7 @@ fn interrupted_batch_write_reports_confirmed_rows_and_unknown_outcome() {
             mock.expect_batch_write().returning(move |_| {
                 let (tx, rx) = tokio::sync::mpsc::channel(1);
                 tx.try_send(Ok(batch_write_groups_ok(vec![0, 1]))).unwrap();
-                started_tx.send(()).unwrap();
+                let _ = started_tx.send(());
                 // Keep the stream open after two confirmed writes; group 2 has no outcome yet.
                 tokio::spawn(async move { tx.closed().await });
                 Ok(tonic::Response::new(rx))
@@ -4283,10 +4303,11 @@ fn interrupted_batch_write_reports_confirmed_rows_and_unknown_outcome() {
         });
         let mut connection = server.connect();
         let mut statement = batch_write_ingest_statement(&mut connection);
+        // The cancel case gets a deadline it cannot reach, so a slow cancel cannot turn into Timeout.
         statement
             .set_option(
                 OptionStatement::Other(spanner_adbc::OPTION_RPC_TIMEOUT_UPDATE.into()),
-                OptionValue::Double(1.0),
+                OptionValue::Double(if cancel_operation { 60.0 } else { 1.0 }),
             )
             .unwrap();
         statement.bind(ingest_batch(3)).unwrap();
