@@ -1,5 +1,5 @@
 > [!WARNING]
-> **Experimental.** This project is AI-generated and has not yet seen real-world use.
+> Experimental: this project is AI-generated and has not yet seen real-world use.
 
 # spanner-adbc
 
@@ -10,10 +10,10 @@ An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver f
 [Google Cloud Spanner](https://cloud.google.com/spanner) and Spanner Omni. Query results come
 back as Arrow record batches. The driver ships as a [Python package](https://pypi.org/project/spanner-adbc/),
 a [shared library](#shared-library) for any ADBC driver manager, and a [Rust crate](#rust).
-CI tests it against the Spanner emulator and Spanner Omni; Cloud Spanner and authentication
-tests run locally.
-
 Only GoogleSQL databases are supported, not the PostgreSQL dialect.
+
+CI tests the driver against the Spanner emulator and Spanner Omni. Cloud Spanner and
+authentication tests run locally.
 
 ## Quickstart
 
@@ -39,26 +39,77 @@ with spanner.connect(db_kwargs={
 The [Python guide](python/README.md) covers parameters, transactions, DataFrames, bulk ingest
 and partitioned reads.
 
+## Shared library
+
+Other ADBC clients load the driver as a shared library: `libspanner_adbc.so` on Linux,
+`libspanner_adbc.dylib` on macOS or `spanner_adbc.dll` on Windows. Its entrypoint is
+`AdbcSpannerInit`, with `AdbcDriverInit` as a fallback.
+
+Download it from a [release](https://github.com/fornwall/spanner-adbc/releases) or the
+[shared libraries workflow](https://github.com/fornwall/spanner-adbc/actions/workflows/libraries.yml),
+or build it with `cargo build --release`, which writes it to `target/release/`. To load it by
+name (`driver="spanner"`), point the library paths in [spanner.toml](spanner.toml) at it and
+install the file as a [driver manifest](https://arrow.apache.org/adbc/current/format/driver_manifests.html).
+
+## Connecting
+
+The database option `uri` selects the database and backend:
+
+| Backend | `uri` |
+| --- | --- |
+| Cloud Spanner | `spanner:///projects/<p>/instances/<i>/databases/<d>` |
+| Emulator | `spanner://localhost:9010/projects/<p>/instances/<i>/databases/<d>?spanner.emulator=true` |
+| Spanner Omni | `spanner://localhost:15000/projects/default/instances/default/databases/<d>?spanner.instance_type=omni` |
+
+A `host:port` authority sets `spanner.endpoint` and connects over plaintext. For TLS, set
+`spanner.endpoint` to an `https://` URL instead. If `SPANNER_EMULATOR_HOST` is set, the Cloud
+Spanner form connects to that emulator. See [connection URIs](docs/options.md#connection-uris).
+
+Other options can be set on the database, connection or statement. Driver options start with
+`spanner.` and standard ADBC options with `adbc.`. The [option reference](docs/options.md) lists
+every option with its type and default.
+
+### Authentication
+
+Cloud Spanner connections use [Application Default Credentials](https://docs.cloud.google.com/docs/authentication/application-default-credentials)
+unless one of these database options is set:
+
+| Option | Credentials |
+| --- | --- |
+| `spanner.auth.keyfile` | A service account, authorized user, impersonated service account or external account JSON file |
+| `spanner.auth.keyfile_json` | The same JSON, as a string |
+| `spanner.auth.access_token` | A bearer token, sent as is and never refreshed |
+| `spanner.auth.impersonate.target_principal` | A service account to impersonate, with the keyfile or ADC as base credentials |
+
+`spanner.auth.quota_project` sets the project billed for quota. URIs are often logged, so the
+driver rejects `keyfile_json` and `access_token` as URI query parameters.
+
+The emulator connects without credentials and rejects credential options. Omni and plaintext
+endpoints (any scheme but `https://`) ignore ADC and only send credentials you set explicitly,
+which a plaintext endpoint sends unencrypted. See [anonymous connections](docs/options.md#anonymous-connections).
+
 ## Features
 
-- Streaming queries, returned in Arrow batches of up to 8192 rows and prefetched in the background.
+- Streaming queries, returned in Arrow batches of up to 8192 rows and prefetched in the
+  background. See [execution](docs/adbc.md#execution).
 - DML and DDL, including `;`-separated batches of one kind. DML batches are atomic, and
   autocommit DML supports `THEN RETURN`.
-- Manual transactions.
-- Parameter binding from Arrow data, by position or by name, preserving Arrow types.
+- Parameter binding from Arrow data to GoogleSQL `@name` parameters, by position or by name.
+  See [parameters](docs/adbc.md#parameters-and-ingest).
 - Bulk ingest in all four ADBC modes.
+- Manual transactions. See [transactions](docs/transactions.md#adbc-transactions).
 - Partitioned queries, optionally on [Data Boost](https://docs.cloud.google.com/spanner/docs/databoost/databoost-overview)
   (Cloud Spanner only).
 - Result and parameter schemas from the query plan, without running the query.
 - Metadata through `get_objects()`, `get_table_schema()`, `get_statistics()` and the other ADBC
-  metadata calls.
-- Cancellation of running calls and result fetches.
+  metadata calls. See [metadata](docs/adbc.md#metadata-and-planning).
+- Cancellation of running calls and result fetches, and per-operation timeouts.
 - Spanner-specific options such as stale reads, isolation level, request priority and tags,
-  directed reads, retries, timeouts, partitioned DML and BatchWrite ingest. See the
-  [option reference](docs/options.md).
+  directed reads, retries, partitioned DML and BatchWrite ingest.
+- Change streams through ordinary SQL: DDL to create them and `READ_<stream>` queries to read
+  them.
 
-Change streams work through ordinary SQL: DDL to create them and `READ_<stream>` queries to
-read them.
+[ADBC support](docs/adbc.md#adbc-support) lists the supported ADBC versions and features.
 
 ## Limitations
 
@@ -81,56 +132,8 @@ read them.
   `""`, so use qualified names for named schemas.
 - Substrait plans, incremental partitioning and temporary ingest tables are not supported.
 
-See [transactions](docs/transactions.md), the [ADBC interface](docs/adbc.md) and
-[known limitations](docs/limitations.md) for details.
-
-## Shared library
-
-Other ADBC clients load the driver as a shared library: `libspanner_adbc.so` on Linux,
-`libspanner_adbc.dylib` on macOS or `spanner_adbc.dll` on Windows. Its entrypoint is
-`AdbcSpannerInit`, with `AdbcDriverInit` as a fallback.
-
-Download it from a [release](https://github.com/fornwall/spanner-adbc/releases) or the
-[shared libraries workflow](https://github.com/fornwall/spanner-adbc/actions/workflows/libraries.yml),
-or build it with `cargo build --release`, which writes it to `target/release/`.
-
-### Configuration
-
-Set options on the database, connection or statement. Driver options start with `spanner.`
-and standard ADBC options with `adbc.`. The database needs a `uri`:
-
-```text
-spanner:///projects/p/instances/i/databases/d
-spanner://localhost:9010/projects/p/instances/i/databases/d?spanner.emulator=true
-```
-
-The second form connects to an emulator on `localhost:9010`. For Spanner Omni, set
-`spanner.instance_type=omni` and `spanner.endpoint`. The [option reference](docs/options.md)
-lists every option with its type and default, and describes [connection URIs](docs/options.md#connection-uris).
-
-### Authentication
-
-The driver uses [Application Default Credentials](https://docs.cloud.google.com/docs/authentication/application-default-credentials)
-unless you configure something else:
-
-- `spanner.auth.keyfile` (a path) or `spanner.auth.keyfile_json` (the contents) loads service
-  account, authorized user, impersonated service account or external account credentials.
-- `spanner.auth.access_token` sends a fixed bearer token. The driver never refreshes it.
-- `spanner.auth.impersonate.target_principal` impersonates a service account, using the keyfile
-  or ADC as base credentials.
-- `spanner.auth.quota_project` sets the project billed for quota.
-
-For the emulator, set `SPANNER_EMULATOR_HOST`, or `spanner.emulator=true` together with an
-endpoint. The driver then connects without credentials and rejects explicit credential options
-and a quota project.
-
-Spanner Omni and plaintext endpoints (any scheme but `https://`, or a bare `host:port`) also
-connect without credentials unless you set a keyfile, access token or impersonation target, and
-they reject a quota project without one. Explicit credentials sent to a plaintext endpoint are
-unencrypted, so use `https://` for remote hosts. See [anonymous connections](docs/options.md#anonymous-connections).
-
-Keep secrets out of URIs: the driver rejects `keyfile_json` and `access_token` as URI query
-parameters. See [database options](docs/options.md#database-options) for precedence rules.
+[Known limitations](docs/limitations.md) describes restrictions of the pinned Google Cloud
+client.
 
 ## Type mapping
 
