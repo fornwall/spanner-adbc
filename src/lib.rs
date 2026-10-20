@@ -608,7 +608,7 @@ pub const OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS: &str =
 /// Connection and statement option: the Arrow type of Spanner `TIMESTAMP` columns.
 ///
 /// - `nanoseconds_error_on_overflow` (the default): `Timestamp(Nanosecond, "UTC")`. A value
-///   outside about 1677 to 2262, the range of `i64` nanoseconds, fails with `InvalidArguments`.
+///   outside about 1677 to 2262, the range of `i64` nanoseconds, fails with `InvalidData`.
 /// - `microseconds`: `Timestamp(Microsecond, "UTC")`, which covers Spanner's years 1 to 9999,
 ///   like the Snowflake driver's `max_timestamp_precision`. Sub-microsecond digits are floored.
 ///
