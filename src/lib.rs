@@ -13,31 +13,27 @@
 //!
 //! ## Configuration
 //!
-//! Every level is configured through ADBC options. See
-//! [docs/options.md](https://github.com/fornwall/spanner-adbc/blob/main/docs/options.md) for the
-//! full reference, including types, defaults and `get_option` behavior. Connection and statement
-//! options set on a connection are inherited by the statements it creates, which can override
-//! them.
-//!
-//! The database is selected with the standard
-//! [`OptionDatabase::Uri`](adbc_core::options::OptionDatabase::Uri) option, which takes a
-//! `spanner://` URI; a bare database path is not accepted. The URI path names the database, the
-//! optional `//host:port` authority sets [`OPTION_ENDPOINT`], and query parameters set other
+//! Every level is configured through ADBC options, and statements inherit the options of their
+//! connection. See [docs/options.md](https://github.com/fornwall/spanner-adbc/blob/main/docs/options.md)
+//! for the reference. The standard [`OptionDatabase::Uri`](adbc_core::options::OptionDatabase::Uri)
+//! option selects the database with a `spanner://` URI, whose query parameters can set other
 //! database options:
 //!
 //! ```text
 //! spanner:///projects/<p>/instances/<i>/databases/<d>?spanner.emulator=true
 //! ```
 //!
-//! The URI is expanded into individual options when it is set, so options set afterwards take
-//! precedence. URIs are often logged, so [`OPTION_KEYFILE_JSON`] and [`OPTION_ACCESS_TOKEN`] are
-//! rejected as query parameters and must be set as options. [`OPTION_KEYFILE`] is a path and may
-//! appear in a URI.
-//!
 //! ## Transactions
 //!
 //! Connections start in autocommit mode. [`SpannerConnection`] describes manual transactions,
 //! which hold either queries or buffered writes.
+//!
+//! ## Async callers
+//!
+//! The ADBC traits are synchronous, and each call blocks on the driver's own Tokio runtime. From
+//! async code, call the driver inside `tokio::task::spawn_blocking` or on another thread; a call
+//! on a current-thread runtime's own thread panics. See
+//! [synchronous calls from Tokio](https://github.com/fornwall/spanner-adbc/blob/main/docs/limitations.md#synchronous-calls-from-tokio).
 //!
 //! ## Example
 //!

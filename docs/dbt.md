@@ -22,7 +22,7 @@ crates differ from dbt's.
 
 | Driver behavior | Consequence for an adapter |
 | --- | --- |
-| GoogleSQL only, with `@name` parameters | PostgreSQL-dialect databases need a separate effort. |
+| GoogleSQL databases only, with `@name` parameters | The adapter's SQL dialect and macros are GoogleSQL. |
 | ADBC autocommit defaults to on, and DBAPI's to off | Set autocommit explicitly. Don't send SQL `BEGIN` or `COMMIT`. |
 | Autocommit DML statements and `;`-separated DML batches commit atomically | Keep statements that must apply together in one call. |
 | A manual transaction either queries or buffers writes, with no read-your-writes | Don't query a table inside the transaction that writes it. |

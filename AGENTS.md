@@ -77,6 +77,7 @@ Only release when asked, and use `cargo-release` as described in
 - [docs/adbc.md](docs/adbc.md) and `src/ffi/mod.rs`: supported ADBC features, ownership, errors
   and C ABI design.
 - [docs/transactions.md](docs/transactions.md): transaction boundaries and RPCs.
-- [python/README.md](python/README.md): Python API. [docs/dbt.md](docs/dbt.md): dbt integration.
+- [python/README.md](python/README.md): Python API.
+- [docs/dbt.md](docs/dbt.md): notes for a future dbt adapter.
 
 Keep this file under 100 lines. Link to detailed docs instead of copying them.

@@ -91,7 +91,8 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 base64 = "0.23"
 # Static bearer-token headers; must match google-cloud-auth's http major version.
 http = "1"
-# Parse and format DATE/TIMESTAMP values without clock or timezone dependencies.
+# Format bound DATE and TIMESTAMP values; results decode without it. arrow-array enables its
+# clock feature regardless.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 arbitrary = { version = "1", features = ["derive"], optional = true }
 # Forward structured gRPC status details into ADBC errors.
