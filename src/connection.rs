@@ -411,7 +411,7 @@ impl Connection for SpannerConnection {
             db_schema,
             table_name,
         )?;
-        let batch = crate::statistics::build(self.catalog(), schemas, out_schema.clone())?;
+        let batch = crate::statistics::build(self.catalog(), schemas)?;
         Ok(Box::new(RecordBatchIterator::new(
             vec![Ok(batch)],
             out_schema,

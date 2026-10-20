@@ -3,7 +3,7 @@ use adbc_core::constants::{
     ADBC_STATISTIC_DISTINCT_COUNT_KEY, ADBC_STATISTIC_NULL_COUNT_KEY, ADBC_STATISTIC_ROW_COUNT_KEY,
 };
 use adbc_core::schemas::GET_STATISTICS_SCHEMA;
-use arrow_array::{ListArray, UnionArray};
+use arrow_array::{ListArray, StructArray, UnionArray};
 
 const CATALOG: &str = "adbc-test";
 
@@ -51,7 +51,7 @@ fn build_reports_each_statistic_exactly_and_never_as_approximate() {
             },
         ],
     }];
-    let batch = build(CATALOG, schemas, GET_STATISTICS_SCHEMA.clone()).unwrap();
+    let batch = build(CATALOG, schemas).unwrap();
     assert_eq!(batch.schema(), GET_STATISTICS_SCHEMA.clone());
     assert_eq!(batch.num_rows(), 1); // one catalog
 
@@ -97,10 +97,10 @@ fn build_reports_each_statistic_exactly_and_never_as_approximate() {
 #[test]
 fn build_table_query_pairs_each_aggregate_with_its_plan_entry() {
     let columns = vec![
-        ("Id".to_string(), true),
+        ("Id", true),
         // Not groupable, like an ARRAY column: no COUNT(DISTINCT).
-        ("Tags".to_string(), false),
-        ("Name".to_string(), true),
+        ("Tags", false),
+        ("Name", true),
     ];
     let (sql, plan) = build_table_query("", "Users", &columns).unwrap();
     assert_eq!(
@@ -126,11 +126,60 @@ fn build_table_query_pairs_each_aggregate_with_its_plan_entry() {
     assert!(plan.is_empty());
 }
 
+#[test]
+fn prepare_tables_groups_discovery_rows_by_table_and_applies_the_filter() {
+    let strings = |values: Vec<Option<&str>>| Arc::new(StringArray::from(values)) as ArrayRef;
+    // `Empty` has no visible columns, so its row has NULL columns.
+    let discovery = RecordBatch::try_from_iter([
+        ("TABLE_SCHEMA", strings(vec![Some(""); 4])),
+        (
+            "TABLE_NAME",
+            strings(vec![
+                Some("Empty"),
+                Some("Users"),
+                Some("Users"),
+                Some("Other"),
+            ]),
+        ),
+        (
+            "COLUMN_NAME",
+            strings(vec![None, Some("Id"), Some("Tags"), Some("Id")]),
+        ),
+        (
+            "SPANNER_TYPE",
+            strings(vec![
+                None,
+                Some("INT64"),
+                Some("ARRAY<INT64>"),
+                Some("INT64"),
+            ]),
+        ),
+    ])
+    .unwrap();
+
+    let prepared = prepare_tables(&discovery, |_, table| table != "Other").unwrap();
+    let tables: Vec<_> = prepared
+        .iter()
+        .map(|p| (p.table.as_str(), p.sql.as_str()))
+        .collect();
+    assert_eq!(
+        tables,
+        [
+            ("Empty", "SELECT COUNT(*) FROM `Empty`"),
+            (
+                "Users",
+                "SELECT COUNT(*), COUNTIF(`Id` IS NULL), COUNT(DISTINCT `Id`), \
+                 COUNTIF(`Tags` IS NULL) FROM `Users`"
+            ),
+        ]
+    );
+}
+
 /// Distinct counts catch an off-by-one between `plan` and the result columns, which would
 /// silently report one statistic's value as another's.
 #[test]
 fn parse_table_statistics_reads_each_plan_entry_at_its_own_aggregate() {
-    let columns = vec![("Id".to_string(), true), ("Tags".to_string(), false)];
+    let columns = vec![("Id", true), ("Tags", false)];
     let (_, plan) = build_table_query("", "Users", &columns).unwrap();
     // COUNT(*), COUNTIF(Id IS NULL), COUNT(DISTINCT Id), COUNTIF(Tags IS NULL).
     let counts = [100i64, 7, 93, 11];
@@ -250,7 +299,7 @@ fn groupable_types() {
 
 #[test]
 fn empty_is_valid() {
-    let batch = build(CATALOG, Vec::new(), GET_STATISTICS_SCHEMA.clone()).unwrap();
+    let batch = build(CATALOG, Vec::new()).unwrap();
     assert_eq!(batch.schema(), GET_STATISTICS_SCHEMA.clone());
     assert_eq!(batch.num_rows(), 1);
 }

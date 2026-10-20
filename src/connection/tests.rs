@@ -440,17 +440,15 @@ mod statistics_deadline {
     /// One table `t` with no visible columns, so the only scan is `COUNT(*)`.
     fn delayed_response(request: &v1::ExecuteSqlRequest) -> v1::PartialResultSet {
         use v1::TypeCode::{Int64, String};
-        let (fields, values): (Vec<(&str, v1::TypeCode)>, Vec<&str>) =
-            if request.sql.contains("INFORMATION_SCHEMA.TABLES") {
-                (
-                    vec![("TABLE_SCHEMA", String), ("TABLE_NAME", String)],
-                    vec!["", "t"],
-                )
-            } else if request.sql.contains("INFORMATION_SCHEMA.COLUMNS") {
+        let (fields, values): (Vec<(&str, v1::TypeCode)>, Vec<Option<&str>>) =
+            if request.sql.contains("INFORMATION_SCHEMA") {
                 let names = ["TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "SPANNER_TYPE"];
-                (names.map(|name| (name, String)).to_vec(), Vec::new())
+                (
+                    names.map(|name| (name, String)).to_vec(),
+                    vec![Some(""), Some("t"), None, None],
+                )
             } else {
-                (vec![("n", Int64)], vec!["3"])
+                (vec![("n", Int64)], vec![Some("3")])
             };
         let inline_begin = matches!(
             request
@@ -480,7 +478,10 @@ mod statistics_deadline {
             values: values
                 .into_iter()
                 .map(|value| prost_types::Value {
-                    kind: Some(prost_types::value::Kind::StringValue(value.into())),
+                    kind: Some(match value {
+                        Some(value) => prost_types::value::Kind::StringValue(value.into()),
+                        None => prost_types::value::Kind::NullValue(0),
+                    }),
                 })
                 .collect(),
             last: true,
@@ -488,8 +489,8 @@ mod statistics_deadline {
         }
     }
 
-    /// The query timeout is one deadline for the whole call. Discovery (two sequential queries)
-    /// and the scan each fit in it, but together they don't.
+    /// The query timeout is one deadline for the whole call. Discovery and the scan each fit in
+    /// it, but together they don't.
     #[test]
     fn one_query_deadline_covers_discovery_and_scans() {
         let requests = Requests::default();
@@ -514,20 +515,20 @@ mod statistics_deadline {
         assert!(statistics.is_ok(), "no deadline: {:?}", statistics.err());
         assert_eq!(
             server.requests.lock().unwrap().len(),
-            3,
-            "TABLES, COLUMNS, one scan"
+            2,
+            "discovery, one scan"
         );
 
         connection
             .set_option(
                 OptionConnection::Other(crate::OPTION_RPC_TIMEOUT_QUERY.into()),
-                OptionValue::Double(2.5 * DELAY.as_secs_f64()),
+                OptionValue::Double(1.5 * DELAY.as_secs_f64()),
             )
             .unwrap();
         let error = connection
             .get_statistics(None, None, None, false)
             .err()
-            .expect("three sequential delays exceed one deadline");
+            .expect("two sequential delays exceed one deadline");
         assert_eq!(error.status, Status::Timeout, "{}", error.message);
     }
 }

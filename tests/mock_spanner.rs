@@ -4062,15 +4062,7 @@ fn get_statistics_shares_one_read_only_transaction() {
                     record.lock().unwrap().push(request.transaction);
                     // Columns are read by position, so only their count and types matter.
                     let (fields, values): (Vec<(&str, v1::TypeCode)>, Vec<&str>) =
-                        if request.sql.contains("INFORMATION_SCHEMA.TABLES") {
-                            (
-                                vec![
-                                    ("TABLE_SCHEMA", v1::TypeCode::String),
-                                    ("TABLE_NAME", v1::TypeCode::String),
-                                ],
-                                vec!["", "MockTable"],
-                            )
-                        } else if request.sql.contains("INFORMATION_SCHEMA.COLUMNS") {
+                        if request.sql.contains("INFORMATION_SCHEMA") {
                             (
                                 vec![
                                     ("TABLE_SCHEMA", v1::TypeCode::String),
@@ -4121,8 +4113,8 @@ fn get_statistics_shares_one_read_only_transaction() {
 
     let seen = selectors.lock().unwrap();
     assert!(
-        seen.len() >= 3,
-        "discovery (TABLES + COLUMNS) plus at least one aggregate scan, got {}",
+        seen.len() >= 2,
+        "discovery plus at least one aggregate scan, got {}",
         seen.len()
     );
     let first = seen[0]

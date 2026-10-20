@@ -3,21 +3,20 @@
 //! table. Min/max values are omitted because the statistic union cannot represent every Spanner
 //! type.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use adbc_core::error::{Error, Result, Status};
+use adbc_core::schemas::GET_STATISTICS_SCHEMA;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Int16Array, Int64Array, RecordBatch, StringArray, StructArray,
-    new_null_array,
+    Array, ArrayRef, BooleanArray, Int16Array, Int64Array, RecordBatch, StringArray,
 };
-use arrow_schema::{DataType, Fields, SchemaRef};
+use arrow_schema::{DataType, FieldRef};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use google_cloud_spanner::client::DatabaseClient;
 
 use crate::error::err;
-use crate::metadata::{LikeMatcher, metadata_sql_builder, query_txn, str_cols};
-use crate::nested::{arrow_err, dense_union, field, list_item, list_of, struct_fields};
+use crate::metadata::{LikeMatcher, filtered_query, metadata_sql_builder, query_txn, str_cols};
+use crate::nested::{arrow_err, dense_union, field, shape_err, strings, struct_list};
 use crate::options::SharedConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::sql::{qualified_table, quote_ident};
@@ -45,6 +44,15 @@ pub(crate) struct SchemaStatistics {
     pub statistics: Vec<Statistic>,
 }
 
+/// One row per visible column of each base table, in ordinal order, or one row with null columns
+/// for a table without any. Hidden columns, such as implicit `rowid` keys, are omitted as in
+/// `get_objects`.
+const DISCOVERY_SQL: &str = "SELECT t.TABLE_SCHEMA, t.TABLE_NAME, c.COLUMN_NAME, c.SPANNER_TYPE \
+     FROM INFORMATION_SCHEMA.TABLES AS t \
+     LEFT JOIN INFORMATION_SCHEMA.COLUMNS AS c \
+       ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME \
+      AND NOT CAST(c.IS_HIDDEN AS BOOL)";
+
 /// Compute exact statistics for the base tables matching the `LIKE` filters: `ROW_COUNT` per
 /// table, and per column `NULL_COUNT` plus `DISTINCT_COUNT` for groupable types.
 pub(crate) fn collect_statistics(
@@ -57,8 +65,22 @@ pub(crate) fn collect_statistics(
 ) -> Result<Vec<SchemaStatistics>> {
     let bound = config.read_staleness.multi_use_timestamp_bound()?;
     let client = client.clone();
-    let db_schema_matcher = db_schema.map(LikeMatcher::new);
-    let table_name_matcher = table_name.map(LikeMatcher::new);
+    // As in `get_objects`, the pushed-down filters only cut transferred rows.
+    let discovery = filtered_query(
+        config,
+        DISCOVERY_SQL,
+        Some("t.TABLE_TYPE = 'BASE TABLE'"),
+        &[("t.TABLE_SCHEMA", db_schema), ("t.TABLE_NAME", table_name)],
+        "t.TABLE_SCHEMA, t.TABLE_NAME, c.ORDINAL_POSITION",
+    );
+    let (schema_matcher, table_matcher) = (
+        db_schema.map(LikeMatcher::new),
+        table_name.map(LikeMatcher::new),
+    );
+    let matches = move |schema: &str, table: &str| {
+        schema_matcher.as_ref().is_none_or(|m| m.matches(schema))
+            && table_matcher.as_ref().is_none_or(|m| m.matches(table))
+    };
     // One cancel signal and query deadline cover discovery and every scan, as for `get_objects`.
     let (prepared, batches) = block_on_cancellable(
         runtime,
@@ -69,33 +91,7 @@ pub(crate) fn collect_statistics(
             async move {
                 // Discovery and aggregate scans share one snapshot, including for stale reads.
                 let txn = crate::staleness::multi_use(&client, bound).await?;
-                let tables = query_txn(
-                    &txn,
-                    metadata_sql_builder(
-                        config,
-                        "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
-                         WHERE TABLE_TYPE = 'BASE TABLE'",
-                    ),
-                )
-                .await?;
-                // Match get_objects: omit hidden columns, including implicit rowid keys.
-                let columns = query_txn(
-                    &txn,
-                    metadata_sql_builder(
-                        config,
-                        "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SPANNER_TYPE \
-                         FROM INFORMATION_SCHEMA.COLUMNS \
-                         WHERE NOT CAST(IS_HIDDEN AS BOOL) \
-                         ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
-                    ),
-                )
-                .await?;
-                let prepared = prepare_tables(
-                    &tables,
-                    &columns,
-                    db_schema_matcher.as_ref(),
-                    table_name_matcher.as_ref(),
-                )?;
+                let prepared = prepare_tables(&query_txn(&txn, discovery).await?, matches)?;
                 // `buffered` keeps input order.
                 let batches: Vec<RecordBatch> = stream::iter(
                     prepared
@@ -110,67 +106,51 @@ pub(crate) fn collect_statistics(
         ),
     )?;
 
-    // Group by schema in first-seen order without repeatedly scanning the output.
+    // Discovery orders by schema, so each schema's tables are adjacent.
     let mut schemas: Vec<SchemaStatistics> = Vec::new();
-    let mut schema_index: HashMap<String, usize> = HashMap::new();
     for (p, batch) in prepared.into_iter().zip(batches) {
         let stats = parse_table_statistics(&batch, &p.table, p.plan)?;
-        match schema_index.get(&p.schema) {
-            Some(&idx) => schemas[idx].statistics.extend(stats),
-            None => {
-                schema_index.insert(p.schema.clone(), schemas.len());
-                schemas.push(SchemaStatistics {
-                    db_schema: p.schema,
-                    statistics: stats,
-                });
-            }
+        match schemas.last_mut() {
+            Some(last) if last.db_schema == p.schema => last.statistics.extend(stats),
+            _ => schemas.push(SchemaStatistics {
+                db_schema: p.schema,
+                statistics: stats,
+            }),
         }
     }
     Ok(schemas)
 }
 
-/// Build the aggregate query of each discovered base table that matches the filters, from the
-/// `INFORMATION_SCHEMA.TABLES` and `COLUMNS` discovery batches.
+/// Build the aggregate query of each discovered base table that `matches` its schema and name.
 fn prepare_tables(
-    table_batch: &RecordBatch,
-    column_batch: &RecordBatch,
-    db_schema_matcher: Option<&LikeMatcher>,
-    table_name_matcher: Option<&LikeMatcher>,
+    discovery: &RecordBatch,
+    matches: impl Fn(&str, &str) -> bool,
 ) -> Result<Vec<PreparedTable>> {
-    let [ts, tn] = str_cols(table_batch)?;
-    let [cts, ctn, ccn, ctype] = str_cols(column_batch)?;
-
-    // Group columns once, preserving ordinal order within each table.
-    let mut columns_by_table: HashMap<(&str, &str), Vec<(String, bool)>> = HashMap::new();
-    for c in 0..column_batch.num_rows() {
-        columns_by_table
-            .entry((cts.value(c), ctn.value(c)))
-            .or_default()
-            .push((ccn.value(c).to_string(), is_groupable(ctype.value(c))));
-    }
-
-    let mut prepared: Vec<PreparedTable> = Vec::new();
-    for r in 0..table_batch.num_rows() {
-        let schema = ts.value(r);
-        let table = tn.value(r);
-        if db_schema_matcher.is_some_and(|m| !m.matches(schema)) {
-            continue;
-        }
-        if table_name_matcher.is_some_and(|m| !m.matches(table)) {
-            continue;
-        }
-        let columns = columns_by_table
-            .remove(&(schema, table))
-            .unwrap_or_default();
-        let (sql, plan) = build_table_query(schema, table, &columns)?;
-        prepared.push(PreparedTable {
-            schema: schema.to_string(),
-            table: table.to_string(),
-            sql,
-            plan,
-        });
-    }
-    Ok(prepared)
+    let [schema, table, column, spanner_type] = str_cols(discovery)?;
+    let name = |r: usize| (schema.value(r), table.value(r));
+    let rows: Vec<usize> = (0..discovery.num_rows()).collect();
+    // Each table's rows are adjacent: discovery orders by schema and table.
+    rows.chunk_by(|&a, &b| name(a) == name(b))
+        .filter(|rows| {
+            let (schema, table) = name(rows[0]);
+            matches(schema, table)
+        })
+        .map(|rows| {
+            let (schema, table) = name(rows[0]);
+            let columns: Vec<(&str, bool)> = rows
+                .iter()
+                .filter(|&&r| column.is_valid(r))
+                .map(|&r| (column.value(r), is_groupable(spanner_type.value(r))))
+                .collect();
+            let (sql, plan) = build_table_query(schema, table, &columns)?;
+            Ok(PreparedTable {
+                schema: schema.to_string(),
+                table: table.to_string(),
+                sql,
+                plan,
+            })
+        })
+        .collect()
 }
 
 /// A per-table aggregate statistics query, prepared but not yet run.
@@ -189,19 +169,19 @@ struct PreparedTable {
 fn build_table_query(
     schema: &str,
     table: &str,
-    columns: &[(String, bool)],
+    columns: &[(&str, bool)],
 ) -> Result<(String, Vec<(String, i16)>)> {
     use adbc_core::constants::{ADBC_STATISTIC_DISTINCT_COUNT_KEY, ADBC_STATISTIC_NULL_COUNT_KEY};
 
     let mut exprs = vec!["COUNT(*)".to_string()];
     let mut plan: Vec<(String, i16)> = Vec::new();
-    for (name, groupable) in columns {
+    for &(name, groupable) in columns {
         let quoted = quote_ident(name)?;
         exprs.push(format!("COUNTIF({quoted} IS NULL)"));
-        plan.push((name.clone(), ADBC_STATISTIC_NULL_COUNT_KEY));
-        if *groupable {
+        plan.push((name.to_string(), ADBC_STATISTIC_NULL_COUNT_KEY));
+        if groupable {
             exprs.push(format!("COUNT(DISTINCT {quoted})"));
-            plan.push((name.clone(), ADBC_STATISTIC_DISTINCT_COUNT_KEY));
+            plan.push((name.to_string(), ADBC_STATISTIC_DISTINCT_COUNT_KEY));
         }
     }
     let sql = format!(
@@ -272,91 +252,49 @@ fn is_groupable(spanner_type: &str) -> bool {
 }
 
 /// Build the `get_statistics` batch for `catalog`, the connection's only catalog.
-pub(crate) fn build(
-    catalog: &str,
-    schemas: Vec<SchemaStatistics>,
-    out_schema: SchemaRef,
-) -> Result<RecordBatch> {
-    let top_fields = out_schema.fields();
-
-    let db_schemas_field = field(top_fields, "catalog_db_schemas")?;
-    let db_schema_item = list_item(&db_schemas_field)?;
-    let db_schema_fields = struct_fields(&db_schema_item)?;
-
-    // Flatten statistics across schemas into one struct array, then split by schema.
-    let stats_field = field(&db_schema_fields, "db_schema_statistics")?;
-    let stat_item = list_item(&stats_field)?;
-    let stat_fields = struct_fields(&stat_item)?;
-    let flat: Vec<&Statistic> = schemas.iter().flat_map(|s| s.statistics.iter()).collect();
-    let stat_struct = build_statistic_struct(&stat_fields, &flat)?;
-    let lengths: Vec<usize> = schemas.iter().map(|s| s.statistics.len()).collect();
-    let db_schema_statistics = list_of(stat_item, &lengths, stat_struct)?;
-
-    let schema_names: ArrayRef = Arc::new(StringArray::from_iter_values(
-        schemas.iter().map(|s| s.db_schema.as_str()),
-    ));
-    let db_schema_struct: ArrayRef = Arc::new(
-        StructArray::try_new(
-            db_schema_fields.clone(),
-            vec![schema_names, db_schema_statistics],
-            None,
-        )
-        .map_err(arrow_err)?,
-    );
-    let catalog_db_schemas = list_of(db_schema_item, &[schemas.len()], db_schema_struct)?;
-
-    let catalog_name: ArrayRef = Arc::new(StringArray::from(vec![catalog]));
-    RecordBatch::try_new(out_schema, vec![catalog_name, catalog_db_schemas]).map_err(arrow_err)
+pub(crate) fn build(catalog: &str, schemas: Vec<SchemaStatistics>) -> Result<RecordBatch> {
+    let out_schema = GET_STATISTICS_SCHEMA.clone();
+    let db_schemas_field = field(out_schema.fields(), "catalog_db_schemas")?;
+    let db_schemas = struct_list(&db_schemas_field, &[schemas.len()], None, |f| {
+        match f.name().as_str() {
+            "db_schema_name" => Ok(Some(strings(schemas.iter().map(|s| s.db_schema.as_str())))),
+            "db_schema_statistics" => statistics_list(f, &schemas).map(Some),
+            _ => Ok(None),
+        }
+    })?;
+    RecordBatch::try_new(out_schema, vec![strings([catalog]), db_schemas]).map_err(arrow_err)
 }
 
-/// Build the statistic struct array. All values are exact integers.
-fn build_statistic_struct(stat_fields: &Fields, stats: &[&Statistic]) -> Result<ArrayRef> {
-    let n = stats.len();
-
-    let value_field = field(stat_fields, "statistic_value")?;
-    let union_fields = match value_field.data_type() {
-        DataType::Union(fields, _) => fields.clone(),
-        _ => {
-            return Err(err(
-                "unexpected ADBC result schema shape: expected `statistic_value` to be a union",
-                Status::Internal,
-            ));
-        }
-    };
-    let int64_values: ArrayRef =
-        Arc::new(Int64Array::from_iter_values(stats.iter().map(|s| s.value)));
-    // Every value is in the `int64` branch; `dense_union` fills the others with empty children.
-    let type_ids = vec![INT64_BRANCH; n];
-    let offsets: Vec<i32> = (0..n as i32).collect();
-    let statistic_value = dense_union(
-        &union_fields,
-        &[(INT64_BRANCH, int64_values)],
-        type_ids,
-        offsets,
-    )?;
-
-    let arrays: Vec<ArrayRef> = stat_fields
-        .iter()
-        .map(|f| match f.name().as_str() {
-            "table_name" => Arc::new(StringArray::from_iter_values(
-                stats.iter().map(|s| s.table.as_str()),
-            )) as ArrayRef,
+/// Each schema's `db_schema_statistics`. All values are exact integers.
+fn statistics_list(field: &FieldRef, schemas: &[SchemaStatistics]) -> Result<ArrayRef> {
+    let lengths: Vec<usize> = schemas.iter().map(|s| s.statistics.len()).collect();
+    let stats: Vec<&Statistic> = schemas.iter().flat_map(|s| &s.statistics).collect();
+    struct_list(field, &lengths, None, |f| {
+        Ok(Some(match f.name().as_str() {
+            "table_name" => strings(stats.iter().map(|s| s.table.as_str())),
             // NULL for table-level statistics.
             "column_name" => Arc::new(StringArray::from_iter(
                 stats.iter().map(|s| s.column.as_deref()),
-            )) as ArrayRef,
-            "statistic_key" => {
-                Arc::new(Int16Array::from_iter_values(stats.iter().map(|s| s.key))) as ArrayRef
+            )),
+            "statistic_key" => Arc::new(Int16Array::from_iter_values(stats.iter().map(|s| s.key))),
+            "statistic_value" => {
+                let DataType::Union(union_fields, _) = f.data_type() else {
+                    return Err(shape_err("`statistic_value` to be a union"));
+                };
+                let values: ArrayRef =
+                    Arc::new(Int64Array::from_iter_values(stats.iter().map(|s| s.value)));
+                // Every value is in the `int64` branch; `dense_union` leaves the others empty.
+                dense_union(
+                    union_fields,
+                    &[(INT64_BRANCH, values)],
+                    vec![INT64_BRANCH; stats.len()],
+                    (0..stats.len() as i32).collect(),
+                )?
             }
-            "statistic_value" => statistic_value.clone(),
-            "statistic_is_approximate" => Arc::new(BooleanArray::from(vec![false; n])) as ArrayRef,
-            _ => new_null_array(f.data_type(), n),
-        })
-        .collect();
-
-    Ok(Arc::new(
-        StructArray::try_new(stat_fields.clone(), arrays, None).map_err(arrow_err)?,
-    ))
+            "statistic_is_approximate" => Arc::new(BooleanArray::from(vec![false; stats.len()])),
+            _ => return Ok(None),
+        }))
+    })
 }
 
 #[cfg(test)]
