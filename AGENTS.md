@@ -74,7 +74,8 @@ Only release when asked, and use `cargo-release` as described in
 ## References
 
 - [README.md](README.md): public behavior, type mapping and authentication.
-- [docs/adbc.md](docs/adbc.md) and `src/ffi/mod.rs`: ADBC ownership, errors and C ABI design.
+- [docs/adbc.md](docs/adbc.md) and `src/ffi/mod.rs`: supported ADBC features, ownership, errors
+  and C ABI design.
 - [docs/transactions.md](docs/transactions.md): transaction boundaries and RPCs.
 - [python/README.md](python/README.md): Python API. [docs/dbt.md](docs/dbt.md): dbt integration.
 
