@@ -37,6 +37,7 @@ fuzz_target!(|sql: String| {
         " \t\n",
         "-- line comment\n",
         "# hash comment\n",
+        "-- line comment\r", // GoogleSQL also ends a line comment at a bare CR
         "/* block comment */",
         "@{USE_ADDITIONAL_PARALLELISM=TRUE} ",
         "@{HINT='}'}", // a `}` inside a hint's string literal must not close the hint
