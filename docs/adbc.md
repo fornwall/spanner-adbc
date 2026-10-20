@@ -192,9 +192,27 @@ idle handle succeeds; the driver doesn't track whether an operation is running.
 
 ## Errors
 
-[error.rs](../src/error.rs) maps gRPC failures to ADBC status codes. For example,
-`PERMISSION_DENIED` becomes `Unauthorized`, `FAILED_PRECONDITION` becomes `InvalidState` and
-`DEADLINE_EXCEEDED` becomes `Timeout`.
+[error.rs](../src/error.rs) maps each gRPC status code to an ADBC status, and the message
+starts with the code, as in `Spanner error: NOT_FOUND: Table not found: Singers`.
+
+| gRPC code | ADBC status |
+| --- | --- |
+| `INVALID_ARGUMENT` | `InvalidArguments` |
+| `NOT_FOUND` | `NotFound` |
+| `ALREADY_EXISTS` | `Integrity` |
+| `FAILED_PRECONDITION` | `InvalidState` |
+| `OUT_OF_RANGE` | `InvalidData` |
+| `UNAUTHENTICATED` | `Unauthenticated` |
+| `PERMISSION_DENIED` | `Unauthorized` |
+| `DEADLINE_EXCEEDED` | `Timeout` |
+| `CANCELLED` | `Cancelled` |
+| `UNAVAILABLE`, `ABORTED`, `RESOURCE_EXHAUSTED`, `DATA_LOSS` | `IO` |
+| `UNIMPLEMENTED` | `NotImplemented` |
+| `UNKNOWN` | `Unknown` |
+| `INTERNAL` | `Internal` |
+
+Errors without a gRPC status become `Unauthenticated` for credential failures, `Timeout` for
+client deadlines, `IO` for connection and transport failures and `Internal` otherwise.
 
 Constraint violations become `Integrity`, which Python raises as `IntegrityError`. Spanner reports
 a duplicate primary or unique index key as `ALREADY_EXISTS`. NOT NULL, foreign key, CHECK and
