@@ -336,26 +336,23 @@ impl SpannerDatabase {
         // configured credentials would let a stray `SPANNER_EMULATOR_HOST` redirect real traffic,
         // unauthenticated, to another endpoint, so refuse the combination. Ambient ADC is not an
         // explicit option and does not count. A quota project would also be silently ignored.
-        if emulator {
-            let cause = if self.emulator {
-                "the `spanner.emulator` option"
+        if emulator
+            && let Some(option) = self
+                .explicit_credential_option()
+                .or(self.quota_project.is_some().then_some(OPTION_QUOTA_PROJECT))
+        {
+            let (cause, disable) = if self.emulator {
+                ("the `spanner.emulator` option", "set that option to false")
             } else {
-                "the `SPANNER_EMULATOR_HOST` environment variable"
+                (
+                    "the `SPANNER_EMULATOR_HOST` environment variable",
+                    "unset the variable",
+                )
             };
-            if let Some(option) = self.explicit_credential_option() {
-                return Err(invalid_state(format!(
-                    "emulator mode (enabled by {cause}) forces anonymous plaintext credentials \
-                     and would silently ignore the configured `{option}` option; unset the \
-                     credential option(s) or disable emulator mode"
-                )));
-            }
-            if self.quota_project.is_some() {
-                return Err(invalid_state(format!(
-                    "emulator mode (enabled by {cause}) forces anonymous plaintext credentials \
-                     and would silently ignore the configured `{OPTION_QUOTA_PROJECT}` option; \
-                     unset it or disable emulator mode"
-                )));
-            }
+            return Err(invalid_state(format!(
+                "emulator mode (enabled by {cause}) forces anonymous plaintext credentials and \
+                 would silently ignore the configured `{option}` option; unset it or {disable}"
+            )));
         }
         // Emulator mode has no default address. Without one the client dials production
         // anonymously and fails with a confusing authentication error.
