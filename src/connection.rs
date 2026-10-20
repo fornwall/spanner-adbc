@@ -42,9 +42,10 @@ pub(crate) use txn::{SharedTxn, TxnKind, TxnState, lock_txn};
 /// # Transactions
 ///
 /// The connection starts in autocommit mode. Setting `adbc.connection.autocommit` to `false`
-/// enters manual mode. A manual transaction holds either queries or DML, decided by its first
-/// statement; work of the other kind fails with [`Status::InvalidState`] until
-/// [`Connection::commit`] or [`Connection::rollback`]:
+/// enters manual mode, and setting it back to `true` commits the pending transaction; if that
+/// commit fails, the connection stays in manual mode. A manual transaction holds either queries
+/// or DML, decided by its first statement; work of the other kind fails with
+/// [`Status::InvalidState`] until [`Connection::commit`] or [`Connection::rollback`]:
 ///
 /// - Queries share one multi-use read-only transaction: a consistent snapshot pinned at the first
 ///   query's `spanner.read.staleness` bound. Commit and rollback just drop it.
