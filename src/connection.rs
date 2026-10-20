@@ -120,7 +120,7 @@ impl SpannerConnection {
                 &self.client,
                 &self.cancel.current(),
                 &self.config,
-                mutations.clone(),
+                mutations.iter().cloned(),
             )
             .map_err(note_commit_outcome_unknown);
         }

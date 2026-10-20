@@ -149,14 +149,22 @@ pub(crate) fn run_batch_txn(
 /// mutations twice. `write` begins the transaction with a mutation key and retries `ABORTED`
 /// internally, so success means the mutations were applied once. Isolation does not apply: the
 /// transaction performs no reads, and the builder has no isolation setter.
-pub(crate) fn write_mutations_txn(
+///
+/// The client converts each mutation as it consumes them, so a caller that must keep its
+/// mutations can pass a cloning iterator instead of a cloned buffer.
+pub(crate) fn write_mutations_txn<I>(
     runtime: &SharedRuntime,
     client: &DatabaseClient,
     cancel: &CancelSignal,
     config: &SharedConfig,
-    mutations: Vec<Mutation>,
-) -> Result<()> {
-    if mutations.is_empty() {
+    mutations: I,
+) -> Result<()>
+where
+    I: IntoIterator<Item = Mutation>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let mutations = mutations.into_iter();
+    if mutations.len() == 0 {
         return Ok(());
     }
     let transaction = config
