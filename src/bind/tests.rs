@@ -511,18 +511,44 @@ fn dictionary_cells_bind_as_their_values() {
     );
     assert_eq!(param(&ints, 0), (Value::from("9"), Some(types::int64())));
     // A null key on a dictionary of lists binds a null array.
-    let lists = DictionaryArray::new(
-        Int8Array::from(vec![Some(0), None]),
-        Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>([Some(
-            vec![Some(1)],
-        )])),
-    );
+    let one = || [Some(vec![Some(1)])];
+    let list_values: Vec<ArrayRef> = vec![
+        Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(one())),
+        Arc::new(LargeListArray::from_iter_primitive::<Int64Type, _, _>(one())),
+        Arc::new(FixedSizeListArray::from_iter_primitive::<Int64Type, _, _>(
+            one(),
+            1,
+        )),
+    ];
     let array_type = Some(types::array(types::int64()));
-    assert_eq!(
-        param(&lists, 0),
-        (Value::from(vec![Value::from(1_i64)]), array_type.clone())
+    for values in list_values {
+        let lists = DictionaryArray::new(Int8Array::from(vec![Some(0), None]), values);
+        assert_eq!(
+            param(&lists, 0),
+            (Value::from(vec![Value::from(1_i64)]), array_type.clone())
+        );
+        assert_eq!(param(&lists, 1), (Value::null(), array_type.clone()));
+    }
+    // Polars sends `List(Categorical)` as a list of dictionary-encoded strings.
+    let categories = DictionaryArray::new(
+        Int8Array::from(vec![Some(1), None, Some(0)]),
+        Arc::new(StringArray::from(vec![None, Some("a")])),
     );
-    assert_eq!(param(&lists, 1), (Value::null(), array_type));
+    let categorical_lists = LargeListArray::new(
+        Arc::new(Field::new("item", categories.data_type().clone(), true)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i64, 3, 3])),
+        Arc::new(categories),
+        Some(NullBuffer::from(vec![true, false])),
+    );
+    let array_type = Some(types::array(types::string()));
+    assert_eq!(
+        param(&categorical_lists, 0),
+        (
+            Value::from(vec![Value::from("a"), Value::null(), Value::null()]),
+            array_type.clone()
+        )
+    );
+    assert_eq!(param(&categorical_lists, 1), (Value::null(), array_type));
     // Mutations decode them too.
     let dbg = format!(
         "{:?}",
@@ -552,12 +578,12 @@ fn rejects_unsupported_types_naming_the_parameter_and_type() {
             Arc::new(ListArray::new_null(
                 Arc::new(Field::new(
                     "item",
-                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::UInt64)),
                     true,
                 )),
                 1,
             )),
-            "List(Dictionary(Int32, Utf8))",
+            "List(Dictionary(Int32, UInt64))",
         ),
     ];
     for (array, type_name) in arrays {
@@ -679,6 +705,10 @@ fn maps_arrow_types_to_ingest_columns() {
         ),
         (Field::new("c", list(DataType::Date32), true), "ARRAY<DATE>"),
         (
+            Field::new("c", list(dictionary(DataType::LargeUtf8)), true),
+            "ARRAY<STRING(MAX)>",
+        ),
+        (
             Field::new(
                 "c",
                 DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 768),
@@ -720,7 +750,7 @@ fn ingest_ddl_rejects_types_the_value_encoder_cannot_bind() {
         list(DataType::Null),
         list(list(DataType::Int64)),
         dictionary(list(list(DataType::Int64))),
-        list(dictionary(DataType::Utf8)),
+        list(dictionary(DataType::UInt64)),
     ] {
         let schema = Schema::new(vec![
             Field::new("ok", DataType::Int64, true),
@@ -801,6 +831,10 @@ fn ingest_value_check_fails_where_mutation_building_would() {
             Arc::new(Date32Array::from(vec![0, i32::MAX])),
         )),
         Arc::new(ListArray::from_iter_primitive::<Date32Type, _, _>([
+            Some(vec![Some(0)]),
+            Some(vec![Some(i32::MAX)]),
+        ])),
+        Arc::new(LargeListArray::from_iter_primitive::<Date32Type, _, _>([
             Some(vec![Some(0)]),
             Some(vec![Some(i32::MAX)]),
         ])),

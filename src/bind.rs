@@ -2,8 +2,8 @@
 //!
 //! [`resolve_parameter_names`] maps columns to named SQL parameters; [`cell_value`] supplies the
 //! shared encoding for queries and mutations. Dictionary cells bind as their decoded values.
-//! Lists, large lists and fixed-size lists of supported scalars become arrays; nested arrays and
-//! structs are rejected.
+//! Lists, large lists and fixed-size lists of supported scalars, dictionary-encoded or not, become
+//! arrays; nested arrays and structs are rejected.
 //!
 //! Integers widen to INT64, except UInt64, which can exceed its range. Float16/Float32 widen
 //! losslessly. Strings, bytes, booleans, dates, timestamps and Decimal128 retain their values and
@@ -410,6 +410,22 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
         },
         // NullArray has no validity buffer, so its physical `is_valid` returns true.
         DataType::Null => |_, _, _| Ok(Value::null()),
+        // List elements, as in Polars' `List(Categorical)`. Top-level dictionaries are decoded
+        // by `cell_value`, which also handles dictionaries of lists.
+        DataType::Dictionary(_, value) if scalar_binder(value).is_some() => |target, a, i| {
+            downcast_dictionary_array!(
+                a => match a.key(i) {
+                    Some(key) => {
+                        let values = a.values();
+                        let bind = scalar_binder(values.data_type())
+                            .ok_or_else(|| unsupported(target, values.data_type()))?;
+                        bind(target, values.as_ref(), key)
+                    }
+                    None => Ok(Value::null()),
+                },
+                _ => unreachable!("downcast_dictionary_array dispatched a non-dictionary"),
+            )
+        },
         _ => return None,
     })
 }

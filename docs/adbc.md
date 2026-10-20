@@ -140,8 +140,9 @@ the SQL. `prepare()` only checks that one of them is set; Spanner plans the SQL 
 Parameters and ingested columns keep their Arrow type:
 
 - `UInt8`, `UInt16` and `UInt32` widen to `INT64`, and `Float16` to `FLOAT32`. `FixedSizeBinary`
-  maps to `BYTES`. Dictionary-encoded columns bind as their values. `LargeList` and
-  `FixedSizeList`, such as embedding vectors, bind as `ARRAY` like `List`.
+  maps to `BYTES`. Dictionary-encoded columns and list elements, such as Polars categoricals,
+  bind as their values. `LargeList` and `FixedSizeList`, such as embedding vectors, bind as
+  `ARRAY` like `List`.
 - `UInt64`, structs and nested lists are not supported.
 - `Date64` values must be whole days (multiples of 86,400,000 ms). Use an Arrow timestamp to keep
   a time of day.
