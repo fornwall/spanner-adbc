@@ -140,12 +140,7 @@ impl SpannerStatement {
         // create or drop the table before the ingest is rejected. The check is repeated under the
         // lock at buffer time; holding the connection-wide lock across the admin RPC instead
         // would stall the connection for seconds.
-        {
-            let txn = lock_txn(&self.txn);
-            if !txn.autocommit() {
-                txn.check_kind_allowed(TxnKind::Dml)?;
-            }
-        }
+        lock_txn(&self.txn).check_kind_allowed(TxnKind::Dml)?;
         self.check_ingest_names(table)?;
         let ingest_ddl = self.build_ingest_table_ddl(table, self.ingest_mode)?;
         // A bad value must fail before anything is written: DDL can't be rolled back, `replace`
@@ -157,6 +152,12 @@ impl SpannerStatement {
         if let Some(ddl) = ingest_ddl {
             self.run_ddl(ddl)
                 .map_err(|error| self.remap_ingest_create_error(table, error))?;
+        }
+        // No insert reports a missing table at execution when there are no rows, or when the
+        // inserts are buffered until commit.
+        if self.bound.iter().all(|batch| batch.num_rows() == 0) || !lock_txn(&self.txn).autocommit()
+        {
+            self.check_append_target_exists(table)?;
         }
         self.run_ingest_mutations(table)
             .map_err(|error| self.remap_ingest_append_error(table, error))
@@ -233,8 +234,6 @@ impl SpannerStatement {
             // Build outside the connection-wide txn lock, since it is O(rows).
             let rows = self.bound.iter().map(RecordBatch::num_rows).sum();
             let mutations = self.build_range_mutations(&target, 0, rows)?;
-            // An empty append buffers nothing, so the commit would never reveal a missing table.
-            self.check_empty_append_target(table, rows as i64)?;
             let mut txn = lock_txn(&self.txn);
             if !txn.autocommit() {
                 // `buffer_mutation` re-checks the kind, since a concurrent statement may have
@@ -253,16 +252,13 @@ impl SpannerStatement {
         for chunk in chunk_ranges(&self.bound) {
             total += self.commit_ingest_range(&target, chunk.start, chunk.end, total)?;
         }
-        self.check_empty_append_target(table, total)?;
         Ok(Some(total))
     }
 
-    /// Return `NotFound` for an empty `append` into a missing table. With no rows there is no
-    /// insert error to remap, but ADBC requires `NotFound` regardless. The other modes create the
-    /// table. If the probe fails, the empty ingest succeeds.
-    fn check_empty_append_target(&self, table: &str, ingested: i64) -> Result<()> {
-        if ingested == 0
-            && matches!(self.ingest_mode, Some(IngestMode::Append))
+    /// Return `NotFound` for an `append` into a missing table, as ADBC requires. The other modes
+    /// create the table. If the probe fails, the ingest proceeds.
+    fn check_append_target_exists(&self, table: &str) -> Result<()> {
+        if matches!(self.ingest_mode, Some(IngestMode::Append))
             && matches!(self.ingest_table_exists(table), Ok(false))
         {
             return Err(err(

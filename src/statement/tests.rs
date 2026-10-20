@@ -710,8 +710,9 @@ mod manual_txn {
         start_with(Box::new(|_| CommitAction::Ok))
     }
 
-    /// Queries on `Missing` fail with `INVALID_ARGUMENT`, as Spanner reports an unknown table.
-    /// Other queries return one row, and the transaction id when they begin inline. Batch DML
+    /// Queries on `Missing` fail with `INVALID_ARGUMENT`, as Spanner reports an unknown table, and
+    /// a table-existence probe finds no `Missing` table. Other queries return one row, and the
+    /// transaction id when they begin inline. Batch DML
     /// reports one row per statement; commits follow `commits`.
     fn start_with(commits: CommitScript) -> MockServer {
         let recorded = Arc::new(Recorded::default());
@@ -737,14 +738,24 @@ mod manual_txn {
                 if request.sql.contains("Missing") {
                     return Err(tonic::Status::invalid_argument("Table not found: Missing"));
                 }
+                let probes_missing = request
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.fields.get("table"))
+                    .is_some_and(|table| {
+                        table.kind == Some(prost_types::value::Kind::StringValue("Missing".into()))
+                    });
                 let id = {
                     let mut begun = begun.lock().unwrap();
                     *begun += u32::from(inline_begin);
                     format!("ro-{begun}")
                 };
+                let mut response = result(inline_begin, id.as_bytes());
+                if probes_missing {
+                    response.values.clear();
+                }
                 let (tx, rx) = tokio::sync::mpsc::channel(1);
-                tx.try_send(Ok(result(inline_begin, id.as_bytes())))
-                    .unwrap();
+                tx.try_send(Ok(response)).unwrap();
                 Ok(tonic::Response::new(rx))
             });
         let record = recorded.clone();
@@ -997,6 +1008,22 @@ mod manual_txn {
                 "{sql}: later queries share the transaction the first successful query began"
             );
         }
+    }
+
+    /// ADBC requires `NotFound` for an append into a missing table, but a buffered insert would
+    /// only fail at commit, so a manual ingest checks for the table first and buffers nothing.
+    #[test]
+    fn manual_append_into_a_missing_table_fails_at_execution() {
+        let server = start();
+        let mut connection = manual(&server);
+        let mut statement = ingest(&mut connection, 2);
+        statement
+            .set_option(OptionStatement::TargetTable, OptionValue::from("Missing"))
+            .unwrap();
+        let error = statement.execute_update().unwrap_err();
+        assert_eq!(error.status, Status::NotFound, "{error}");
+        connection.commit().unwrap();
+        assert!(server.recorded.commits.lock().unwrap().is_empty());
     }
 
     /// A query whose parameter fails to bind runs nothing, so it must not fix the manual
