@@ -93,11 +93,7 @@ pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
     let client_errors =
         || chain(&error).filter_map(|e| e.downcast_ref::<google_cloud_spanner::Error>());
     if let Some(status) = client_errors().find_map(|e| e.status()) {
-        return service_error(
-            status.code as i32,
-            &status.message,
-            details_for_adbc(&status.details),
-        );
+        return service_error(status.code as i32, &status.message, &status.details);
     }
     let status = if client_errors().any(google_cloud_spanner::Error::is_authentication) {
         Status::Unauthenticated
@@ -116,23 +112,27 @@ pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
 /// [`from_spanner`] so bulk-ingest error handling is the same for both ingest paths.
 pub(crate) fn from_status_parts(code: i32, message: &str, details: &[Any]) -> Error {
     let decoded: Vec<StatusDetails> = details.iter().map(StatusDetails::from).collect();
-    service_error(code, message, details_for_adbc(&decoded))
+    service_error(code, message, &decoded)
 }
 
 /// The error for a gRPC status, formatted `CODE: message` like grpc-java exceptions.
-fn service_error(code: i32, message: &str, details: Option<Vec<(String, Vec<u8>)>>) -> Error {
+fn service_error(code: i32, message: &str, details: &[StatusDetails]) -> Error {
     let grpc_code = Code::from(code);
     let mut text = format!("Spanner error: {grpc_code}: {message}");
-    // The message already names the missing permission. Naming a role could steer callers to an
-    // over-broad grant.
-    if grpc_code == Code::PermissionDenied {
+    // The message names the missing permission; naming a role could steer callers to an
+    // over-broad grant. Other ErrorInfo reasons, such as a disabled API, aren't about IAM, and
+    // their messages say what to do.
+    let iam_denial = details.iter().all(|detail| {
+        !matches!(detail, StatusDetails::ErrorInfo(info) if info.reason != "IAM_PERMISSION_DENIED")
+    });
+    if grpc_code == Code::PermissionDenied && iam_denial {
         text.push_str(
             " (grant an IAM role that includes it; see https://cloud.google.com/spanner/docs/iam)",
         );
     }
     let mut error = err(text, status_for_rpc(grpc_code, message));
     error.vendor_code = code;
-    error.details = details;
+    error.details = details_for_adbc(details);
     error
 }
 

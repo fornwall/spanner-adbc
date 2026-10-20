@@ -332,6 +332,24 @@ fn permission_denied_appends_iam_guidance_without_naming_a_role() {
         );
     }
 
+    // A disabled API is not an IAM problem, and Google's message says how to enable it.
+    let with_reason = |reason: &str| {
+        let info = serde_json::json!({
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": reason,
+            "domain": "googleapis.com",
+        });
+        from_spanner(GaxError::service(
+            RpcStatus::default()
+                .set_code(Code::PermissionDenied)
+                .set_message("denied")
+                .set_details([serde_json::from_value::<StatusDetails>(info).unwrap()]),
+        ))
+        .message
+    };
+    assert!(!with_reason("SERVICE_DISABLED").contains("docs/iam"));
+    assert!(with_reason("IAM_PERMISSION_DENIED").contains("docs/iam"));
+
     // The guidance depends on the code, not on the message mentioning a permission.
     let not_found = from_spanner(service(
         Code::NotFound,
