@@ -58,9 +58,8 @@ narrow integers widen to `INT64`, fixed-size binary comes back as variable-width
 or value comparison is disabled.
 
 The [skip list](skip_baseline.txt) contains only TIME-of-day cases and features the driver
-lacks: temporary tables, cross-catalog operations, changing the current catalog or schema,
-UNIQUE table constraints, and ingest nullability (the driver doesn't report `xdbc_nullable` or
-create NOT NULL columns from Arrow field nullability).
+lacks: temporary tables, cross-catalog operations, changing the current catalog or schema, and
+UNIQUE table constraints.
 
 ## Skip baseline
 

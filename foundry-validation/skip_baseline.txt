@@ -7,7 +7,7 @@
 #   FOUNDRY_UPDATE_SKIP_BASELINE=1 scripts/run-foundry-validation.sh
 
 tests/test_connection.py::TestConnection::test_get_objects_constraints_unique[spanner:emulator]  # not implemented
-tests/test_connection.py::TestConnection::test_get_table_schema_catalog[spanner:emulator]  # secondary_catalog not supported
+tests/test_connection.py::TestConnection::test_get_table_schema_catalog[spanner:emulator]  # secondary_catalog_schema not supported
 tests/test_connection.py::TestConnection::test_set_current_catalog[spanner:emulator]  # not implemented
 tests/test_connection.py::TestConnection::test_set_current_schema[spanner:emulator]  # not implemented
 tests/test_ingest.py::TestIngest::test_catalog[spanner:emulator]  # not implemented
@@ -15,7 +15,6 @@ tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/time_ms]  
 tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/time_ns]  # Spanner has no TIME-of-day type
 tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/time_s]  # Spanner has no TIME-of-day type
 tests/test_ingest.py::TestIngest::test_create[spanner:emulator:ingest/time_us]  # Spanner has no TIME-of-day type
-tests/test_ingest.py::TestIngest::test_not_null[spanner:emulator]  # not implemented
 tests/test_ingest.py::TestIngest::test_replace_catalog[spanner:emulator:ingest/string]  # not implemented
 tests/test_ingest.py::TestIngest::test_temporary[spanner:emulator:ingest/string]  # not implemented
 tests/test_ingest.py::TestIngest::test_temporary_get_objects[spanner:emulator:ingest/string]  # not implemented
