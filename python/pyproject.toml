@@ -24,8 +24,8 @@ classifiers = [
     "Programming Language :: Rust",
     "Topic :: Database",
 ]
-# 1.6 added Connection.cursor(adbc_stmt_kwargs=...).
-dependencies = ["adbc-driver-manager>=1.6"]
+# Earlier releases bind the keys of a parameter mapping as values.
+dependencies = ["adbc-driver-manager>=1.8"]
 
 [project.optional-dependencies]
 dbapi = ["adbc-driver-manager[dbapi]"]
