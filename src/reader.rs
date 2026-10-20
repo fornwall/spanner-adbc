@@ -290,59 +290,36 @@ struct BoundQueryChunks {
     fetch_timeout: Option<Duration>,
 }
 
+impl BoundQueryChunks {
+    /// Pull the next non-empty chunk, executing further statements as result sets drain so a row
+    /// with an empty result yields no empty batch. Empty, ending the stream, once all are drained.
+    async fn pull(&mut self) -> Result<Vec<Row>> {
+        loop {
+            if let Some(rs) = self.result_set.as_mut() {
+                let rows = pull_chunk(rs, self.batch_size).await?;
+                if !rows.is_empty() {
+                    return Ok(rows);
+                }
+                self.result_set = None;
+            }
+            let Some(statement) = self.statements.next_statement() else {
+                return Ok(Vec::new());
+            };
+            let rs = self.transaction.execute_query(statement?).await;
+            self.result_set = Some(rs.map_err(from_spanner)?);
+        }
+    }
+}
+
 impl ChunkSource for BoundQueryChunks {
     type Row = Row;
 
     fn next_chunk(&mut self) -> impl std::future::Future<Output = Result<Vec<Row>>> + Send {
-        let Self {
-            transaction,
-            statements,
-            result_set,
-            batch_size,
-            fetch_timeout,
-        } = self;
         with_timeout(
-            *fetch_timeout,
+            self.fetch_timeout,
             crate::OPTION_RPC_TIMEOUT_FETCH,
-            async move {
-                // An empty chunk ends the stream.
-                Ok(
-                    next_bound_chunk(transaction, statements.as_mut(), result_set, *batch_size)
-                        .await?
-                        .unwrap_or_default(),
-                )
-            },
+            self.pull(),
         )
-    }
-}
-
-/// Pull the next non-empty chunk, executing further statements as result sets drain so a row
-/// with an empty result yields no empty batch. `None` once everything is drained.
-async fn next_bound_chunk(
-    transaction: &MultiUseReadOnlyTransaction,
-    statements: &mut dyn BoundStatementSource,
-    result_set: &mut Option<ResultSet>,
-    batch_size: usize,
-) -> Result<Option<Vec<Row>>> {
-    loop {
-        if let Some(rs) = result_set.as_mut() {
-            let rows = pull_chunk(rs, batch_size).await?;
-            if !rows.is_empty() {
-                return Ok(Some(rows));
-            }
-            *result_set = None;
-        }
-        match statements.next_statement() {
-            Some(statement) => {
-                *result_set = Some(
-                    transaction
-                        .execute_query(statement?)
-                        .await
-                        .map_err(from_spanner)?,
-                );
-            }
-            None => return Ok(None),
-        }
     }
 }
 
