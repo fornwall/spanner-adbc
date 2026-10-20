@@ -210,62 +210,52 @@ fn parse_table_statistics_reads_each_plan_entry_at_its_own_aggregate() {
 
 /// A malformed aggregate result is an `Internal` error; nothing may panic across the C ABI.
 #[test]
-fn parse_table_statistics_rejects_a_result_that_is_not_one_row_of_integers() {
-    let plan = vec![("Id".to_string(), ADBC_STATISTIC_NULL_COUNT_KEY)];
-    let two_rows = RecordBatch::try_from_iter([
-        ("a", Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef),
-        ("b", Arc::new(Int64Array::from(vec![3, 4])) as ArrayRef),
-    ])
-    .unwrap();
-    let Err(error) = parse_table_statistics(&two_rows, "Users", plan.clone()) else {
-        panic!("a two-row aggregate result must be rejected")
+fn parse_table_statistics_rejects_malformed_aggregates() {
+    let counts = |columns: Vec<Vec<Option<i64>>>| {
+        RecordBatch::try_from_iter(columns.into_iter().enumerate().map(|(i, values)| {
+            (
+                format!("c{i}"),
+                Arc::new(Int64Array::from(values)) as ArrayRef,
+            )
+        }))
+        .unwrap()
     };
-    assert_eq!(error.status, Status::Internal);
-
-    // The right shape, but a string aggregate.
-    let wrong_type = RecordBatch::try_from_iter([
-        ("a", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
-        ("b", Arc::new(StringArray::from(vec!["3"])) as ArrayRef),
+    let null_count = || vec![("Id".to_string(), ADBC_STATISTIC_NULL_COUNT_KEY)];
+    let string_aggregate = RecordBatch::try_from_iter([
+        ("c0", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+        ("c1", Arc::new(StringArray::from(vec!["3"])) as ArrayRef),
     ])
     .unwrap();
-    let Err(error) = parse_table_statistics(&wrong_type, "Users", plan) else {
-        panic!("a non-integer aggregate must be rejected")
-    };
-    assert_eq!(error.status, Status::Internal);
-}
-
-#[test]
-fn parse_table_statistics_rejects_missing_or_extra_aggregates() {
-    let batch = RecordBatch::try_from_iter([
-        ("rows", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
-        ("nulls", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
-    ])
-    .unwrap();
-    for plan in [
-        Vec::new(),
-        vec![("Id".to_string(), ADBC_STATISTIC_NULL_COUNT_KEY); 2],
-    ] {
+    let cases = [
+        (
+            "two rows",
+            counts(vec![vec![Some(1), Some(2)], vec![Some(3), Some(4)]]),
+            null_count(),
+        ),
+        (
+            "a missing aggregate",
+            counts(vec![vec![Some(1)]]),
+            null_count(),
+        ),
+        (
+            "an extra aggregate",
+            counts(vec![vec![Some(1)], vec![Some(0)]]),
+            Vec::new(),
+        ),
+        ("a string aggregate", string_aggregate, null_count()),
+        ("a NULL count", counts(vec![vec![None]]), Vec::new()),
+        ("a negative count", counts(vec![vec![Some(-1)]]), Vec::new()),
+        (
+            "no columns",
+            RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty())),
+            Vec::new(),
+        ),
+    ];
+    for (case, batch, plan) in cases {
         let Err(error) = parse_table_statistics(&batch, "Users", plan) else {
-            panic!("aggregate columns must match the query plan")
+            panic!("{case} must be rejected")
         };
-        assert_eq!(error.status, Status::Internal);
-    }
-    let empty = RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty()));
-    assert!(parse_table_statistics(&empty, "Users", Vec::new()).is_err());
-}
-
-#[test]
-fn parse_table_statistics_rejects_null_and_negative_counts() {
-    for count in [None, Some(-1)] {
-        let batch = RecordBatch::try_from_iter([(
-            "rows",
-            Arc::new(Int64Array::from(vec![count])) as ArrayRef,
-        )])
-        .unwrap();
-        let Err(error) = parse_table_statistics(&batch, "Users", Vec::new()) else {
-            panic!("invalid counts must not be reported as statistics")
-        };
-        assert_eq!(error.status, Status::Internal);
+        assert_eq!(error.status, Status::Internal, "{case}");
     }
 }
 
