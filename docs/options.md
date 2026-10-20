@@ -33,8 +33,8 @@ isolation level can only be set on the connection, but are copied into each new 
   Booleans, `spanner.instance_type`, isolation levels, ingest modes and `spanner.rows_per_batch`
   must match exactly; other parsed values, such as staleness, have surrounding whitespace trimmed.
 
-Invalid values return `InvalidArguments`, except unknown ingest modes, which return
-`NotImplemented`.
+Invalid values return `InvalidArguments`. Values the driver can't support, such as an unknown
+ingest mode or `adbc.ingest.temporary=true`, return `NotImplemented`.
 
 The Get column describes the string getter. "always" returns the value or its default; "set"
 returns a value only once it has been set and otherwise `NotFound`; "write-only" always returns
@@ -60,12 +60,12 @@ connections keep theirs. Getters don't show values taken from the environment.
 | `spanner.auth.keyfile` | credential JSON file path | ADC | set | Supports `service_account`, `authorized_user`, `impersonated_service_account` and `external_account` JSON. |
 | `spanner.auth.keyfile_json` | inline credential JSON | ADC | write-only | Same formats as `keyfile`, and takes precedence over it. Not allowed in URIs. |
 | `spanner.auth.impersonate.target_principal` | service account email | unset | set | Impersonates this account, using the keyfile or ADC as base credentials. |
-| `spanner.auth.impersonate.delegates` | comma-separated service account emails | no delegates | nonempty | Delegation chain. Entries are trimmed and empty entries dropped. Ignored without a target principal. |
-| `spanner.auth.impersonate.scopes` | comma-separated OAuth scopes | `cloud-platform` | nonempty | Scopes for the impersonated token, normalized like delegates. Ignored without a target principal. |
-| `spanner.auth.impersonate.lifetime` | non-negative integer seconds | `3600` | explicitly set only | Lifetime of the impersonated token. Accepts an integer or integer string. Ignored without a target principal. |
+| `spanner.auth.impersonate.delegates` | comma-separated service account emails | no delegates | set | Delegation chain. Entries are trimmed and empty entries dropped. Ignored without a target principal. |
+| `spanner.auth.impersonate.scopes` | comma-separated OAuth scopes | `cloud-platform` | set | Scopes for the impersonated token, normalized like delegates. Ignored without a target principal. |
+| `spanner.auth.impersonate.lifetime` | non-negative integer seconds | `3600` | set | Lifetime of the impersonated token. Accepts an integer or integer string. Ignored without a target principal. |
 | `spanner.auth.access_token` | OAuth bearer token | ADC | write-only | Sent as is and never refreshed. Not allowed in URIs. |
 | `spanner.auth.quota_project` | project ID; `""` unsets | credential default | set | Sends `x-goog-user-project`; the caller needs `serviceusage.services.use`. With ADC, `GOOGLE_CLOUD_QUOTA_PROJECT` takes precedence. Rejected in emulator mode and [anonymous connections](#anonymous-connections). |
-| `spanner.rpc.timeout_seconds.connect` | non-negative fractional seconds | `30` | explicitly set only | Deadline for building the client stack, including session creation and its retries; see [connect timeout](#connect-timeout). |
+| `spanner.rpc.timeout_seconds.connect` | non-negative fractional seconds | `30` | set | Deadline for building the client stack, including session creation and its retries; see [connect timeout](#connect-timeout). |
 
 In emulator mode, creating the client stack fails with `InvalidState` if a keyfile, inline JSON,
 access token, impersonation target or quota project is set. Ambient ADC doesn't count. An access
@@ -160,9 +160,9 @@ effective value, whether inherited or overridden.
 | `spanner.rpc.timeout_seconds.fetch` | non-negative fractional seconds | unset | set | Deadline for each later result chunk; see [RPC timeouts](#rpc-timeouts). |
 | `spanner.retry.max_attempts` | integer `1..=4294967295` | client default | set | Maximum attempts, including the first; `1` disables retries. See [retry tuning](#retry-tuning). |
 | `spanner.retry.max_elapsed_seconds` | positive fractional seconds | unset | set | Time limit for retrying. Has no effect on resuming streamed queries and BatchWrite. |
-| `spanner.retry.backoff.initial_seconds` | positive fractional seconds | `1` | explicitly set only | Initial backoff delay, clamped at execution. |
-| `spanner.retry.backoff.max_seconds` | positive fractional seconds | `60` | explicitly set only | Maximum backoff delay, clamped at execution. |
-| `spanner.retry.backoff.multiplier` | positive finite number | `2` | explicitly set only | Backoff growth factor, clamped at execution. |
+| `spanner.retry.backoff.initial_seconds` | positive fractional seconds | `1` | set | Initial backoff delay, clamped at execution. |
+| `spanner.retry.backoff.max_seconds` | positive fractional seconds | `60` | set | Maximum backoff delay, clamped at execution. |
+| `spanner.retry.backoff.multiplier` | positive finite number | `2` | set | Backoff growth factor, clamped at execution. |
 
 Commit delay and commit statistics apply to read/write and write-only commits, not to BatchWrite
 or partitioned DML. Internal metadata reads use the priority, directed read, retry and timeout

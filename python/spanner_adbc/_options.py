@@ -83,7 +83,7 @@ class ConnectionOptions(enum.StrEnum):
     RPC_TIMEOUT_FETCH = "spanner.rpc.timeout_seconds.fetch"
     #: Cap on retry attempts (first try + retries) for a retryable RPC.
     RETRY_MAX_ATTEMPTS = "spanner.retry.max_attempts"
-    #: Cap (seconds) on total wall-clock time spent retrying a retryable RPC.
+    #: Cap (seconds) on time spent retrying a unary RPC; streaming queries ignore it.
     RETRY_MAX_ELAPSED_SECONDS = "spanner.retry.max_elapsed_seconds"
     #: Initial delay (seconds) of the exponential backoff between retry attempts.
     RETRY_BACKOFF_INITIAL_SECONDS = "spanner.retry.backoff.initial_seconds"
@@ -96,7 +96,7 @@ class ConnectionOptions(enum.StrEnum):
 class StatementOptions(enum.StrEnum):
     """Statement-level options (set via ``conn.cursor(adbc_stmt_kwargs=...)``)."""
 
-    #: Rows converted into each streamed Arrow ``RecordBatch`` (default ``8192``).
+    #: Maximum rows in each Arrow ``RecordBatch`` (default ``8192``).
     ROWS_PER_BATCH = "spanner.rows_per_batch"
     #: ``"true"`` runs ``execute_partitions`` partitions on Data Boost.
     DATA_BOOST = "spanner.data_boost"
