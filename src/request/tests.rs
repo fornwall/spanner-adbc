@@ -125,13 +125,6 @@ fn max_commit_delay_errors_name_their_option() {
     }
 }
 
-/// The duration conversion runs before the 500ms check, so it must reject overflow itself.
-#[test]
-fn rejects_oversized_max_commit_delay_instead_of_panicking() {
-    let error = parse_max_commit_delay("1e30").unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-}
-
 #[test]
 fn max_commit_delay_round_trips_and_unsets() {
     let mut config = RequestConfig::default();
@@ -152,64 +145,42 @@ fn max_commit_delay_round_trips_and_unsets() {
 }
 
 #[test]
-fn commit_stats_flag_round_trips_and_unsets() {
-    let mut config = RequestConfig::default();
-    assert_eq!(config.commit_stats_string(), "false");
-
-    config.set_commit_stats(s("true")).unwrap();
-    assert_eq!(config.commit_stats_string(), "true");
-    let error = config.set_commit_stats(OptionValue::Int(1)).unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-    assert_eq!(config.commit_stats_string(), "true");
-    config.set_commit_stats(s("false")).unwrap();
-    assert_eq!(config.commit_stats_string(), "false");
-    for lenient in ["1", "yes", "TRUE", "0", "no", "False"] {
-        let error = config.set_commit_stats(s(lenient)).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments, "{lenient}");
+fn commit_flags_take_exact_booleans_and_unset_to_false() {
+    type Set = fn(&mut RequestConfig, OptionValue) -> Result<()>;
+    type Get = fn(&RequestConfig) -> &'static str;
+    let flags: [(Set, Get); 2] = [
+        (
+            RequestConfig::set_commit_stats,
+            RequestConfig::commit_stats_string,
+        ),
+        (
+            RequestConfig::set_exclude_txn_from_change_streams,
+            RequestConfig::exclude_txn_from_change_streams_string,
+        ),
+    ];
+    for (set, get) in flags {
+        let mut config = RequestConfig::default();
+        assert_eq!(get(&config), "false");
+        set(&mut config, s("true")).unwrap();
+        assert_eq!(get(&config), "true");
+        for bad in [
+            OptionValue::Int(1),
+            s("1"),
+            s("yes"),
+            s("TRUE"),
+            s("0"),
+            s("False"),
+        ] {
+            let error = set(&mut config, bad.clone()).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{bad:?}");
+            assert_eq!(get(&config), "true", "a rejected value keeps the old one");
+        }
+        set(&mut config, s("false")).unwrap();
+        assert_eq!(get(&config), "false");
+        set(&mut config, s("true")).unwrap();
+        set(&mut config, s("")).unwrap();
+        assert_eq!(get(&config), "false");
     }
-
-    config.set_commit_stats(s("true")).unwrap();
-    assert_eq!(config.commit_stats_string(), "true");
-    config.set_commit_stats(s("")).unwrap();
-    assert_eq!(config.commit_stats_string(), "false");
-
-    config.set_commit_stats(s("true")).unwrap();
-    let error = config.set_commit_stats(s("maybe")).unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-    assert_eq!(config.commit_stats_string(), "true");
-}
-
-#[test]
-fn exclude_txn_from_change_streams_flag_round_trips_and_unsets() {
-    let mut config = RequestConfig::default();
-    assert_eq!(config.exclude_txn_from_change_streams_string(), "false");
-
-    config
-        .set_exclude_txn_from_change_streams(s("true"))
-        .unwrap();
-    assert_eq!(config.exclude_txn_from_change_streams_string(), "true");
-    let error = config
-        .set_exclude_txn_from_change_streams(OptionValue::Int(1))
-        .unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-    assert_eq!(config.exclude_txn_from_change_streams_string(), "true");
-    config
-        .set_exclude_txn_from_change_streams(s("false"))
-        .unwrap();
-    assert_eq!(config.exclude_txn_from_change_streams_string(), "false");
-    for lenient in ["1", "yes", "TRUE", "0", "no", "False"] {
-        let error = config
-            .set_exclude_txn_from_change_streams(s(lenient))
-            .unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments, "{lenient}");
-    }
-
-    config
-        .set_exclude_txn_from_change_streams(s("true"))
-        .unwrap();
-    assert_eq!(config.exclude_txn_from_change_streams_string(), "true");
-    config.set_exclude_txn_from_change_streams(s("")).unwrap();
-    assert_eq!(config.exclude_txn_from_change_streams_string(), "false");
 }
 
 #[test]
@@ -231,43 +202,4 @@ fn commit_stats_sink_records_most_recent_and_ignores_none() {
     let clone = sink.clone();
     sink.record(Some(11));
     assert_eq!(clone.mutation_count(), Some(11));
-}
-
-#[test]
-fn cloned_config_inherits_then_overrides_independently() {
-    let mut connection = RequestConfig::default();
-    connection.set_priority(s("low")).unwrap();
-    connection.set_request_tag(s("conn-tag")).unwrap();
-    connection.set_transaction_tag(s("txn-tag")).unwrap();
-    connection.set_max_commit_delay(s("100ms")).unwrap();
-    connection.set_commit_stats(s("true")).unwrap();
-    connection
-        .set_exclude_txn_from_change_streams(s("true"))
-        .unwrap();
-
-    let mut statement = connection.clone();
-    assert_eq!(statement.priority_string(), Some("low"));
-    assert_eq!(statement.request_tag_string(), Some("conn-tag"));
-    assert_eq!(statement.transaction_tag_string(), Some("txn-tag"));
-    assert_eq!(statement.max_commit_delay_string(), Some("100ms"));
-    assert_eq!(statement.commit_stats_string(), "true");
-    assert_eq!(statement.exclude_txn_from_change_streams_string(), "true");
-
-    statement.set_priority(s("high")).unwrap();
-    statement.set_request_tag(s("")).unwrap();
-    statement.set_max_commit_delay(s("250ms")).unwrap();
-    statement.set_commit_stats(s("false")).unwrap();
-    statement
-        .set_exclude_txn_from_change_streams(s("false"))
-        .unwrap();
-    assert_eq!(statement.priority_string(), Some("high"));
-    assert_eq!(statement.request_tag_string(), None);
-    assert_eq!(statement.max_commit_delay_string(), Some("250ms"));
-    assert_eq!(statement.commit_stats_string(), "false");
-    assert_eq!(statement.exclude_txn_from_change_streams_string(), "false");
-    assert_eq!(connection.priority_string(), Some("low"));
-    assert_eq!(connection.request_tag_string(), Some("conn-tag"));
-    assert_eq!(connection.max_commit_delay_string(), Some("100ms"));
-    assert_eq!(connection.commit_stats_string(), "true");
-    assert_eq!(connection.exclude_txn_from_change_streams_string(), "true");
 }

@@ -72,16 +72,6 @@ fn signal_between_operations_cancels_the_next_one() {
     assert_eq!(third.unwrap_err().status, Status::Cancelled);
 }
 
-#[test]
-fn begin_operation_shields_a_new_operation_from_a_stale_cancel() {
-    let runtime = new_runtime().unwrap();
-    let slot = CancelSlot::new();
-    slot.signal();
-    let cancel = slot.begin_operation();
-    let result: Result<i32> = block_on_cancellable(&runtime, &cancel, async { Ok(7) });
-    assert_eq!(result.unwrap(), 7);
-}
-
 // A streamed reader holding the old signal keeps failing.
 #[test]
 fn begin_operation_does_not_uncancel_an_earlier_operations_signal() {

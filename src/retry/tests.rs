@@ -17,61 +17,18 @@ fn s(v: &str) -> OptionValue {
 #[test]
 fn parses_attempts_from_strings_ints_and_whole_doubles() {
     let mut config = SharedConfig::default();
-    config.set_option(MAX_ATTEMPTS, s(" 3 ")).unwrap();
-    assert_eq!(config.option_string(MAX_ATTEMPTS).unwrap(), "3");
-    config
-        .set_option(MAX_ATTEMPTS, OptionValue::Int(5))
-        .unwrap();
-    assert_eq!(config.option_string(MAX_ATTEMPTS).unwrap(), "5");
-    config
-        .set_option(MAX_ATTEMPTS, OptionValue::Double(2.0))
-        .unwrap();
-    assert_eq!(config.option_string(MAX_ATTEMPTS).unwrap(), "2");
-    // One attempt, no retries.
-    config.set_option(MAX_ATTEMPTS, s("1")).unwrap();
-    assert_eq!(config.option_string(MAX_ATTEMPTS).unwrap(), "1");
-}
-
-#[test]
-fn parses_elapsed_from_strings_ints_and_doubles() {
-    let mut config = SharedConfig::default();
-    config.set_option(MAX_ELAPSED_SECONDS, s(" 2.5 ")).unwrap();
-    assert_eq!(config.option_string(MAX_ELAPSED_SECONDS).unwrap(), "2.5");
-    assert_eq!(
-        config.retry.max_elapsed_duration(),
-        Some(Duration::from_millis(2500))
-    );
-    config
-        .set_option(MAX_ELAPSED_SECONDS, OptionValue::Int(30))
-        .unwrap();
-    assert_eq!(config.option_string(MAX_ELAPSED_SECONDS).unwrap(), "30");
-    config
-        .set_option(MAX_ELAPSED_SECONDS, OptionValue::Double(0.05))
-        .unwrap();
-    assert_eq!(
-        config.retry.max_elapsed_duration(),
-        Some(Duration::from_millis(50))
-    );
-}
-
-#[test]
-fn empty_string_unsets_each_independently() {
-    let mut config = SharedConfig::default();
-    config.set_option(MAX_ATTEMPTS, s("4")).unwrap();
-    config.set_option(MAX_ELAPSED_SECONDS, s("10")).unwrap();
-    config.set_option(MAX_ATTEMPTS, s("")).unwrap();
+    for (value, expected) in [
+        (s(" 3 "), "3"),
+        (OptionValue::Int(5), "5"),
+        (OptionValue::Double(2.0), "2"),
+        (s("1"), "1"),
+    ] {
+        config.set_option(MAX_ATTEMPTS, value).unwrap();
+        assert_eq!(config.option_string(MAX_ATTEMPTS).unwrap(), expected);
+    }
+    config.set_option(MAX_ATTEMPTS, s(" ")).unwrap();
     assert_eq!(
         config.option_string(MAX_ATTEMPTS).unwrap_err().status,
-        Status::NotFound
-    );
-    assert_eq!(config.option_string(MAX_ELAPSED_SECONDS).unwrap(), "10");
-    // Whitespace-only counts as empty too.
-    config.set_option(MAX_ELAPSED_SECONDS, s("  ")).unwrap();
-    assert_eq!(
-        config
-            .option_string(MAX_ELAPSED_SECONDS)
-            .unwrap_err()
-            .status,
         Status::NotFound
     );
 }
@@ -85,8 +42,8 @@ fn rejects_bad_attempts() {
         OptionValue::Int(-1),
         s("0"),
         s("-2"),
-        s("1.5"),                 // fractional
-        OptionValue::Double(2.5), // fractional double
+        s("1.5"),
+        OptionValue::Double(2.5),
         OptionValue::Double(f64::NAN),
         s("abc"),
         OptionValue::Bytes(vec![1]),
@@ -99,128 +56,24 @@ fn rejects_bad_attempts() {
     }
 }
 
+/// The elapsed limit and both backoff delays take positive seconds.
 #[test]
-fn rejects_bad_elapsed() {
-    let mut config = SharedConfig::default();
-    config.set_option(MAX_ELAPSED_SECONDS, s("5")).unwrap();
-    let bad = [
-        OptionValue::Double(0.0), // zero budget is degenerate
-        s("0"),
-        OptionValue::Double(-1.0),
-        OptionValue::Int(-3),
-        OptionValue::Double(f64::NAN),
-        OptionValue::Double(f64::INFINITY),
-        s("inf"),
-        s("abc"),
-        s("1s"),
-        OptionValue::Double(1e300), // too large for Duration
-        OptionValue::Bytes(vec![1, 2]),
+fn second_options_parse_unset_and_reject_independently() {
+    let keys = [
+        MAX_ELAPSED_SECONDS,
+        BACKOFF_INITIAL_SECONDS,
+        BACKOFF_MAX_SECONDS,
     ];
-    for value in bad {
-        let error = config
-            .set_option(MAX_ELAPSED_SECONDS, value.clone())
-            .unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments, "value {value:?}");
-        assert_eq!(config.option_string(MAX_ELAPSED_SECONDS).unwrap(), "5");
-    }
-}
-
-#[test]
-fn retry_policy_arg_is_none_until_configured() {
     let mut config = SharedConfig::default();
-    assert!(config.retry.retry_policy_arg().is_none());
-    config.set_option(MAX_ATTEMPTS, s("3")).unwrap();
-    assert!(config.retry.retry_policy_arg().is_some());
-    config.set_option(MAX_ATTEMPTS, s("")).unwrap();
-    assert!(config.retry.retry_policy_arg().is_none());
-    config.set_option(MAX_ELAPSED_SECONDS, s("10")).unwrap();
-    assert!(config.retry.retry_policy_arg().is_some());
-    config.set_option(MAX_ATTEMPTS, s("5")).unwrap();
-    assert!(config.retry.retry_policy_arg().is_some());
-}
-
-#[test]
-fn statement_inherits_then_overrides_independently() {
-    let mut connection = SharedConfig::default();
-    connection.set_option(MAX_ATTEMPTS, s("10")).unwrap();
-    connection.set_option(MAX_ELAPSED_SECONDS, s("20")).unwrap();
-
-    let mut statement = connection.inherit();
-    assert_eq!(statement.option_string(MAX_ATTEMPTS).unwrap(), "10");
-    assert_eq!(statement.option_string(MAX_ELAPSED_SECONDS).unwrap(), "20");
-
-    statement.set_option(MAX_ATTEMPTS, s("2")).unwrap();
-    statement.set_option(MAX_ELAPSED_SECONDS, s("")).unwrap();
-    assert_eq!(statement.option_string(MAX_ATTEMPTS).unwrap(), "2");
-    assert_eq!(
-        statement
-            .option_string(MAX_ELAPSED_SECONDS)
-            .unwrap_err()
-            .status,
-        Status::NotFound
-    );
-    assert_eq!(connection.option_string(MAX_ATTEMPTS).unwrap(), "10");
-    assert_eq!(connection.option_string(MAX_ELAPSED_SECONDS).unwrap(), "20");
-}
-
-#[test]
-fn parses_backoff_knobs_from_strings_ints_and_doubles() {
-    let mut config = SharedConfig::default();
-    config
-        .set_option(BACKOFF_INITIAL_SECONDS, s(" 0.5 "))
-        .unwrap();
-    assert_eq!(
-        config.option_string(BACKOFF_INITIAL_SECONDS).unwrap(),
-        "0.5"
-    );
-    config
-        .set_option(BACKOFF_MAX_SECONDS, OptionValue::Int(30))
-        .unwrap();
-    assert_eq!(config.option_string(BACKOFF_MAX_SECONDS).unwrap(), "30");
-    config
-        .set_option(BACKOFF_MULTIPLIER, OptionValue::Double(1.5))
-        .unwrap();
-    assert_eq!(config.option_string(BACKOFF_MULTIPLIER).unwrap(), "1.5");
-}
-
-#[test]
-fn empty_string_unsets_each_backoff_knob_independently() {
-    let mut config = SharedConfig::default();
-    config.set_option(BACKOFF_INITIAL_SECONDS, s("1")).unwrap();
-    config.set_option(BACKOFF_MAX_SECONDS, s("10")).unwrap();
-    config.set_option(BACKOFF_MULTIPLIER, s("2")).unwrap();
-
-    config.set_option(BACKOFF_INITIAL_SECONDS, s("")).unwrap();
-    assert_eq!(
-        config
-            .option_string(BACKOFF_INITIAL_SECONDS)
-            .unwrap_err()
-            .status,
-        Status::NotFound
-    );
-    assert_eq!(config.option_string(BACKOFF_MAX_SECONDS).unwrap(), "10");
-    assert_eq!(config.option_string(BACKOFF_MULTIPLIER).unwrap(), "2");
-    // Whitespace-only counts as empty too.
-    config.set_option(BACKOFF_MAX_SECONDS, s("  ")).unwrap();
-    assert_eq!(
-        config
-            .option_string(BACKOFF_MAX_SECONDS)
-            .unwrap_err()
-            .status,
-        Status::NotFound
-    );
-    config.set_option(BACKOFF_MULTIPLIER, s("")).unwrap();
-    assert_eq!(
-        config.option_string(BACKOFF_MULTIPLIER).unwrap_err().status,
-        Status::NotFound
-    );
-}
-
-#[test]
-fn rejects_bad_backoff_seconds() {
-    for key in [BACKOFF_INITIAL_SECONDS, BACKOFF_MAX_SECONDS] {
-        let mut config = SharedConfig::default();
-        config.set_option(key, s("2")).unwrap();
+    for key in keys {
+        for (value, expected) in [
+            (s(" 2.5 "), "2.5"),
+            (OptionValue::Int(30), "30"),
+            (OptionValue::Double(0.05), "0.05"),
+        ] {
+            config.set_option(key, value).unwrap();
+            assert_eq!(config.option_string(key).unwrap(), expected, "{key}");
+        }
         let bad = [
             OptionValue::Double(0.0),
             s("0"),
@@ -231,18 +84,33 @@ fn rejects_bad_backoff_seconds() {
             s("inf"),
             s("abc"),
             s("1s"),
-            OptionValue::Double(1e300), // too large for Duration
+            OptionValue::Double(1e300),
             OptionValue::Bytes(vec![1]),
         ];
         for value in bad {
             let error = config.set_option(key, value.clone()).unwrap_err();
-            assert_eq!(error.status, Status::InvalidArguments, "value {value:?}");
+            assert_eq!(error.status, Status::InvalidArguments, "{key} {value:?}");
+            assert_eq!(config.option_string(key).unwrap(), "0.05", "{key}");
         }
+    }
+    assert_eq!(
+        config.retry.max_elapsed_duration(),
+        Some(Duration::from_millis(50))
+    );
+    // Unsetting one, with whitespace too, leaves the others alone.
+    config.set_option(MAX_ELAPSED_SECONDS, s("  ")).unwrap();
+    assert_eq!(config.retry.max_elapsed_duration(), None);
+    for key in keys {
+        assert_eq!(
+            config.option_string(key).is_ok(),
+            key != MAX_ELAPSED_SECONDS,
+            "{key}"
+        );
     }
 }
 
 #[test]
-fn rejects_bad_backoff_multiplier() {
+fn backoff_multiplier_takes_any_positive_factor() {
     let mut config = SharedConfig::default();
     config.set_option(BACKOFF_MULTIPLIER, s("2")).unwrap();
     let bad = [
@@ -268,61 +136,59 @@ fn rejects_bad_backoff_multiplier() {
         .set_option(BACKOFF_MULTIPLIER, OptionValue::Double(0.5))
         .unwrap();
     assert_eq!(config.option_string(BACKOFF_MULTIPLIER).unwrap(), "0.5");
+    config.set_option(BACKOFF_MULTIPLIER, s("")).unwrap();
+    assert_eq!(
+        config.option_string(BACKOFF_MULTIPLIER).unwrap_err().status,
+        Status::NotFound
+    );
 }
 
+/// Unset options keep the client's own policies, and each policy only depends on its options.
 #[test]
-fn backoff_policy_arg_is_none_until_configured() {
+fn policies_are_built_only_from_their_own_options() {
     let mut config = SharedConfig::default();
+    assert!(config.retry.retry_policy_arg().is_none());
     assert!(config.retry.backoff_policy_arg().is_none());
-    config.set_option(MAX_ATTEMPTS, s("3")).unwrap();
-    config.set_option(MAX_ELAPSED_SECONDS, s("10")).unwrap();
-    assert!(config.retry.backoff_policy_arg().is_none());
-    config
-        .set_option(BACKOFF_INITIAL_SECONDS, s("0.25"))
-        .unwrap();
-    assert!(config.retry.backoff_policy_arg().is_some());
-    config.set_option(BACKOFF_INITIAL_SECONDS, s("")).unwrap();
-    assert!(config.retry.backoff_policy_arg().is_none());
-    config.set_option(BACKOFF_MAX_SECONDS, s("30")).unwrap();
-    assert!(config.retry.backoff_policy_arg().is_some());
-    config.set_option(BACKOFF_MAX_SECONDS, s("")).unwrap();
-    assert!(config.retry.backoff_policy_arg().is_none());
-    config.set_option(BACKOFF_MULTIPLIER, s("3")).unwrap();
-    assert!(config.retry.backoff_policy_arg().is_some());
+    for key in [MAX_ATTEMPTS, MAX_ELAPSED_SECONDS] {
+        config.set_option(key, s("3")).unwrap();
+        assert!(config.retry.retry_policy_arg().is_some(), "{key}");
+        assert!(config.retry.backoff_policy_arg().is_none(), "{key}");
+        config.set_option(key, s("")).unwrap();
+        assert!(config.retry.retry_policy_arg().is_none(), "{key}");
+    }
+    for key in [
+        BACKOFF_INITIAL_SECONDS,
+        BACKOFF_MAX_SECONDS,
+        BACKOFF_MULTIPLIER,
+    ] {
+        config.set_option(key, s("3")).unwrap();
+        assert!(config.retry.backoff_policy_arg().is_some(), "{key}");
+        assert!(config.retry.retry_policy_arg().is_none(), "{key}");
+        config.set_option(key, s("")).unwrap();
+        assert!(config.retry.backoff_policy_arg().is_none(), "{key}");
+    }
 }
 
 #[test]
-fn retry_and_backoff_are_independent() {
-    let mut backoff_only = SharedConfig::default();
-    backoff_only.set_option(BACKOFF_MULTIPLIER, s("4")).unwrap();
-    assert!(backoff_only.retry.retry_policy_arg().is_none());
-    assert!(backoff_only.retry.backoff_policy_arg().is_some());
-
-    let mut retry_only = SharedConfig::default();
-    retry_only.set_option(MAX_ATTEMPTS, s("5")).unwrap();
-    assert!(retry_only.retry.retry_policy_arg().is_some());
-    assert!(retry_only.retry.backoff_policy_arg().is_none());
-}
-
-#[test]
-fn statement_inherits_then_overrides_backoff_independently() {
+fn statement_inherits_then_overrides_independently() {
     let mut connection = SharedConfig::default();
-    connection
-        .set_option(BACKOFF_INITIAL_SECONDS, s("0.5"))
-        .unwrap();
-    connection.set_option(BACKOFF_MAX_SECONDS, s("40")).unwrap();
-    connection.set_option(BACKOFF_MULTIPLIER, s("3")).unwrap();
+    for (key, value) in [
+        (MAX_ATTEMPTS, "10"),
+        (MAX_ELAPSED_SECONDS, "20"),
+        (BACKOFF_INITIAL_SECONDS, "0.5"),
+        (BACKOFF_MAX_SECONDS, "40"),
+        (BACKOFF_MULTIPLIER, "3"),
+    ] {
+        connection.set_option(key, s(value)).unwrap();
+    }
 
     let mut statement = connection.inherit();
-    assert_eq!(
-        statement.option_string(BACKOFF_INITIAL_SECONDS).unwrap(),
-        "0.5"
-    );
+    assert_eq!(statement.option_string(MAX_ATTEMPTS).unwrap(), "10");
     assert_eq!(statement.option_string(BACKOFF_MAX_SECONDS).unwrap(), "40");
-    assert_eq!(statement.option_string(BACKOFF_MULTIPLIER).unwrap(), "3");
 
+    statement.set_option(MAX_ATTEMPTS, s("2")).unwrap();
     statement.set_option(BACKOFF_MAX_SECONDS, s("")).unwrap();
-    statement.set_option(BACKOFF_MULTIPLIER, s("2")).unwrap();
+    assert_eq!(statement.option_string(MAX_ATTEMPTS).unwrap(), "2");
     assert_eq!(
         statement
             .option_string(BACKOFF_MAX_SECONDS)
@@ -330,9 +196,9 @@ fn statement_inherits_then_overrides_backoff_independently() {
             .status,
         Status::NotFound
     );
-    assert_eq!(statement.option_string(BACKOFF_MULTIPLIER).unwrap(), "2");
+    assert_eq!(statement.option_string(MAX_ELAPSED_SECONDS).unwrap(), "20");
+    assert_eq!(connection.option_string(MAX_ATTEMPTS).unwrap(), "10");
     assert_eq!(connection.option_string(BACKOFF_MAX_SECONDS).unwrap(), "40");
-    assert_eq!(connection.option_string(BACKOFF_MULTIPLIER).unwrap(), "3");
 }
 
 /// Out-of-range backoff values pass option validation. Using `build()` instead of `clamp()` would

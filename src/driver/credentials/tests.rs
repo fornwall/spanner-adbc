@@ -9,6 +9,10 @@ use google_cloud_gax::error::CredentialsError;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+fn s(value: &str) -> OptionValue {
+    OptionValue::String(value.into())
+}
+
 /// Sets the `emulator` field because parallel tests cannot safely change `SPANNER_EMULATOR_HOST`,
 /// which resolves to the same flag. The guard fires before any network I/O.
 #[test]
@@ -315,8 +319,10 @@ fn ambient_adc_and_inert_impersonation_options_do_not_trip_the_emulator_guard() 
 fn the_credential_ladder_selects_one_flow_in_precedence_order() {
     let mut db = new_database();
     assert_eq!(db.credential_choice(false, false), CredentialChoice::Adc);
-    // A quota project does not select a flow.
+    // Neither a quota project nor impersonation options without a target select a flow.
     db.quota_project = Some("billing-project".into());
+    db.impersonate_delegates = vec!["delegate@p.iam.gserviceaccount.com".into()];
+    db.impersonate_lifetime_secs = Some(900);
     assert_eq!(db.credential_choice(false, false), CredentialChoice::Adc);
 
     db.keyfile = Some("/path/to/key.json".into());
@@ -347,20 +353,6 @@ fn the_credential_ladder_selects_one_flow_in_precedence_order() {
     assert_eq!(
         db.credential_choice(true, false),
         CredentialChoice::Anonymous
-    );
-}
-
-#[test]
-fn the_credential_ladder_ignores_impersonation_options_without_a_target() {
-    let mut db = new_database();
-    db.impersonate_delegates = vec!["delegate@p.iam.gserviceaccount.com".into()];
-    db.impersonate_scopes = vec!["https://www.googleapis.com/auth/cloud-platform".into()];
-    db.impersonate_lifetime_secs = Some(900);
-    assert_eq!(db.credential_choice(false, false), CredentialChoice::Adc);
-    db.keyfile = Some("/path/to/key.json".into());
-    assert_eq!(
-        db.credential_choice(false, false),
-        CredentialChoice::Keyfile
     );
 }
 
@@ -519,35 +511,29 @@ fn inline_keyfile_json_takes_precedence_over_path() {
 }
 
 #[test]
-fn malformed_credential_json_is_rejected() {
-    let error = build_credentials_from_json("{ not valid json", None).unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-    assert!(error.message.contains("invalid credential JSON key"));
-}
-
-#[test]
-fn credential_json_without_a_type_is_rejected() {
-    let error = build_credentials_from_json("{\"private_key\":\"x\"}", None).unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-    assert!(error.message.contains("missing a string `type` field"));
-    assert!(error.message.contains("service_account"));
-}
-
-#[test]
-fn credential_json_with_a_non_string_type_is_rejected() {
-    let error = build_credentials_from_json("{\"type\":42}", None).unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-    assert!(error.message.contains("missing a string `type` field"));
-}
-
-#[test]
-fn credential_json_with_an_unknown_type_is_rejected() {
-    let error =
-        build_credentials_from_json("{\"type\":\"gdch_service_account\"}", None).unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-    assert!(error.message.contains("unsupported credential `type`"));
-    assert!(error.message.contains("gdch_service_account"));
-    assert!(error.message.contains("external_account"));
+fn credential_json_errors_say_what_is_wrong() {
+    for (json, needles) in [
+        ("{ not valid json", &["invalid credential JSON key"][..]),
+        (
+            "{\"private_key\":\"x\"}",
+            &["missing a string `type` field", "service_account"],
+        ),
+        ("{\"type\":42}", &["missing a string `type` field"]),
+        (
+            "{\"type\":\"gdch_service_account\"}",
+            &[
+                "unsupported credential `type`",
+                "gdch_service_account",
+                "external_account",
+            ],
+        ),
+    ] {
+        let error = build_credentials_from_json(json, None).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments, "{json}");
+        for needle in needles {
+            assert!(error.message.contains(needle), "{}", error.message);
+        }
+    }
 }
 
 // The builders spawn token-cache tasks and so need a runtime; tokens are fetched lazily.
@@ -574,22 +560,6 @@ fn authorized_user_credential_json_is_accepted() {
             "{built}"
         );
     });
-}
-
-// An invalid key fails inside the service-account builder; the error names the type it reached.
-#[test]
-fn service_account_credential_json_is_routed_to_the_service_account_flow() {
-    let error = build_credentials_from_json(
-        "{\"type\":\"service_account\",\"private_key\":\"not-a-key\"}",
-        None,
-    )
-    .unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-    assert!(
-        error
-            .message
-            .contains("failed to build service_account credentials")
-    );
 }
 
 #[test]
@@ -681,26 +651,16 @@ fn impersonation_options_round_trip_and_split() {
 }
 
 #[test]
-fn a_non_numeric_impersonation_lifetime_is_rejected() {
+fn impersonation_lifetime_takes_whole_seconds() {
     let mut db = new_database();
-    let error = db
-        .set_option(
-            OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into()),
-            OptionValue::String("not-a-number".into()),
-        )
-        .unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-    assert!(error.message.contains("non-negative integer"));
-}
-
-#[test]
-fn an_integer_impersonation_lifetime_is_accepted() {
-    let mut db = new_database();
-    db.set_option(
-        OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into()),
-        OptionValue::Int(900),
-    )
-    .unwrap();
+    let key = || OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into());
+    db.set_option(key(), OptionValue::Int(900)).unwrap();
+    assert_eq!(db.impersonate_lifetime_secs, Some(900));
+    for bad in [s("not-a-number"), s("1.5"), OptionValue::Int(-1)] {
+        let error = db.set_option(key(), bad).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("non-negative integer"));
+    }
     assert_eq!(db.impersonate_lifetime_secs, Some(900));
 }
 

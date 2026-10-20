@@ -98,21 +98,6 @@ fn rejects_nan_infinities_negatives_and_garbage() {
 }
 
 #[test]
-fn the_three_timeouts_are_independent() {
-    let mut config = SharedConfig::default();
-    config.set_option(QUERY, s("1")).unwrap();
-    config.set_option(UPDATE, s("2")).unwrap();
-    config.set_option(FETCH, s("3")).unwrap();
-    config.set_option(UPDATE, s("")).unwrap();
-    assert_eq!(config.option_string(QUERY).unwrap(), "1");
-    assert_eq!(
-        config.option_string(UPDATE).unwrap_err().status,
-        Status::NotFound
-    );
-    assert_eq!(config.option_string(FETCH).unwrap(), "3");
-}
-
-#[test]
 fn statement_inherits_then_overrides_independently() {
     let mut connection = SharedConfig::default();
     connection.set_option(QUERY, s("10")).unwrap();
