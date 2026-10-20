@@ -1054,3 +1054,23 @@ fn temporal_parsers_match_chrono_across_spanner_range() {
         None
     );
 }
+
+#[test]
+fn errors_name_the_column_and_struct_field() {
+    let item = DataType::Struct(Fields::from(vec![Field::new(
+        "price",
+        DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
+        true,
+    )]));
+    let column = Arc::new(Field::new(
+        "Items",
+        DataType::List(Arc::new(Field::new(LIST_ITEM, item, true))),
+        true,
+    ));
+    let value = vec![vec!["abc"].to_value()].to_value();
+    let error = build_column(&column, &[Some(&value)]).unwrap_err();
+    assert_eq!(
+        error.message,
+        r#"column "Items": field "price": cannot decode Spanner NUMERIC wire value "abc""#
+    );
+}

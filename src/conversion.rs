@@ -479,12 +479,9 @@ pub(crate) fn build_schema(
                 .iter()
                 .enumerate()
                 .map(|(i, name)| match types.get(i) {
-                    // Name the column, as `build_column` does, so errors are traceable in wide
-                    // results.
-                    Some(ty) => arrow_field(name, ty, true, precision).map_err(|mut e| {
-                        e.message = format!("column {name:?}: {}", e.message);
-                        e
-                    }),
+                    Some(ty) => {
+                        arrow_field(name, ty, true, precision).map_err(within("column", name))
+                    }
                     None => Ok(Field::new(name, DataType::Utf8, true)),
                 })
                 .collect::<Result<_>>()?;
@@ -652,12 +649,20 @@ fn build_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
     })
 }
 
-/// [`build_array`] for a top-level column, naming the column in errors.
-fn build_column(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
-    build_array(field.data_type(), values).map_err(|mut e| {
-        e.message = format!("column {:?}: {}", field.name(), e.message);
+/// Prefix an error with the column or struct field it occurred in, so errors are traceable in
+/// wide and nested results.
+fn within(
+    kind: &str,
+    name: &str,
+) -> impl FnOnce(adbc_core::error::Error) -> adbc_core::error::Error {
+    move |mut e| {
+        e.message = format!("{kind} {name:?}: {}", e.message);
         e
-    })
+    }
+}
+
+fn build_column(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
+    build_array(field.data_type(), values).map_err(within("column", field.name()))
 }
 
 /// The value, unless it is SQL `NULL` or absent.
@@ -778,9 +783,8 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
                     builder.append_value(parse_timestamp_nanos(s).ok_or_else(|| {
                         if parse_timestamp(s).is_some() {
                             invalid_argument(format!(
-                                "TIMESTAMP value {s:?} is outside the range representable as an \
-                                 Arrow Timestamp(Nanosecond) (~1677-09-21 to 2262-04-11); set \
-                                 {}={} to read it at microsecond precision instead",
+                                "TIMESTAMP {s:?} is outside the Arrow Timestamp(Nanosecond) range \
+                                 (1677-09-21 to 2262-04-11); set {}={} to read it",
                                 crate::OPTION_MAX_TIMESTAMP_PRECISION,
                                 TimestampPrecision::MICROSECONDS,
                             ))
@@ -916,7 +920,7 @@ fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> 
         .map(|(i, field)| {
             scratch.clear();
             scratch.extend(rows.iter().map(|row| row.and_then(|list| list.get(i))));
-            build_array(field.data_type(), &scratch)
+            build_array(field.data_type(), &scratch).map_err(within("field", field.name()))
         })
         .collect::<Result<Vec<_>>>()?;
     let array =
