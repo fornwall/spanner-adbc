@@ -4,7 +4,9 @@
 //! are adapted; remove this module when the pinned admin client supports gRPC directly.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use google_cloud_gax::exponential_backoff::ExponentialBackoffBuilder;
 use google_cloud_gax::options::RequestOptions;
 use google_cloud_gax::options::internal::set_default_idempotency;
 use google_cloud_gax::response::{Parts, Response};
@@ -22,8 +24,16 @@ mod wire;
 use wire::{OperationResult, WireGetOperation, WireOperation, WireUpdateDatabaseDdl};
 
 pub(crate) async fn database_admin(
-    config: ClientConfig,
+    mut config: ClientConfig,
 ) -> google_cloud_gax::client_builder::Result<DatabaseAdmin> {
+    // Cloud schema changes take seconds to minutes. The default poll interval doubles up to a
+    // minute, so it can notice completion almost as late again as the change took.
+    let polling = ExponentialBackoffBuilder::new()
+        .with_initial_delay(Duration::from_secs(1))
+        .with_maximum_delay(Duration::from_secs(10))
+        .with_scaling(1.5)
+        .clamp();
+    config.polling_backoff_policy = Some(Arc::new(polling));
     let transport = Client::new(config, "https://spanner.googleapis.com").await?;
     Ok(DatabaseAdmin::from_stub(DdlTransport(transport)))
 }
