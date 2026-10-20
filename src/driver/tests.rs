@@ -280,6 +280,16 @@ fn unknown_database_option_is_not_implemented() {
         )
         .unwrap_err();
     assert_eq!(error.status, Status::NotImplemented);
+
+    for key in [OptionDatabase::Username, OptionDatabase::Password] {
+        let name = key.as_ref().to_owned();
+        let error = db.set_option(key, "secret".into()).unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented, "{name}");
+        for needle in [&name, "Application Default Credentials", OPTION_KEYFILE] {
+            assert!(error.message.contains(needle), "{}", error.message);
+        }
+        assert!(!error.message.contains("secret"), "{}", error.message);
+    }
 }
 
 /// Databases run on their driver's runtime. `src/ffi/database/tests.rs` checks that the C ABI

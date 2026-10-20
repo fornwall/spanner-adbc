@@ -19,7 +19,7 @@ use google_cloud_spanner::omni::{InstanceType, SpannerBuilderExt};
 use crate::connection::SpannerConnection;
 use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, option_not_set,
-    unknown_option,
+    unknown_option, unsupported,
 };
 use crate::options::{F64Range, f64_option, impl_typed_option_getters};
 use crate::runtime::{SharedRuntime, block_on, new_runtime};
@@ -526,6 +526,14 @@ impl Optionable for SpannerDatabase {
             }
             OptionDatabase::Other(name) if name == OPTION_RPC_TIMEOUT_CONNECT => {
                 self.connect_timeout_secs = f64_option(value, name, F64Range::NonNegativeSeconds)?
+            }
+            OptionDatabase::Username | OptionDatabase::Password => {
+                return Err(unsupported(format!(
+                    "Spanner does not use the {} option; it authenticates with Application \
+                     Default Credentials unless {OPTION_KEYFILE}, {OPTION_KEYFILE_JSON}, \
+                     {OPTION_ACCESS_TOKEN} or {OPTION_IMPERSONATE_TARGET_PRINCIPAL} is set",
+                    key.as_ref()
+                )));
             }
             other => {
                 return Err(unknown_option("database", other.as_ref()));
