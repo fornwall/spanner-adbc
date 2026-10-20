@@ -16,12 +16,10 @@ use std::time::Duration;
 
 use adbc_core::error::{Result, Status};
 use adbc_core::options::OptionValue;
-use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, GenericByteBuilder, PrimitiveBuilder, StringBuilder,
-};
+use arrow_array::builder::{BinaryBuilder, BooleanBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::types::{
-    ArrowPrimitiveType, ByteArrayType, Date32Type, Decimal128Type, Float32Type, Float64Type,
-    Int64Type, TimestampMicrosecondType,
+    ArrowPrimitiveType, Date32Type, Decimal128Type, Float32Type, Float64Type, Int64Type,
+    TimestampMicrosecondType,
 };
 use arrow_array::{
     ArrayRef, ListArray, PrimitiveArray, RecordBatch, RecordBatchOptions, RecordBatchReader,
@@ -573,7 +571,11 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision, depth: usize) -> Result<
             DataType::Timestamp(precision.time_unit(), Some(TIMESTAMP_TZ.into()))
         }
         TypeCode::Numeric => DataType::Decimal128(NUMERIC_PRECISION, NUMERIC_SCALE),
-        TypeCode::Struct => struct_arrow_type(ty, precision, depth)?,
+        TypeCode::Struct => match ty.struct_type() {
+            Some(st) => DataType::Struct(struct_fields(st, precision, depth)?),
+            // Without its fields, a struct can only be shown as JSON text.
+            None => DataType::Utf8,
+        },
         TypeCode::Array => match ty.array_element_type() {
             // Spanner has no arrays of arrays; anything unexpected falls back to JSON text.
             Some(element) if !matches!(element.code(), TypeCode::Array | TypeCode::Unspecified) => {
@@ -595,14 +597,6 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision, depth: usize) -> Result<
         // `CAST(@p AS ...)` to write one back. Bulk-ingest mutations are unaffected.
         _ => DataType::Utf8,
     })
-}
-
-/// Falls back to `Utf8` if the metadata lacks the struct's fields.
-fn struct_arrow_type(ty: &Type, precision: TimestampPrecision, depth: usize) -> Result<DataType> {
-    match ty.struct_type() {
-        Some(st) => Ok(DataType::Struct(struct_fields(st, precision, depth)?)),
-        None => Ok(DataType::Utf8),
-    }
 }
 
 /// Child fields of a struct type. Names are kept verbatim, including empty and duplicate ones.
@@ -689,39 +683,18 @@ fn decode_error(spanner_type: &str, value: &Value) -> adbc_core::error::Error {
     )
 }
 
-/// Builders [`build_with`] can append nulls to; Arrow's `ArrayBuilder` trait has no `append_null`.
-trait NullableBuilder {
-    fn append_null(&mut self);
-}
-
-impl NullableBuilder for BooleanBuilder {
-    fn append_null(&mut self) {
-        BooleanBuilder::append_null(self);
-    }
-}
-
-impl<T: ArrowPrimitiveType> NullableBuilder for PrimitiveBuilder<T> {
-    fn append_null(&mut self) {
-        PrimitiveBuilder::append_null(self);
-    }
-}
-
-impl<T: ByteArrayType> NullableBuilder for GenericByteBuilder<T> {
-    fn append_null(&mut self) {
-        GenericByteBuilder::append_null(self);
-    }
-}
-
-/// Fill `builder` from one value per row: NULLs become null slots, other values go to `append`.
+/// Fill `builder` from one value per row: NULLs go to `append_null`, other values to `append`.
+/// Arrow's `ArrayBuilder` trait has no `append_null`, so callers pass the builder's own.
 #[inline]
-fn build_with<B: NullableBuilder>(
+fn build_with<B>(
     values: &[Option<&Value>],
     mut builder: B,
+    append_null: impl Fn(&mut B),
     mut append: impl FnMut(&mut B, &Value) -> Result<()>,
 ) -> Result<B> {
     for &value in values {
         match present(value) {
-            None => builder.append_null(),
+            None => append_null(&mut builder),
             Some(v) => append(&mut builder, v)?,
         }
     }
@@ -753,6 +726,7 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
             build_with(
                 values,
                 BooleanBuilder::with_capacity(values.len()),
+                BooleanBuilder::append_null,
                 |builder, v| {
                     builder.append_value(v.as_bool().ok_or_else(|| decode_error("BOOL", v))?);
                     Ok(())
@@ -778,6 +752,7 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
             let array = build_with(
                 values,
                 TimestampNanosecondArray::builder(values.len()),
+                PrimitiveBuilder::append_null,
                 |builder, v| {
                     let s = v.as_str().ok_or_else(|| decode_error("TIMESTAMP", v))?;
                     builder.append_value(parse_timestamp_nanos(s).ok_or_else(|| {
@@ -819,8 +794,9 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
         // `decode_vec` appends, so clear it first.
         DataType::Binary => {
             let mut scratch = Vec::new();
+            let builder = BinaryBuilder::new();
             Arc::new(
-                build_with(values, BinaryBuilder::new(), |builder, v| {
+                build_with(values, builder, BinaryBuilder::append_null, |builder, v| {
                     let s = v.as_str().ok_or_else(|| decode_error("BYTES", v))?;
                     scratch.clear();
                     base64::engine::general_purpose::STANDARD
@@ -835,16 +811,19 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
         DataType::List(field) => build_list(field, values)?,
         DataType::Struct(fields) => build_struct(fields, values)?,
         // Utf8 and fallbacks: strings verbatim, anything else as JSON text.
-        _ => Arc::new(
-            build_with(values, StringBuilder::new(), |builder, v| {
-                match v.as_str() {
-                    Some(s) => builder.append_value(s),
-                    None => builder.append_value(value_to_json(v)?.to_string()),
-                }
-                Ok(())
-            })?
-            .finish(),
-        ),
+        _ => {
+            let builder = StringBuilder::new();
+            Arc::new(
+                build_with(values, builder, StringBuilder::append_null, |builder, v| {
+                    match v.as_str() {
+                        Some(s) => builder.append_value(s),
+                        None => builder.append_value(value_to_json(v)?.to_string()),
+                    }
+                    Ok(())
+                })?
+                .finish(),
+            )
+        }
     })
 }
 
