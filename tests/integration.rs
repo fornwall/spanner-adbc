@@ -11,7 +11,7 @@ use adbc_core::options::{
     AdbcVersion, InfoCode, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement,
     OptionValue,
 };
-use adbc_core::{Connection, Database, Driver, Optionable, Statement};
+use adbc_core::{Connection, Driver, Optionable, Statement};
 use adbc_driver_manager::ManagedDriver;
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
@@ -22,129 +22,28 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{NaiveDate, SecondsFormat};
 use google_cloud_lro::Poller;
-use google_cloud_spanner_admin_instance_v1::model::Instance;
 use proptest::prelude::*;
 use spanner_adbc::{SpannerConnection, SpannerDatabase, SpannerDriver, SpannerStatement};
 
 mod common;
-use common::{TestTarget, gcp_target, require_target, test_target};
-#[path = "common/omni.rs"]
-mod omni_setup;
+use common::{
+    TestTarget, cdylib_path, connect_with_retry, ensure_database_once, gcp_target, omni,
+    test_target,
+};
 
-/// DDL for the `Singers` table the tests read from.
-fn singers_ddl(if_not_exists: bool) -> String {
-    let guard = if if_not_exists { "IF NOT EXISTS " } else { "" };
-    format!(
-        "CREATE TABLE {guard}Singers (\
-             SingerId INT64 NOT NULL, \
-             Name STRING(MAX), \
-             Active BOOL, \
-             Score FLOAT64\
-         ) PRIMARY KEY (SingerId)"
-    )
-}
-
-/// DDL for scratch tables used by several tests. They are created during one-time setup because
-/// the emulator rejects schema changes while any read-write transaction is in flight, which would
-/// make parallel tests flaky.
-fn prop_tables_ddl(if_not_exists: bool) -> Vec<String> {
-    let g = if if_not_exists { "IF NOT EXISTS " } else { "" };
-    vec![
-        format!(
-            "CREATE TABLE {g}AdbcPropBind \
-                 (Id INT64, IntCol INT64, FloatCol FLOAT64, BoolCol BOOL, \
-                  StrCol STRING(MAX), BytesCol BYTES(MAX), \
-                  DateCol DATE, TsCol TIMESTAMP, NumCol NUMERIC) \
-             PRIMARY KEY (Id)"
-        ),
-        format!(
-            "CREATE TABLE {g}AdbcPropTypes \
-                 (Id INT64, D DATE, T TIMESTAMP, N NUMERIC) PRIMARY KEY (Id)"
-        ),
-        format!("CREATE TABLE {g}AdbcReturn (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)"),
-        format!("CREATE TABLE {g}AdbcHint (Id INT64, N INT64) PRIMARY KEY (Id)"),
-    ]
-}
-
-/// Create the instance (emulator only), database and test tables, ignoring `AlreadyExists` so
-/// reruns against a persistent database work.
-async fn ensure_database(target: &TestTarget) {
-    if let Some(endpoint) = &target.omni_endpoint {
-        let mut statements = vec![singers_ddl(true)];
-        statements.extend(prop_tables_ddl(true));
-        omni_setup::update_ddl(endpoint, target.database_path(), statements, Vec::new())
-            .await
-            .expect("initialize Omni test tables");
-        return;
-    }
-    let spanner = target.spanner().await;
-
-    if target.is_emulator {
-        let instance_admin = spanner
-            .instance_admin_builder()
-            .build()
-            .await
-            .expect("failed to build instance admin client");
-        let _ = instance_admin
-            .create_instance()
-            .set_parent(format!("projects/{}", target.project))
-            .set_instance_id(&target.instance)
-            .set_instance(
-                Instance::new()
-                    .set_config(format!(
-                        "projects/{}/instanceConfigs/emulator-config",
-                        target.project
-                    ))
-                    .set_display_name("ADBC test instance")
-                    .set_node_count(1),
-            )
-            .poller()
-            .until_done()
-            .await;
-    }
-
-    let database_admin = spanner
-        .database_admin_builder()
-        .build()
-        .await
-        .expect("failed to build database admin client");
-    let mut create_statements = vec![singers_ddl(false)];
-    create_statements.extend(prop_tables_ddl(false));
-    let _ = database_admin
-        .create_database()
-        .set_parent(target.instance_path())
-        .set_create_statement(format!("CREATE DATABASE `{}`", target.database))
-        .set_extra_statements(create_statements)
-        .poller()
-        .until_done()
-        .await;
-
-    // If the database already existed, its extra statements never ran. That includes an emulator
-    // database created first by `tests/ffi_lifecycle.rs`, which creates no tables.
-    let mut reconcile = vec![singers_ddl(true)];
-    reconcile.extend(prop_tables_ddl(true));
-    let _ = database_admin
-        .update_database_ddl()
-        .set_database(target.database_path())
-        .set_statements(reconcile)
-        .poller()
-        .until_done()
-        .await;
-}
-
-/// Run [`ensure_database`] once per test binary. Concurrent setup races on the emulator, which
-/// can report `Instance not found` when two `create_instance` calls overlap.
-fn ensure_database_once(target: &TestTarget) {
-    static DONE: Mutex<bool> = Mutex::new(false);
-    // Ignore poisoning so a failed setup is retried by the next test instead of cascading.
-    let mut done = DONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !*done {
-        tokio::runtime::Runtime::new()
-            .expect("failed to build setup runtime")
-            .block_on(ensure_database(target));
-        *done = true;
-    }
-}
+/// Tables that several tests share. Setup creates them because the emulator rejects schema
+/// changes while any read-write transaction is in flight, which would make parallel tests flaky.
+const SETUP_DDL: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS Singers (SingerId INT64 NOT NULL, Name STRING(MAX), \
+     Active BOOL, Score FLOAT64) PRIMARY KEY (SingerId)",
+    "CREATE TABLE IF NOT EXISTS AdbcPropBind (Id INT64, IntCol INT64, FloatCol FLOAT64, \
+     BoolCol BOOL, StrCol STRING(MAX), BytesCol BYTES(MAX), DateCol DATE, TsCol TIMESTAMP, \
+     NumCol NUMERIC) PRIMARY KEY (Id)",
+    "CREATE TABLE IF NOT EXISTS AdbcPropTypes (Id INT64, D DATE, T TIMESTAMP, N NUMERIC) \
+     PRIMARY KEY (Id)",
+    "CREATE TABLE IF NOT EXISTS AdbcReturn (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
+    "CREATE TABLE IF NOT EXISTS AdbcHint (Id INT64, N INT64) PRIMARY KEY (Id)",
+];
 
 /// Configure the database through a `spanner:` URI and run a query. On the emulator the URI
 /// carries a percent-encoded `spanner.endpoint` to exercise decoding.
@@ -155,7 +54,7 @@ fn connect_via_connection_uri() {
         return;
     };
 
-    ensure_database_once(&target);
+    ensure_database_once(&target, SETUP_DDL);
     let _serial = serial_guard();
 
     let uri = if target.is_emulator {
@@ -3516,7 +3415,7 @@ fn prop_bind_round_trip() {
         eprintln!("no Spanner target set; skipping prop_bind_round_trip");
         return;
     };
-    ensure_database_once(&target);
+    ensure_database_once(&target, SETUP_DDL);
     let _serial = serial_guard();
 
     let connection = RefCell::new(connect_with_retry(shared_database(&target)));
@@ -3678,7 +3577,7 @@ fn prop_temporal_round_trip() {
         eprintln!("no Spanner target set; skipping prop_temporal_round_trip");
         return;
     };
-    ensure_database_once(&target);
+    ensure_database_once(&target, SETUP_DDL);
     let _serial = serial_guard();
 
     let connection = RefCell::new(connect_with_retry(shared_database(&target)));
@@ -3800,37 +3699,6 @@ fn ddl_execute_clears_stale_bound_rows() {
     drop_tables(connection, &["BoundLeak"]);
 }
 
-/// The built shared library in `target/<profile>/`, one level above the test binary.
-fn cdylib_path() -> Option<std::path::PathBuf> {
-    let dir = std::env::current_exe()
-        .ok()?
-        .parent()?
-        .parent()?
-        .to_path_buf();
-    let name = if cfg!(target_os = "windows") {
-        "spanner_adbc.dll"
-    } else if cfg!(target_os = "macos") {
-        "libspanner_adbc.dylib"
-    } else {
-        "libspanner_adbc.so"
-    };
-    let path = dir.join(name);
-    path.exists().then_some(path)
-}
-
-/// Like [`cdylib_path`], but panics when `ADBC_TEST_REQUIRE_TARGET` is set and the library is
-/// missing.
-fn required_cdylib_path() -> Option<std::path::PathBuf> {
-    let path = cdylib_path();
-    if path.is_none() && require_target() {
-        panic!(
-            "ADBC_TEST_REQUIRE_TARGET is set but the shared library is not built next to the \
-             test binary; run `cargo build` first"
-        );
-    }
-    path
-}
-
 /// Metadata, queries, DML, transactions and ingest through the driver manager, checking the
 /// canonical ADBC result schemas.
 #[test]
@@ -3841,11 +3709,11 @@ fn conformance_via_driver_manager() {
         eprintln!("no Spanner target set; skipping conformance_via_driver_manager");
         return;
     };
-    let Some(cdylib) = required_cdylib_path() else {
+    let Some(cdylib) = cdylib_path() else {
         eprintln!("shared library not built; skipping conformance test (run `cargo build` first)");
         return;
     };
-    ensure_database_once(&target);
+    ensure_database_once(&target, SETUP_DDL);
     let _guard = serial_guard();
 
     let mut driver = ManagedDriver::load_dynamic_from_filename(
@@ -4313,21 +4181,6 @@ fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// A newly created emulator database can be briefly invisible to the data plane.
-fn connect_with_retry<D: Database>(database: &D) -> D::ConnectionType {
-    let mut last_err = None;
-    for _ in 0..20 {
-        match database.new_connection() {
-            Ok(connection) => return connection,
-            Err(e) => {
-                last_err = Some(e);
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            }
-        }
-    }
-    panic!("create connection failed after retries: {last_err:?}");
-}
-
 /// One driver and database for the whole binary, to avoid a runtime and channel pool per test.
 /// Tests must not set database options on it; tests that need their own build their own driver.
 fn shared_database(target: &TestTarget) -> &'static SpannerDatabase {
@@ -4371,7 +4224,7 @@ fn build_fixture(serial: bool) -> Option<Fixture> {
         eprintln!("no Spanner target configured; skipping Spanner integration test");
         return None;
     };
-    ensure_database_once(&target);
+    ensure_database_once(&target, SETUP_DDL);
     let _serial = serial.then(serial_guard);
 
     let database = shared_database(&target);
@@ -5185,7 +5038,7 @@ fn hinted_dml_routes_to_the_read_write_path() {
     };
     let connection = &mut fx.connection;
 
-    // `AdbcHint` is created during setup; see `prop_tables_ddl`.
+    // `AdbcHint` is created during setup; see `SETUP_DDL`.
     run(connection, "DELETE FROM AdbcHint WHERE true");
 
     // The emulator rejects most statement hints, but accepts `LOCK_SCANNED_RANGES`.
@@ -5217,7 +5070,7 @@ fn dml_then_return_round_trip() {
     };
     let connection = &mut fx.connection;
 
-    // `AdbcReturn` is created during setup; see `prop_tables_ddl`.
+    // `AdbcReturn` is created during setup; see `SETUP_DDL`.
     run(connection, "DELETE FROM AdbcReturn WHERE true");
 
     let mut insert = connection.new_statement().expect("new statement");
@@ -5514,7 +5367,7 @@ fn readonly_connection_rejects_writes() {
         eprintln!("no Spanner target set; skipping readonly_connection_rejects_writes");
         return;
     };
-    ensure_database_once(&target);
+    ensure_database_once(&target, SETUP_DDL);
     let _serial = serial_guard();
 
     use adbc_core::error::Status;
@@ -5665,7 +5518,7 @@ fn readonly_toggle_from_another_thread_locks_existing_statement() {
         eprintln!("no Spanner target set; skipping readonly_toggle_from_another_thread");
         return;
     };
-    ensure_database_once(&target);
+    ensure_database_once(&target, SETUP_DDL);
     let _serial = serial_guard();
 
     use adbc_core::error::Status;
@@ -6551,7 +6404,7 @@ mod auth_end_to_end {
         };
 
         // Setup uses ADC, not the keyfile under test.
-        ensure_database_once(&target);
+        ensure_database_once(&target, SETUP_DDL);
 
         let mut driver = SpannerDriver::try_new().expect("create driver");
         let database = driver
@@ -6585,7 +6438,7 @@ mod auth_end_to_end {
             return;
         };
 
-        ensure_database_once(&target);
+        ensure_database_once(&target, SETUP_DDL);
 
         let mut driver = SpannerDriver::try_new().expect("create driver");
         let database = driver
@@ -6686,7 +6539,7 @@ fn ensure_proto_bundle_once(target: &TestTarget) {
         .expect("failed to build setup runtime")
         .block_on(async {
             if let Some(endpoint) = &target.omni_endpoint {
-                let result = omni_setup::update_ddl(
+                let result = omni::update_ddl(
                     endpoint,
                     target.database_path(),
                     vec!["CREATE PROTO BUNDLE (`adbc.test.Color`, `adbc.test.Point`)".to_string()],

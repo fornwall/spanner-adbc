@@ -15,131 +15,17 @@
 //! without it, unless `ADBC_TEST_REQUIRE_TARGET` is set.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use adbc_core::error::Status;
 use adbc_core::options::{AdbcVersion, OptionDatabase, OptionStatement, OptionValue};
-use adbc_core::{Connection, Database, Driver, Optionable, Statement};
+use adbc_core::{Connection, Driver, Optionable, Statement};
 use adbc_driver_manager::ManagedDriver;
 use arrow_array::{RecordBatch, RecordBatchReader};
-use google_cloud_lro::Poller;
-use google_cloud_spanner_admin_instance_v1::model::Instance;
 use spanner_adbc::SpannerDriver;
 
 // Shares its target and database names with `tests/integration.rs`.
 mod common;
-use common::{TestTarget, require_target, test_target};
-
-/// Create the emulator instance and the test database if they do not exist; errors such as
-/// `AlreadyExists` are ignored. Creates no tables, which `tests/integration.rs` sets up itself.
-/// A Cloud instance must already exist.
-async fn ensure_database(target: &TestTarget) {
-    if target.omni_endpoint.is_some() {
-        // scripts/with-omni.sh provisions the database through the bundled CLI.
-        return;
-    }
-    let spanner = target.spanner().await;
-
-    if target.is_emulator {
-        let instance_admin = spanner
-            .instance_admin_builder()
-            .build()
-            .await
-            .expect("failed to build instance admin client");
-        let _ = instance_admin
-            .create_instance()
-            .set_parent(format!("projects/{}", target.project))
-            .set_instance_id(&target.instance)
-            .set_instance(
-                Instance::new()
-                    .set_config(format!(
-                        "projects/{}/instanceConfigs/emulator-config",
-                        target.project
-                    ))
-                    .set_display_name("ADBC test instance")
-                    .set_node_count(1),
-            )
-            .poller()
-            .until_done()
-            .await;
-    }
-
-    let database_admin = spanner
-        .database_admin_builder()
-        .build()
-        .await
-        .expect("failed to build database admin client");
-    let _ = database_admin
-        .create_database()
-        .set_parent(target.instance_path())
-        .set_create_statement(format!("CREATE DATABASE `{}`", target.database))
-        .poller()
-        .until_done()
-        .await;
-}
-
-/// Run [`ensure_database`] once per test binary. Concurrent setup races: the emulator can report
-/// `Instance not found` when two `create_instance` calls overlap.
-fn ensure_database_once(target: &TestTarget) {
-    static DONE: Mutex<bool> = Mutex::new(false);
-    // After a panic in setup, `done` is still false and the next test retries; poisoning would
-    // only repeat the first failure in every later test.
-    let mut done = DONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !*done {
-        tokio::runtime::Runtime::new()
-            .expect("failed to build setup runtime")
-            .block_on(ensure_database(target));
-        *done = true;
-    }
-}
-
-/// Open a connection, retrying briefly: a new emulator database can be invisible to the data
-/// plane for a moment after `create_database` returns.
-fn connect_with_retry<D: Database>(database: &D) -> D::ConnectionType {
-    let mut last_err = None;
-    for _ in 0..20 {
-        match database.new_connection() {
-            Ok(connection) => return connection,
-            Err(e) => {
-                last_err = Some(e);
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            }
-        }
-    }
-    panic!("create connection failed after retries: {last_err:?}");
-}
-
-/// The built cdylib, which lives in `target/<profile>/`, one level above the test binary.
-fn cdylib_path() -> Option<PathBuf> {
-    let dir = std::env::current_exe()
-        .ok()?
-        .parent()?
-        .parent()?
-        .to_path_buf();
-    let name = if cfg!(target_os = "windows") {
-        "spanner_adbc.dll"
-    } else if cfg!(target_os = "macos") {
-        "libspanner_adbc.dylib"
-    } else {
-        "libspanner_adbc.so"
-    };
-    let path = dir.join(name);
-    path.exists().then_some(path)
-}
-
-/// The built cdylib, or `None` to skip. Panics instead when `ADBC_TEST_REQUIRE_TARGET` is set,
-/// so CI cannot pass the C ABI tests without running them.
-fn required_cdylib_path() -> Option<PathBuf> {
-    let path = cdylib_path();
-    if path.is_none() && require_target() {
-        panic!(
-            "ADBC_TEST_REQUIRE_TARGET is set but the cdylib \
-             (libspanner_adbc.so / .dylib / spanner_adbc.dll) is not built next to the test \
-             binary; run `cargo build` first."
-        );
-    }
-    path
-}
+use common::{TestTarget, cdylib_path, connect_with_retry, ensure_database_once, test_target};
 
 /// The test target with its database provisioned, or `None` to skip.
 fn setup(test: &str) -> Option<TestTarget> {
@@ -147,14 +33,14 @@ fn setup(test: &str) -> Option<TestTarget> {
         eprintln!("no Spanner target set; skipping {test}");
         return None;
     };
-    ensure_database_once(&target);
+    ensure_database_once(&target, &[]);
     Some(target)
 }
 
 /// Like [`setup`], but also requires the built cdylib.
 fn ffi_setup(test: &str) -> Option<(TestTarget, PathBuf)> {
     let target = setup(test)?;
-    let Some(cdylib) = required_cdylib_path() else {
+    let Some(cdylib) = cdylib_path() else {
         eprintln!("cdylib not built; skipping {test} (run `cargo build` first)");
         return None;
     };
