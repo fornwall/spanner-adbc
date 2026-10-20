@@ -14,13 +14,14 @@ license-files = ["LICENSE"]
 authors = [{ name = "Fredrik Fornwall", email = "fredrik@fornwall.net" }]
 keywords = ["adbc", "arrow", "spanner", "database", "gcp"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Rust",
     "Topic :: Database",
 ]
