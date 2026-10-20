@@ -55,7 +55,6 @@ fn connect_via_connection_uri() {
     };
 
     ensure_database_once(&target, SETUP_DDL);
-    let _serial = serial_guard();
 
     let uri = if target.is_emulator {
         let host = std::env::var("SPANNER_EMULATOR_HOST").unwrap();
@@ -152,12 +151,7 @@ fn manual_transaction_kinds_round_trip() {
     };
     autocommit_insert(&mut writer, 1);
 
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("false".into()),
-        )
-        .expect("disable autocommit");
+    set_autocommit(connection, false);
 
     // The first query pins the snapshot; a later commit elsewhere stays invisible.
     assert_eq!(count_rows(connection, "AdbcReadTxn"), 1);
@@ -292,12 +286,7 @@ fn manual_transaction_kinds_round_trip() {
         "rollback must not undo immediately-applied DDL"
     );
 
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("true".into()),
-        )
-        .expect("re-enable autocommit");
+    set_autocommit(connection, true);
     let mut cleanup = connection.new_statement().expect("new statement");
     cleanup
         .set_sql_query(
@@ -451,11 +440,11 @@ fn get_table_schema_reports_column_types() {
     let hostile = connection
         .get_table_schema(None, None, "no`such`table")
         .expect_err("hostile table name must not resolve");
-    assert_eq!(hostile.status, adbc_core::error::Status::InvalidArguments);
+    assert_eq!(hostile.status, Status::InvalidArguments);
     let absent = connection
         .get_table_schema(None, None, "NoSuchTable")
         .expect_err("an absent table must not resolve");
-    assert_eq!(absent.status, adbc_core::error::Status::NotFound);
+    assert_eq!(absent.status, Status::NotFound);
 
     // The only catalog is the database id.
     let own_catalog = connection
@@ -465,7 +454,7 @@ fn get_table_schema_reports_column_types() {
     let bogus_catalog = connection
         .get_table_schema(Some("nosuchcatalog"), None, "Singers")
         .expect_err("a named catalog does not exist in Spanner");
-    assert_eq!(bogus_catalog.status, adbc_core::error::Status::NotFound);
+    assert_eq!(bogus_catalog.status, Status::NotFound);
 }
 
 /// A `;`-separated DDL batch reports no count, and the new table is usable right away.
@@ -522,12 +511,7 @@ fn manual_transaction_buffers_commits_and_rolls_back() {
         "DROP TABLE IF EXISTS AdbcTxn; CREATE TABLE AdbcTxn (Id INT64) PRIMARY KEY (Id)",
     );
 
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("false".into()),
-        )
-        .expect("disable autocommit");
+    set_autocommit(connection, false);
 
     // Buffered DML returns None because the count is unknown until commit.
     for id in [1, 2] {
@@ -599,12 +583,7 @@ fn manual_transaction_buffers_commits_and_rolls_back() {
         .unwrap();
     assert_eq!(pending.execute_update().expect("buffered insert"), None);
     assert_query_guarded(connection, "AdbcTxn");
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("true".into()),
-        )
-        .expect("enable autocommit");
+    set_autocommit(connection, true);
     assert_eq!(
         count_rows(connection, "AdbcTxn"),
         4,
@@ -612,12 +591,7 @@ fn manual_transaction_buffers_commits_and_rolls_back() {
     );
 
     // Setting autocommit again is a no-op.
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("true".into()),
-        )
-        .expect("re-enable autocommit is a no-op");
+    set_autocommit(connection, true);
     let mut immediate = connection.new_statement().expect("new statement");
     immediate
         .set_sql_query("INSERT INTO AdbcTxn (Id) VALUES (6)")
@@ -661,19 +635,9 @@ fn failed_commit_keeps_the_transaction_replayable() {
     );
 
     // DML against an unknown table buffers without an RPC and fails at commit.
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("false".into()),
-        )
-        .expect("disable autocommit");
-    let buffer_sql = |connection: &mut SpannerConnection, sql: &str| {
-        let mut s = connection.new_statement().expect("new statement");
-        s.set_sql_query(sql).unwrap();
-        assert_eq!(s.execute_update().expect("buffer DML"), None);
-    };
-    buffer_sql(connection, "INSERT INTO AdbcTxn (Id) VALUES (7)");
-    buffer_sql(connection, "INSERT INTO AdbcTxnNoSuchTable (Id) VALUES (7)");
+    set_autocommit(connection, false);
+    buffer_dml(connection, "INSERT INTO AdbcTxn (Id) VALUES (7)");
+    buffer_dml(connection, "INSERT INTO AdbcTxnNoSuchTable (Id) VALUES (7)");
     assert!(
         connection.commit().is_err(),
         "committing a batch with an unknown table must fail"
@@ -703,19 +667,14 @@ fn failed_commit_keeps_the_transaction_replayable() {
         "a failed implicit commit must not flip the connection into autocommit mode"
     );
     connection.rollback().expect("rollback failed batch");
-    buffer_sql(connection, "INSERT INTO AdbcTxn (Id) VALUES (7)");
+    buffer_dml(connection, "INSERT INTO AdbcTxn (Id) VALUES (7)");
     connection.commit().expect("commit after rollback");
     assert_eq!(
         count_rows(connection, "AdbcTxn"),
         6,
         "the replacement batch must commit normally after the failed one was rolled back"
     );
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("true".into()),
-        )
-        .expect("re-enable autocommit");
+    set_autocommit(connection, true);
 
     drop_tables(connection, &["AdbcTxn"]);
 }
@@ -740,35 +699,15 @@ fn manual_transaction_commits_buffered_ingest_with_dml() {
         seed.execute_update().expect("seed the transaction table"),
         Some(6)
     );
-    let buffer_sql = |connection: &mut SpannerConnection, sql: &str| {
-        let mut s = connection.new_statement().expect("new statement");
-        s.set_sql_query(sql).unwrap();
-        assert_eq!(s.execute_update().expect("buffer DML"), None);
-    };
 
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("false".into()),
-        )
-        .expect("disable autocommit for ingest");
+    set_autocommit(connection, false);
     let buffer_ingest = |connection: &mut SpannerConnection, ids: &[i64]| {
         let rows = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
             vec![Arc::new(Int64Array::from(ids.to_vec()))],
         )
         .unwrap();
-        let mut s = connection.new_statement().expect("new statement");
-        s.set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcTxn".into()),
-        )
-        .unwrap();
-        s.set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .unwrap();
+        let mut s = ingest_stmt(connection, "AdbcTxn", "append");
         s.bind(rows).expect("bind manual-mode ingest rows");
         assert_eq!(
             s.execute_update().expect("buffered ingest"),
@@ -777,7 +716,7 @@ fn manual_transaction_commits_buffered_ingest_with_dml() {
         );
     };
     buffer_ingest(connection, &[100, 101]);
-    buffer_sql(connection, "INSERT INTO AdbcTxn (Id) VALUES (102)");
+    buffer_dml(connection, "INSERT INTO AdbcTxn (Id) VALUES (102)");
     assert_query_guarded(connection, "AdbcTxn");
     connection.commit().expect("commit ingest + DML");
     assert_eq!(
@@ -792,12 +731,7 @@ fn manual_transaction_commits_buffered_ingest_with_dml() {
         9,
         "rolled-back ingest mutations must not appear"
     );
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("true".into()),
-        )
-        .expect("re-enable autocommit after ingest");
+    set_autocommit(connection, true);
 
     drop_tables(connection, &["AdbcTxn"]);
 }
@@ -860,7 +794,7 @@ fn bulk_ingest_defaults_to_create_mode() {
         .expect_err("create onto an existing table must fail");
     assert_eq!(
         dup_err.status,
-        adbc_core::error::Status::AlreadyExists,
+        Status::AlreadyExists,
         "default (create) ingest onto an existing table must be AlreadyExists, got: {dup_err:?}"
     );
     drop_tables(connection, &["AdbcDefaultMode"]);
@@ -929,7 +863,7 @@ fn bulk_ingest_append_failures_remap_to_the_adbc_contract() {
         .expect_err("append onto a missing table must fail");
     assert_eq!(
         missing_err.status,
-        adbc_core::error::Status::NotFound,
+        Status::NotFound,
         "append onto a missing table must be NotFound, got: {missing_err:?}"
     );
 
@@ -951,7 +885,7 @@ fn bulk_ingest_append_failures_remap_to_the_adbc_contract() {
         .expect_err("append with an incompatible schema must fail");
     assert_eq!(
         mismatch_err.status,
-        adbc_core::error::Status::AlreadyExists,
+        Status::AlreadyExists,
         "append with an incompatible schema must be AlreadyExists, got: {mismatch_err:?}"
     );
     assert_eq!(count_rows(connection, "AdbcBind"), 2);
@@ -1172,7 +1106,7 @@ fn ingest_create_modes_and_the_implicit_hidden_key() {
         .expect_err("create-mode ingest onto an existing table must fail");
     assert_eq!(
         create_on_existing.status,
-        adbc_core::error::Status::AlreadyExists,
+        Status::AlreadyExists,
         "create onto an existing table must be AlreadyExists, got: {create_on_existing:?}"
     );
     assert!(
@@ -1227,7 +1161,7 @@ fn ingest_create_append_mode_creates_then_appends() {
         .expect_err("create_append with an incompatible schema must fail");
     assert_eq!(
         ca_mismatch_err.status,
-        adbc_core::error::Status::AlreadyExists,
+        Status::AlreadyExists,
         "create_append with an incompatible schema must be AlreadyExists, got: {ca_mismatch_err:?}"
     );
     assert_eq!(count_rows(connection, "AdbcCreateAppend"), 4);
@@ -1271,7 +1205,7 @@ fn ingest_appends_into_a_user_keyed_table() {
     let dup_err = keyed_ingest(connection).expect_err("appending duplicate primary keys must fail");
     assert_eq!(
         dup_err.status,
-        adbc_core::error::Status::Integrity,
+        Status::Integrity,
         "duplicate primary key must be Integrity, got: {dup_err:?}"
     );
     drop_tables(connection, &["AdbcIngestPk"]);
@@ -1284,7 +1218,7 @@ fn ingest_appends_into_a_user_keyed_table() {
         .expect_err("an unsupported ingest primary-key option must be rejected");
     assert_eq!(
         gone_err.status,
-        adbc_core::error::Status::NotImplemented,
+        Status::NotImplemented,
         "an unsupported option must report NotImplemented, got: {gone_err:?}"
     );
 }
@@ -1343,15 +1277,7 @@ fn constraint_violations_are_integrity_errors() {
         assert_eq!(error.status, Status::Integrity, "{sql}: {error}");
     }
 
-    let autocommit = |connection: &mut SpannerConnection, enabled: &str| {
-        connection
-            .set_option(
-                OptionConnection::AutoCommit,
-                OptionValue::String(enabled.into()),
-            )
-            .expect("set autocommit");
-    };
-    autocommit(connection, "false");
+    set_autocommit(connection, false);
     run(
         connection,
         "INSERT INTO AdbcIntegrity (Id, Name, Age) VALUES (1, 'd', 1)",
@@ -1361,7 +1287,7 @@ fn constraint_violations_are_integrity_errors() {
         .expect_err("the buffered duplicate key fails at commit");
     assert_eq!(error.status, Status::Integrity, "{error}");
     connection.rollback().unwrap();
-    autocommit(connection, "true");
+    set_autocommit(connection, true);
 
     let rows = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
@@ -1649,7 +1575,7 @@ fn prepare_requires_a_query_or_an_ingest_target() {
     let mut unprepared = connection.new_statement().expect("new statement");
     assert_eq!(
         unprepared.prepare().unwrap_err().status,
-        adbc_core::error::Status::InvalidState,
+        Status::InvalidState,
     );
     // An ingest target needs no query, and the table need not exist yet.
     let mut ingest_prepare = connection.new_statement().expect("new statement");
@@ -2280,19 +2206,7 @@ fn bulk_ingest_via_batch_write() {
     )
     .unwrap();
 
-    let mut ingest = connection.new_statement().expect("new statement");
-    ingest
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcBatchWrite".into()),
-        )
-        .unwrap();
-    ingest
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .unwrap();
+    let mut ingest = ingest_stmt(connection, "AdbcBatchWrite", "append");
     ingest
         .set_option(
             OptionStatement::Other(spanner_adbc::OPTION_INGEST_BATCH_WRITE.into()),
@@ -2337,17 +2251,7 @@ fn bulk_ingest_via_batch_write() {
         "all BatchWrite-ingested rows must be readable back"
     );
 
-    let mut dup = connection.new_statement().expect("new statement");
-    dup.set_option(
-        OptionStatement::TargetTable,
-        OptionValue::String("AdbcBatchWrite".into()),
-    )
-    .unwrap();
-    dup.set_option(
-        OptionStatement::IngestMode,
-        OptionValue::String("append".into()),
-    )
-    .unwrap();
+    let mut dup = ingest_stmt(connection, "AdbcBatchWrite", "append");
     dup.set_option(
         OptionStatement::Other(spanner_adbc::OPTION_INGEST_BATCH_WRITE.into()),
         OptionValue::String("true".into()),
@@ -2527,20 +2431,8 @@ fn bulk_ingest_edge_cases() {
         .unwrap()
     };
     let empty = || RecordBatch::new_empty(schema.clone());
-    let append_stmt = |connection: &mut SpannerConnection| {
-        let mut s = connection.new_statement().expect("new statement");
-        s.set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("AdbcEdge".into()),
-        )
-        .unwrap();
-        s.set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .unwrap();
-        s
-    };
+    let append_stmt =
+        |connection: &mut SpannerConnection| ingest_stmt(connection, "AdbcEdge", "append");
 
     // Zero-row batches at the start, middle and end of a stream must not truncate the ingest.
     let mut zero_rows = append_stmt(connection);
@@ -2575,12 +2467,7 @@ fn bulk_ingest_edge_cases() {
     assert_eq!(count_rows(connection, "AdbcEdge"), 3);
 
     // The same in a manual transaction.
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("false".into()),
-        )
-        .expect("disable autocommit");
+    set_autocommit(connection, false);
     let mut manual = append_stmt(connection);
     manual
         .bind_stream(Box::new(RecordBatchIterator::new(
@@ -2599,12 +2486,7 @@ fn bulk_ingest_edge_cases() {
         5,
         "every row around the zero-row batches must land on commit"
     );
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("true".into()),
-        )
-        .expect("re-enable autocommit");
+    set_autocommit(connection, true);
 
     // In create mode the table schema can come from an empty first batch.
     let mut create = ingest_stmt(connection, "AdbcEdgeCreate", "create");
@@ -2696,7 +2578,7 @@ fn bulk_ingest_edge_cases() {
     for error in [update_err, execute_err] {
         assert_eq!(
             error.status,
-            adbc_core::error::Status::InvalidState,
+            Status::InvalidState,
             "bound data without a destination must be InvalidState, got: {error:?}"
         );
         assert!(
@@ -2731,7 +2613,7 @@ fn bulk_ingest_edge_cases() {
         .expect_err("ingest with no bound data must fail");
     assert_eq!(
         error.status,
-        adbc_core::error::Status::InvalidState,
+        Status::InvalidState,
         "ingest with no bound data must be InvalidState, got: {error:?}"
     );
     assert!(
@@ -2744,7 +2626,7 @@ fn bulk_ingest_edge_cases() {
         .expect("ingest via execute with no bound data must fail");
     assert_eq!(
         error.status,
-        adbc_core::error::Status::InvalidState,
+        Status::InvalidState,
         "ingest via execute with no bound data must be InvalidState, got: {error:?}"
     );
 
@@ -2799,7 +2681,7 @@ fn bulk_ingest_edge_cases() {
         .expect_err("duplicate-PK ingest must fail");
     assert_eq!(
         error.status,
-        adbc_core::error::Status::Integrity,
+        Status::Integrity,
         "a duplicate primary key must surface as Integrity, got: {error:?}"
     );
     assert!(
@@ -2968,7 +2850,7 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
         .expect_err("empty append to a nonexistent table must fail");
     assert_eq!(
         append_missing_err.status,
-        adbc_core::error::Status::NotFound,
+        Status::NotFound,
         "empty append to a nonexistent table must be NotFound, got: {append_missing_err:?}"
     );
 
@@ -2999,7 +2881,7 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
         .expect_err("an ingest with no bound data (schema was cleared) must fail");
     assert_eq!(
         stale_err.status,
-        adbc_core::error::Status::InvalidState,
+        Status::InvalidState,
         "a stale empty-stream schema must not survive a DML execution: {stale_err:?}"
     );
     // Creating the table now succeeds only if the failed ingest did not create it.
@@ -3016,12 +2898,7 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
     );
 
     // The same existence check applies in a manual transaction.
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("false".into()),
-        )
-        .expect("disable autocommit for manual empty append");
+    set_autocommit(connection, false);
     let mut manual_append_missing = ingest_stmt(connection, "AdbcNoSuchManualZeroTable", "append");
     manual_append_missing
         .bind_stream(Box::new(empty_stream()))
@@ -3031,24 +2908,14 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
         .expect_err("manual-mode empty append to a nonexistent table must fail");
     assert_eq!(
         manual_append_err.status,
-        adbc_core::error::Status::NotFound,
+        Status::NotFound,
         "manual empty append to a nonexistent table must be NotFound, got: {manual_append_err:?}"
     );
     connection.rollback().expect("end the manual transaction");
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("true".into()),
-        )
-        .expect("re-enable autocommit after manual empty append");
+    set_autocommit(connection, true);
 
     // A create-mode ingest in a read-only transaction is rejected before its DDL runs.
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("false".into()),
-        )
-        .expect("disable autocommit");
+    set_autocommit(connection, false);
     let mut fix_read = connection.new_statement().expect("new statement");
     fix_read
         .set_sql_query("SELECT Id FROM AdbcEmptyHijack")
@@ -3063,16 +2930,11 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
         .expect_err("create-mode ingest in a query transaction must be rejected");
     assert_eq!(
         create_in_read_err.status,
-        adbc_core::error::Status::InvalidState,
+        Status::InvalidState,
         "a DML-kind ingest in a query transaction must be InvalidState, got: {create_in_read_err:?}"
     );
     connection.rollback().expect("end the read transaction");
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("true".into()),
-        )
-        .expect("re-enable autocommit");
+    set_autocommit(connection, true);
     let mut probe_not_created = ingest_stmt(connection, "AdbcEmptyReadTxn", "create");
     probe_not_created
         .bind_stream(Box::new(empty_stream()))
@@ -3085,13 +2947,10 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
         "the rejected in-txn create must not have left a table behind"
     );
 
-    for table in ["AdbcEmptyReadTxn", "AdbcStaleLeak", "AdbcEmptyHijack"] {
-        let mut drop_stmt = connection.new_statement().expect("new statement");
-        drop_stmt
-            .set_sql_query(format!("DROP TABLE {table}"))
-            .unwrap();
-        drop_stmt.execute_update().expect("drop table");
-    }
+    drop_tables(
+        connection,
+        &["AdbcEmptyReadTxn", "AdbcStaleLeak", "AdbcEmptyHijack"],
+    );
 }
 
 /// When a later chunk of a multi-chunk ingest fails, the error reports how many rows earlier
@@ -3140,7 +2999,7 @@ fn bulk_ingest_mid_chunk_failure_reports_committed_rows() {
 
     assert_eq!(
         error.status,
-        adbc_core::error::Status::Integrity,
+        Status::Integrity,
         "a duplicate key in a later chunk must be Integrity, got: {error:?}"
     );
     assert!(
@@ -3411,14 +3270,10 @@ fn run(connection: &mut SpannerConnection, sql: &str) {
 /// Scalar values bound as parameters read back unchanged, nulls included.
 #[test]
 fn prop_bind_round_trip() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set; skipping prop_bind_round_trip");
+    let Some(fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target, SETUP_DDL);
-    let _serial = serial_guard();
-
-    let connection = RefCell::new(connect_with_retry(shared_database(&target)));
+    let connection = RefCell::new(fx.connection);
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
     // NaN and infinities do not compare with `==`.
     let float = any::<f64>().prop_filter("finite", |f| f.is_finite());
@@ -3573,14 +3428,10 @@ fn prop_bind_round_trip() {
 /// values.
 #[test]
 fn prop_temporal_round_trip() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set; skipping prop_temporal_round_trip");
+    let Some(fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target, SETUP_DDL);
-    let _serial = serial_guard();
-
-    let connection = RefCell::new(connect_with_retry(shared_database(&target)));
+    let connection = RefCell::new(fx.connection);
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
 
     proptest!(prop_config_with(PROP_TEMPORAL_CASES), |(
@@ -3820,12 +3671,7 @@ fn conformance_via_driver_manager() {
     assert_eq!(s.execute_update().expect("insert"), Some(1));
     assert_eq!(ffi_count(&mut connection, "AdbcConf"), 1);
 
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("false".into()),
-        )
-        .expect("disable autocommit");
+    set_autocommit(&mut connection, false);
     let mut s = connection.new_statement().expect("new statement");
     s.set_sql_query("INSERT INTO AdbcConf (Id, Name) VALUES (2, 'b')")
         .unwrap();
@@ -3863,12 +3709,7 @@ fn conformance_via_driver_manager() {
         2,
         "rollback discards"
     );
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("true".into()),
-        )
-        .expect("enable autocommit");
+    set_autocommit(&mut connection, true);
 
     let rows = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
@@ -4131,25 +3972,13 @@ fn named_schema_round_trip() {
     )
     .expect("build ingest batch");
 
-    let mut ingest = connection.new_statement().expect("new statement");
+    let mut ingest = ingest_stmt(connection, "Widget", "append");
     ingest
         .set_option(
             OptionStatement::TargetDbSchema,
             OptionValue::String("adbc_ns".into()),
         )
         .expect("set target_db_schema");
-    ingest
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("Widget".into()),
-        )
-        .expect("set target table");
-    ingest
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .expect("set ingest mode");
     ingest
         .bind_stream(Box::new(RecordBatchIterator::new(
             [Ok(ingest_batch)],
@@ -4340,6 +4169,22 @@ fn count_rows_ending_txn(connection: &mut SpannerConnection, table: &str) -> i64
         .rollback()
         .expect("end the query-kind transaction the count opened");
     n
+}
+
+/// Run DML in a manual transaction, which buffers it and reports no count.
+fn buffer_dml(connection: &mut SpannerConnection, sql: &str) {
+    let mut s = connection.new_statement().expect("new statement");
+    s.set_sql_query(sql).unwrap();
+    assert_eq!(s.execute_update().expect("buffer DML"), None);
+}
+
+fn set_autocommit<C: Optionable<Option = OptionConnection>>(connection: &mut C, enabled: bool) {
+    connection
+        .set_option(
+            OptionConnection::AutoCommit,
+            OptionValue::String(enabled.to_string()),
+        )
+        .unwrap_or_else(|e| panic!("set autocommit to {enabled}: {e:?}"));
 }
 
 /// Assert that a query is rejected while the manual transaction has buffered writes.
@@ -4770,7 +4615,7 @@ fn bind_by_name_modes() {
     );
     let error = query_pair(connection, batch(["a", "x"]), Some("true"))
         .expect_err("bind_by_name=true must reject an unmatched column");
-    assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
+    assert_eq!(error.status, Status::InvalidArguments);
     assert!(
         error.message.contains("cannot bind column \"x\""),
         "error must name the unmatched column: {}",
@@ -4788,7 +4633,7 @@ fn bind_by_name_modes() {
             .set_option(bind_by_name_key(), OptionValue::String(String::new()))
             .expect_err("empty bind_by_name must be rejected")
             .status,
-        adbc_core::error::Status::InvalidArguments,
+        Status::InvalidArguments,
     );
 }
 
@@ -5145,12 +4990,7 @@ fn dml_then_return_round_trip() {
     assert_eq!(error.status, Status::Integrity, "{error}");
     assert_eq!(count_rows(connection, "AdbcReturn"), 4);
 
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("false".into()),
-        )
-        .expect("disable autocommit");
+    set_autocommit(connection, false);
     let mut manual = connection.new_statement().expect("new statement");
     manual
         .set_sql_query("DELETE FROM AdbcReturn WHERE true THEN RETURN Id")
@@ -5158,15 +4998,10 @@ fn dml_then_return_round_trip() {
     let error = manual
         .execute_update()
         .expect_err("THEN RETURN must be rejected in manual transaction mode");
-    assert_eq!(error.status, adbc_core::error::Status::InvalidState);
+    assert_eq!(error.status, Status::InvalidState);
     assert!(error.message.contains("THEN RETURN"), "{}", error.message);
     connection.rollback().expect("rollback");
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("true".into()),
-        )
-        .expect("re-enable autocommit");
+    set_autocommit(connection, true);
 }
 
 /// `execute_partitions` and `read_partition` together return every row exactly once.
@@ -5321,7 +5156,7 @@ fn execute_partitions_round_trip() {
 
 #[test]
 fn query_with_trailing_semicolons_returns_rows() {
-    let Some(mut fx) = fixture() else {
+    let Some(mut fx) = fixture_unguarded() else {
         return;
     };
     let connection = &mut fx.connection;
@@ -5363,16 +5198,10 @@ fn query_with_trailing_semicolons_returns_rows() {
 /// existing statements.
 #[test]
 fn readonly_connection_rejects_writes() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set; skipping readonly_connection_rejects_writes");
+    let Some(mut fx) = fixture() else {
         return;
     };
-    ensure_database_once(&target, SETUP_DDL);
-    let _serial = serial_guard();
-
-    use adbc_core::error::Status;
-
-    let mut connection = connect_with_retry(shared_database(&target));
+    let connection = &mut fx.connection;
 
     assert_eq!(
         connection
@@ -5514,17 +5343,12 @@ fn readonly_connection_rejects_writes() {
 /// Setting `adbc.connection.readonly` on another thread locks a statement created earlier.
 #[test]
 fn readonly_toggle_from_another_thread_locks_existing_statement() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target set; skipping readonly_toggle_from_another_thread");
-        return;
-    };
-    ensure_database_once(&target, SETUP_DDL);
-    let _serial = serial_guard();
-
-    use adbc_core::error::Status;
     use std::sync::mpsc;
 
-    let mut connection = connect_with_retry(shared_database(&target));
+    let Some(fx) = fixture() else {
+        return;
+    };
+    let mut connection = fx.connection;
 
     let mut dml = connection.new_statement().expect("new statement");
     dml.set_sql_query("DELETE FROM Singers WHERE false")
@@ -5571,9 +5395,7 @@ fn readonly_toggle_from_another_thread_locks_existing_statement() {
 /// `rollback()` fails in autocommit mode and is a no-op in an empty manual transaction.
 #[test]
 fn rollback_without_a_transaction_is_invalid_state() {
-    use adbc_core::error::Status;
-
-    let Some(mut fx) = fixture() else {
+    let Some(mut fx) = fixture_unguarded() else {
         return;
     };
     let connection = &mut fx.connection;
@@ -5588,12 +5410,7 @@ fn rollback_without_a_transaction_is_invalid_state() {
         error.message
     );
 
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("false".into()),
-        )
-        .expect("disable autocommit");
+    set_autocommit(connection, false);
     connection
         .rollback()
         .expect("rollback with nothing buffered is a no-op");
@@ -5608,12 +5425,7 @@ fn rollback_without_a_transaction_is_invalid_state() {
         "rollback discards buffered work, not the transaction mode"
     );
 
-    connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("true".into()),
-        )
-        .expect("re-enable autocommit");
+    set_autocommit(connection, true);
     assert_eq!(
         connection
             .rollback()
@@ -5733,7 +5545,6 @@ fn connection_cancel_is_sticky_until_the_next_operation() {
 /// ignores them, so this only checks that requests succeed.
 #[test]
 fn request_priority_and_tags() {
-    use adbc_core::error::Status;
     use spanner_adbc::{OPTION_REQUEST_PRIORITY, OPTION_REQUEST_TAG, OPTION_TRANSACTION_TAG};
 
     let Some(mut fx) = fixture() else {
@@ -6078,7 +5889,6 @@ fn zero_row_schema_fidelity() {
 /// `Timeout`. The DDL deadline is tested in `tests/mock_spanner.rs`.
 #[test]
 fn rpc_timeouts() {
-    use adbc_core::error::Status;
     use spanner_adbc::{
         OPTION_RPC_TIMEOUT_FETCH, OPTION_RPC_TIMEOUT_QUERY, OPTION_RPC_TIMEOUT_UPDATE,
     };
