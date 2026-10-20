@@ -26,8 +26,9 @@ fn parse_priority(value: &str) -> Result<Priority> {
         "medium" => Ok(Priority::Medium),
         "high" => Ok(Priority::High),
         other => Err(invalid_argument(format!(
-            "unknown request priority {other:?}; expected \"low\", \"medium\" or \"high\" \
-             (or an empty string to unset)"
+            "option {} expects \"low\", \"medium\" or \"high\" (or \"\" to unset), got \
+             {other:?}",
+            crate::OPTION_REQUEST_PRIORITY
         ))),
     }
 }

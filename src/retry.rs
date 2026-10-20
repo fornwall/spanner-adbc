@@ -178,11 +178,13 @@ impl RetryConfig {
 fn parse_max_attempts(value: OptionValue) -> Result<Option<u32>> {
     let reject = || {
         invalid_argument(format!(
-            "option {} must be a positive integer number of attempts (>= 1)",
-            crate::OPTION_RETRY_MAX_ATTEMPTS
+            "option {} expects a whole number of attempts from 1 to {}, got {}",
+            crate::OPTION_RETRY_MAX_ATTEMPTS,
+            u32::MAX,
+            crate::options::shown(&value)
         ))
     };
-    let attempts: i64 = match value {
+    let attempts: i64 = match &value {
         OptionValue::String(s) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
@@ -190,9 +192,9 @@ fn parse_max_attempts(value: OptionValue) -> Result<Option<u32>> {
             }
             trimmed.parse::<i64>().map_err(|_| reject())?
         }
-        OptionValue::Int(i) => i,
+        OptionValue::Int(i) => *i,
         // Accept the `set_option_double` shape only when it is a whole number.
-        OptionValue::Double(d) if d.is_finite() && d.fract() == 0.0 => d as i64,
+        OptionValue::Double(d) if d.is_finite() && d.fract() == 0.0 => *d as i64,
         _ => return Err(reject()),
     };
     if !(1..=i64::from(u32::MAX)).contains(&attempts) {

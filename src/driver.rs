@@ -491,10 +491,10 @@ impl Optionable for SpannerDatabase {
                 self.instance_type = match string_value(&key, value)?.as_str() {
                     "cloud" => InstanceType::Cloud,
                     "omni" => InstanceType::Omni,
-                    _ => {
-                        return Err(invalid_argument(
-                            "spanner.instance_type expects cloud or omni",
-                        ));
+                    other => {
+                        return Err(invalid_argument(format!(
+                            "option {name} expects \"cloud\" or \"omni\", got {other:?}"
+                        )));
                     }
                 };
             }
