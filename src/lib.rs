@@ -45,7 +45,6 @@
 //! use adbc_core::{Driver, Database, Connection, Statement};
 //! use adbc_core::options::{OptionDatabase, OptionValue};
 //! use spanner_adbc::SpannerDriver;
-//! use arrow_array::RecordBatchReader;
 //!
 //! # fn main() -> adbc_core::error::Result<()> {
 //! let mut driver = SpannerDriver::try_new()?;
