@@ -84,6 +84,8 @@ mod error;
 mod ffi;
 mod info;
 mod metadata;
+#[cfg(test)]
+mod mock_server;
 mod nested;
 mod objects;
 mod options;

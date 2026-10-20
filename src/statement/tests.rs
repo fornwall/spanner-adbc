@@ -204,49 +204,33 @@ mod mock {
     use std::sync::{Arc, Mutex};
 
     use adbc_core::error::Status;
-    use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
-    use adbc_core::{Connection, Database, Driver, Optionable, Statement};
+    use adbc_core::options::{OptionConnection, OptionStatement, OptionValue};
+    use adbc_core::{Connection, Optionable, Statement};
     use arrow_array::{Date32Array, Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use spanner_grpc_mock::MockSpanner;
     use spanner_grpc_mock::google::spanner::v1;
 
-    use crate::{SpannerConnection, SpannerDriver, SpannerStatement};
+    use crate::{SpannerConnection, SpannerStatement};
 
     type Requests = Arc<Mutex<Vec<v1::ExecuteSqlRequest>>>;
 
     struct MockServer {
-        endpoint: String,
+        server: crate::mock_server::MockServer,
         requests: Requests,
         /// Transaction and DML RPCs, which the mock rejects without recording their content.
         other_rpcs: Arc<AtomicUsize>,
-        server: tokio::task::JoinHandle<()>,
-        _runtime: tokio::runtime::Runtime,
-    }
-
-    impl Drop for MockServer {
-        fn drop(&mut self) {
-            self.server.abort();
-        }
     }
 
     fn start() -> MockServer {
         let requests = Requests::default();
         let mut mock = MockSpanner::new();
-        mock.expect_create_session().returning(|request| {
-            Ok(tonic::Response::new(v1::Session {
-                name: format!("{}/sessions/mock", request.into_inner().database),
-                multiplexed: true,
-                ..Default::default()
-            }))
-        });
         let record = requests.clone();
         mock.expect_execute_streaming_sql()
             .returning(move |request| {
                 record.lock().unwrap().push(request.into_inner());
                 Err(tonic::Status::unimplemented("mock spanner server"))
             });
-        // An unexpected call would panic the server task, which the client retries forever.
         let other_rpcs = Arc::new(AtomicUsize::new(0));
         macro_rules! reject_and_count {
             ($($method:ident),+) => {
@@ -266,20 +250,10 @@ mod mock {
             expect_execute_batch_dml,
             expect_batch_write
         );
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let (endpoint, server) = runtime
-            .block_on(spanner_grpc_mock::start("127.0.0.1:0", mock))
-            .unwrap();
         MockServer {
-            endpoint,
+            server: crate::mock_server::MockServer::serve(mock),
             requests,
             other_rpcs,
-            server,
-            _runtime: runtime,
         }
     }
 
@@ -288,25 +262,7 @@ mod mock {
     }
 
     fn connect(server: &MockServer) -> SpannerConnection {
-        let mut driver = SpannerDriver::try_new().unwrap();
-        driver
-            .new_database_with_opts([
-                (
-                    OptionDatabase::Uri,
-                    OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
-                ),
-                (
-                    OptionDatabase::Other(crate::OPTION_ENDPOINT.into()),
-                    OptionValue::String(server.endpoint.clone()),
-                ),
-                (
-                    OptionDatabase::Other(crate::OPTION_EMULATOR.into()),
-                    OptionValue::String("true".into()),
-                ),
-            ])
-            .unwrap()
-            .new_connection()
-            .unwrap()
+        server.server.connect()
     }
 
     fn set_connection_option(connection: &mut SpannerConnection, key: OptionConnection, v: &str) {
@@ -630,14 +586,14 @@ mod manual_txn {
     use std::time::{Duration, Instant};
 
     use adbc_core::error::Status;
-    use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
-    use adbc_core::{Connection, Database, Driver, Optionable, Statement};
+    use adbc_core::options::{OptionConnection, OptionStatement, OptionValue};
+    use adbc_core::{Connection, Optionable, Statement};
     use arrow_array::{RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use spanner_grpc_mock::MockSpanner;
     use spanner_grpc_mock::google::spanner::v1;
 
-    use crate::{SpannerConnection, SpannerDriver, SpannerStatement};
+    use crate::{SpannerConnection, SpannerStatement};
 
     type Selectors = Arc<Mutex<Vec<(String, Option<v1::transaction_selector::Selector>)>>>;
 
@@ -660,19 +616,16 @@ mod manual_txn {
     }
 
     struct MockServer {
-        endpoint: String,
+        server: crate::mock_server::MockServer,
         recorded: Arc<Recorded>,
         selectors: Selectors,
         /// Releases hung commits, so dropping the server does not wait on them.
         gate: Arc<AtomicBool>,
-        server: tokio::task::JoinHandle<()>,
-        _runtime: tokio::runtime::Runtime,
     }
 
     impl Drop for MockServer {
         fn drop(&mut self) {
             self.gate.store(true, Ordering::SeqCst);
-            self.server.abort();
         }
     }
 
@@ -720,13 +673,6 @@ mod manual_txn {
         let selectors = Selectors::default();
         let gate = Arc::new(AtomicBool::new(false));
         let mut mock = MockSpanner::new();
-        mock.expect_create_session().returning(|request| {
-            Ok(tonic::Response::new(v1::Session {
-                name: format!("{}/sessions/mock", request.into_inner().database),
-                multiplexed: true,
-                ..Default::default()
-            }))
-        });
         let record = selectors.clone();
         let begun = Arc::new(Mutex::new(0_u32));
         mock.expect_execute_streaming_sql()
@@ -824,44 +770,16 @@ mod manual_txn {
                 }
             }
         });
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let (endpoint, server) = runtime
-            .block_on(spanner_grpc_mock::start("127.0.0.1:0", mock))
-            .unwrap();
         MockServer {
-            endpoint,
+            server: crate::mock_server::MockServer::serve(mock),
             recorded,
             selectors,
             gate,
-            server,
-            _runtime: runtime,
         }
     }
 
     fn connect(server: &MockServer) -> SpannerConnection {
-        let mut driver = SpannerDriver::try_new().unwrap();
-        driver
-            .new_database_with_opts([
-                (
-                    OptionDatabase::Uri,
-                    OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
-                ),
-                (
-                    OptionDatabase::Other(crate::OPTION_ENDPOINT.into()),
-                    OptionValue::String(server.endpoint.clone()),
-                ),
-                (
-                    OptionDatabase::Other(crate::OPTION_EMULATOR.into()),
-                    OptionValue::String("true".into()),
-                ),
-            ])
-            .unwrap()
-            .new_connection()
-            .unwrap()
+        server.server.connect()
     }
 
     fn manual(server: &MockServer) -> SpannerConnection {

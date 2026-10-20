@@ -194,12 +194,12 @@ mod table_schema_probe {
     use std::sync::{Arc, Mutex};
 
     use adbc_core::error::Status;
-    use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
-    use adbc_core::{Connection, Database, Driver, Optionable};
+    use adbc_core::options::{OptionConnection, OptionValue};
+    use adbc_core::{Connection, Optionable};
     use spanner_grpc_mock::MockSpanner;
     use spanner_grpc_mock::google::spanner::v1;
 
-    use crate::{SpannerConnection, SpannerDriver};
+    use crate::SpannerConnection;
 
     pub(super) type Requests = Arc<Mutex<Vec<v1::ExecuteSqlRequest>>>;
     pub(super) type Sender = tokio::sync::mpsc::Sender<tonic::Result<v1::PartialResultSet>>;
@@ -212,16 +212,8 @@ mod table_schema_probe {
     }
 
     pub(super) struct MockServer {
-        endpoint: String,
+        server: crate::mock_server::MockServer,
         pub(super) requests: Requests,
-        server: tokio::task::JoinHandle<()>,
-        _runtime: tokio::runtime::Runtime,
-    }
-
-    impl Drop for MockServer {
-        fn drop(&mut self) {
-            self.server.abort();
-        }
     }
 
     /// Serves sessions, answers the schema query per `schema_query`, and answers any
@@ -268,52 +260,16 @@ mod table_schema_probe {
         serve(mock, requests)
     }
 
-    /// Serves sessions plus `mock`'s expectations on an ephemeral port. `requests` is what the
-    /// expectations record.
-    pub(super) fn serve(mut mock: MockSpanner, requests: Requests) -> MockServer {
-        mock.expect_create_session().returning(|request| {
-            Ok(tonic::Response::new(v1::Session {
-                name: format!("{}/sessions/mock", request.into_inner().database),
-                multiplexed: true,
-                ..Default::default()
-            }))
-        });
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let (endpoint, server) = runtime
-            .block_on(spanner_grpc_mock::start("127.0.0.1:0", mock))
-            .unwrap();
+    /// Serves `mock`'s expectations, which record into `requests`.
+    pub(super) fn serve(mock: MockSpanner, requests: Requests) -> MockServer {
         MockServer {
-            endpoint,
+            server: crate::mock_server::MockServer::serve(mock),
             requests,
-            server,
-            _runtime: runtime,
         }
     }
 
     pub(super) fn connect(server: &MockServer) -> SpannerConnection {
-        let mut driver = SpannerDriver::try_new().unwrap();
-        driver
-            .new_database_with_opts([
-                (
-                    OptionDatabase::Uri,
-                    OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
-                ),
-                (
-                    OptionDatabase::Other(crate::OPTION_ENDPOINT.into()),
-                    OptionValue::String(server.endpoint.clone()),
-                ),
-                (
-                    OptionDatabase::Other(crate::OPTION_EMULATOR.into()),
-                    OptionValue::String("true".into()),
-                ),
-            ])
-            .unwrap()
-            .new_connection()
-            .unwrap()
+        server.server.connect()
     }
 
     fn single_use_bound(
