@@ -506,7 +506,7 @@ impl Connection for SpannerConnection {
 /// The payload is the client's [`Partition`] serde form, which this driver does not control.
 /// Bump the version on incompatible changes so an older driver rejects newer descriptors with a
 /// clear error instead of a shape mismatch.
-pub(crate) const PARTITION_DESCRIPTOR_VERSION: u64 = 1;
+const PARTITION_DESCRIPTOR_VERSION: u64 = 1;
 
 /// The executable SDK partition plus optional column types for empty partition responses.
 #[derive(Debug)]
@@ -570,7 +570,9 @@ pub(crate) fn decode_partition(descriptor: &[u8]) -> Result<PartitionDescriptor>
     })?;
     if v != PARTITION_DESCRIPTOR_VERSION {
         return Err(invalid_argument(format!(
-            "partition descriptor version {v} not supported by this driver"
+            "partition descriptor version {v} is not supported by this driver, which reads \
+             version {PARTITION_DESCRIPTOR_VERSION}; read it with the driver version that \
+             created it"
         )));
     }
     let payload = value.get("partition").cloned().ok_or_else(|| {

@@ -6,8 +6,8 @@ use adbc_core::options::OptionValue;
 use google_cloud_spanner::model::transaction_options::IsolationLevel;
 
 use super::{
-    PARTITION_DESCRIPTOR_VERSION, check_fixed_catalog_or_schema, decode_partition,
-    encode_partition, isolation_to_adbc_string, parse_isolation_level,
+    check_fixed_catalog_or_schema, decode_partition, encode_partition, isolation_to_adbc_string,
+    parse_isolation_level,
 };
 
 /// Every ADBC level maps to a Spanner level, and the getter reports the effective one.
@@ -98,48 +98,46 @@ fn setting_current_catalog_or_schema_accepts_only_the_reported_value() {
     );
 }
 
-/// `read_partition` takes caller-supplied bytes, so decoding must reject garbage cleanly.
+/// `read_partition` takes caller-supplied bytes, so decoding must reject anything else with
+/// `InvalidArguments`, and a descriptor of another version on its version, not its payload.
+/// `lib.rs`'s fuzzing oracle checks the accepted seeds' round trip.
 #[test]
-fn garbage_partition_descriptors_error_cleanly() {
-    let cases: [&[u8]; 6] = [
-        b"",                      // empty
-        b"\xff\xfe\x00 not json", // non-UTF-8, non-JSON bytes
-        b"{",                     // truncated JSON
-        b"{}",                    // valid JSON object missing every descriptor field
-        br#"{"hello": "world"}"#, // valid JSON object of the wrong shape
-        b"[1, 2, 3]",             // valid JSON that is not an object
+fn malformed_partition_descriptors_are_invalid_arguments() {
+    let cases: [(&[u8], &str); 12] = [
+        (b"", "invalid partition descriptor: EOF"),
+        (b"\xff\xfe\x00 not json", "invalid partition descriptor"),
+        (b"{", "invalid partition descriptor: EOF"),
+        (b"[1, 2, 3]", "missing \"v\" version field"),
+        (
+            br#"{"inner":{"Query":{"sql":"SELECT 1"}}}"#,
+            "missing \"v\" version field",
+        ),
+        (
+            br#"{"v":"one"}"#,
+            "version \"one\" is not an unsigned integer",
+        ),
+        (br#"{"v":-1}"#, "version -1 is not an unsigned integer"),
+        (
+            br#"{"v":2,"partition":{"future":"format"}}"#,
+            "version 2 is not supported by this driver, which reads version 1",
+        ),
+        (br#"{"v":0}"#, "version 0 is not supported by this driver"),
+        (br#"{"v":1}"#, "missing \"partition\" field"),
+        (br#"{"v":1,"partition":{}}"#, "invalid partition descriptor"),
+        (
+            br#"{"v":1,"partition":{"version":1,"inner":{"Query":{"sql":"SELECT 1"}}}}"#,
+            "missing session",
+        ),
     ];
-    for descriptor in cases {
+    for (descriptor, expected) in cases {
         let error = decode_partition(descriptor).unwrap_err();
-        assert_eq!(
-            error.status,
-            Status::InvalidArguments,
-            "descriptor {descriptor:?}"
-        );
+        assert_eq!(error.status, Status::InvalidArguments, "{descriptor:?}");
         assert!(
-            error.message.contains("invalid partition descriptor"),
-            "unexpected message for {descriptor:?}: {}",
+            error.message.contains(expected),
+            "{descriptor:?}: {}",
             error.message
         );
     }
-}
-
-/// `encode_partition` writes the versioned envelope, and decode then encode is a fixed point.
-#[test]
-fn partition_descriptor_envelope_round_trips() {
-    let descriptor = include_bytes!("../../fuzz/seeds/partition/enveloped-query-descriptor");
-    let partition = decode_partition(descriptor).expect("enveloped descriptor decodes");
-
-    let encoded = encode_partition(&partition).expect("encode");
-    let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
-    assert_eq!(value["v"], PARTITION_DESCRIPTOR_VERSION);
-    assert!(
-        value.get("partition").is_some(),
-        "envelope carries the partition payload: {value}"
-    );
-
-    let again = decode_partition(&encoded).expect("enveloped descriptor decodes");
-    assert_eq!(encode_partition(&again).expect("re-encode"), encoded);
 }
 
 #[test]
@@ -189,85 +187,6 @@ fn partition_descriptor_preserves_fallback_types_and_reader_precision() {
     malformed["row_type"] = serde_json::json!(17);
     let error = decode_partition(&serde_json::to_vec(&malformed).unwrap()).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
-}
-
-/// A payload without the versioned envelope is rejected.
-#[test]
-fn bare_partition_descriptor_is_rejected() {
-    let bare: &[u8] = br#"{"inner":{"Query":{"sql":"SELECT 1"}}}"#;
-    let error = decode_partition(bare).unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-    assert!(
-        error.message.contains("missing \"v\" version field"),
-        "unexpected message: {}",
-        error.message
-    );
-}
-
-/// An unknown version is rejected on the version, not on the payload shape.
-#[test]
-fn unsupported_partition_descriptor_version_errors_cleanly() {
-    for descriptor in [
-        br#"{"v":2,"partition":{"future":"format"}}"#.as_slice(),
-        br#"{"v":0}"#.as_slice(),
-    ] {
-        let error = decode_partition(descriptor).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-        assert!(
-            error.message.contains("partition descriptor version")
-                && error.message.contains("not supported by this driver"),
-            "unexpected message for {descriptor:?}: {}",
-            error.message
-        );
-    }
-    let error = decode_partition(br#"{"v":2,"partition":{}}"#).unwrap_err();
-    assert!(
-        error
-            .message
-            .contains("partition descriptor version 2 not supported by this driver"),
-        "{}",
-        error.message
-    );
-}
-
-/// Non-integer versions and missing or malformed payloads are `InvalidArguments`.
-#[test]
-fn malformed_partition_descriptor_envelopes_error_cleanly() {
-    let cases: [&[u8]; 4] = [
-        br#"{"v":"one"}"#,            // non-integer version
-        br#"{"v":-1}"#,               // negative version
-        br#"{"v":1}"#,                // missing "partition" payload
-        br#"{"v":1,"partition":{}}"#, // payload of the wrong shape
-    ];
-    for descriptor in cases {
-        let error = decode_partition(descriptor).unwrap_err();
-        assert_eq!(
-            error.status,
-            Status::InvalidArguments,
-            "descriptor {descriptor:?}"
-        );
-        assert!(
-            error.message.contains("invalid partition descriptor"),
-            "unexpected message for {descriptor:?}: {}",
-            error.message
-        );
-    }
-}
-
-#[test]
-fn partition_descriptor_round_trips_large_floats() {
-    // Integer literals beyond i64/u64 become f64 values in `_unknown_fields`. serde_json's
-    // `float_roundtrip` feature keeps re-encoding them byte-stable.
-    let descriptor = br#"{"v": 1, "partition": {"version": 1, "inner": {"Query": {"session":"projects/p/instances/i/databases/d/sessions/s","transaction":{"id":"dHg="},"partitionToken":"dG9rZW4=","sql":"SELECT 1","con[": 44444424444444444249, "/+%n":4444440000000000000000074074764, "/s%n": "prns/s"}}}}"#;
-
-    let partition = decode_partition(descriptor).expect("descriptor decodes");
-    let first = encode_partition(&partition).expect("a decoded partition re-encodes");
-    let normalized = decode_partition(&first).expect("re-encoded descriptor decodes");
-    let again = encode_partition(&normalized).expect("a decoded partition re-encodes");
-    assert_eq!(
-        first, again,
-        "re-encoding the encoder's output must be byte-stable"
-    );
 }
 
 /// `get_table_schema` against an in-process mock Spanner server, for its existence probe.
