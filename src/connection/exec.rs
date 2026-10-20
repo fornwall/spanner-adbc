@@ -1,6 +1,6 @@
 //! Read/write transaction execution: isolation levels, batch DML and write-only commits.
 
-use adbc_core::error::{Error, Result};
+use adbc_core::error::Result;
 use adbc_core::options::OptionValue;
 use google_cloud_spanner::builder::{BatchDmlBuilder, TransactionRunnerBuilder};
 use google_cloud_spanner::client::DatabaseClient;
@@ -10,62 +10,51 @@ use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use crate::error::{from_spanner, invalid_argument};
-use crate::options::SharedConfig;
+use crate::options::{SharedConfig, string_option};
 use crate::request::RequestConfig;
 use crate::retry::RetryConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
 use crate::timeout::with_timeout;
 
-/// Apply an explicit isolation level; unspecified leaves Spanner's SERIALIZABLE default.
-#[must_use]
-pub(super) fn apply_isolation(
-    builder: TransactionRunnerBuilder,
-    isolation: IsolationLevel,
-) -> TransactionRunnerBuilder {
-    match isolation {
-        IsolationLevel::Unspecified => builder,
-        level => builder.set_isolation_level(level),
-    }
-}
-
 /// Configure a read/write transaction runner with isolation, request options and retry bounds.
+/// `Unspecified` is the wire default, so it leaves Spanner's SERIALIZABLE default.
 pub(crate) fn runner_builder(
     client: &DatabaseClient,
     isolation: IsolationLevel,
     request: &RequestConfig,
     retry: RetryConfig,
 ) -> TransactionRunnerBuilder {
-    retry.apply_to_runner(
-        request.apply_to_runner(apply_isolation(client.read_write_transaction(), isolation)),
-    )
+    let builder = client
+        .read_write_transaction()
+        .set_isolation_level(isolation);
+    retry.apply_to_runner(request.apply_to_runner(builder))
 }
 
-/// Map ADBC isolation levels to Spanner's SERIALIZABLE or REPEATABLE_READ.
-/// Spanner's REPEATABLE_READ provides snapshot isolation, so weaker levels are promoted to it.
-/// SERIALIZABLE is externally consistent and satisfies linearizable requests. Getters report the
-/// effective level, or `default` when no level is sent.
+/// Map an ADBC isolation level to Spanner's SERIALIZABLE or REPEATABLE_READ, promoting a level
+/// Spanner lacks to the weakest one that satisfies it. REPEATABLE_READ is snapshot isolation, and
+/// SERIALIZABLE is externally consistent, which satisfies linearizable requests. Getters report
+/// the effective level, or `default` when no level is sent.
 ///
 /// REPEATABLE_READ detects write-write conflicts only: DML that reads rows it does not write can
 /// exhibit write skew, even in a single autocommit statement.
 pub(super) fn parse_isolation_level(value: OptionValue) -> Result<IsolationLevel> {
     use adbc_core::constants::*;
-    let OptionValue::String(s) = value else {
-        return Err(invalid_argument(
-            "expected a string isolation-level option value",
-        ));
-    };
-    match s.as_str() {
+    let value = string_option(
+        value,
+        &format!("option {ADBC_CONNECTION_OPTION_ISOLATION_LEVEL}"),
+    )?;
+    match value.as_str() {
         ADBC_OPTION_ISOLATION_LEVEL_DEFAULT => Ok(IsolationLevel::Unspecified),
-        ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE => Ok(IsolationLevel::Serializable),
-        ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ => Ok(IsolationLevel::RepeatableRead),
-        // A native match, not a promotion: REPEATABLE_READ is snapshot isolation.
-        ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT => Ok(IsolationLevel::RepeatableRead),
-        // Promote to the weakest supported level that satisfies the request.
-        ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED
-        | ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED => Ok(IsolationLevel::RepeatableRead),
-        ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE => Ok(IsolationLevel::Serializable),
+        ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE | ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE => {
+            Ok(IsolationLevel::Serializable)
+        }
+        ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ
+        | ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT
+        | ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED
+        | ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED => Ok(IsolationLevel::RepeatableRead),
         other => Err(invalid_argument(format!(
-            "unknown isolation level {other:?}"
+            "unknown isolation level {other:?} for option {ADBC_CONNECTION_OPTION_ISOLATION_LEVEL}; \
+             expected an ADBC isolation constant such as {ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE:?}"
         ))),
     }
 }
@@ -105,49 +94,52 @@ pub(crate) fn run_batch_txn(
     if statements.is_empty() && mutations.is_empty() {
         return Ok(0);
     }
-    let isolation = config.isolation.clone();
-    let request = config.request.clone();
-    let retry = config.retry;
-    let timeout = config.timeouts.update_timeout();
-    let client = client.clone();
-    let transaction = async move {
-        // Commit priority and transaction tag go on the runner, the request tag on the batch.
-        let runner = runner_builder(&client, isolation, &request, retry).build();
+    // Commit priority and transaction tag go on the runner, the request tag on the batch.
+    let batch = (!statements.is_empty()).then(|| {
+        let mut batch = config
+            .retry
+            .apply_to_batch_dml(config.request.apply_to_batch_dml(BatchDmlBuilder::new()))
+            .set_last_statements(last_statements);
+        for statement in statements {
+            batch = batch.add_statement(statement.clone());
+        }
+        batch.build()
+    });
+    let runner = runner_builder(
+        client,
+        config.isolation.clone(),
+        &config.request,
+        config.retry,
+    )
+    .build();
+    let transaction = async {
         let outcome = runner
-            .run(move |transaction: ReadWriteTransaction| {
-                let request = request.clone();
-                async move {
-                    transaction.buffer(mutations.iter().cloned())?;
-                    if statements.is_empty() {
-                        return Ok(0);
-                    }
-                    let mut batch = retry
-                        .apply_to_batch_dml(request.apply_to_batch_dml(BatchDmlBuilder::new()))
-                        .set_last_statements(last_statements);
-                    for statement in statements {
-                        batch = batch.add_statement(statement.clone());
-                    }
-                    let counts = transaction.execute_batch_update(batch.build()).await?;
-                    Ok(counts.into_iter().sum::<i64>())
-                }
+            .run(async |transaction: ReadWriteTransaction| {
+                transaction.buffer(mutations.iter().cloned())?;
+                let Some(batch) = &batch else {
+                    return Ok(0);
+                };
+                let counts = transaction.execute_batch_update(batch.clone()).await?;
+                Ok(counts.into_iter().sum::<i64>())
             })
             .await
             .map_err(from_spanner)?;
         // Present only when `spanner.commit_stats` is enabled.
-        let mutation_count = outcome
-            .commit_response
+        let stats = outcome.commit_response.commit_stats;
+        config
             .commit_stats
-            .as_ref()
-            .map(|stats| stats.mutation_count);
-        Ok::<(i64, Option<i64>), Error>((outcome.result, mutation_count))
+            .record(stats.map(|stats| stats.mutation_count));
+        Ok(outcome.result)
     };
-    let (count, mutation_count) = block_on_cancellable(
+    block_on_cancellable(
         runtime,
         cancel,
-        with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_UPDATE, transaction),
-    )?;
-    config.commit_stats.record(mutation_count);
-    Ok(count)
+        with_timeout(
+            config.timeouts.update_timeout(),
+            crate::OPTION_RPC_TIMEOUT_UPDATE,
+            transaction,
+        ),
+    )
 }
 
 /// Commit `mutations` without DML in one write-only transaction. Used by mutations-only manual
@@ -167,30 +159,29 @@ pub(crate) fn write_mutations_txn(
     if mutations.is_empty() {
         return Ok(());
     }
-    let request = config.request.clone();
-    let retry = config.retry;
-    let timeout = config.timeouts.update_timeout();
-    let client = client.clone();
-    let transaction = async move {
-        let response = retry
-            .apply_to_write_only(request.apply_to_write_only(client.write_only_transaction()))
-            .build()
-            .write(mutations)
-            .await
-            .map_err(from_spanner)?;
-        // Present only when `spanner.commit_stats` is enabled.
-        Ok::<Option<i64>, Error>(
-            response
-                .commit_stats
-                .as_ref()
-                .map(|stats| stats.mutation_count),
+    let transaction = config
+        .retry
+        .apply_to_write_only(
+            config
+                .request
+                .apply_to_write_only(client.write_only_transaction()),
         )
+        .build();
+    let commit = async {
+        let response = transaction.write(mutations).await.map_err(from_spanner)?;
+        // Present only when `spanner.commit_stats` is enabled.
+        config
+            .commit_stats
+            .record(response.commit_stats.map(|stats| stats.mutation_count));
+        Ok(())
     };
-    let mutation_count = block_on_cancellable(
+    block_on_cancellable(
         runtime,
         cancel,
-        with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_UPDATE, transaction),
-    )?;
-    config.commit_stats.record(mutation_count);
-    Ok(())
+        with_timeout(
+            config.timeouts.update_timeout(),
+            crate::OPTION_RPC_TIMEOUT_UPDATE,
+            commit,
+        ),
+    )
 }

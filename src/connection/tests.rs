@@ -10,99 +10,66 @@ use super::{
     encode_partition, isolation_to_adbc_string, parse_isolation_level,
 };
 
+/// Every ADBC level maps to a Spanner level, and the getter reports the effective one.
 #[test]
-fn parses_supported_isolation_levels() {
+fn isolation_levels_map_to_the_effective_spanner_level() {
     use adbc_core::constants::*;
-    let parse = |s: &str| parse_isolation_level(OptionValue::String(s.to_string()));
-    assert_eq!(
-        parse(ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE).unwrap(),
-        IsolationLevel::Serializable
-    );
-    assert_eq!(
-        parse(ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ).unwrap(),
-        IsolationLevel::RepeatableRead
-    );
-    // Spanner's REPEATABLE_READ is snapshot isolation.
-    assert_eq!(
-        parse(ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT).unwrap(),
-        IsolationLevel::RepeatableRead
-    );
-    // No level is sent; Spanner defaults to SERIALIZABLE.
-    assert_eq!(
-        parse(ADBC_OPTION_ISOLATION_LEVEL_DEFAULT).unwrap(),
-        IsolationLevel::Unspecified
-    );
-}
-
-#[test]
-fn promotes_unsupported_isolation_levels() {
-    use adbc_core::constants::*;
-    let parse = |s: &str| parse_isolation_level(OptionValue::String(s.to_string()));
-    assert_eq!(
-        parse(ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED).unwrap(),
-        IsolationLevel::RepeatableRead
-    );
-    assert_eq!(
-        parse(ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED).unwrap(),
-        IsolationLevel::RepeatableRead
-    );
-    assert_eq!(
-        parse(ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE).unwrap(),
-        IsolationLevel::Serializable
-    );
-    assert_eq!(
-        parse("not-a-level").unwrap_err().status,
-        Status::InvalidArguments
-    );
-    assert_eq!(
-        parse_isolation_level(OptionValue::Int(1))
-            .unwrap_err()
-            .status,
-        Status::InvalidArguments
-    );
-}
-
-#[test]
-fn isolation_level_round_trips_to_adbc_string() {
-    use adbc_core::constants::*;
-    assert_eq!(
-        isolation_to_adbc_string(&IsolationLevel::Serializable),
-        ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE
-    );
-    assert_eq!(
-        isolation_to_adbc_string(&IsolationLevel::RepeatableRead),
-        ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ
-    );
-    assert_eq!(
-        isolation_to_adbc_string(&IsolationLevel::Unspecified),
-        ADBC_OPTION_ISOLATION_LEVEL_DEFAULT
-    );
-}
-
-#[test]
-fn promoted_isolation_level_round_trips_to_effective_level() {
-    use adbc_core::constants::*;
-    // `get_option` reports the level that will run, not the one that was set.
-    let effective = |s: &str| {
-        let level = parse_isolation_level(OptionValue::String(s.to_string())).expect("parses");
-        isolation_to_adbc_string(&level)
-    };
-    assert_eq!(
-        effective(ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED),
-        ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ
-    );
-    assert_eq!(
-        effective(ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED),
-        ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ
-    );
-    assert_eq!(
-        effective(ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT),
-        ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ
-    );
-    assert_eq!(
-        effective(ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE),
-        ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE
-    );
+    let cases = [
+        (
+            ADBC_OPTION_ISOLATION_LEVEL_DEFAULT,
+            IsolationLevel::Unspecified,
+            ADBC_OPTION_ISOLATION_LEVEL_DEFAULT,
+        ),
+        (
+            ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE,
+            IsolationLevel::Serializable,
+            ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE,
+        ),
+        (
+            ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE,
+            IsolationLevel::Serializable,
+            ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE,
+        ),
+        (
+            ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ,
+            IsolationLevel::RepeatableRead,
+            ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ,
+        ),
+        (
+            ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT,
+            IsolationLevel::RepeatableRead,
+            ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ,
+        ),
+        (
+            ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED,
+            IsolationLevel::RepeatableRead,
+            ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ,
+        ),
+        (
+            ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED,
+            IsolationLevel::RepeatableRead,
+            ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ,
+        ),
+    ];
+    for (requested, level, effective) in cases {
+        let parsed = parse_isolation_level(OptionValue::String(requested.into())).unwrap();
+        assert_eq!(parsed, level, "{requested}");
+        assert_eq!(isolation_to_adbc_string(&parsed), effective, "{requested}");
+    }
+    for invalid in [
+        OptionValue::String("serializable".into()),
+        OptionValue::Int(1),
+    ] {
+        let error = parse_isolation_level(invalid).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(
+            error
+                .message
+                .contains(ADBC_CONNECTION_OPTION_ISOLATION_LEVEL),
+            "{}",
+            error.message
+        );
+    }
 }
 
 #[test]
