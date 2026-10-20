@@ -31,7 +31,7 @@ fn column_batch(array: ArrayRef) -> RecordBatch {
 /// The value and parameter type that binding `array[row]` as `@p` sends.
 fn param(array: &dyn Array, row: usize) -> (Value, Option<Type>) {
     let field = Field::new("p", array.data_type().clone(), true);
-    let (value, json_type) = cell_value("p", &field, array, row).unwrap();
+    let (value, json_type) = cell_value(Target::Parameter("p"), &field, array, row).unwrap();
     (
         value,
         json_type.or_else(|| parameter_type(array.data_type())),
@@ -274,11 +274,11 @@ fn numeric_string_formats_any_scale_exactly() {
 fn timestamp_string_keeps_negative_subsecond_instants() {
     // One nanosecond before the epoch, not truncated toward zero.
     assert_eq!(
-        timestamp_string("t", TimeUnit::Nanosecond, -1).unwrap(),
+        timestamp_string(Target::Parameter("t"), TimeUnit::Nanosecond, -1).unwrap(),
         "1969-12-31T23:59:59.999999999Z"
     );
     assert_eq!(
-        timestamp_string("t", TimeUnit::Millisecond, -1).unwrap(),
+        timestamp_string(Target::Parameter("t"), TimeUnit::Millisecond, -1).unwrap(),
         "1969-12-31T23:59:59.999Z"
     );
 }
@@ -287,7 +287,10 @@ fn timestamp_string_keeps_negative_subsecond_instants() {
 fn temporal_binding_accepts_spanner_range_boundaries() {
     for date in ["0001-01-01", "9999-12-31"] {
         let days = crate::conversion::parse_date_days(date).unwrap();
-        assert_eq!(date_string("d", days.into()).unwrap(), date);
+        assert_eq!(
+            date_string(Target::Parameter("d"), days.into()).unwrap(),
+            date
+        );
     }
     for (unit, multiplier, fraction) in [
         (TimeUnit::Second, 1, ""),
@@ -295,7 +298,7 @@ fn temporal_binding_accepts_spanner_range_boundaries() {
         (TimeUnit::Microsecond, 1_000_000, ".999999"),
     ] {
         assert_eq!(
-            timestamp_string("t", unit, -62_135_596_800 * multiplier).unwrap(),
+            timestamp_string(Target::Parameter("t"), unit, -62_135_596_800 * multiplier).unwrap(),
             match unit {
                 TimeUnit::Second => "0001-01-01T00:00:00Z",
                 TimeUnit::Millisecond => "0001-01-01T00:00:00.000Z",
@@ -303,12 +306,17 @@ fn temporal_binding_accepts_spanner_range_boundaries() {
             }
         );
         assert_eq!(
-            timestamp_string("t", unit, 253_402_300_800 * multiplier - 1).unwrap(),
+            timestamp_string(
+                Target::Parameter("t"),
+                unit,
+                253_402_300_800 * multiplier - 1
+            )
+            .unwrap(),
             format!("9999-12-31T23:59:59{fraction}Z")
         );
     }
     for value in [i64::MIN, i64::MAX] {
-        assert!(timestamp_string("t", TimeUnit::Nanosecond, value).is_ok());
+        assert!(timestamp_string(Target::Parameter("t"), TimeUnit::Nanosecond, value).is_ok());
     }
 }
 
@@ -366,11 +374,17 @@ fn temporal_binding_rejects_values_spanner_cannot_store() {
                 )
                 .unwrap_err();
                 assert_eq!(error.status, Status::InvalidArguments);
-                assert!(error.message.contains("\"created_at\""), "{error}");
+                assert!(
+                    error
+                        .message
+                        .starts_with("cannot bind parameter \"created_at\" as "),
+                    "{error}"
+                );
                 assert!(error.message.contains(reason), "{error}");
+                // Ingest names the column instead.
                 assert_eq!(
                     insert_mutation("events", &b, row).unwrap_err().message,
-                    error.message
+                    error.message.replacen("parameter", "ingest column", 1)
                 );
             }
         }
@@ -549,17 +563,17 @@ fn rejects_unsupported_types_naming_the_parameter_and_type() {
     for (array, type_name) in arrays {
         let b = column_batch(array.clone());
         for row in 0..array.len() {
-            for error in [
-                bind_row(&b, row).unwrap_err(),
-                insert_mutation("t", &b, row).unwrap_err(),
+            for (error, target) in [
+                (bind_row(&b, row).unwrap_err(), "parameter \"p0\""),
+                (
+                    insert_mutation("t", &b, row).unwrap_err(),
+                    "ingest column \"p\"",
+                ),
             ] {
                 assert_eq!(error.status, Status::InvalidArguments);
-                assert!(
-                    error.message.starts_with("cannot bind parameter \"p")
-                        && error
-                            .message
-                            .ends_with(&format!("unsupported Arrow type {type_name}")),
-                    "{error}"
+                assert_eq!(
+                    error.message,
+                    format!("cannot bind {target}: unsupported Arrow type {type_name}")
                 );
             }
         }
@@ -628,7 +642,7 @@ fn json_tagged_strings_bind_as_json() {
     // A null outer key keeps the JSON type as well.
     let field = json_field("nested", nested.data_type().clone());
     assert_eq!(
-        cell_value("nested", &field, &nested, 2).unwrap(),
+        cell_value(Target::Parameter("nested"), &field, &nested, 2).unwrap(),
         (Value::null(), Some(types::json()))
     );
 }

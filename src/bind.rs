@@ -130,7 +130,7 @@ fn bind_one(
     column: &dyn Array,
     row: usize,
 ) -> Result<StatementBuilder> {
-    let (value, param_type) = cell_value(name, field, column, row)?;
+    let (value, param_type) = cell_value(Target::Parameter(name), field, column, row)?;
     let param_type = param_type.or_else(|| parameter_type(column.data_type()));
     Ok(match param_type {
         Some(t) => builder.add_typed_param(name, value, t),
@@ -180,7 +180,8 @@ fn dictionary_values(mut data_type: &DataType) -> &DataType {
 pub(crate) fn insert_mutation(table: &str, batch: &RecordBatch, row: usize) -> Result<Mutation> {
     let mut builder = Mutation::new_insert_builder(table);
     for (field, column) in batch.schema_ref().fields().iter().zip(batch.columns()) {
-        let (value, _param_type) = cell_value(field.name(), field, column.as_ref(), row)?;
+        let target = Target::Column(field.name());
+        let (value, _param_type) = cell_value(target, field, column.as_ref(), row)?;
         builder = builder.set(field.name().clone()).to(value);
     }
     Ok(builder.build())
@@ -207,7 +208,7 @@ pub(crate) fn check_ingest_values(batch: &RecordBatch) -> Result<()> {
             batch.num_rows()
         };
         for row in 0..rows {
-            cell_value(field.name(), field, column.as_ref(), row)?;
+            cell_value(Target::Column(field.name()), field, column.as_ref(), row)?;
         }
     }
     Ok(())
@@ -254,7 +255,7 @@ pub(crate) fn mutation_table(db_schema: Option<&str>, table_name: &str) -> Strin
 
 /// Encode a cell for a query or mutation. Only JSON parameters need an explicit wire type.
 fn cell_value(
-    name: &str,
+    target: Target<'_>,
     field: &Field,
     column: &dyn Array,
     row: usize,
@@ -262,10 +263,10 @@ fn cell_value(
     let data_type = column.data_type();
     match data_type {
         DataType::List(item) => {
-            list_cell_value(name, data_type, item, list_elements::<i32>(column, row))
+            list_cell_value(target, data_type, item, list_elements::<i32>(column, row))
         }
         DataType::LargeList(item) => {
-            list_cell_value(name, data_type, item, list_elements::<i64>(column, row))
+            list_cell_value(target, data_type, item, list_elements::<i64>(column, row))
         }
         DataType::FixedSizeList(item, size) => {
             let list = column.as_fixed_size_list();
@@ -273,19 +274,19 @@ fn cell_value(
             let elements = list
                 .is_valid(row)
                 .then(|| (list.values().as_ref(), start..start + *size as usize));
-            list_cell_value(name, data_type, item, elements)
+            list_cell_value(target, data_type, item, elements)
         }
         // Decode recursively, validating the logical type for null keys too.
         DataType::Dictionary(_, _) => downcast_dictionary_array!(
             column => match column.key(row) {
-                Some(value_row) => cell_value(name, field, column.values().as_ref(), value_row),
-                None => null_dictionary_value(name, field, column.values().data_type()),
+                Some(value_row) => cell_value(target, field, column.values().as_ref(), value_row),
+                None => null_dictionary_value(target, field, column.values().data_type()),
             },
             _ => unreachable!("downcast_dictionary_array dispatched a non-dictionary {data_type:?}")
         ),
         _ => {
-            let bind = scalar_binder(data_type).ok_or_else(|| unsupported(name, data_type))?;
-            let value = bind(name, column, row)?;
+            let bind = scalar_binder(data_type).ok_or_else(|| unsupported(target, data_type))?;
+            let value = bind(target, column, row)?;
             Ok((value, is_json_field(field).then(types::json)))
         }
     }
@@ -306,9 +307,25 @@ fn list_elements<O: OffsetSizeTrait>(
     })
 }
 
-fn unsupported(name: &str, data_type: &DataType) -> adbc_core::error::Error {
+/// What a converted value is bound to, for error messages.
+#[derive(Clone, Copy)]
+enum Target<'a> {
+    Parameter(&'a str),
+    Column(&'a str),
+}
+
+impl std::fmt::Display for Target<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Target::Parameter(name) => write!(f, "parameter {name:?}"),
+            Target::Column(name) => write!(f, "ingest column {name:?}"),
+        }
+    }
+}
+
+fn unsupported(target: Target<'_>, data_type: &DataType) -> adbc_core::error::Error {
     invalid_argument(format!(
-        "cannot bind parameter {name:?}: unsupported Arrow type {data_type}"
+        "cannot bind {target}: unsupported Arrow type {data_type}"
     ))
 }
 
@@ -316,7 +333,7 @@ fn unsupported(name: &str, data_type: &DataType) -> adbc_core::error::Error {
 ///
 /// Encoders map a valid cell through `Option::into`, which consumes owned strings where
 /// `ToValue` would copy them.
-type ScalarBinder = fn(&str, &dyn Array, usize) -> Result<Value>;
+type ScalarBinder = fn(Target<'_>, &dyn Array, usize) -> Result<Value>;
 
 /// Select the shared scalar encoder, or `None` for an unsupported type. Keep new type support
 /// aligned with [`spanner_column_type`] and the read mapping.
@@ -356,18 +373,18 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
                 .then(|| a.as_fixed_size_binary().value(i))
                 .into())
         },
-        DataType::Date32 => |name, a, i| {
+        DataType::Date32 => |target, a, i| {
             a.is_valid(i)
-                .then(|| date_string(name, a.as_primitive::<Date32Type>().value(i).into()))
+                .then(|| date_string(target, a.as_primitive::<Date32Type>().value(i).into()))
                 .transpose()
                 .map(Value::from)
         },
-        DataType::Date64 => |name, a, i| {
+        DataType::Date64 => |target, a, i| {
             a.is_valid(i)
                 .then(|| {
                     date_string(
-                        name,
-                        date64_days(name, a.as_primitive::<Date64Type>().value(i))?,
+                        target,
+                        date64_days(target, a.as_primitive::<Date64Type>().value(i))?,
                     )
                 })
                 .transpose()
@@ -411,9 +428,9 @@ where
 }
 
 fn timestamp_binder<T: ArrowTimestampType>() -> ScalarBinder {
-    |name, a, i| {
+    |target, a, i| {
         a.is_valid(i)
-            .then(|| timestamp_string(name, T::UNIT, a.as_primitive::<T>().value(i)))
+            .then(|| timestamp_string(target, T::UNIT, a.as_primitive::<T>().value(i)))
             .transpose()
             .map(Value::from)
     }
@@ -421,17 +438,17 @@ fn timestamp_binder<T: ArrowTimestampType>() -> ScalarBinder {
 
 /// Validate a null dictionary cell's logical type and retain its JSON parameter type.
 fn null_dictionary_value(
-    name: &str,
+    target: Target<'_>,
     field: &Field,
     value_type: &DataType,
 ) -> Result<(Value, Option<Type>)> {
     let value_type = dictionary_values(value_type);
     match value_type {
         DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
-            list_cell_value(name, value_type, item, None)
+            list_cell_value(target, value_type, item, None)
         }
         _ => {
-            scalar_binder(value_type).ok_or_else(|| unsupported(name, value_type))?;
+            scalar_binder(value_type).ok_or_else(|| unsupported(target, value_type))?;
             Ok((Value::null(), is_json_field(field).then(types::json)))
         }
     }
@@ -440,18 +457,18 @@ fn null_dictionary_value(
 /// Encode a list cell from its borrowed child range, avoiding a sliced array allocation.
 /// `None` means a null array. Validate element types even for empty and null arrays.
 fn list_cell_value(
-    name: &str,
+    target: Target<'_>,
     list_type: &DataType,
     item: &Field,
     elements: Option<(&dyn Array, Range<usize>)>,
 ) -> Result<(Value, Option<Type>)> {
-    let bind = scalar_binder(item.data_type()).ok_or_else(|| unsupported(name, list_type))?;
+    let bind = scalar_binder(item.data_type()).ok_or_else(|| unsupported(target, list_type))?;
     let value = match elements {
         None => Value::null(),
         // Consume the elements; `ToValue` would deep-copy them.
         Some((values, range)) => Value::from(
             range
-                .map(|i| bind(name, values, i))
+                .map(|i| bind(target, values, i))
                 .collect::<Result<Vec<Value>>>()?,
         ),
     };
@@ -463,18 +480,17 @@ fn list_cell_value(
 
 /// Convert Date64 milliseconds to days. Arrow requires whole days but its constructors don't
 /// check.
-fn date64_days(name: &str, millis: i64) -> Result<i64> {
+fn date64_days(target: Target<'_>, millis: i64) -> Result<i64> {
     if millis % 86_400_000 != 0 {
         return Err(invalid_argument(format!(
-            "cannot bind DATE parameter {name:?}: Date64 value {millis}ms is not a whole number of days; use a timestamp type to retain time of day"
+            "cannot bind {target} as DATE: Date64 value {millis}ms is not a whole number of days; use a timestamp type to retain time of day"
         )));
     }
     Ok(millis / 86_400_000)
 }
 
-/// Format days since the Unix epoch as the Spanner `DATE` wire form, `YYYY-MM-DD`. `name` is used
-/// only for the out-of-range error message.
-fn date_string(name: &str, days: i64) -> Result<String> {
+/// Format days since the Unix epoch as the Spanner `DATE` wire form, `YYYY-MM-DD`.
+fn date_string(target: Target<'_>, days: i64) -> Result<String> {
     // Chrono counts 0001-01-01 as day 1; 1970-01-01 is day 719_163.
     let date = i32::try_from(days + 719_163)
         .ok()
@@ -482,7 +498,7 @@ fn date_string(name: &str, days: i64) -> Result<String> {
         .filter(|date| (1..=9999).contains(&date.year()))
         .ok_or_else(|| {
             invalid_argument(format!(
-                "cannot bind DATE parameter {name:?}: {days} days since 1970-01-01 is out of range; Spanner supports 0001-01-01 through 9999-12-31"
+                "cannot bind {target} as DATE: {days} days since 1970-01-01 is out of range; Spanner supports 0001-01-01 through 9999-12-31"
             ))
         })?;
     // `Display` writes `YYYY-MM-DD` for these years without parsing a format string per call.
@@ -491,7 +507,7 @@ fn date_string(name: &str, days: i64) -> Result<String> {
 
 /// Format a UTC timestamp at its source precision, rejecting years outside Spanner's range.
 /// Negative subsecond values retain their exact instant (for example, -1 ns ends in .999999999Z).
-fn timestamp_string(name: &str, unit: TimeUnit, value: i64) -> Result<String> {
+fn timestamp_string(target: Target<'_>, unit: TimeUnit, value: i64) -> Result<String> {
     let (ts, format) = match unit {
         TimeUnit::Second => (
             DateTime::<Utc>::from_timestamp(value, 0),
@@ -513,7 +529,7 @@ fn timestamp_string(name: &str, unit: TimeUnit, value: i64) -> Result<String> {
     };
     let ts = ts.filter(|ts| (1..=9999).contains(&ts.year())).ok_or_else(|| {
         invalid_argument(format!(
-            "cannot bind TIMESTAMP parameter {name:?}: {value} ({unit:?}) is out of range; Spanner supports years 0001 through 9999"
+            "cannot bind {target} as TIMESTAMP: {value} ({unit:?}) is out of range; Spanner supports years 0001 through 9999"
         ))
     })?;
     Ok(ts.to_rfc3339_opts(format, true))
