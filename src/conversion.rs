@@ -10,6 +10,7 @@
 //! query metadata, so they map to their wire primitives (an `Int64` ordinal and `Binary` bytes).
 
 use std::collections::HashMap;
+use std::ops::{Add, Mul};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -775,7 +776,7 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
                 |builder, v| {
                     let s = v.as_str().ok_or_else(|| decode_error("TIMESTAMP", v))?;
                     builder.append_value(parse_timestamp_nanos(s).ok_or_else(|| {
-                        if scan_timestamp_utc(s).is_some() {
+                        if parse_timestamp(s).is_some() {
                             invalid_argument(format!(
                                 "TIMESTAMP value {s:?} is outside the range representable as an \
                                  Arrow Timestamp(Nanosecond) (~1677-09-21 to 2262-04-11); set \
@@ -944,146 +945,110 @@ fn parse_f64(value: &Value) -> Option<f64> {
     }
 }
 
-/// Parse a Spanner `DATE` (`YYYY-MM-DD`) into days since the Unix epoch.
-///
-/// Reads fixed byte offsets instead of using chrono's strftime parser, which re-tokenizes its
-/// format on every call and was over half the temporal conversion cost in profiling. Spanner
-/// always sends this canonical shape; anything else returns `None`.
-pub(crate) fn parse_date_days(s: &str) -> Option<i32> {
-    let b = s.as_bytes();
+/// The value of a run of ASCII digits, or `None` if any byte is not a digit. Callers bound the
+/// length so the result fits in `T`.
+fn digits<T: From<u8> + Mul<Output = T> + Add<Output = T>>(b: &[u8]) -> Option<T> {
+    b.iter().try_fold(T::from(0), |n, &c| {
+        let d = c.wrapping_sub(b'0');
+        (d < 10).then(|| n * T::from(10) + T::from(d))
+    })
+}
+
+/// Days since 1970-01-01 of a `YYYY-MM-DD` date in years 1-9999, or `None` if it is malformed or
+/// does not exist.
+fn date_days(b: &[u8]) -> Option<i32> {
     if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
         return None;
     }
-    let digit = |i: usize| -> Option<u32> {
-        let d = b[i].wrapping_sub(b'0');
-        (d < 10).then_some(u32::from(d))
+    let (year, month, day): (u32, u32, u32) =
+        (digits(&b[..4])?, digits(&b[5..7])?, digits(&b[8..])?);
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = match month {
+        2 => 28 + u32::from(leap),
+        4 | 6 | 9 | 11 => 30,
+        1..=12 => 31,
+        _ => return None,
     };
-    let year = digit(0)? * 1000 + digit(1)? * 100 + digit(2)? * 10 + digit(3)?;
-    if year == 0 {
+    if year == 0 || day == 0 || day > month_days {
         return None;
     }
-    let month = digit(5)? * 10 + digit(6)?;
-    let day = digit(8)? * 10 + digit(9)?;
-    let date = chrono::NaiveDate::from_ymd_opt(year as i32, month, day)?;
-    // `num_days_from_ce` counts 0001-01-01 as day 1, making 1970-01-01 day 719_163.
-    Some(chrono::Datelike::num_days_from_ce(&date) - 719_163)
+    // Howard Hinnant's `days_from_civil`: years start in March so that the leap day comes last,
+    // and the calendar repeats every 400 years (146,097 days).
+    let y = if month <= 2 { year - 1 } else { year };
+    let (era, year_of_era) = (y / 400, y % 400);
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some((era * 146_097 + day_of_era) as i32 - 719_468)
 }
 
-/// The two ASCII digits at `off` as a number.
-fn two_digits(b: &[u8], off: usize) -> Option<u32> {
-    let hi = b[off].wrapping_sub(b'0');
-    let lo = b[off + 1].wrapping_sub(b'0');
-    (hi < 10 && lo < 10).then(|| u32::from(hi) * 10 + u32::from(lo))
+/// Parse a Spanner `DATE` (`YYYY-MM-DD`, the only form Spanner sends) into days since the Unix
+/// epoch.
+pub(crate) fn parse_date_days(s: &str) -> Option<i32> {
+    date_days(s.as_bytes())
 }
 
-/// Scan the canonical UTC form Spanner emits, `YYYY-MM-DDTHH:MM:SS[.fraction]Z` with 1-9
-/// fractional digits, at fixed offsets instead of using chrono's RFC 3339 parser. chrono still
-/// validates the fields. Any other shape returns `None`.
-fn scan_timestamp_utc(s: &str) -> Option<chrono::NaiveDateTime> {
+/// Parse the canonical UTC form Spanner sends for a `TIMESTAMP`,
+/// `YYYY-MM-DDTHH:MM:SS[.fraction]Z` with 1-9 fractional digits, into whole seconds since the
+/// Unix epoch and the nanoseconds past them. Any other shape returns `None`.
+fn parse_timestamp(s: &str) -> Option<(i64, u32)> {
     let b = s.as_bytes();
-    // Shortest legal form is `YYYY-MM-DDTHH:MM:SSZ` (20 bytes); the separators are fixed.
-    if b.len() < 20
-        || b[4] != b'-'
-        || b[7] != b'-'
-        || b[10] != b'T'
-        || b[13] != b':'
-        || b[16] != b':'
-    {
+    if b.len() < 20 || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[b.len() - 1] != b'Z' {
         return None;
     }
-    let year = two_digits(b, 0)? * 100 + two_digits(b, 2)?;
-    if year == 0 {
+    let days = date_days(&b[..10])?;
+    let (hour, min, sec): (u32, u32, u32) = (
+        digits(&b[11..13])?,
+        digits(&b[14..16])?,
+        digits(&b[17..19])?,
+    );
+    if hour > 23 || min > 59 || sec > 59 {
         return None;
     }
-    let month = two_digits(b, 5)?;
-    let day = two_digits(b, 8)?;
-    let hour = two_digits(b, 11)?;
-    let min = two_digits(b, 14)?;
-    let sec = two_digits(b, 17)?;
-    // After the seconds: either `Z` (no fraction) or `.<1..=9 digits>Z`.
-    let nanos = match b[19] {
-        b'Z' if b.len() == 20 => 0,
-        // The length check keeps the slice below in bounds for a bare trailing `.`.
-        b'.' if b.len() > 20 => {
-            let frac = &b[20..b.len() - 1];
-            if b[b.len() - 1] != b'Z' || frac.is_empty() || frac.len() > 9 {
-                return None;
-            }
-            let mut nanos: u32 = 0;
-            for &d in frac {
-                let d = d.wrapping_sub(b'0');
-                if d >= 10 {
-                    return None;
-                }
-                nanos = nanos * 10 + u32::from(d);
-            }
-            // `.789` is 789_000_000 nanoseconds.
-            nanos * 10u32.pow(9 - frac.len() as u32)
+    let nanos = match &b[19..b.len() - 1] {
+        [] => 0,
+        [b'.', frac @ ..] if (1..=9).contains(&frac.len()) => {
+            digits::<u32>(frac)? * 10_u32.pow(9 - frac.len() as u32)
         }
         _ => return None,
     };
-    chrono::NaiveDate::from_ymd_opt(year as i32, month, day)?
-        .and_hms_nano_opt(hour, min, sec, nanos)
+    let secs = i64::from(days) * 86_400 + i64::from(hour * 3_600 + min * 60 + sec);
+    Some((secs, nanos))
 }
 
 /// Parse a Spanner `TIMESTAMP` into nanoseconds since the Unix epoch. `None` if malformed or
 /// outside the i64 nanosecond range (~1677-09-21 to 2262-04-11).
 pub(crate) fn parse_timestamp_nanos(s: &str) -> Option<i64> {
-    scan_timestamp_utc(s)?.and_utc().timestamp_nanos_opt()
+    let (secs, nanos) = parse_timestamp(s)?;
+    i64::try_from(i128::from(secs) * 1_000_000_000 + i128::from(nanos)).ok()
 }
 
 /// Parse a Spanner `TIMESTAMP` into microseconds since the Unix epoch, truncating sub-microsecond
-/// digits toward negative infinity: chrono splits an instant into floor seconds plus a
-/// non-negative fraction, so `1969-12-31T23:59:59.9999999Z` becomes -1. `None` if malformed.
+/// digits toward negative infinity, so `1969-12-31T23:59:59.9999999Z` becomes -1. `None` if
+/// malformed.
 pub(crate) fn parse_timestamp_micros(s: &str) -> Option<i64> {
-    let dt = scan_timestamp_utc(s)?.and_utc();
-    dt.timestamp()
-        .checked_mul(1_000_000)?
-        .checked_add(i64::from(dt.timestamp_subsec_micros()))
+    let (secs, nanos) = parse_timestamp(s)?;
+    Some(secs * 1_000_000 + i64::from(nanos / 1_000))
 }
 
-/// Parse a Spanner `NUMERIC` into an unscaled `i128` at scale 9. `None` if malformed or beyond
-/// precision 38.
+/// Parse a Spanner `NUMERIC` (`[-]digits[.digits]`, at most 29 integer and 9 fractional digits)
+/// into an unscaled `i128` at scale 9. `None` if malformed or out of range.
 pub(crate) fn parse_numeric_i128(s: &str) -> Option<i128> {
-    // Spanner emits only `[-]digits[.digits]` with at most nine fractional digits. Scanning bytes
-    // avoids `trim` and `split_once('.')`, which dominated NUMERIC decoding in profiling.
-    let (negative, bytes) = match s.as_bytes().split_first() {
-        Some((b'-', rest)) => (true, rest),
-        _ => (false, s.as_bytes()),
+    let (negative, b) = match s.as_bytes() {
+        [b'-', rest @ ..] => (true, rest),
+        b => (false, b),
     };
-    // A trailing `.` is malformed.
-    let (int_part, frac_part) = match bytes.iter().position(|&b| b == b'.') {
-        Some(i) if i + 1 < bytes.len() => (&bytes[..i], &bytes[i + 1..]),
+    let (int, frac) = match b.iter().position(|&c| c == b'.') {
+        Some(i) if i + 1 < b.len() => (&b[..i], &b[i + 1..]),
         Some(_) => return None,
-        None => (bytes, &bytes[bytes.len()..]),
+        None => (b, &b[b.len()..]),
     };
-    // Rejects "", "-" and a leading `.`.
-    if int_part.is_empty() || frac_part.len() > NUMERIC_SCALE as usize {
+    let int_digits = usize::from(NUMERIC_PRECISION) - NUMERIC_SCALE as usize;
+    if !(1..=int_digits).contains(&int.len()) || frac.len() > NUMERIC_SCALE as usize {
         return None;
-    }
-    let mut int_val: i128 = 0;
-    for &b in int_part {
-        let d = b.wrapping_sub(b'0');
-        if d >= 10 {
-            return None;
-        }
-        int_val = int_val.checked_mul(10)?.checked_add(i128::from(d))?;
-    }
-    let mut frac_val: i128 = 0;
-    for &b in frac_part {
-        let d = b.wrapping_sub(b'0');
-        if d >= 10 {
-            return None;
-        }
-        frac_val = frac_val * 10 + i128::from(d);
     }
     // `.25` is 250_000_000.
-    frac_val *= 10_i128.pow(NUMERIC_SCALE as u32 - frac_part.len() as u32);
-    let unscaled = int_val.checked_mul(1_000_000_000)?.checked_add(frac_val)?;
-    // i128 also holds some 39-digit values, which Decimal128(38, 9) cannot represent.
-    if unscaled >= 10_i128.pow(u32::from(NUMERIC_PRECISION)) {
-        return None;
-    }
+    let frac = digits::<u32>(frac)? * 10_u32.pow(NUMERIC_SCALE as u32 - frac.len() as u32);
+    let unscaled = (digits::<u128>(int)? * 1_000_000_000 + u128::from(frac)) as i128;
     Some(if negative { -unscaled } else { unscaled })
 }
 

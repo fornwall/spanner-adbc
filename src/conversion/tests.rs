@@ -282,25 +282,6 @@ fn timestamps_to_epoch_nanos() {
 }
 
 #[test]
-fn timestamp_scanner_matches_chrono_on_canonical_utc() {
-    for s in [
-        "1970-01-01T00:00:00Z",
-        "2024-01-15T12:34:56Z",
-        "2024-01-15T12:34:56.7Z",
-        "2024-01-15T12:34:56.789Z",
-        "2024-01-15T12:34:56.789012Z",
-        "2024-01-15T12:34:56.789012345Z",
-        "1969-12-31T23:59:59.999999999Z",
-        "2000-02-29T00:00:00Z", // leap day
-    ] {
-        let expected = chrono::DateTime::parse_from_rfc3339(s)
-            .unwrap()
-            .timestamp_nanos_opt();
-        assert_eq!(parse_timestamp_nanos(s), expected, "mismatch for {s}");
-    }
-}
-
-#[test]
 fn timestamp_scanner_rejects_noncanonical() {
     for s in [
         "2024-01-15T12:34:56+02:00",       // non-Z offset
@@ -1024,4 +1005,52 @@ fn zero_column_result_converts_to_an_empty_batch() {
     assert!(schema.fields().is_empty());
     assert_eq!(batch.num_columns(), 0);
     assert_eq!(batch.num_rows(), 0);
+}
+
+#[test]
+fn temporal_parsers_match_chrono_across_spanner_range() {
+    use chrono::{NaiveDate, NaiveDateTime};
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    for year in 0..=9999 {
+        for month in 0..=13 {
+            for day in [0, 1, 28, 29, 30, 31, 32] {
+                let text = format!("{year:04}-{month:02}-{day:02}");
+                let expected = NaiveDate::from_ymd_opt(year, month, day)
+                    .filter(|_| year > 0)
+                    .map(|d| (d - epoch).num_days() as i32);
+                assert_eq!(parse_date_days(&text), expected, "{text}");
+            }
+        }
+        let text = format!("{year:04}-02-28T23:59:59.987654321Z");
+        let expected = NaiveDateTime::parse_from_str(&text, "%Y-%m-%dT%H:%M:%S%.fZ")
+            .ok()
+            .filter(|_| year > 0)
+            .map(|t| t.and_utc());
+        assert_eq!(
+            parse_timestamp_nanos(&text),
+            expected.and_then(|t| t.timestamp_nanos_opt()),
+            "{text}"
+        );
+        assert_eq!(
+            parse_timestamp_micros(&text),
+            expected.map(|t| t.timestamp_micros()),
+            "{text}"
+        );
+    }
+    assert_eq!(
+        parse_timestamp_nanos("1677-09-21T00:12:43.145224192Z"),
+        Some(i64::MIN)
+    );
+    assert_eq!(
+        parse_timestamp_nanos("1677-09-21T00:12:43.145224191Z"),
+        None
+    );
+    assert_eq!(
+        parse_timestamp_nanos("2262-04-11T23:47:16.854775807Z"),
+        Some(i64::MAX)
+    );
+    assert_eq!(
+        parse_timestamp_nanos("2262-04-11T23:47:16.854775808Z"),
+        None
+    );
 }
