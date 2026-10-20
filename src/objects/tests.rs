@@ -275,6 +275,18 @@ fn assemble_objects_applies_every_filter_client_side() {
     .unwrap();
     assert_eq!(schemas.len(), 2);
     assert!(schemas.iter().all(|s| s.tables.is_empty()));
+
+    // An empty table_type list is no filter.
+    let schemas = assemble_objects(
+        &sample_batches(),
+        &ObjectFilters {
+            table_type: Some(&[]),
+            ..no_filters()
+        },
+    )
+    .unwrap();
+    let tables = schemas.iter().map(|s| s.tables.len()).sum::<usize>();
+    assert_eq!(tables, 3);
 }
 
 #[test]

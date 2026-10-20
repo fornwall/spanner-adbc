@@ -74,7 +74,8 @@ pub(crate) struct DbSchema {
 }
 
 /// `get_objects` filters: ADBC `LIKE` patterns for names and an exact-match list of table types.
-/// `None` means no filter; an empty `table_type` list matches nothing.
+/// `None` means no filter. So does an empty `table_type` list, as in the C++ reference drivers;
+/// the Go and Python driver managers pass an empty list as NULL.
 pub(crate) struct ObjectFilters<'a> {
     pub db_schema: Option<&'a str>,
     pub table_name: Option<&'a str>,
@@ -336,7 +337,7 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
             if !table_matches(name)
                 || filters
                     .table_type
-                    .is_some_and(|types| !types.contains(&table_type))
+                    .is_some_and(|types| !types.is_empty() && !types.contains(&table_type))
             {
                 continue;
             }
