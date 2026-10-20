@@ -44,8 +44,9 @@ class WheelPy3None(bdist_wheel):
         if len(libraries) != 1:
             raise SetupError(
                 "A wheel requires exactly one native Spanner driver library in spanner_adbc/. "
-                "Run `cargo build --release` from the repository root and copy the resulting "
-                ".so, .dylib, or .dll from target/release/ into python/spanner_adbc/. "
+                "Run `cargo build --release --features strip-logging` from the repository root "
+                "and copy the resulting .so, .dylib, or .dll from target/release/ into "
+                "python/spanner_adbc/. "
                 f"Found: {', '.join(libraries) or 'none'}."
             )
         super().run()

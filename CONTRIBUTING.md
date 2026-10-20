@@ -27,8 +27,8 @@ scripts/with-emulator.sh cargo test
 ```
 
 For FFI or feature changes, also run `cargo build --no-default-features`. For rustdoc changes,
-run `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`. For changes to `scripts/`,
-run `python3 -m unittest discover -s scripts/tests`. CI runs these along with the Python tests,
+run `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`. For changes to `scripts/`
+or the dependency pins, run `python3 -m unittest discover -s scripts/tests`. CI runs these along with the Python tests,
 the external validation suites and dependency checks.
 
 ## Coding conventions
@@ -67,8 +67,8 @@ Each family on its own prevents publishing to crates.io, so the release configur
 `publish = false`. Rust users of the crate have to match the pins; see the
 [README](README.md#rust).
 
-Keep each family on a single revision. Before removing a pin, check that a registry release
-has the APIs the driver uses.
+Keep each family on a single revision, which `scripts/tests/test_pins.py` checks. Before
+removing a pin, check that a registry release has the APIs the driver uses.
 
 ### Registry migration checklist
 
@@ -101,12 +101,13 @@ cargo release patch            # dry run
 cargo release patch --execute  # bump, commit, tag and push
 ```
 
-The pre-release hook runs fmt, clippy and `cargo test`, and cargo-release also updates the
-Python package version in `python/spanner_adbc/_version.py`.
+The pre-release hook runs the fmt, clippy, build and test checks, and cargo-release also updates
+the Python package version in `python/spanner_adbc/_version.py`.
 
 Pushing a `vX.Y.Z` tag starts `.github/workflows/libraries.yml`. It checks that the tag matches
-the crate version and that CI and both validation workflows passed for the tagged commit,
-attaches the shared libraries to a GitHub release, and publishes wheels to PyPI.
+the crate and Python package versions and that CI and both validation workflows passed for the
+tagged commit, builds the shared libraries with the `strip-logging` feature, attaches them to a
+GitHub release, and publishes wheels to PyPI.
 
 PyPI publishing uses trusted publishing for the `spanner-adbc` project, with owner `fornwall`,
 repository `spanner-adbc`, workflow `libraries.yml` and environment `pypi`.

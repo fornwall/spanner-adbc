@@ -11,11 +11,11 @@ temporary emulator in Docker.
 python3 -m venv .venv
 . .venv/bin/activate
 pip install 'adbc-driver-manager[dbapi]' polars google-cloud-spanner
-cargo build --release
+cargo build --release --features strip-logging
 cp target/release/libspanner_adbc.so python/spanner_adbc/
 ```
 
-Copy the library again after each rebuild.
+The feature matches the released library. Copy the library again after each rebuild.
 
 ## End-to-end comparison
 
@@ -46,7 +46,7 @@ official client. `PERF_ROWS` and `PERF_LOOPS` default to 500,000 and 8. To profi
 pointers, rebuild and stage the library before recording:
 
 ```sh
-RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
+RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling --features strip-logging
 cp target/profiling/libspanner_adbc.so python/spanner_adbc/
 PYTHONPATH=python scripts/with-emulator.sh \
   perf record -F 199 --call-graph fp -o perf.data -- \
