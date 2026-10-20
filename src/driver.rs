@@ -584,7 +584,7 @@ impl Database for SpannerDatabase {
 }
 
 fn string_value(key: &OptionDatabase, value: OptionValue) -> Result<String> {
-    crate::options::string_option(value, &format!("option {}", key.as_ref()))
+    crate::options::string_option(value, key.as_ref())
 }
 
 /// Split a comma-separated value, trimming entries and dropping empty ones.
@@ -615,7 +615,7 @@ fn u64_seconds_value(key: &OptionDatabase, value: OptionValue) -> Result<u64> {
 }
 
 fn bool_value(key: &OptionDatabase, value: OptionValue) -> Result<bool> {
-    crate::options::bool_option(value, &format!("option {}", key.as_ref()))
+    crate::options::bool_option(value, key.as_ref())
 }
 
 #[cfg(test)]

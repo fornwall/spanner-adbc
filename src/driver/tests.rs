@@ -206,7 +206,7 @@ fn boolean_options_reject_int_typed_sets() {
         assert_eq!(error.status, Status::InvalidArguments, "Int({i})");
         assert!(error.message.contains(OPTION_EMULATOR), "{}", error.message);
         assert!(
-            error.message.contains("\"true\"/\"false\""),
+            error.message.contains("\"true\" or \"false\""),
             "{}",
             error.message
         );

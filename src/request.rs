@@ -112,8 +112,7 @@ impl RequestConfig {
     }
 
     pub(crate) fn set_commit_stats(&mut self, value: OptionValue) -> Result<()> {
-        self.return_commit_stats =
-            bool_option_unsettable(value, &format!("option {}", crate::OPTION_COMMIT_STATS))?;
+        self.return_commit_stats = bool_option_unsettable(value, crate::OPTION_COMMIT_STATS)?;
         Ok(())
     }
 
@@ -126,10 +125,8 @@ impl RequestConfig {
     }
 
     pub(crate) fn set_exclude_txn_from_change_streams(&mut self, value: OptionValue) -> Result<()> {
-        self.exclude_txn_from_change_streams = bool_option_unsettable(
-            value,
-            &format!("option {}", crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS),
-        )?;
+        self.exclude_txn_from_change_streams =
+            bool_option_unsettable(value, crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS)?;
         Ok(())
     }
 

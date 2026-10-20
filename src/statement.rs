@@ -794,7 +794,7 @@ impl Optionable for SpannerStatement {
                 // that always set the option keep working.
                 check_unsupported_true(
                     value,
-                    "option adbc.ingest.temporary",
+                    key.as_ref(),
                     "setting adbc.ingest.temporary to true: Spanner has no temporary tables; \
                      leave it unset or false",
                 )?;
@@ -802,7 +802,7 @@ impl Optionable for SpannerStatement {
             OptionStatement::Incremental => {
                 check_unsupported_true(
                     value,
-                    "option adbc.statement.exec.incremental",
+                    key.as_ref(),
                     "setting adbc.statement.exec.incremental to true: incremental \
                      execute_partitions is not implemented; leave it unset or false",
                 )?;
@@ -817,14 +817,13 @@ impl Optionable for SpannerStatement {
                 self.dml_partitioned = dml_partitioned_option(value)?;
             }
             OptionStatement::Other(k) if k == crate::OPTION_BIND_BY_NAME => {
-                self.bind_by_name = bool_option(value, "option adbc.statement.bind_by_name")?;
+                self.bind_by_name = bool_option(value, k)?;
             }
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
-                self.rows_per_batch =
-                    crate::options::positive_usize(value, "option spanner.rows_per_batch")?;
+                self.rows_per_batch = crate::options::positive_usize(value, k)?;
             }
             OptionStatement::Other(k) if k == crate::OPTION_DATA_BOOST => {
-                self.data_boost = bool_option(value, "option spanner.data_boost")?;
+                self.data_boost = bool_option(value, k)?;
             }
             // Options shared with the connection. Unknown keys, including connection-only ones
             // such as `spanner.transaction.tag`, are reported as not implemented.
@@ -1039,7 +1038,7 @@ impl Statement for SpannerStatement {
 
 /// Parse a string option, naming `key` in the error.
 fn string_option(key: &OptionStatement, value: OptionValue) -> Result<String> {
-    crate::options::string_option(value, &format!("option {}", key.as_ref()))
+    crate::options::string_option(value, key.as_ref())
 }
 
 /// Reject DDL and DML in the query-only entry points. DML, including `THEN RETURN`, would
@@ -1165,10 +1164,7 @@ fn check_unsupported_true(value: OptionValue, what: &str, rejection: &str) -> Re
 
 /// Parse `spanner.dml.partitioned`; an empty or whitespace-only string resets it to `false`.
 fn dml_partitioned_option(value: OptionValue) -> Result<bool> {
-    crate::options::bool_option_unsettable(
-        value,
-        &format!("option {}", crate::OPTION_DML_PARTITIONED),
-    )
+    crate::options::bool_option_unsettable(value, crate::OPTION_DML_PARTITIONED)
 }
 
 #[cfg(test)]

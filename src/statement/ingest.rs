@@ -464,10 +464,7 @@ pub(super) fn ingest_mode_option(key: &OptionStatement, value: OptionValue) -> R
 
 /// Parse `spanner.ingest.batch_write`; an empty or whitespace-only string resets it to `false`.
 pub(super) fn ingest_batch_write_option(value: OptionValue) -> Result<bool> {
-    crate::options::bool_option_unsettable(
-        value,
-        &format!("option {}", crate::OPTION_INGEST_BATCH_WRITE),
-    )
+    crate::options::bool_option_unsettable(value, crate::OPTION_INGEST_BATCH_WRITE)
 }
 
 /// Add to a failed autocommit ingest's error how many rows were already committed and remain in

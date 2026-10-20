@@ -1,7 +1,5 @@
-//! Option value parsing, and the configuration shared by connections and statements.
-//!
-//! The parsers take a `what` label for error messages, such as `"option spanner.emulator"`.
-//! [`f64_option`] instead takes the bare key and adds the `option ` prefix itself.
+//! Option value parsing, and the configuration shared by connections and statements. The
+//! parsers take the option key and name it in their errors.
 
 use std::time::Duration;
 
@@ -21,45 +19,52 @@ use crate::retry::RetryConfig;
 use crate::staleness::ReadStaleness;
 use crate::timeout::RpcTimeouts;
 
-/// Parse a boolean option from the string `true` or `false`.
-///
-/// Integers are rejected because the getters return the string form, so an int set would not
-/// round-trip.
-pub(crate) fn bool_option(value: OptionValue, what: &str) -> Result<bool> {
+/// Describe a rejected value for an error message.
+pub(crate) fn shown(value: &OptionValue) -> String {
     match value {
-        OptionValue::String(s) => match s.as_str() {
-            "true" => Ok(true),
-            "false" => Ok(false),
-            other => Err(invalid_argument(format!(
-                "{what} expects \"true\" or \"false\", got {other:?}"
-            ))),
-        },
-        _ => Err(invalid_argument(format!(
-            "{what} is a boolean option and takes the strings \"true\"/\"false\" \
-             (int- and other non-string-typed values are not accepted)"
+        OptionValue::String(s) => format!("{s:?}"),
+        OptionValue::Int(i) => format!("the integer {i}"),
+        OptionValue::Double(d) => format!("the double {d}"),
+        OptionValue::Bytes(_) => "a bytes value".to_string(),
+        _ => "an unsupported value type".to_string(),
+    }
+}
+
+/// Parse a boolean option from the string `true` or `false`.
+pub(crate) fn bool_option(value: OptionValue, key: &str) -> Result<bool> {
+    match value {
+        OptionValue::String(s) if s == "true" => Ok(true),
+        OptionValue::String(s) if s == "false" => Ok(false),
+        // An integer would not round-trip, since the getters return the string form.
+        other => Err(invalid_argument(format!(
+            "option {key} expects the string \"true\" or \"false\", got {}",
+            shown(&other)
         ))),
     }
 }
 
 /// Like [`bool_option`], but a blank string resets the option to `false`.
-pub(crate) fn bool_option_unsettable(value: OptionValue, what: &str) -> Result<bool> {
+pub(crate) fn bool_option_unsettable(value: OptionValue, key: &str) -> Result<bool> {
     match &value {
         OptionValue::String(s) if s.trim().is_empty() => Ok(false),
-        _ => bool_option(value, what),
+        _ => bool_option(value, key),
     }
 }
 
 /// Parse a string option.
-pub(crate) fn string_option(value: OptionValue, what: &str) -> Result<String> {
+pub(crate) fn string_option(value: OptionValue, key: &str) -> Result<String> {
     match value {
         OptionValue::String(s) => Ok(s),
-        _ => Err(invalid_argument(format!("{what} requires a string value"))),
+        other => Err(invalid_argument(format!(
+            "option {key} expects a string, got {}",
+            shown(&other)
+        ))),
     }
 }
 
 /// Parse a string option where `""` means unset. The value is not trimmed.
-pub(crate) fn non_empty_string_option(value: OptionValue, what: &str) -> Result<Option<String>> {
-    Ok(Some(string_option(value, what)?).filter(|s| !s.is_empty()))
+pub(crate) fn non_empty_string_option(value: OptionValue, key: &str) -> Result<Option<String>> {
+    Ok(Some(string_option(value, key)?).filter(|s| !s.is_empty()))
 }
 
 /// An option's string, kept for `get_option`, alongside its parsed value. Both change together
@@ -84,10 +89,10 @@ impl<T> RawParsed<T> {
     pub(crate) fn set(
         &mut self,
         value: OptionValue,
-        what: &str,
+        key: &str,
         parse: impl FnOnce(&str) -> Result<T>,
     ) -> Result<()> {
-        let raw = string_option(value, what)?;
+        let raw = string_option(value, key)?;
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             self.raw = None;
@@ -121,76 +126,69 @@ pub(crate) enum F64Range {
 
 /// Parse a finite number in `range` from a numeric string, an integer or a double. A blank string
 /// yields `None` (unset).
-pub(crate) fn f64_option(value: OptionValue, what: &str, range: F64Range) -> Result<Option<f64>> {
-    let (bound, unit) = match range {
-        F64Range::PositiveSeconds => ("strictly positive", " of seconds"),
-        F64Range::NonNegativeSeconds => ("non-negative", " of seconds"),
-        F64Range::PositiveFactor => ("strictly positive", ""),
+pub(crate) fn f64_option(value: OptionValue, key: &str, range: F64Range) -> Result<Option<f64>> {
+    let expected = match range {
+        F64Range::PositiveSeconds => "a finite, strictly positive number of seconds",
+        F64Range::NonNegativeSeconds => "a finite, non-negative number of seconds",
+        F64Range::PositiveFactor => "a finite, strictly positive number",
     };
     let reject = || {
         invalid_argument(format!(
-            "option {what} must be a finite, {bound} number{unit}"
+            "option {key} expects {expected}, got {}",
+            shown(&value)
         ))
     };
-    let n = match value {
-        OptionValue::String(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                return Ok(None);
-            }
-            trimmed.parse::<f64>().map_err(|_| reject())?
-        }
-        OptionValue::Double(d) => d,
-        OptionValue::Int(i) => i as f64,
+    let n = match &value {
+        OptionValue::String(s) if s.trim().is_empty() => return Ok(None),
+        OptionValue::String(s) => s.trim().parse::<f64>().map_err(|_| reject())?,
+        OptionValue::Double(d) => *d,
+        OptionValue::Int(i) => *i as f64,
         _ => return Err(reject()),
     };
     let in_range = match range {
         F64Range::NonNegativeSeconds => n >= 0.0,
         F64Range::PositiveSeconds | F64Range::PositiveFactor => n > 0.0,
     };
-    if !n.is_finite() || !in_range {
-        return Err(reject());
+    let fits = range == F64Range::PositiveFactor || Duration::try_from_secs_f64(n).is_ok();
+    if n.is_finite() && in_range && fits {
+        Ok(Some(n))
+    } else {
+        Err(reject())
     }
-    if range != F64Range::PositiveFactor && Duration::try_from_secs_f64(n).is_err() {
-        return Err(reject());
-    }
-    Ok(Some(n))
 }
 
 /// Parse a positive integer from an integer or a numeric string.
-pub(crate) fn positive_i64(value: OptionValue, what: &str) -> Result<i64> {
-    let reject = || invalid_argument(format!("{what} must be a positive integer"));
-    let n = match value {
-        OptionValue::Int(i) => i,
-        OptionValue::String(s) => s.parse::<i64>().map_err(|_| reject())?,
-        _ => return Err(reject()),
+pub(crate) fn positive_usize(value: OptionValue, key: &str) -> Result<usize> {
+    let n = match &value {
+        OptionValue::Int(i) => usize::try_from(*i).ok(),
+        OptionValue::String(s) => s.parse::<usize>().ok(),
+        _ => None,
     };
-    if n > 0 { Ok(n) } else { Err(reject()) }
-}
-
-/// [`positive_i64`], narrowed to `usize`.
-pub(crate) fn positive_usize(value: OptionValue, what: &str) -> Result<usize> {
-    let n = positive_i64(value, what)?;
-    usize::try_from(n).map_err(|_| invalid_argument(format!("{what} must be a positive integer")))
+    n.filter(|&n| n > 0).ok_or_else(|| {
+        invalid_argument(format!(
+            "option {key} expects a positive integer, got {}",
+            shown(&value)
+        ))
+    })
 }
 
 /// Parse a `get_option_string` result for `get_option_int`.
 ///
 /// Lookup errors pass through unchanged, since ADBC's `NotFound` means unset or unknown. A value
 /// that is not an integer is `InvalidArguments`.
-pub(crate) fn int_from_stored_string(stored: Result<String>, what: &str) -> Result<i64> {
+pub(crate) fn int_from_stored_string(stored: Result<String>, key: &str) -> Result<i64> {
     let value = stored?;
     value
         .parse::<i64>()
-        .map_err(|_| invalid_argument(format!("{what} value {value:?} is not an integer")))
+        .map_err(|_| invalid_argument(format!("option {key} value {value:?} is not an integer")))
 }
 
 /// Parse a `get_option_string` result for `get_option_double`, as [`int_from_stored_string`].
-pub(crate) fn double_from_stored_string(stored: Result<String>, what: &str) -> Result<f64> {
+pub(crate) fn double_from_stored_string(stored: Result<String>, key: &str) -> Result<f64> {
     let value = stored?;
     value
         .parse::<f64>()
-        .map_err(|_| invalid_argument(format!("{what} value {value:?} is not a double")))
+        .map_err(|_| invalid_argument(format!("option {key} value {value:?} is not a number")))
 }
 
 /// Implement `get_option_bytes`, `get_option_int` and `get_option_double` in terms of
@@ -202,13 +200,13 @@ macro_rules! impl_typed_option_getters {
         }
 
         fn get_option_int(&self, key: Self::Option) -> Result<i64> {
-            let what = format!("option {}", key.as_ref());
-            crate::options::int_from_stored_string(self.get_option_string(key), &what)
+            let name = key.as_ref().to_string();
+            crate::options::int_from_stored_string(self.get_option_string(key), &name)
         }
 
         fn get_option_double(&self, key: Self::Option) -> Result<f64> {
-            let what = format!("option {}", key.as_ref());
-            crate::options::double_from_stored_string(self.get_option_string(key), &what)
+            let name = key.as_ref().to_string();
+            crate::options::double_from_stored_string(self.get_option_string(key), &name)
         }
     };
 }

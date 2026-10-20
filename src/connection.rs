@@ -145,8 +145,7 @@ impl Optionable for SpannerConnection {
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         match &key {
             OptionConnection::AutoCommit => {
-                let enable =
-                    crate::options::bool_option(value, "option adbc.connection.autocommit")?;
+                let enable = crate::options::bool_option(value, key.as_ref())?;
                 // Enabling autocommit commits the active manual transaction. `enter_autocommit`
                 // flips the mode and takes the state under one lock, so concurrent statements
                 // cannot strand work behind the flip. Like a failed `commit`, a failed apply keeps
@@ -168,7 +167,7 @@ impl Optionable for SpannerConnection {
                 }
             }
             OptionConnection::ReadOnly => self.config.read_only.store(
-                crate::options::bool_option(value, "option adbc.connection.readonly")?,
+                crate::options::bool_option(value, key.as_ref())?,
                 Ordering::Release,
             ),
             OptionConnection::IsolationLevel => {

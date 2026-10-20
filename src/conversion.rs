@@ -81,14 +81,14 @@ impl TimestampPrecision {
 
     /// Parse an option value; the empty string resets to the default.
     pub(crate) fn parse_option(value: OptionValue) -> Result<Self> {
-        let what = format!("option {}", crate::OPTION_MAX_TIMESTAMP_PRECISION);
-        let s = crate::options::string_option(value, &what)?;
+        let key = crate::OPTION_MAX_TIMESTAMP_PRECISION;
+        let s = crate::options::string_option(value, key)?;
         match s.trim() {
             "" => Ok(Self::default()),
             Self::NANOSECONDS_ERROR_ON_OVERFLOW => Ok(Self::NanosecondsErrorOnOverflow),
             Self::MICROSECONDS => Ok(Self::Microseconds),
             other => Err(invalid_argument(format!(
-                "{what} expects {:?} or {:?} (or \"\" to reset to the default), got {other:?}",
+                "option {key} expects {:?} or {:?} (or \"\" to reset to the default), got {other:?}",
                 Self::NANOSECONDS_ERROR_ON_OVERFLOW,
                 Self::MICROSECONDS,
             ))),
