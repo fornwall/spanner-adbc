@@ -191,14 +191,18 @@ impl SpannerDatabase {
     /// Outside Omni, a non-empty `SPANNER_EMULATOR_HOST` enables emulator mode and supplies the
     /// endpoint unless one was set explicitly.
     pub(crate) fn connect(&self) -> Result<Connected> {
-        let emulator_host = std::env::var("SPANNER_EMULATOR_HOST").ok();
+        self.connect_with(std::env::var("SPANNER_EMULATOR_HOST").ok().as_deref())
+    }
+
+    /// [`Self::connect`] with `emulator_host` as the value of `SPANNER_EMULATOR_HOST`.
+    fn connect_with(&self, emulator_host: Option<&str>) -> Result<Connected> {
         let Target {
             database,
             endpoint,
             endpoint_from_env,
             emulator,
             anonymous_default,
-        } = self.resolve_target(emulator_host.as_deref())?;
+        } = self.resolve_target(emulator_host)?;
         let choice = self.credential_choice(emulator, anonymous_default);
 
         // Blocking file I/O, so read the key file before entering the runtime.

@@ -13,8 +13,10 @@ fn s(value: &str) -> OptionValue {
     OptionValue::String(value.into())
 }
 
-/// Sets the `emulator` field because parallel tests cannot safely change `SPANNER_EMULATOR_HOST`,
-/// which resolves to the same flag. The guard fires before any network I/O.
+/// Emulator mode comes from the option or from `SPANNER_EMULATOR_HOST`, passed in because
+/// parallel tests can't safely change the environment. The guard fires before any network I/O.
+/// From the variable, it stops a stray value from sending the configured credentials' traffic,
+/// unauthenticated, to another endpoint.
 #[test]
 fn emulator_mode_refuses_every_credential_option_and_a_quota_project() {
     type Set = fn(&mut SpannerDatabase);
@@ -41,16 +43,55 @@ fn emulator_mode_refuses_every_credential_option_and_a_quota_project() {
         ),
     ];
     for (set, option) in cases {
-        let mut db = new_database();
-        db.database = Some("projects/p/instances/i/databases/d".into());
-        db.emulator = true;
-        set(&mut db);
-        let error = db.connect().unwrap_err();
-        assert_eq!(error.status, Status::InvalidState, "{option}");
-        for needle in ["emulator mode", "`spanner.emulator` option", option] {
-            assert!(error.message.contains(needle), "{}", error.message);
+        for (from_option, emulator_host, cause) in [
+            (true, None, "`spanner.emulator` option"),
+            (
+                false,
+                Some("localhost:9010"),
+                "`SPANNER_EMULATOR_HOST` environment variable",
+            ),
+        ] {
+            let mut db = new_database();
+            db.database = Some("projects/p/instances/i/databases/d".into());
+            db.emulator = from_option;
+            set(&mut db);
+            let error = db.connect_with(emulator_host).unwrap_err();
+            assert_eq!(error.status, Status::InvalidState, "{option}");
+            for needle in ["emulator mode", cause, option] {
+                assert!(error.message.contains(needle), "{}", error.message);
+            }
         }
     }
+}
+
+/// A token endpoint that refuses connections fails every fetch transiently. The client would only
+/// report the connect timeout, so the error names the credentials and the cause instead.
+#[test]
+fn a_token_that_never_arrives_is_unauthenticated() {
+    let mut db = new_database();
+    db.database = Some("projects/p/instances/i/databases/d".into());
+    db.endpoint = Some("https://127.0.0.1:1".into());
+    db.connect_timeout_secs = Some(0.5);
+    db.keyfile_json = Some(
+        serde_json::json!({
+            "type": "authorized_user",
+            "client_id": "id",
+            "client_secret": "secret",
+            "refresh_token": "SECRET-REFRESH-TOKEN",
+            "token_uri": "http://127.0.0.1:1/token",
+        })
+        .to_string(),
+    );
+    let error = db.connect_with(None).unwrap_err();
+    assert_eq!(error.status, Status::Unauthenticated, "{}", error.message);
+    for needle in [
+        "timed out after 0.5s",
+        "the configured credentials supplied no access token",
+        "refused",
+    ] {
+        assert!(error.message.contains(needle), "{}", error.message);
+    }
+    assert!(!error.message.contains("SECRET"), "{}", error.message);
 }
 
 /// Fails every token fetch, counting the attempts.
@@ -690,4 +731,36 @@ fn impersonated_credentials_build_without_network() {
             "{built}"
         );
     });
+}
+
+/// ADC naming a missing file fails with the path, which is safe to show and the likely fix. The
+/// variable is set only for a child test process, since parallel tests share the environment.
+#[test]
+fn adc_naming_a_missing_key_file_reports_the_path() {
+    const MISSING: &str = "/nonexistent/spanner-adbc-adc-key.json";
+    if std::env::var("GOOGLE_APPLICATION_CREDENTIALS").as_deref() != Ok(MISSING) {
+        let name = "driver::credentials::tests::adc_naming_a_missing_key_file_reports_the_path";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env("GOOGLE_APPLICATION_CREDENTIALS", MISSING)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        assert!(
+            stdout.contains("1 passed"),
+            "the child ran no test: {stdout}"
+        );
+        return;
+    }
+    let error = build_adc(Some("billing-project")).unwrap_err();
+    assert_eq!(error.status, Status::InvalidArguments);
+    assert!(
+        error
+            .message
+            .starts_with("failed to load Application Default Credentials: "),
+        "{}",
+        error.message
+    );
+    assert!(error.message.contains(MISSING), "{}", error.message);
 }

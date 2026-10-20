@@ -353,6 +353,22 @@ fn emulator_mode_without_an_endpoint_is_rejected() {
     assert!(db.resolve_target(None).unwrap().emulator);
 }
 
+/// `0` disables the deadline, so a connect that fails by itself still reports its own error.
+#[test]
+fn a_disabled_connect_timeout_still_reports_credential_errors() {
+    let mut db = new_database();
+    db.database = Some("projects/p/instances/i/databases/d".into());
+    db.connect_timeout_secs = Some(0.0);
+    db.keyfile_json = Some("not json".into());
+    let error = db.connect_with(None).unwrap_err();
+    assert_eq!(error.status, Status::InvalidArguments, "{}", error.message);
+    assert!(
+        error.message.contains("invalid credential JSON"),
+        "{}",
+        error.message
+    );
+}
+
 fn connect_timeout_key() -> OptionDatabase {
     OptionDatabase::Other(OPTION_RPC_TIMEOUT_CONNECT.into())
 }
