@@ -647,6 +647,31 @@ mod manual_commit_limit {
                 "The transaction contains too many mutations. (Maximum number: 80000)",
             ))
         });
+        // The append's check that its table exists finds it.
+        mock.expect_execute_streaming_sql().returning(|_| {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(Ok(v1::PartialResultSet {
+                metadata: Some(v1::ResultSetMetadata {
+                    row_type: Some(v1::StructType {
+                        fields: vec![v1::struct_type::Field {
+                            name: "TABLE_NAME".into(),
+                            r#type: Some(v1::Type {
+                                code: v1::TypeCode::String as i32,
+                                ..Default::default()
+                            }),
+                        }],
+                    }),
+                    ..Default::default()
+                }),
+                values: vec![prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue("t".into())),
+                }],
+                last: true,
+                ..Default::default()
+            }))
+            .unwrap();
+            Ok(tonic::Response::new(rx))
+        });
         let server = serve(mock, Requests::default());
         let mut connection = connect(&server);
         connection
