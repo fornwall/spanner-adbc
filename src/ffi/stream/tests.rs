@@ -9,11 +9,6 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use super::*;
 use crate::ffi::test_support::null;
 
-/// Export with no `private_driver`, as for a directly linked caller.
-fn exported(reader: Box<dyn RecordBatchReader + Send>) -> FFI_ArrowArrayStream {
-    export_reader(reader, null())
-}
-
 struct PanickingReader {
     schema: SchemaRef,
     panic_in_schema: bool,
@@ -40,7 +35,7 @@ fn exports_an_ordinary_reader() {
         RecordBatch::try_from_iter([("value", Arc::new(Int64Array::from(vec![7])) as ArrayRef)])
             .unwrap();
     let schema = batch.schema();
-    let mut stream = exported(Box::new(RecordBatchIterator::new(
+    let mut stream = export_reader(Box::new(RecordBatchIterator::new(
         std::iter::once(Ok(batch.clone())),
         schema,
     )));
@@ -116,7 +111,7 @@ fn get_last_error_tolerates_a_released_or_null_stream() {
 }
 
 fn error_stream(error: ArrowError) -> FFI_ArrowArrayStream {
-    exported(Box::new(RecordBatchIterator::new(
+    export_reader(Box::new(RecordBatchIterator::new(
         std::iter::once(Err(error)),
         Arc::new(Schema::empty()),
     )))
@@ -179,7 +174,7 @@ fn error_from_array_stream_exposes_the_pending_error() {
 fn error_from_array_stream_reports_ok_when_nothing_failed() {
     use super::super::abi::ADBC_STATUS_OK;
 
-    let mut stream = exported(Box::new(RecordBatchIterator::new(
+    let mut stream = export_reader(Box::new(RecordBatchIterator::new(
         std::iter::empty(),
         Arc::new(Schema::empty()),
     )));
@@ -217,7 +212,7 @@ fn error_from_array_stream_rejects_foreign_and_null_streams() {
 
 #[test]
 fn contains_reader_panics_in_get_next() {
-    let mut stream = exported(Box::new(PanickingReader {
+    let mut stream = export_reader(Box::new(PanickingReader {
         schema: Arc::new(Schema::empty()),
         panic_in_schema: false,
     }));
@@ -241,7 +236,7 @@ fn contains_reader_panics_in_get_next() {
 #[test]
 fn contains_reader_panics_in_get_schema() {
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
-    let mut stream = exported(Box::new(PanickingReader {
+    let mut stream = export_reader(Box::new(PanickingReader {
         schema,
         panic_in_schema: true,
     }));
@@ -280,7 +275,7 @@ fn contains_reader_panics_in_release() {
         }
     }
 
-    let mut stream = exported(Box::new(DropPanic(PanickingReader {
+    let mut stream = export_reader(Box::new(DropPanic(PanickingReader {
         schema: Arc::new(Schema::empty()),
         panic_in_schema: false,
     })));
@@ -289,27 +284,21 @@ fn contains_reader_panics_in_release() {
     assert!(stream.private_data().is_null());
 }
 
-/// The driver manager reads error details through `private_driver`, which nothing but the driver
-/// can fill in for an error in driver-owned storage.
+/// The C++ driver manager writes `private_driver` into the returned error, so a later call must
+/// keep it.
 #[test]
-fn a_stream_error_carries_the_handles_driver_vtable() {
-    let vtable = 0x5eed_usize as *const AdbcDriver;
-    let mut stream = export_reader(
-        Box::new(RecordBatchIterator::new(
-            std::iter::once(Err(ArrowError::MemoryError("no room".to_owned()))),
-            Arc::new(Schema::empty()),
-        )),
-        vtable,
-    );
+fn a_stream_error_keeps_the_private_driver_the_manager_wrote() {
+    let vtable = 0x5eed_usize as *const super::super::abi::AdbcDriver;
+    let mut stream = error_stream(ArrowError::MemoryError("no room".to_owned()));
     let mut out = FFI_ArrowArray::empty();
     assert_eq!(
         unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut out) },
         ENOMEM
     );
 
-    let mut status: AdbcStatusCode = 0xEE;
-    let exported = unsafe { error_from_array_stream(&raw mut stream, &raw mut status) };
-    assert!(!exported.is_null());
+    let exported = unsafe { error_from_array_stream(&raw mut stream, null()) };
+    unsafe { (*exported.cast_mut()).private_driver = vtable };
+    let exported = unsafe { error_from_array_stream(&raw mut stream, null()) };
     assert_eq!(unsafe { (*exported).private_driver }, vtable);
     unsafe { stream.release().unwrap()(&raw mut stream) };
 }
@@ -321,7 +310,7 @@ fn a_released_stream_survives_a_second_release_and_stale_callbacks() {
         RecordBatch::try_from_iter([("value", Arc::new(Int64Array::from(vec![1])) as ArrayRef)])
             .unwrap();
     let schema = batch.schema();
-    let mut stream = exported(Box::new(RecordBatchIterator::new(
+    let mut stream = export_reader(Box::new(RecordBatchIterator::new(
         std::iter::once(Ok(batch)),
         schema,
     )));
@@ -365,7 +354,7 @@ fn a_successful_read_clears_the_previous_failure() {
         RecordBatch::try_from_iter([("value", Arc::new(Int64Array::from(vec![7])) as ArrayRef)])
             .unwrap();
     let schema = batch.schema();
-    let mut stream = exported(Box::new(RecordBatchIterator::new(
+    let mut stream = export_reader(Box::new(RecordBatchIterator::new(
         std::iter::once(Ok(batch)),
         schema,
     )));
@@ -461,7 +450,7 @@ fn contains_panicking_payloads_in_callbacks_and_release() {
     }
 
     for schema_callback in [false, true] {
-        let mut stream = exported(Box::new(Reader));
+        let mut stream = export_reader(Box::new(Reader));
         let code = if schema_callback {
             let mut out = FFI_ArrowSchema::empty();
             unsafe { stream.get_schema().unwrap()(&raw mut stream, &raw mut out) }

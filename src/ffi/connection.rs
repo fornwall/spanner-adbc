@@ -10,12 +10,12 @@ use arrow_array::RecordBatchReader;
 use arrow_array::ffi::FFI_ArrowSchema;
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 
-use super::abi::{AdbcConnection, AdbcDatabase, AdbcDriver, AdbcError, AdbcStatusCode};
+use super::abi::{AdbcConnection, AdbcDatabase, AdbcError, AdbcStatusCode};
 use super::guard::{
     byte_slice, optional_str, optional_str_list, required_output, required_str, write_out,
 };
 use super::handle::{Staged, install_cancel_handle};
-use super::options::{FfiHandle, driver_of, slot_of, with_state};
+use super::options::{FfiHandle, slot_of, with_state};
 use crate::connection::SpannerConnection;
 use crate::error::invalid_argument;
 
@@ -33,10 +33,6 @@ impl FfiHandle for AdbcConnection {
 
     fn private_data_mut(&mut self) -> &mut *mut c_void {
         &mut self.private_data
-    }
-
-    fn private_driver(&self) -> *const AdbcDriver {
-        self.private_driver
     }
 }
 
@@ -63,20 +59,14 @@ pub(super) unsafe extern "C" fn connection_init(
     }
 }
 
-/// Export `reader` as an Arrow C stream carrying the connection's `private_driver` (see
-/// [`driver_of`]).
-///
 /// # Safety
-/// `connection` must be null or point to a valid `AdbcConnection`, and `out` must be null or
-/// point to a writable `FFI_ArrowArrayStream`.
+/// `out` must be null or point to a writable `FFI_ArrowArrayStream`.
 unsafe fn export_stream(
-    connection: *mut AdbcConnection,
     reader: Box<dyn RecordBatchReader + Send>,
     out: *mut FFI_ArrowArrayStream,
 ) -> Result<()> {
-    let stream = super::stream::export_reader(reader, unsafe { driver_of(connection) });
     // On a null `out`, ownership never transferred and the stream is dropped here.
-    unsafe { write_out(out, stream, "out") }
+    unsafe { write_out(out, super::stream::export_reader(reader), "out") }
 }
 
 /// # Safety
@@ -134,7 +124,7 @@ pub(super) unsafe extern "C" fn connection_get_info(
                 )
             };
             let reader = state.ready(KIND)?.get_info(codes)?;
-            export_stream(connection, reader, out)
+            export_stream(reader, out)
         })
     }
 }
@@ -182,7 +172,7 @@ pub(super) unsafe extern "C" fn connection_get_objects(
                 table_type,
                 column_name,
             )?;
-            export_stream(connection, reader, out)
+            export_stream(reader, out)
         })
     }
 }
@@ -233,7 +223,7 @@ pub(super) unsafe extern "C" fn connection_get_table_types(
         with_state(connection, error, |state| {
             required_output(out, "out")?;
             let reader = state.ready(KIND)?.get_table_types()?;
-            export_stream(connection, reader, out)
+            export_stream(reader, out)
         })
     }
 }
@@ -264,7 +254,7 @@ pub(super) unsafe extern "C" fn connection_get_statistics(
                 // The header declares a C boolean as `char`; anything non-zero is true.
                 approximate != 0,
             )?;
-            export_stream(connection, reader, out)
+            export_stream(reader, out)
         })
     }
 }
@@ -280,7 +270,7 @@ pub(super) unsafe extern "C" fn connection_get_statistic_names(
         with_state(connection, error, |state| {
             required_output(out, "out")?;
             let reader = state.ready(KIND)?.get_statistic_names()?;
-            export_stream(connection, reader, out)
+            export_stream(reader, out)
         })
     }
 }
@@ -304,7 +294,7 @@ pub(super) unsafe extern "C" fn connection_read_partition(
                 "serialized_partition",
             )?;
             let reader = state.ready(KIND)?.read_partition(partition)?;
-            export_stream(connection, reader, out)
+            export_stream(reader, out)
         })
     }
 }

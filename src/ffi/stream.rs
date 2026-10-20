@@ -15,9 +15,7 @@ use arrow_schema::ArrowError;
 
 use libc::{EACCES, ECANCELED, EEXIST, EINVAL, EIO, ENOENT, ENOMEM, ENOSYS, ENOTSUP, ETIMEDOUT};
 
-use super::abi::{
-    ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA, ADBC_STATUS_OK, AdbcDriver, AdbcError, AdbcStatusCode,
-};
+use super::abi::{ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA, ADBC_STATUS_OK, AdbcError, AdbcStatusCode};
 use super::error::export_error;
 use super::guard::{drop_panic_payload, panic_message, sanitized_cstring};
 use crate::error::chain;
@@ -36,9 +34,6 @@ const STREAM_MAGIC: u64 = 0x5350_414e_5354_524d; // "SPANSTRM"
 struct PrivateData {
     magic: u64,
     reader: Box<dyn RecordBatchReader + Send>,
-    /// The producing handle's `private_driver`, copied into errors from
-    /// [`error_from_array_stream`].
-    private_driver: *const AdbcDriver,
     last_error: Option<LastError>,
     /// The error returned by [`error_from_array_stream`], which must stay valid until the stream
     /// is released.
@@ -56,14 +51,10 @@ impl Drop for PrivateData {
     }
 }
 
-pub(super) fn export_reader(
-    reader: Box<dyn RecordBatchReader + Send>,
-    private_driver: *const AdbcDriver,
-) -> FFI_ArrowArrayStream {
+pub(super) fn export_reader(reader: Box<dyn RecordBatchReader + Send>) -> FFI_ArrowArrayStream {
     let private_data = Box::new(PrivateData {
         magic: STREAM_MAGIC,
         reader,
-        private_driver,
         last_error: None,
         exported_error: None,
         panicked: false,
@@ -174,7 +165,6 @@ pub(super) unsafe extern "C" fn error_from_array_stream(
         }
         // Kept in `PrivateData` to outlive this call. Exporting again releases the previous
         // error first.
-        let private_driver = private.private_driver;
         let exported = private.exported_error.get_or_insert_with(|| {
             Box::new(AdbcError {
                 message: std::ptr::null_mut(),
@@ -182,7 +172,7 @@ pub(super) unsafe extern "C" fn error_from_array_stream(
                 sqlstate: [0; 5],
                 release: None,
                 private_data: std::ptr::null_mut(),
-                private_driver,
+                private_driver: std::ptr::null(),
             })
         });
         match private.last_error.as_ref() {
@@ -207,7 +197,8 @@ pub(super) unsafe extern "C" fn error_from_array_stream(
                 }
             }
         }
-        std::ptr::from_ref::<AdbcError>(&**exported)
+        // The driver manager writes `private_driver` through the returned pointer.
+        (&raw mut **exported).cast_const()
     }))
     .unwrap_or_else(|cause| {
         drop_panic_payload(cause);

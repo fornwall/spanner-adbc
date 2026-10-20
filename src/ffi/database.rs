@@ -7,7 +7,7 @@ use adbc_core::Driver;
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::OptionDatabase;
 
-use super::abi::{AdbcDatabase, AdbcDriver, AdbcError, AdbcStatusCode};
+use super::abi::{AdbcDatabase, AdbcError, AdbcStatusCode};
 use super::handle::Staged;
 use super::options::{FfiHandle, with_state};
 use crate::driver::{SpannerDatabase, SpannerDriver};
@@ -26,10 +26,6 @@ impl FfiHandle for AdbcDatabase {
 
     fn private_data_mut(&mut self) -> &mut *mut c_void {
         &mut self.private_data
-    }
-
-    fn private_driver(&self) -> *const AdbcDriver {
-        self.private_driver
     }
 }
 

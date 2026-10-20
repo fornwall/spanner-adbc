@@ -8,7 +8,7 @@ use adbc_core::Optionable;
 use adbc_core::error::Result;
 use adbc_core::options::OptionValue;
 
-use super::abi::{ADBC_STATUS_OK, AdbcDriver, AdbcError, AdbcStatusCode};
+use super::abi::{ADBC_STATUS_OK, AdbcError, AdbcStatusCode};
 use super::guard::{
     byte_slice, missing_argument, required_str, write_bytes, write_out, write_string,
 };
@@ -23,8 +23,6 @@ pub(super) trait FfiHandle {
     const KIND: &'static str;
     fn private_data(&self) -> *mut c_void;
     fn private_data_mut(&mut self) -> &mut *mut c_void;
-    /// The vtable the driver manager stored in the handle; see [`driver_of`].
-    fn private_driver(&self) -> *const AdbcDriver;
 }
 
 /// How options reach the state behind a handle. A [`Staged`] object buffers sets and refuses gets
@@ -81,18 +79,6 @@ type KeyOf<H> = <<H as FfiHandle>::State as OptionTarget>::Key;
 /// `handle` must be null or point to a valid ABI struct.
 pub(super) unsafe fn slot_of<H: FfiHandle>(handle: *mut H) -> *mut c_void {
     unsafe { handle.as_ref() }.map_or(std::ptr::null_mut(), FfiHandle::private_data)
-}
-
-/// The handle's `private_driver`, or null.
-///
-/// Exported streams carry it: `AdbcErrorFromArrayStream` returns an `AdbcError` in driver-owned
-/// storage, and the driver manager finds that error's detail getters through this field. A
-/// directly linked caller leaves it null.
-///
-/// # Safety
-/// `handle` must be null or point to a valid ABI struct.
-pub(super) unsafe fn driver_of<H: FfiHandle>(handle: *mut H) -> *const AdbcDriver {
-    unsafe { handle.as_ref() }.map_or(std::ptr::null(), FfiHandle::private_driver)
 }
 
 /// Reject a null handle pointer as a bad argument. A null `private_data` is instead an object

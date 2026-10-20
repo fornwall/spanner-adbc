@@ -14,13 +14,12 @@ use arrow_array::{RecordBatch, StructArray};
 use arrow_schema::{DataType, Schema};
 
 use super::abi::{
-    ADBC_STATUS_OK, AdbcConnection, AdbcDriver, AdbcError, AdbcPartitions, AdbcStatement,
-    AdbcStatusCode,
+    ADBC_STATUS_OK, AdbcConnection, AdbcError, AdbcPartitions, AdbcStatement, AdbcStatusCode,
 };
 use super::guard::{byte_slice, catch, required_output, required_str, write_out};
 use super::handle::{Exported, finish};
 use super::import::{BoundStreamReader, contain_import, validate_imported};
-use super::options::{FfiHandle, already_populated, driver_of, slot_of, with_state};
+use super::options::{FfiHandle, already_populated, slot_of, with_state};
 use crate::error::invalid_argument;
 use crate::statement::SpannerStatement;
 
@@ -38,10 +37,6 @@ impl FfiHandle for AdbcStatement {
 
     fn private_data_mut(&mut self) -> &mut *mut c_void {
         &mut self.private_data
-    }
-
-    fn private_driver(&self) -> *const AdbcDriver {
-        self.private_driver
     }
 }
 
@@ -234,10 +229,7 @@ pub(super) unsafe extern "C" fn statement_execute_query(
             // every `execute` this way. Queries, DDL and buffered writes report -1 (unknown),
             // which also overwrites any previous count.
             let (reader, affected) = state.execute_counted()?;
-            std::ptr::write_unaligned(
-                out,
-                super::stream::export_reader(reader, driver_of(statement)),
-            );
+            std::ptr::write_unaligned(out, super::stream::export_reader(reader));
             write_rows_affected(rows_affected, affected.unwrap_or(-1));
             Ok(())
         })
