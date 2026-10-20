@@ -37,6 +37,7 @@ class SpannerQuirks(model.DriverQuirks):
             "xdbc_type_name",
             "xdbc_nullable",
             "xdbc_is_nullable",
+            "xdbc_is_autoincrement",
             "xdbc_is_generatedcolumn",
         ],
         # The driver reports the database id as the ADBC catalog; the default schema is
