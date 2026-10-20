@@ -4400,7 +4400,9 @@ fn get_statistics_reports_real_counts() {
     run(
         connection,
         "DROP TABLE IF EXISTS AdbcStats; \
-         CREATE TABLE AdbcStats (Id INT64, Name STRING(MAX), Tag UUID) PRIMARY KEY (Id)",
+         DROP TABLE IF EXISTS AdbcStatsEmpty; \
+         CREATE TABLE AdbcStats (Id INT64, Name STRING(MAX), Tag UUID) PRIMARY KEY (Id); \
+         CREATE TABLE AdbcStatsEmpty (Id INT64) PRIMARY KEY (Id)",
     );
     run(
         connection,
@@ -4462,7 +4464,31 @@ fn get_statistics_reports_real_counts() {
         "approximate=true must serve the same exact statistics"
     );
 
-    drop_tables(connection, &["AdbcStats"]);
+    // Both tables match the patterns and share the default schema's one entry.
+    let both = connection
+        .get_statistics(None, Some(""), Some("AdbcStats%"), false)
+        .expect("get_statistics for two tables")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect two tables");
+    let db_schemas = col::<ListArray>(both[0].column(1)).value(0);
+    assert_eq!(db_schemas.len(), 1, "one entry for the default schema");
+    let both = extract_statistics(&both[0]);
+    assert!(
+        both.iter().any(|(t, c, k, v)| t == "AdbcStatsEmpty"
+            && c.is_none()
+            && *k == ADBC_STATISTIC_ROW_COUNT_KEY
+            && *v == 0),
+        "{both:?}"
+    );
+    assert_eq!(
+        both.iter()
+            .filter(|(t, ..)| t == "AdbcStats")
+            .cloned()
+            .collect::<Vec<_>>(),
+        stats
+    );
+
+    drop_tables(connection, &["AdbcStats", "AdbcStatsEmpty"]);
 }
 
 /// JSON maps to `Utf8` tagged `arrow.json`, and FLOAT32 to `Float32`, in reads, binds and ingest.
