@@ -121,17 +121,17 @@ pub(crate) async fn result_set_to_batch(
     }
     // The ResultSet retains the metadata sent with the first partial result set, so the schema is
     // known even for an empty result.
-    rows_to_batch(Some(rs.metadata()), &rows, precision)
+    rows_to_batch(rs.metadata(), &rows, precision)
 }
 
 /// Convert rows drained elsewhere, such as DML `THEN RETURN` rows read inside a transaction
 /// runner.
 pub(crate) fn rows_to_batch(
-    metadata: Option<&ResultSetMetadata>,
+    metadata: &ResultSetMetadata,
     rows: &[Row],
     precision: TimestampPrecision,
 ) -> Result<(SchemaRef, RecordBatch)> {
-    let schema = build_schema(metadata, rows.first(), precision)?;
+    let schema = build_schema(metadata, precision)?;
     let batch = build_batch(schema.clone(), rows)?;
     Ok((schema, batch))
 }
@@ -201,10 +201,9 @@ pub(crate) async fn stream_query(
     fallback_schema: Option<SchemaRef>,
 ) -> Result<SpannerBatchReader> {
     let first = pull_chunk(&mut rs, batch_size).await?;
-    let schema = if first.is_empty() && rs.metadata().column_names().is_empty() {
-        fallback_schema.unwrap_or_else(|| Arc::new(Schema::empty()))
-    } else {
-        build_schema(Some(rs.metadata()), first.first(), precision)?
+    let schema = match fallback_schema {
+        Some(schema) if rs.metadata().column_names().is_empty() => schema,
+        _ => build_schema(rs.metadata(), precision)?,
     };
     let source = ResultSetChunks {
         result_set: rs,
@@ -378,7 +377,7 @@ pub(crate) async fn stream_bound_query(
     let (first, schema) = match result_set.as_mut() {
         Some(rs) => {
             let rows = pull_chunk(rs, batch_size).await?;
-            let schema = build_schema(Some(rs.metadata()), rows.first(), precision)?;
+            let schema = build_schema(rs.metadata(), precision)?;
             (Some(rows), schema)
         }
         None => (None, Arc::new(Schema::empty())),
@@ -462,35 +461,15 @@ async fn next_bound_chunk(
     }
 }
 
-/// Build the result schema from column metadata, falling back to `Utf8` and the first row's
-/// width when metadata is unavailable. Type errors include the column name.
-pub(crate) fn build_schema(
-    metadata: Option<&ResultSetMetadata>,
-    first_row: Option<&Row>,
-    precision: TimestampPrecision,
-) -> Result<SchemaRef> {
-    if let Some(md) = metadata {
-        let names = md.column_names();
-        if !names.is_empty() {
-            let types = md.column_types();
-            let fields: Vec<Field> = names
-                .iter()
-                .enumerate()
-                .map(|(i, name)| match types.get(i) {
-                    Some(ty) => {
-                        arrow_field(name, ty, true, precision).map_err(within("column", name))
-                    }
-                    None => Ok(Field::new(name, DataType::Utf8, true)),
-                })
-                .collect::<Result<_>>()?;
-            return Ok(Arc::new(Schema::new(fields)));
-        }
-    }
-
-    let width = first_row.map_or(0, |r| r.raw_values().len());
-    let fields: Vec<Field> = (0..width)
-        .map(|i| Field::new(format!("col{i}"), DataType::Utf8, true))
-        .collect();
+/// Build the result schema from column metadata. The client rejects rows that arrive without
+/// it, so every row has one value per column.
+fn build_schema(metadata: &ResultSetMetadata, precision: TimestampPrecision) -> Result<SchemaRef> {
+    let fields = metadata
+        .column_names()
+        .iter()
+        .zip(metadata.column_types())
+        .map(|(name, ty)| arrow_field(name, ty, true, precision).map_err(within("column", name)))
+        .collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(Schema::new(fields)))
 }
 

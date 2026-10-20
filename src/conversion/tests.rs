@@ -669,8 +669,7 @@ fn timestamp_precision_option_parses_and_round_trips() {
 /// converts. Arrow cannot infer a batch's length from zero columns.
 #[test]
 fn zero_column_result_converts_to_an_empty_batch() {
-    let (schema, batch) = rows_to_batch(None, &[], TimestampPrecision::default()).unwrap();
-    assert!(schema.fields().is_empty());
+    let batch = build_batch(Arc::new(Schema::empty()), &[]).unwrap();
     assert_eq!(batch.num_columns(), 0);
     assert_eq!(batch.num_rows(), 0);
 }
