@@ -1569,16 +1569,22 @@ fn standalone_parameters_preserve_arrow_types_and_values() {
     }
 }
 
+/// Decimals of any scale bind when `NUMERIC` holds them exactly, and fail before any RPC otherwise.
 #[test]
-fn negative_scale_numeric_parameters_round_trip() {
+fn numeric_parameters_of_any_scale_round_trip() {
     let Some(mut fx) = fixture_unguarded() else {
         return;
     };
+    let max = 10_i128.pow(38) - 1;
     for (scale, unscaled, expected) in [
-        (-2, Some(99), Some(9_900_000_000_000)),
-        (-2, Some(-99), Some(-9_900_000_000_000)),
+        (-2, Some(99), Some(Ok(9_900_000_000_000))),
+        (-2, Some(-99), Some(Ok(-9_900_000_000_000))),
         (-2, None, None),
-        (i8::MIN, Some(0), Some(0)),
+        (i8::MIN, Some(0), Some(Ok(0))),
+        (9, Some(-max), Some(Ok(-max))),
+        (10, Some(15_000_000_000), Some(Ok(1_500_000_000))),
+        (10, Some(15_000_000_001), Some(Err(()))),
+        (0, Some(10_i128.pow(29)), Some(Err(()))),
     ] {
         let input = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
@@ -1596,14 +1602,17 @@ fn negative_scale_numeric_parameters_round_trip() {
         let mut statement = fx.connection.new_statement().unwrap();
         statement.set_sql_query("SELECT @amount AS amount").unwrap();
         statement.bind(input).unwrap();
-        let batches = statement
-            .execute()
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let result = statement.execute();
+        if let Some(Err(())) = expected {
+            let error = result.err().unwrap();
+            assert_eq!(error.status, Status::InvalidArguments, "{error}");
+            continue;
+        }
+        let batches = result.unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(batches.len(), 1);
         let result = col::<Decimal128Array>(batches[0].column(0));
         assert_eq!(result.data_type(), &DataType::Decimal128(38, 9));
+        let expected = expected.map(Result::unwrap);
         assert_eq!(result.iter().collect::<Vec<_>>(), vec![expected]);
     }
 }

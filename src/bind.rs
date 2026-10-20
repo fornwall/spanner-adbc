@@ -7,7 +7,7 @@
 //!
 //! Integers widen to INT64, except UInt64, which can exceed its range. Float16/Float32 widen
 //! losslessly. Strings, bytes, booleans, dates, timestamps and Decimal128 retain their values and
-//! nulls. Timestamps preserve the source unit's precision; decimal formatting uses the full i128.
+//! nulls. Timestamps preserve the source unit's precision; decimals must fit `NUMERIC` exactly.
 //!
 //! Parameters carry their Arrow logical type, including nulls and empty lists. `arrow.json`-tagged
 //! strings bind as `JSON`; Arrow `Null` leaves inference to SQL. Mutations use the target column's
@@ -18,12 +18,14 @@ use std::ops::Range;
 use adbc_core::error::Result;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    ArrowPrimitiveType, ArrowTimestampType, Date32Type, Date64Type, Decimal128Type, Float16Type,
-    Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, TimestampMicrosecondType,
+    ArrowPrimitiveType, ArrowTimestampType, Date32Type, Date64Type, Float16Type, Float32Type,
+    Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, TimestampMicrosecondType,
     TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type,
     UInt32Type,
 };
-use arrow_array::{Array, OffsetSizeTrait, RecordBatch, downcast_dictionary_array};
+use arrow_array::{
+    Array, Decimal128Array, OffsetSizeTrait, RecordBatch, downcast_dictionary_array,
+};
 use arrow_schema::{DataType, Field, TimeUnit};
 use chrono::{DateTime, Datelike, NaiveDate, SecondsFormat, Utc};
 use google_cloud_spanner::mutation::Mutation;
@@ -216,7 +218,7 @@ pub(crate) fn check_ingest_values(batch: &RecordBatch) -> Result<()> {
 }
 
 /// Whether [`scalar_binder`] accepts every value of `data_type` once it accepts the type. Types
-/// not listed here, such as dates and timestamps, are checked value by value.
+/// not listed here, such as dates, timestamps and decimals, are checked value by value.
 fn values_always_convert(data_type: &DataType) -> bool {
     match dictionary_values(data_type) {
         DataType::Null
@@ -237,8 +239,7 @@ fn values_always_convert(data_type: &DataType) -> bool {
         | DataType::Binary
         | DataType::LargeBinary
         | DataType::BinaryView
-        | DataType::FixedSizeBinary(_)
-        | DataType::Decimal128(_, _) => true,
+        | DataType::FixedSizeBinary(_) => true,
         DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
             values_always_convert(item.data_type())
         }
@@ -401,13 +402,13 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
         DataType::Timestamp(TimeUnit::Nanosecond, _) => {
             timestamp_binder::<TimestampNanosecondType>()
         }
-        // A larger scale, possible in an imported schema, would overflow `numeric_string`'s u128
-        // divisor. Spanner checks whether the formatted value fits NUMERIC's precision and scale.
-        DataType::Decimal128(_, scale) if *scale <= 38 => |_, a, i| {
-            let a = a.as_primitive::<Decimal128Type>();
-            Ok(a.is_valid(i)
-                .then(|| numeric_string(a.value(i), a.scale()))
-                .into())
+        // A larger scale, possible in an imported schema, would overflow `numeric_string`'s i128
+        // divisor.
+        DataType::Decimal128(_, scale) if *scale <= 38 => |target, a, i| {
+            a.is_valid(i)
+                .then(|| numeric_string(target, a.as_primitive(), i))
+                .transpose()
+                .map(Value::from)
         },
         // NullArray has no validity buffer, so its physical `is_valid` returns true.
         DataType::Null => |_, _, _| Ok(Value::null()),
@@ -552,28 +553,38 @@ fn timestamp_string(target: Target<'_>, unit: TimeUnit, value: i64) -> Result<St
     Ok(ts.to_rfc3339_opts(format, true))
 }
 
-/// Format an unscaled `Decimal128` value at the given scale as a plain decimal string, exact across
-/// the whole `i128` range (which covers Spanner's `NUMERIC`). `scale` must be `<= 38`.
-fn numeric_string(unscaled: i128, scale: i8) -> String {
-    if scale <= 0 {
-        let mut value = unscaled.to_string();
-        if unscaled != 0 && scale < 0 {
-            // Append zeros instead of multiplying: the decimal value may exceed i128,
-            // and even i8::MIN is a valid negative Arrow scale.
-            value.extend(std::iter::repeat_n('0', usize::from(scale.unsigned_abs())));
+/// Format a `Decimal128` cell, whose scale is at most 38, as a Spanner `NUMERIC` at scale 9. A
+/// value that `NUMERIC` can't hold exactly is an error naming it: Spanner would reject it with a
+/// failed precondition, and rounding would change the data.
+fn numeric_string(target: Target<'_>, array: &Decimal128Array, row: usize) -> Result<String> {
+    let value = array.value(row);
+    let shift = 9 - i32::from(array.scale());
+    let unscaled = match u32::try_from(shift) {
+        // A zero fits at any scale, even where the multiplier overflows.
+        Ok(shift) => match 10_i128.checked_pow(shift) {
+            Some(multiplier) => value.checked_mul(multiplier),
+            None => (value == 0).then_some(0),
+        },
+        Err(_) => {
+            let divisor = 10_i128.pow(shift.unsigned_abs());
+            (value % divisor == 0).then(|| value / divisor)
         }
-        return value;
     }
-    let negative = unscaled < 0;
+    .filter(|unscaled| unscaled.unsigned_abs() < 10_u128.pow(38))
+    .ok_or_else(|| {
+        invalid_argument(format!(
+            "cannot bind {target} as NUMERIC: {} does not fit Spanner's NUMERIC, which holds up \
+             to 29 integer and 9 fractional digits (precision 38, scale 9)",
+            array.value_as_string(row)
+        ))
+    })?;
     let magnitude = unscaled.unsigned_abs();
-    let divisor = 10u128.pow(scale as u32); // 0 < scale <= 38, so this fits in u128
-    format!(
-        "{}{}.{:0width$}",
-        if negative { "-" } else { "" },
-        magnitude / divisor,
-        magnitude % divisor,
-        width = scale as usize
-    )
+    Ok(format!(
+        "{}{}.{:09}",
+        if unscaled < 0 { "-" } else { "" },
+        magnitude / 1_000_000_000,
+        magnitude % 1_000_000_000
+    ))
 }
 
 /// Map an ingest field to DDL, rejecting types the value encoder cannot bind before any DDL runs.

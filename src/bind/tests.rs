@@ -228,7 +228,7 @@ fn scalars_bind_with_their_spanner_types() {
                     .with_precision_and_scale(38, -2)
                     .unwrap(),
             ),
-            Value::from("-9900"),
+            Value::from("-9900.000000000"),
             types::numeric(),
         ),
     ];
@@ -250,24 +250,65 @@ fn scalars_bind_with_their_spanner_types() {
     assert_eq!(param(&NullArray::new(1), 0), (Value::null(), None));
 }
 
+/// Decimals bind at `NUMERIC`'s scale 9 when they fit it exactly, whatever their own scale.
 #[test]
-fn numeric_string_formats_any_scale_exactly() {
-    assert_eq!(numeric_string(-2_250_000_000, 9), "-2.250000000");
-    assert_eq!(numeric_string(1, 9), "0.000000001");
-    assert_eq!(numeric_string(-1, 9), "-0.000000001");
-    assert_eq!(numeric_string(-7, 0), "-7");
-    // 10^30 overflows a 96-bit decimal mantissa but is a valid NUMERIC.
-    assert_eq!(
-        numeric_string(10i128.pow(30), 9),
-        "1000000000000000000000.000000000"
-    );
-    // Negative scales append zeros instead of multiplying, which could overflow.
-    assert_eq!(numeric_string(0, i8::MIN), "0");
-    assert_eq!(numeric_string(1, i8::MIN), format!("1{}", "0".repeat(128)));
-    assert_eq!(
-        numeric_string(i128::MIN, -1),
-        "-1701411834604692317316873037158841057280"
-    );
+fn decimals_bind_exactly_or_name_the_numeric_limit() {
+    let decimal = |value: i128, scale: i8| {
+        Decimal128Array::from(vec![value])
+            .with_precision_and_scale(38, scale)
+            .unwrap()
+    };
+    let max = 10_i128.pow(38) - 1;
+    for (value, scale, expected) in [
+        (-2_250_000_000, 9, "-2.250000000"),
+        (-1, 9, "-0.000000001"),
+        (-7, 0, "-7.000000000"),
+        (max, 9, "99999999999999999999999999999.999999999"),
+        (-max, 9, "-99999999999999999999999999999.999999999"),
+        // Digits past the ninth fractional one may be zeros.
+        (15_000_000_000, 10, "1.500000000"),
+        (10_i128.pow(37), 38, "0.100000000"),
+        (99, -2, "9900.000000000"),
+        (
+            10_i128.pow(28) - 1,
+            -1,
+            "99999999999999999999999999990.000000000",
+        ),
+        (0, i8::MIN, "0.000000000"),
+    ] {
+        assert_eq!(
+            param(&decimal(value, scale), 0).0,
+            Value::from(expected),
+            "{value} at scale {scale}"
+        );
+    }
+    for (value, scale) in [
+        (1, 10),
+        (15_000_000_001, 10),
+        (max, 38),
+        (max + 1, 9),
+        (10_i128.pow(29), 0),
+        (1, -29),
+        (1, i8::MIN),
+        (i128::MIN, -1),
+    ] {
+        let array = decimal(value, scale);
+        let b = column_batch(Arc::new(array.clone()));
+        for (error, target) in [
+            (bind_row(&b, 0).unwrap_err(), "parameter \"p0\""),
+            (check_ingest_values(&b).unwrap_err(), "ingest column \"p\""),
+        ] {
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert_eq!(
+                error.message,
+                format!(
+                    "cannot bind {target} as NUMERIC: {} does not fit Spanner's NUMERIC, which \
+                     holds up to 29 integer and 9 fractional digits (precision 38, scale 9)",
+                    array.value_as_string(0)
+                )
+            );
+        }
+    }
 }
 
 #[test]
@@ -826,6 +867,11 @@ fn ingest_value_check_fails_where_mutation_building_would() {
         Arc::new(Date32Array::from(vec![0, i32::MAX])),
         Arc::new(Date64Array::from(vec![0, 1])),
         Arc::new(TimestampSecondArray::from(vec![0, i64::MAX])),
+        Arc::new(
+            Decimal128Array::from(vec![0, 1])
+                .with_precision_and_scale(38, 10)
+                .unwrap(),
+        ),
         Arc::new(DictionaryArray::new(
             Int32Array::from(vec![0, 1]),
             Arc::new(Date32Array::from(vec![0, i32::MAX])),

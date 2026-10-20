@@ -146,8 +146,9 @@ Parameters and ingested columns keep their Arrow type:
 - `UInt64`, structs and nested lists are not supported.
 - `Date64` values must be whole days (multiples of 86,400,000 ms). Use an Arrow timestamp to keep
   a time of day.
-- `Decimal128` values with a negative scale keep their value (`99` at scale `-2` is `9900`).
-  Spanner checks the `NUMERIC` range, and values read back with scale 9.
+- `Decimal128` values of any scale keep their value (`99` at scale `-2` is `9900`), and read back
+  with scale 9. A value with more than 29 integer digits, or a nonzero digit past the ninth
+  fractional one, fails with `InvalidArguments` instead of being rounded.
 - Timestamps of any unit keep their precision, and a timestamp without a time zone is taken as
   UTC. `spanner.max_timestamp_precision` only affects reads.
 - Strings tagged with the `arrow.json` extension bind and ingest as `JSON`. For an untagged
