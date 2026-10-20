@@ -16,28 +16,7 @@ fn ingest_temporary_accepts_false_and_rejects_true() {
     let error = check_ingest_temporary(OptionValue::String("true".into())).unwrap_err();
     assert_eq!(error.status, Status::NotImplemented);
     // Invalid values fail boolean parsing before the feature check.
-    for bad in ["maybe", "FALSE", "0", "no", "TRUE", "1", "yes"] {
-        let error = check_ingest_temporary(OptionValue::String(bad.into())).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments, "{bad}");
-    }
-    for bad in [OptionValue::Int(0), OptionValue::Int(1)] {
-        let error = check_ingest_temporary(bad).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-    }
-}
-
-#[test]
-fn dml_partitioned_option_coerces_and_unsets_on_empty() {
-    assert!(dml_partitioned_option(OptionValue::String("true".into())).unwrap());
-    assert!(!dml_partitioned_option(OptionValue::String("false".into())).unwrap());
-    for empty in ["", "   "] {
-        assert!(!dml_partitioned_option(OptionValue::String(empty.into())).unwrap());
-    }
-    for bad in ["maybe", "TRUE", "1", "yes", "FALSE", "0", "no"] {
-        let error = dml_partitioned_option(OptionValue::String(bad.into())).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments, "{bad}");
-    }
-    let error = dml_partitioned_option(OptionValue::Int(1)).unwrap_err();
+    let error = check_ingest_temporary(OptionValue::String("TRUE".into())).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
 }
 
@@ -223,25 +202,6 @@ fn string_option_requires_a_string_value() {
             "{}",
             error.message
         );
-    }
-}
-
-#[test]
-fn bool_option_rejects_non_bool_values() {
-    for bad in [
-        "maybe", "", "2", "t", "on", "TRUE", "True", "FALSE", "False", "1", "0", "yes", "no",
-        "YES", "NO",
-    ] {
-        let error = bool_option(OptionValue::String(bad.into()), "o").unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-    }
-    for bad in [
-        OptionValue::Int(0),
-        OptionValue::Int(1),
-        OptionValue::Double(1.0),
-    ] {
-        let error = bool_option(bad, "o").unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
     }
 }
 

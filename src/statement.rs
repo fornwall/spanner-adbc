@@ -11,7 +11,7 @@ mod ingest;
 
 use dml::DmlOutcome;
 pub(crate) use ingest::is_mutation_limit_exceeded;
-use ingest::{check_target_catalog, ingest_batch_write_option, ingest_mode_option};
+use ingest::{check_target_catalog, ingest_mode_option};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -37,7 +37,9 @@ use crate::driver::SharedDatabaseAdmin;
 use crate::error::{
     err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option, unsupported,
 };
-use crate::options::{SharedConfig, bool_option, impl_typed_option_getters};
+use crate::options::{
+    SharedConfig, bool_option, bool_option_unsettable, impl_typed_option_getters,
+};
 use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable};
 use crate::timeout::with_timeout;
 
@@ -755,10 +757,10 @@ impl Optionable for SpannerStatement {
                 self.ingest_mode = Some(ingest_mode_option(&key, value)?);
             }
             OptionStatement::Other(k) if k == crate::OPTION_INGEST_BATCH_WRITE => {
-                self.ingest_batch_write = ingest_batch_write_option(value)?;
+                self.ingest_batch_write = bool_option_unsettable(value, k)?;
             }
             OptionStatement::Other(k) if k == crate::OPTION_DML_PARTITIONED => {
-                self.dml_partitioned = dml_partitioned_option(value)?;
+                self.dml_partitioned = bool_option_unsettable(value, k)?;
             }
             OptionStatement::Other(k) if k == crate::OPTION_BIND_BY_NAME => {
                 self.bind_by_name = bool_option(value, k)?;
@@ -1114,11 +1116,6 @@ fn check_unsupported_true(value: OptionValue, what: &str, rejection: &str) -> Re
     } else {
         Ok(())
     }
-}
-
-/// Parse `spanner.dml.partitioned`; an empty or whitespace-only string resets it to `false`.
-fn dml_partitioned_option(value: OptionValue) -> Result<bool> {
-    crate::options::bool_option_unsettable(value, crate::OPTION_DML_PARTITIONED)
 }
 
 #[cfg(test)]

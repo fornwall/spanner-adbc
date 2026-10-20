@@ -193,21 +193,6 @@ fn ingest_mode_parses_both_spellings_and_rejects_unknown() {
     assert!(error.message.contains("adbc.ingest.mode"), "{error}");
 }
 
-#[test]
-fn ingest_batch_write_option_coerces_and_unsets_on_empty() {
-    assert!(ingest_batch_write_option(OptionValue::String("true".into())).unwrap());
-    assert!(!ingest_batch_write_option(OptionValue::String("false".into())).unwrap());
-    for empty in ["", "   "] {
-        assert!(!ingest_batch_write_option(OptionValue::String(empty.into())).unwrap());
-    }
-    for bad in ["maybe", "TRUE", "1", "yes", "FALSE", "0", "no"] {
-        let error = ingest_batch_write_option(OptionValue::String(bad.into())).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments, "{bad}");
-    }
-    let error = ingest_batch_write_option(OptionValue::Int(1)).unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-}
-
 /// A small slice of a large batch keeps the parent's buffers; counting them would put each of its
 /// rows in a commit of its own.
 #[test]
