@@ -133,6 +133,12 @@ codegen-units = 1
 [profile.release.package.aws-lc-sys]
 opt-level = "s"
 
+# Credentials and token fetches, reqwest's only use, stay off the per-row path.
+[profile.release.package.google-cloud-auth]
+opt-level = "s"
+[profile.release.package.reqwest]
+opt-level = "s"
+
 # Release performance with symbols for perf and flamegraphs.
 [profile.profiling]
 inherits = "release"
