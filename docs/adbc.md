@@ -159,7 +159,7 @@ bytes with your own descriptors.
 | Method | Result |
 | --- | --- |
 | `get_info` | Driver and vendor metadata. Codes without a value, such as the vendor version, are null; unknown codes are omitted. |
-| `get_objects` | Catalogs, schemas, tables, columns and constraints from `INFORMATION_SCHEMA`. |
+| `get_objects` | Catalogs, schemas, tables, columns and constraints from `INFORMATION_SCHEMA`. The `xdbc_*` column fields carry the Spanner type, nullability, `DEFAULT` expression and whether the column is generated. |
 | `get_table_schema` | A table's columns as Arrow fields. A missing table returns `NotFound`. |
 | `get_table_types` | `BASE TABLE`, `SYNONYM` and `VIEW`. |
 | `get_statistics` | Exact row, distinct and null counts from one aggregate scan per table, even when approximate statistics are requested. |
