@@ -4,6 +4,7 @@ import os
 import tomllib
 from pathlib import Path
 
+import adbc_driver_manager
 import pytest
 
 from conftest import database_options
@@ -23,6 +24,12 @@ def _has_library() -> bool:
 needs_library = pytest.mark.skipif(
     not _has_library(),
     reason="no bundled driver library in this checkout/install",
+)
+
+# pyproject.toml allows older driver managers, which CI also tests.
+needs_uri_connect = pytest.mark.skipif(
+    tuple(int(part) for part in adbc_driver_manager.__version__.split(".")[:2]) < (1, 11),
+    reason="dbapi.connect(uri=...) needs adbc-driver-manager 1.11 or later",
 )
 
 
@@ -154,6 +161,7 @@ def test_user_manifest_uses_platform_config_directory(tmp_path, monkeypatch, pla
 
 
 @needs_library
+@needs_uri_connect
 def test_manifest_makes_the_driver_discoverable_by_name(
     spanner_database, tmp_path, monkeypatch
 ):
