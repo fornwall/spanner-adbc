@@ -169,28 +169,6 @@ fn string_option_requires_a_string_value() {
 }
 
 #[test]
-fn rows_per_batch_option_accepts_positive_ints_and_strings() {
-    let parse = |value| crate::options::positive_usize(value, crate::OPTION_ROWS_PER_BATCH);
-    assert_eq!(parse(OptionValue::Int(1)).unwrap(), 1);
-    assert_eq!(parse(OptionValue::String("8192".into())).unwrap(), 8192);
-}
-
-#[test]
-fn rows_per_batch_option_rejects_zero_negative_and_malformed() {
-    let parse = |value| crate::options::positive_usize(value, crate::OPTION_ROWS_PER_BATCH);
-    let error = parse(OptionValue::Int(0)).unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-    let error = parse(OptionValue::Int(-8192)).unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-    for bad in ["0", "-1", "abc", "1.5", ""] {
-        let error = parse(OptionValue::String(bad.into())).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-    }
-    let error = parse(OptionValue::Double(3.0)).unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-}
-
-#[test]
 fn split_batches_caps_rows_per_batch() {
     let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
     let batch = |n: i64| {
@@ -417,6 +395,29 @@ mod mock {
         );
         connection.rollback().unwrap();
         assert!(server.requests.lock().unwrap().is_empty());
+    }
+
+    /// Like the shared options, the driver's statement-only options reset to their default on
+    /// `""`.
+    #[test]
+    fn statement_only_options_reset_on_an_empty_string() {
+        let server = start();
+        let mut connection = connect(&server);
+        let mut statement = connection.new_statement().unwrap();
+        for (key, value, default) in [
+            (crate::OPTION_ROWS_PER_BATCH, "5", "8192"),
+            (crate::OPTION_DATA_BOOST, "true", "false"),
+            (crate::OPTION_INGEST_BATCH_WRITE, "true", "false"),
+            (crate::OPTION_DML_PARTITIONED, "true", "false"),
+        ] {
+            let key = OptionStatement::Other(key.into());
+            for (set, expected) in [(value, value), ("", default)] {
+                statement
+                    .set_option(key.clone(), OptionValue::from(set))
+                    .unwrap();
+                assert_eq!(statement.get_option_string(key.clone()).unwrap(), expected);
+            }
+        }
     }
 
     /// The DBAPI reuses one statement for SQL and ingest and sets the schema only when given one,

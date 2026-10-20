@@ -765,10 +765,13 @@ impl Optionable for SpannerStatement {
                 self.bind_by_name = bool_option(value, k)?;
             }
             OptionStatement::Other(k) if k == crate::OPTION_ROWS_PER_BATCH => {
-                self.rows_per_batch = crate::options::positive_usize(value, k)?;
+                self.rows_per_batch = match &value {
+                    OptionValue::String(s) if s.trim().is_empty() => DEFAULT_ROWS_PER_BATCH,
+                    _ => crate::options::positive_usize(value, k)?,
+                };
             }
             OptionStatement::Other(k) if k == crate::OPTION_DATA_BOOST => {
-                self.data_boost = bool_option(value, k)?;
+                self.data_boost = bool_option_unsettable(value, k)?;
             }
             // Options shared with the connection. Unknown keys, including connection-only ones
             // such as `spanner.transaction.tag`, are reported as not implemented.

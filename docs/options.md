@@ -173,8 +173,8 @@ settings, but no request or transaction tags.
 
 | Option | Values | Default | Get | Effect |
 | --- | --- | --- | --- | --- |
-| `spanner.rows_per_batch` | positive integer | `8192` | always | Maximum rows per Arrow batch. Batches are also capped by size. |
-| `spanner.data_boost` | boolean | `false` | always | Runs partitioned queries on [Data Boost](https://docs.cloud.google.com/spanner/docs/databoost/databoost-overview). Cloud Spanner only; Omni doesn't support it. Carried in partition descriptors. |
+| `spanner.rows_per_batch` | positive integer; `""` resets | `8192` | always | Maximum rows per Arrow batch. Batches are also capped by size. |
+| `spanner.data_boost` | boolean; `""` resets | `false` | always | Runs partitioned queries on [Data Boost](https://docs.cloud.google.com/spanner/docs/databoost/databoost-overview). Cloud Spanner only; Omni doesn't support it. Carried in partition descriptors. |
 | `adbc.statement.bind_by_name` | boolean | `false` | always | By default, columns bind to distinct parameters in SQL order. `true` matches column names to parameter names, case-insensitively as Spanner does; unknown names return `InvalidArguments`. |
 | `adbc.statement.exec.incremental` | boolean, only `false` supported | `false` | always | `true` returns `NotImplemented`; incremental partitioning is not supported. |
 | `adbc.ingest.target_table` | table name | unset | set | Selects bulk ingest and clears the SQL; setting SQL clears it. Ingest rejects an empty name, or one containing a backtick, backslash or control character, with `InvalidArguments`. |
