@@ -904,22 +904,40 @@ impl Statement for SpannerStatement {
         result
     }
 
+    /// The SQL's parameters in order of first use, as `adbc.h` specifies. A parameter takes its
+    /// type from the column bound to it, else from a PLAN probe.
     fn get_parameter_schema(&self) -> Result<Schema> {
-        // Bound columns are the parameters, with known types.
-        if let Some(batch) = self.bound.first() {
+        let bound = self.bound.first();
+        if self.sql.is_none()
+            && let Some(batch) = bound
+        {
+            // Bulk ingest binds columns without SQL.
             return Ok((*batch.schema()).clone());
         }
-        // Otherwise take the names from the SQL and the types from a PLAN probe. Parameters the
-        // probe can't type, or a failed probe, get `Null`, which ADBC defines as "unknown type".
         let sql = self.sql()?;
         let names = crate::sql::named_parameters(&sql);
-        if names.is_empty() {
-            return Ok(Schema::new(Vec::<Field>::new()));
+        let mut bound_fields = BTreeMap::new();
+        // A binding error surfaces at execution; until then the bound columns give no types.
+        if let Some(batch) = bound
+            && let Ok(resolved) = bind::resolve_parameter_names(&sql, batch, self.bind_by_name)
+        {
+            for (name, field) in resolved.into_iter().zip(batch.schema().fields()) {
+                bound_fields.insert(name.clone(), field.as_ref().clone().with_name(name));
+            }
         }
-        let types = self.plan_parameter_types(&sql).unwrap_or_default();
+        // Parameters the probe can't type, or a failed probe, get `Null`, which ADBC defines as
+        // "unknown type".
+        let types = if names.iter().all(|name| bound_fields.contains_key(name)) {
+            BTreeMap::new()
+        } else {
+            self.plan_parameter_types(&sql).unwrap_or_default()
+        };
         let fields: Vec<Field> = names
             .into_iter()
             .map(|name| {
+                if let Some(field) = bound_fields.remove(&name) {
+                    return Ok(field);
+                }
                 // GoogleSQL parameter names are case-insensitive, and the planner reports each
                 // under the first spelling the SQL uses.
                 let ty = types.get(&name).or_else(|| {

@@ -1412,8 +1412,8 @@ fn failed_bound_query_still_consumes_bound_rows() {
     statement
         .set_sql_query("SELECT c FROM MockTable WHERE c = @p")
         .unwrap();
-    // Binding is positional, so column `c` maps to `@p`. While bound, the parameter schema would
-    // report `c`; once consumed, it falls back to the SQL's `p`.
+    // While bound, the parameter schema would report `@p` as the bound column's Utf8; once the
+    // rows are consumed, the rejected probe leaves it untyped.
     let param_schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, false)]));
     let param_batch =
         RecordBatch::try_new(param_schema, vec![Arc::new(StringArray::from(vec!["v1"]))])
@@ -1428,15 +1428,9 @@ fn failed_bound_query_still_consumes_bound_rows() {
 
     let params = statement.get_parameter_schema().expect("parameter schema");
     assert_eq!(
-        params.fields().len(),
-        1,
-        "the parameter schema must come from the SQL's @name references, not stale bound rows"
-    );
-    assert_eq!(
-        params.field(0).name(),
-        "p",
-        "a surviving bound batch would report its own column name (`c`); consuming it falls back \
-         to the SQL parameter name (`p`)"
+        params,
+        Schema::new(vec![Field::new("p", DataType::Null, true)]),
+        "stale bound rows would type the parameter"
     );
 }
 

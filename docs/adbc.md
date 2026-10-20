@@ -167,7 +167,7 @@ bytes with your own descriptors.
 | `get_table_types` | `BASE TABLE`, `SYNONYM` and `VIEW`. |
 | `get_statistics` | Exact row, distinct and null counts from one aggregate scan per table, even when approximate statistics are requested. |
 | `get_statistic_names` | An empty, typed result: the driver defines no statistics of its own. |
-| `get_parameter_schema` | The bound schema, or parameter names and types from a best-effort PLAN probe. Unresolved types are Arrow `Null`. |
+| `get_parameter_schema` | The SQL's parameters in order, typed by their bound columns or else a best-effort PLAN probe. Unresolved types are Arrow `Null`. |
 | `execute_schema` | The result schema from a PLAN probe. DML and DDL are rejected. |
 
 ### Catalogs

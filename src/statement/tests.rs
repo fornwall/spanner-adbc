@@ -456,6 +456,55 @@ mod mock {
         );
     }
 
+    /// `adbc.h` describes the statement's parameters, so the SQL names them, whatever the bound
+    /// columns are called.
+    #[test]
+    fn parameter_schema_lists_the_sql_parameters_typed_by_bound_columns() {
+        let server = start();
+        let mut connection = connect(&server);
+        let mut statement = connection.new_statement().unwrap();
+        statement.set_sql_query("SELECT @b, @a, @B").unwrap();
+        let batch = |names: &[&str]| {
+            let fields = names
+                .iter()
+                .map(|name| Field::new(*name, DataType::Date32, true));
+            let columns = names
+                .iter()
+                .map(|_| Arc::new(Date32Array::from(vec![0])) as _);
+            RecordBatch::try_new(
+                Arc::new(Schema::new(fields.collect::<Vec<_>>())),
+                columns.collect(),
+            )
+            .unwrap()
+        };
+        statement.bind(batch(&["x", "y"])).unwrap();
+        let expected = |b_type| {
+            Schema::new(vec![
+                Field::new("b", b_type, true),
+                Field::new("a", DataType::Date32, true),
+            ])
+        };
+        assert_eq!(
+            statement.get_parameter_schema().unwrap(),
+            expected(DataType::Date32)
+        );
+        assert_eq!(rpc_count(&server), 0, "bound types need no probe");
+
+        // By name, an unbound parameter's type comes from the probe, which the mock rejects.
+        statement
+            .set_option(
+                OptionStatement::Other(crate::OPTION_BIND_BY_NAME.into()),
+                OptionValue::String("true".into()),
+            )
+            .unwrap();
+        statement.bind(batch(&["A"])).unwrap();
+        assert_eq!(
+            statement.get_parameter_schema().unwrap(),
+            expected(DataType::Null)
+        );
+        assert_eq!(rpc_count(&server), 1);
+    }
+
     fn ingest_statement(
         connection: &mut SpannerConnection,
         db_schema: Option<&str>,
