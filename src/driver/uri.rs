@@ -175,19 +175,18 @@ fn percent_decode(s: &str) -> Result<String> {
     if !s.contains('%') {
         return Ok(s.to_owned());
     }
-    let malformed = || invalid_argument("malformed percent-encoding in connection URI component");
     let bytes = s.as_bytes();
+    let digit = |i: usize| bytes.get(i).and_then(|&b| char::from(b).to_digit(16));
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
-            let hex = bytes.get(i + 1..i + 3).ok_or_else(malformed)?;
-            // `from_str_radix` accepts a leading sign, which is not valid percent-encoding.
-            if !hex.iter().all(u8::is_ascii_hexdigit) {
-                return Err(malformed());
-            }
-            let hex = std::str::from_utf8(hex).map_err(|_| malformed())?;
-            out.push(u8::from_str_radix(hex, 16).map_err(|_| malformed())?);
+            let (Some(high), Some(low)) = (digit(i + 1), digit(i + 2)) else {
+                return Err(invalid_argument(
+                    "malformed percent-encoding in connection URI component",
+                ));
+            };
+            out.push((high * 16 + low) as u8);
             i += 3;
         } else {
             out.push(bytes[i]);
