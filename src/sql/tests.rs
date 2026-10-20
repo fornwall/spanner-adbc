@@ -399,6 +399,22 @@ fn split_respects_literals_and_comments() {
 }
 
 #[test]
+fn line_comments_end_at_a_carriage_return() {
+    // The emulator returns two columns for `SELECT 1 -- c\r, 2`, so a bare `\r` ends the comment.
+    for comment in ["--", "#"] {
+        assert_eq!(
+            split_statements(&format!("SELECT 1 {comment} c\r; SELECT 2")),
+            vec![format!("SELECT 1 {comment} c"), "SELECT 2".to_string()]
+        );
+        let update =
+            format!("{comment} c\rUPDATE t SET a = @a WHERE true {comment} c\rTHEN RETURN a");
+        assert_eq!(first_keyword(&update), Some("UPDATE"));
+        assert!(is_dml_returning(&update));
+        assert_eq!(named_parameters(&update), vec!["a"]);
+    }
+}
+
+#[test]
 fn strips_trailing_query_terminators() {
     assert_eq!(strip_trailing_terminators("SELECT 1;"), "SELECT 1");
     assert_eq!(strip_trailing_terminators("SELECT 1;;;"), "SELECT 1");

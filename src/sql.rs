@@ -53,55 +53,6 @@ pub(crate) fn is_dml_returning(sql: &str) -> bool {
     false
 }
 
-/// Consume a literal or quoted identifier whose opening `quote` has been read, passing each
-/// consumed character to `sink`. Handles triple-quoted strings and backslash escapes.
-///
-/// A backslash escapes the next character in raw literals too: the `r` prefix changes how the
-/// contents are interpreted, not where the literal ends ("a raw string cannot end with an odd
-/// number of backslashes"). So `r'x\'; DROP TABLE t'` is one string. Treating `\` as inert would
-/// let a value ending in a backslash close early and inject a statement boundary.
-///
-/// GoogleSQL ends a non-triple literal at an unescaped newline, but this scan continues to end of
-/// input. Such SQL is invalid anyway, and the lenient scan can only yield fewer statement
-/// boundaries, never more.
-fn consume_quoted(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    quote: char,
-    mut sink: impl FnMut(char),
-) {
-    let triple = quote != '`' && chars.peek() == Some(&quote) && {
-        // Consume the second quote. If a third follows this is a triple-quoted string;
-        // otherwise the literal was empty (`''` / `""`) and is already closed.
-        sink(chars.next().unwrap());
-        if chars.peek() == Some(&quote) {
-            sink(chars.next().unwrap());
-            true
-        } else {
-            return;
-        }
-    };
-    let mut closing_run = 0usize;
-    while let Some(ch) = chars.next() {
-        sink(ch);
-        if ch == '\\' {
-            if let Some(escaped) = chars.next() {
-                sink(escaped);
-            }
-            closing_run = 0;
-        } else if ch == quote {
-            if !triple {
-                return;
-            }
-            closing_run += 1;
-            if closing_run == 3 {
-                return;
-            }
-        } else {
-            closing_run = 0;
-        }
-    }
-}
-
 /// A GoogleSQL token. Tokens partition the input with no gaps or overlaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lexeme<'a> {
@@ -109,7 +60,7 @@ enum Lexeme<'a> {
     Word(&'a str),
     /// A literal or quoted identifier, delimiters included.
     Quoted(&'a str),
-    /// A line comment through its newline, or a block comment. Unterminated comments run to end
+    /// A line comment up to its line break, or a block comment. Unterminated comments run to end
     /// of input.
     Comment(&'a str),
     /// Any other single character.
@@ -140,11 +91,49 @@ impl Lexer<'_> {
         Some(c)
     }
 
-    /// Consume a line comment through its newline. The introducer has already been consumed.
-    fn consume_line_comment(&mut self) {
+    fn bump_if(&mut self, c: char) -> bool {
+        let matched = self.chars.peek() == Some(&c);
+        if matched {
+            self.bump();
+        }
+        matched
+    }
+
+    fn bump_while(&mut self, accept: fn(char) -> bool) {
+        while self.chars.peek().is_some_and(|&c| accept(c)) {
+            self.bump();
+        }
+    }
+
+    /// Consume a literal or quoted identifier whose opening `quote` has been read, including
+    /// triple-quoted strings and backslash escapes.
+    ///
+    /// A backslash escapes the next character in raw literals too: the `r` prefix changes how the
+    /// contents are interpreted, not where the literal ends ("a raw string cannot end with an odd
+    /// number of backslashes"). So `r'x\'; DROP TABLE t'` is one string. Treating `\` as inert
+    /// would let a value ending in a backslash close early and inject a statement boundary.
+    ///
+    /// GoogleSQL ends a non-triple literal at an unescaped newline, but this scan continues to end
+    /// of input. Such SQL is invalid anyway, and the lenient scan can only yield fewer statement
+    /// boundaries, never more.
+    fn consume_quoted(&mut self, quote: char) {
+        // A second quote closes an empty literal unless a third opens a triple-quoted one.
+        let triple = quote != '`' && self.bump_if(quote);
+        if triple && !self.bump_if(quote) {
+            return;
+        }
+        let mut closing_run = 0;
         while let Some(ch) = self.bump() {
-            if ch == '\n' {
-                break;
+            if ch == '\\' {
+                self.bump();
+                closing_run = 0;
+            } else if ch != quote {
+                closing_run = 0;
+            } else {
+                closing_run += 1;
+                if !triple || closing_run == 3 {
+                    return;
+                }
             }
         }
     }
@@ -152,6 +141,11 @@ impl Lexer<'_> {
 
 fn is_ident_char(c: char) -> bool {
     c == '_' || c.is_ascii_alphanumeric()
+}
+
+/// GoogleSQL ends a line comment at `\r` as well as `\n`.
+fn is_not_line_break(c: char) -> bool {
+    c != '\n' && c != '\r'
 }
 
 impl<'a> Iterator for Lexer<'a> {
@@ -162,21 +156,18 @@ impl<'a> Iterator for Lexer<'a> {
         let c = self.bump()?;
         let lexeme = match c {
             '\'' | '"' | '`' => {
-                let mut consumed = 0usize;
-                consume_quoted(&mut self.chars, c, |ch| consumed += ch.len_utf8());
-                self.pos += consumed;
+                self.consume_quoted(c);
                 Lexeme::Quoted(&self.input[start..self.pos])
             }
-            '-' if self.chars.peek() == Some(&'-') => {
-                self.consume_line_comment();
-                Lexeme::Comment(&self.input[start..self.pos])
-            }
             '#' => {
-                self.consume_line_comment();
+                self.bump_while(is_not_line_break);
                 Lexeme::Comment(&self.input[start..self.pos])
             }
-            '/' if self.chars.peek() == Some(&'*') => {
-                self.bump(); // '*'
+            '-' if self.bump_if('-') => {
+                self.bump_while(is_not_line_break);
+                Lexeme::Comment(&self.input[start..self.pos])
+            }
+            '/' if self.bump_if('*') => {
                 let mut prev = '\0';
                 while let Some(ch) = self.bump() {
                     if prev == '*' && ch == '/' {
@@ -187,9 +178,7 @@ impl<'a> Iterator for Lexer<'a> {
                 Lexeme::Comment(&self.input[start..self.pos])
             }
             _ if is_ident_char(c) => {
-                while self.chars.peek().copied().is_some_and(is_ident_char) {
-                    self.bump();
-                }
+                self.bump_while(is_ident_char);
                 Lexeme::Word(&self.input[start..self.pos])
             }
             _ => Lexeme::Other(c),
