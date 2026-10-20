@@ -352,27 +352,38 @@ fn begins_inline(transaction: Option<&v1::TransactionSelector>) -> bool {
 }
 
 /// Serves `ExecuteStreamingSql` with a single-message STRING result, optionally recording each
-/// request's transaction selector. A query in a manual transaction begins its read-only
-/// transaction inline, and the client requires the new transaction id in the first response, so
-/// requests with a `begin` selector get `manual-ro-txn` back.
+/// request. A statement in a manual transaction begins its transaction inline, and the client
+/// requires the new transaction id in the first response, so requests with a `begin` selector get
+/// `inline-txn` back.
 fn serve_streaming_sql_begin_aware(
     mock: &mut MockSpanner,
     values: &'static [&'static str],
-    record: Option<Arc<Mutex<Vec<Option<v1::TransactionSelector>>>>>,
+    record: Option<Arc<Mutex<Vec<v1::ExecuteSqlRequest>>>>,
 ) {
     mock.expect_execute_streaming_sql()
         .returning(move |request| {
             let request = request.into_inner();
-            let inline_begin = begins_inline(request.transaction.as_ref());
-            if let Some(record) = &record {
-                record.lock().unwrap().push(request.transaction);
+            let mut first = partial_result_set(true, values, b"r-1", true);
+            if begins_inline(request.transaction.as_ref()) {
+                set_transaction_id(&mut first, b"inline-txn");
             }
-            let mut first = partial_result_set(true, values, b"ro-1", true);
-            if inline_begin {
-                set_transaction_id(&mut first, b"manual-ro-txn");
+            if let Some(record) = &record {
+                record.lock().unwrap().push(request);
             }
             Ok(stream_of(vec![Ok(first)]))
         });
+}
+
+/// The transaction selector of each recorded request.
+fn transaction_selectors(
+    requests: &Mutex<Vec<v1::ExecuteSqlRequest>>,
+) -> Vec<Option<v1::TransactionSelector>> {
+    requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| request.transaction.clone())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,10 +1028,9 @@ fn query_while_dml_buffered_in_manual_txn_is_rejected() {
 #[test]
 fn manual_transaction_queries_share_one_read_only_transaction() {
     let _watchdog = watchdog!();
-    let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
     let server = {
-        let record = selectors.clone();
+        let record = requests.clone();
         MockServer::start(move |mock| {
             serve_streaming_sql_begin_aware(mock, &["v1"], Some(record));
         })
@@ -1041,7 +1051,7 @@ fn manual_transaction_queries_share_one_read_only_transaction() {
     }
 
     {
-        let seen = selectors.lock().unwrap();
+        let seen = transaction_selectors(&requests);
         assert_eq!(seen.len(), 2, "both queries must reach the wire");
         let first = seen[0]
             .as_ref()
@@ -1063,7 +1073,7 @@ fn manual_transaction_queries_share_one_read_only_transaction() {
             .expect("the second query must carry a transaction selector");
         assert_eq!(
             second,
-            &v1::transaction_selector::Selector::Id(b"manual-ro-txn".to_vec()),
+            &v1::transaction_selector::Selector::Id(b"inline-txn".to_vec()),
             "later queries must reuse the begun read-only transaction"
         );
     }
@@ -1107,25 +1117,10 @@ fn manual_transaction_queries_share_one_read_only_transaction() {
 #[test]
 fn execute_update_routes_a_query_to_the_read_only_path() {
     let _watchdog = watchdog!();
-    type SeenQuery = (String, Vec<String>);
-    let seen: Arc<Mutex<Vec<SeenQuery>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::new(Mutex::new(Vec::new()));
     let record = seen.clone();
     let server = MockServer::start(move |mock| {
-        mock.expect_execute_streaming_sql()
-            .returning(move |request| {
-                let request = request.into_inner();
-                let params = request
-                    .params
-                    .map(|p| p.fields.into_keys().collect::<Vec<_>>())
-                    .unwrap_or_default();
-                record.lock().unwrap().push((request.sql, params));
-                Ok(stream_of(vec![Ok(partial_result_set(
-                    true,
-                    &["v1", "v2"],
-                    b"cor3-1",
-                    true,
-                ))]))
-            });
+        serve_streaming_sql_begin_aware(mock, &["v1", "v2"], Some(record));
     });
 
     let mut connection = server.connect();
@@ -1158,7 +1153,7 @@ fn execute_update_routes_a_query_to_the_read_only_path() {
 
     let seen = seen.lock().unwrap();
     assert_eq!(
-        seen.iter().map(|(sql, _)| sql.as_str()).collect::<Vec<_>>(),
+        seen.iter().map(|r| r.sql.as_str()).collect::<Vec<_>>(),
         vec![
             "SELECT c FROM MockTable",
             "SELECT c FROM MockTable WHERE c = @p",
@@ -1166,8 +1161,11 @@ fn execute_update_routes_a_query_to_the_read_only_path() {
         "both statements must arrive via ExecuteStreamingSql (never ExecuteBatchDml)"
     );
     assert_eq!(
-        seen[1].1,
-        vec!["p".to_string()],
+        seen[1]
+            .params
+            .as_ref()
+            .map(|p| p.fields.keys().map(String::as_str).collect::<Vec<_>>()),
+        Some(vec!["p"]),
         "the bound row must be attached as the @p parameter"
     );
 }
@@ -1304,18 +1302,7 @@ fn execute_schema_binds_the_first_nonempty_batch() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let server = MockServer::start({
         let requests = requests.clone();
-        move |mock| {
-            mock.expect_execute_streaming_sql()
-                .returning(move |request| {
-                    requests.lock().unwrap().push(request.into_inner());
-                    Ok(stream_of(vec![Ok(partial_result_set(
-                        true,
-                        &[],
-                        b"",
-                        true,
-                    ))]))
-                });
-        }
+        move |mock| serve_streaming_sql_begin_aware(mock, &[], Some(requests))
     });
     let mut connection = server.connect();
     let mut statement = connection.new_statement().unwrap();
@@ -2885,23 +2872,10 @@ fn read_staleness_reaches_the_wire_on_single_use_queries() {
     use v1::transaction_options::read_only::TimestampBound as WireBound;
 
     let _watchdog = watchdog!();
-    let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let record = selectors.clone();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let record = requests.clone();
     let server = MockServer::start(move |mock| {
-        mock.expect_execute_streaming_sql()
-            .returning(move |request| {
-                record
-                    .lock()
-                    .unwrap()
-                    .push(request.into_inner().transaction);
-                Ok(stream_of(vec![Ok(partial_result_set(
-                    true,
-                    &["v1"],
-                    b"st-1",
-                    true,
-                ))]))
-            });
+        serve_streaming_sql_begin_aware(mock, &["v1"], Some(record));
     });
 
     let mut connection = server.connect();
@@ -2934,7 +2908,7 @@ fn read_staleness_reaches_the_wire_on_single_use_queries() {
     run_query(Some(&format!("read:{READ_TIMESTAMP_RFC3339}")));
     run_query(Some(&format!("min:{READ_TIMESTAMP_RFC3339}")));
 
-    let selectors = selectors.lock().unwrap();
+    let selectors = transaction_selectors(&requests);
     assert_eq!(selectors.len(), 4, "one request per staleness form");
     let bounds: Vec<WireBound> = selectors
         .iter()
@@ -2986,11 +2960,10 @@ fn read_staleness_reaches_the_wire_on_metadata_reads() {
         seconds: 10,
         nanos: 0,
     });
-    let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
     let server = MockServer::start({
-        let record = selectors.clone();
-        move |mock| serve_streaming_sql_begin_aware(mock, &["default"], Some(record.clone()))
+        let record = requests.clone();
+        move |mock| serve_streaming_sql_begin_aware(mock, &["default"], Some(record))
     });
 
     let mut connection = server.connect();
@@ -3005,7 +2978,7 @@ fn read_staleness_reaches_the_wire_on_metadata_reads() {
     statement.set_sql_query("SELECT c FROM MockTable").unwrap();
     statement.execute_schema().expect("execute_schema probe");
     {
-        let selectors = selectors.lock().unwrap();
+        let selectors = transaction_selectors(&requests);
         assert_eq!(selectors.len(), 1, "one PLAN probe request");
         assert_eq!(
             single_use_read_only_bound(selectors[0].as_ref()),
@@ -3022,7 +2995,7 @@ fn read_staleness_reaches_the_wire_on_metadata_reads() {
         .collect::<Result<Vec<_>, _>>()
         .expect("drain get_objects");
     {
-        let selectors = selectors.lock().unwrap();
+        let selectors = transaction_selectors(&requests);
         let begin = selectors
             .iter()
             .find_map(|s| match s.as_ref().and_then(|s| s.selector.as_ref()) {
@@ -3041,21 +3014,10 @@ fn read_staleness_reaches_the_wire_on_metadata_reads() {
 /// Runs a query with two bound rows and returns each request's transaction selector. Multiple rows
 /// share a multi-use read-only transaction that the first request begins inline.
 fn bound_query_transaction_selectors(staleness: &str) -> Vec<Option<v1::TransactionSelector>> {
-    let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let record = selectors.clone();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let record = requests.clone();
     let server = MockServer::start(move |mock| {
-        mock.expect_execute_streaming_sql()
-            .returning(move |request| {
-                let request = request.into_inner();
-                let inline_begin = begins_inline(request.transaction.as_ref());
-                record.lock().unwrap().push(request.transaction);
-                let mut first = partial_result_set(true, &["v"], b"bq-1", true);
-                if inline_begin {
-                    set_transaction_id(&mut first, b"bound-txn");
-                }
-                Ok(stream_of(vec![Ok(first)]))
-            });
+        serve_streaming_sql_begin_aware(mock, &["v"], Some(record));
     });
 
     let mut connection = server.connect();
@@ -3085,9 +3047,7 @@ fn bound_query_transaction_selectors(staleness: &str) -> Vec<Option<v1::Transact
         .sum();
     assert_eq!(total, 2, "one result row per bound row ({staleness})");
 
-    let seen = selectors.lock().unwrap().clone();
-    drop(server);
-    seen
+    transaction_selectors(&requests)
 }
 
 /// Spanner allows bounded staleness only on single-use transactions, so a multi-row bound query
@@ -3140,7 +3100,7 @@ fn bounded_staleness_is_pinned_for_multi_use_bound_queries() {
             .expect("the second statement must carry a transaction selector");
         assert_eq!(
             second,
-            &v1::transaction_selector::Selector::Id(b"bound-txn".to_vec()),
+            &v1::transaction_selector::Selector::Id(b"inline-txn".to_vec()),
             "later bound-row statements must reuse the begun transaction ({staleness})"
         );
     }
@@ -3159,27 +3119,13 @@ fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
     const INSERT_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
     const RETURNING_SQL: &str = "INSERT INTO MockTable (c) VALUES ('y') THEN RETURN c";
 
-    type SeenExecuteSql = (String, Option<v1::DirectedReadOptions>);
-    let streaming: Arc<Mutex<Vec<SeenExecuteSql>>> = Arc::new(Mutex::new(Vec::new()));
+    let streaming = Arc::new(Mutex::new(Vec::new()));
     let batch_dml: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let record_streaming = streaming.clone();
     let record_batch_dml = batch_dml.clone();
     let server = MockServer::start(move |mock| {
         serve_begin_transaction(mock);
-        mock.expect_execute_streaming_sql()
-            .returning(move |request| {
-                let request = request.into_inner();
-                let inline_begin = begins_inline(request.transaction.as_ref());
-                record_streaming
-                    .lock()
-                    .unwrap()
-                    .push((request.sql.clone(), request.directed_read_options));
-                let mut first = partial_result_set(true, &["v"], b"dr-1", true);
-                if inline_begin {
-                    set_transaction_id(&mut first, b"dml-txn");
-                }
-                Ok(stream_of(vec![Ok(first)]))
-            });
+        serve_streaming_sql_begin_aware(mock, &["v"], Some(record_streaming));
         serve_batch_dml(mock, record_batch_dml.clone());
         mock.expect_commit().returning(|_| commit_ok());
     });
@@ -3234,14 +3180,17 @@ fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
     let directed_for = |sql: &str| -> Option<v1::DirectedReadOptions> {
         streaming
             .iter()
-            .find(|(seen, _)| seen == sql)
+            .find(|request| request.sql == sql)
             .unwrap_or_else(|| {
                 panic!(
                     "no ExecuteSql request seen for {sql:?}; saw: {:?}",
-                    streaming.iter().map(|(seen, _)| seen).collect::<Vec<_>>()
+                    streaming
+                        .iter()
+                        .map(|request| &request.sql)
+                        .collect::<Vec<_>>()
                 )
             })
-            .1
+            .directed_read_options
             .clone()
     };
 
@@ -3293,19 +3242,10 @@ fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
 #[test]
 fn query_optimizer_options_reach_the_wire_on_queries() {
     let _watchdog = watchdog!();
-    let requests: Arc<Mutex<Vec<v1::ExecuteSqlRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
     let record = requests.clone();
     let server = MockServer::start(move |mock| {
-        mock.expect_execute_streaming_sql()
-            .returning(move |request| {
-                record.lock().unwrap().push(request.into_inner());
-                Ok(stream_of(vec![Ok(partial_result_set(
-                    true,
-                    &["v1"],
-                    b"qo-1",
-                    true,
-                ))]))
-            });
+        serve_streaming_sql_begin_aware(mock, &["v1"], Some(record));
     });
 
     let mut connection = server.connect();
@@ -3651,22 +3591,13 @@ fn request_priority_reaches_metadata_reads_but_tags_do_not() {
     const USER_QUERY: &str = "SELECT c FROM MockTable";
     const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
 
-    let queries: Arc<Mutex<Vec<v1::ExecuteSqlRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let queries = Arc::new(Mutex::new(Vec::new()));
     let batch_dml: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let commits: Arc<Mutex<Vec<v1::CommitRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let (rec_q, rec_b, rec_c) = (queries.clone(), batch_dml.clone(), commits.clone());
     let server = MockServer::start(move |mock| {
         serve_begin_transaction(mock);
-        mock.expect_execute_streaming_sql()
-            .returning(move |request| {
-                rec_q.lock().unwrap().push(request.into_inner());
-                Ok(stream_of(vec![Ok(partial_result_set(
-                    true,
-                    &["v"],
-                    b"t",
-                    true,
-                ))]))
-            });
+        serve_streaming_sql_begin_aware(mock, &["v"], Some(rec_q));
         serve_batch_dml(mock, rec_b.clone());
         mock.expect_commit().returning(move |request| {
             rec_c.lock().unwrap().push(request.into_inner());
@@ -4395,16 +4326,7 @@ fn ingest_table_probe_inherits_read_options_without_tags() {
     let queries = Arc::new(Mutex::new(Vec::new()));
     let recorded = queries.clone();
     let server = MockServer::start(move |mock| {
-        mock.expect_execute_streaming_sql()
-            .returning(move |request| {
-                recorded.lock().unwrap().push(request.into_inner());
-                Ok(stream_of(vec![Ok(partial_result_set(
-                    true,
-                    &["MockTable"],
-                    b"t",
-                    true,
-                ))]))
-            });
+        serve_streaming_sql_begin_aware(mock, &["MockTable"], Some(recorded));
     });
     let mut connection = server.connect();
     for (key, value) in [
