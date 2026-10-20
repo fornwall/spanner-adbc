@@ -427,8 +427,8 @@ fn omni_database(endpoint: &str) -> SpannerDatabase {
     db
 }
 
-/// Without explicit credentials, a quota project used to switch anonymous Omni to ADC and send
-/// Google tokens to the Omni host.
+/// Without explicit credentials, a quota project would need ADC, which would send Google tokens to
+/// the Omni host.
 #[test]
 fn anonymous_omni_refuses_a_quota_project() {
     for endpoint in [

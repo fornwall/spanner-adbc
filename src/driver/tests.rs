@@ -300,8 +300,7 @@ fn a_uri_host_authority_endpoint_is_dialed() {
     }
 }
 
-/// `""` used to be dialed as an endpoint, failing with `Internal` and hiding
-/// `SPANNER_EMULATOR_HOST`.
+/// Dialing `""` would fail with `Internal` and hide `SPANNER_EMULATOR_HOST`.
 #[test]
 fn a_blank_endpoint_unsets_it() {
     let mut db = new_database();

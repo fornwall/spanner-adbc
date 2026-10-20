@@ -22,8 +22,8 @@ fn works_and_drops_inside_a_multi_thread_runtime() {
     });
 }
 
-/// The error used to advise `spawn_blocking`, which fails the same way on a current-thread
-/// runtime.
+/// A current-thread runtime's `spawn_blocking` threads carry its handle, so they get the same
+/// error as its tasks.
 #[test]
 fn a_current_thread_caller_runtime_gets_an_error_instead_of_a_panic() {
     let runtime = new_runtime().unwrap();
