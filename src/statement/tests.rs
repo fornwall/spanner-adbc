@@ -1050,6 +1050,29 @@ mod manual_txn {
         }
     }
 
+    /// A query whose parameter fails to bind runs nothing, so it must not fix the manual
+    /// transaction's kind to queries.
+    #[test]
+    fn bind_failure_does_not_fix_the_manual_transaction_kind() {
+        let server = start();
+        let mut connection = manual(&server);
+        let mut statement = sql_statement(&mut connection, "SELECT c FROM t WHERE c = @p");
+        let unsupported = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("p", DataType::UInt64, false)])),
+            vec![Arc::new(arrow_array::UInt64Array::from(vec![1_u64]))],
+        )
+        .unwrap();
+        statement.bind(unsupported).unwrap();
+        let error = statement.execute().err().unwrap();
+        assert_eq!(error.status, Status::InvalidArguments, "{error}");
+        assert_eq!(
+            update(&mut connection, "UPDATE t SET c = 'x' WHERE TRUE"),
+            None
+        );
+        connection.commit().unwrap();
+        assert!(server.selectors.lock().unwrap().is_empty());
+    }
+
     /// An `ABORTED` commit reruns the whole transaction: the batch DML and the buffered
     /// mutations go out again, the commit succeeds once, and the buffer is cleared.
     #[test]

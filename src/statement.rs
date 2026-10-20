@@ -215,140 +215,103 @@ impl SpannerStatement {
     }
 
     /// An empty result reader (empty schema, no rows), for statements that yield no result set.
-    fn empty_reader() -> Box<dyn RecordBatchReader + Send + 'static> {
+    fn empty_reader() -> ResultReader {
         let schema = Arc::new(Schema::empty());
         let empty: Vec<std::result::Result<RecordBatch, ArrowError>> = Vec::new();
         Box::new(RecordBatchIterator::new(empty, schema))
     }
 
-    /// Run a parameterized query once per bound row, streaming the concatenated results.
-    ///
-    /// All rows read the same snapshot: one row uses a single-use transaction, several share a
-    /// multi-use read-only transaction.
-    fn execute_bound_query(
-        &self,
-        sql: &str,
-    ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+    /// Run a query once per bound row, streaming the concatenated results. All rows share one
+    /// multi-use read-only transaction, so they read the same snapshot.
+    fn execute_multi_row_query(&self, sql: &str) -> Result<ResultReader> {
         // Resolve parameter names up front so a mismatch fails before any statement runs; only
         // the per-row binding is deferred to the reader.
-        let mut groups: Vec<(Vec<String>, RecordBatch)> = Vec::new();
-        let mut total_rows = 0usize;
-        for batch in &self.bound {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let names = bind::resolve_parameter_names(sql, batch, self.bind_by_name)?;
-            total_rows += batch.num_rows();
-            groups.push((names, batch.clone()));
-        }
-        let base_builder = self.read_sql_builder(sql);
+        let groups = self
+            .bound
+            .iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .map(|batch| {
+                let names = bind::resolve_parameter_names(sql, batch, self.bind_by_name)?;
+                Ok((names, batch.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let statements: Box<dyn BoundStatementSource> = Box::new(LazyBoundStatements {
+            base_builder: self.read_sql_builder(sql),
+            groups,
+            group: 0,
+            row: 0,
+        });
+        let bound = self.config.read_staleness.multi_use_timestamp_bound()?;
         let manual_txn = self.manual_read_transaction()?;
         let client = self.client.clone();
         let runtime = self.runtime.clone();
         let cancel = self.cancel.current();
         let batch_size = self.rows_per_batch;
         let precision = self.config.timestamp_precision;
-        // The query timeout covers execution through the first chunk; the fetch timeout covers
-        // each later chunk as the reader is iterated.
-        let query_timeout = self.config.timeouts.query_timeout();
         let fetch_timeout = self.config.timeouts.fetch_timeout();
-        if total_rows <= 1 {
-            // A single statement can keep the single-use transaction, which unlike a multi-use
-            // one supports bounded staleness.
-            let Some((names, batch)) = groups.first() else {
-                // No bound rows (e.g. `executemany` with an empty parameter list): return no
-                // rows, but with the query's real schema from a PLAN probe.
-                let schema = self.plan_query_schema(sql)?;
-                let empty: Vec<std::result::Result<RecordBatch, ArrowError>> = Vec::new();
-                return Ok(Box::new(RecordBatchIterator::new(empty, schema)));
-            };
-            let statement = bind::bind_params(base_builder, names, batch, 0)?.build();
-            let bound = self.config.read_staleness.timestamp_bound()?;
-            let txn = manual_txn.clone();
-            let reader = block_on_cancellable(
-                &self.runtime,
-                &self.cancel.current(),
-                with_timeout(query_timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
-                    let result_set = match txn {
-                        Some(txn) => txn.execute_query(statement).await.map_err(from_spanner)?,
-                        None => crate::staleness::single_use(&client, bound)
-                            .execute_query(statement)
-                            .await
-                            .map_err(from_spanner)?,
-                    };
-                    stream_query(
-                        runtime,
-                        cancel,
-                        result_set,
-                        batch_size,
-                        precision,
-                        fetch_timeout,
-                        None,
-                    )
-                    .await
-                }),
-            )
-            .inspect_err(|error| self.discard_unbegun_read_txn(manual_txn.as_ref(), error))?;
-            return Ok(Box::new(reader));
-        }
-        let bound = self.config.read_staleness.multi_use_timestamp_bound()?;
-        let statements: Box<dyn BoundStatementSource> = Box::new(LazyBoundStatements {
-            base_builder,
-            groups,
-            group: 0,
-            row: 0,
-        });
         let txn = manual_txn.clone();
         let reader = block_on_cancellable(
             &self.runtime,
             &self.cancel.current(),
-            with_timeout(query_timeout, crate::OPTION_RPC_TIMEOUT_QUERY, async move {
-                let transaction = match txn {
-                    Some(txn) => txn,
-                    None => Arc::new(crate::staleness::multi_use(&client, bound).await?),
-                };
-                stream_bound_query(
-                    runtime,
-                    cancel,
-                    transaction,
-                    statements,
-                    batch_size,
-                    precision,
-                    fetch_timeout,
-                )
-                .await
-            }),
+            with_timeout(
+                self.config.timeouts.query_timeout(),
+                crate::OPTION_RPC_TIMEOUT_QUERY,
+                async move {
+                    let transaction = match txn {
+                        Some(txn) => txn,
+                        None => Arc::new(crate::staleness::multi_use(&client, bound).await?),
+                    };
+                    stream_bound_query(
+                        runtime,
+                        cancel,
+                        transaction,
+                        statements,
+                        batch_size,
+                        precision,
+                        fetch_timeout,
+                    )
+                    .await
+                },
+            ),
         )
         .inspect_err(|error| self.discard_unbegun_read_txn(manual_txn.as_ref(), error))?;
         Ok(Box::new(reader))
     }
 
-    /// Run `sql` as a read-only query and return a streaming reader. Shared by `execute` and the
-    /// query arm of `execute_update`, whose callers consume the bound rows.
+    /// Run `sql` as a read-only query and return a streaming reader.
     ///
     /// Trailing `;` terminators are stripped: Spanner's query API rejects them, but clients often
     /// append one. In a manual transaction the query uses the transaction's shared snapshot.
-    fn execute_query_reader(
-        &self,
-        sql: &str,
-    ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+    /// Otherwise a single statement uses a single-use transaction, which unlike a multi-use one
+    /// supports bounded staleness.
+    fn execute_query_reader(&self, sql: &str) -> Result<ResultReader> {
         let sql = crate::sql::strip_trailing_terminators(sql);
         self.ensure_query_allowed()?;
-        if !self.bound.is_empty() {
-            return self.execute_bound_query(&sql);
+        let bound_rows: usize = self.bound.iter().map(RecordBatch::num_rows).sum();
+        if bound_rows > 1 {
+            return self.execute_multi_row_query(&sql);
         }
+        if bound_rows == 0 && !self.bound.is_empty() {
+            // `executemany` with no parameter rows runs nothing, but the reader still has the
+            // query's schema.
+            let schema = self.plan_query_schema(&sql)?;
+            let empty: Vec<std::result::Result<RecordBatch, ArrowError>> = Vec::new();
+            return Ok(Box::new(RecordBatchIterator::new(empty, schema)));
+        }
+        // Bind before taking the manual read transaction: a bind error after it would leave the
+        // transaction installed but unbegun, fixing the manual transaction's kind to queries.
+        let statement = self.build_query_statement(&sql, false)?;
+        let bound = self.config.read_staleness.timestamp_bound()?;
         let manual_txn = self.manual_read_transaction()?;
         let client = self.client.clone();
         let runtime = self.runtime.clone();
         let cancel = self.cancel.current();
         let batch_size = self.rows_per_batch;
         let precision = self.config.timestamp_precision;
-        let bound = self.config.read_staleness.timestamp_bound()?;
-        let statement = self.read_sql_builder(&sql).build();
         let fetch_timeout = self.config.timeouts.fetch_timeout();
         let txn = manual_txn.clone();
-        // `stream_query` fetches the first chunk to settle the schema; the reader converts the
-        // rest one chunk at a time.
+        // `stream_query` fetches the first chunk to settle the schema, within the query timeout;
+        // the reader converts the rest one chunk at a time, each within the fetch timeout.
         let reader = block_on_cancellable(
             &self.runtime,
             &self.cancel.current(),
@@ -357,12 +320,14 @@ impl SpannerStatement {
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
                     let result_set = match txn {
-                        Some(txn) => txn.execute_query(statement).await.map_err(from_spanner)?,
-                        None => crate::staleness::single_use(&client, bound)
-                            .execute_query(statement)
-                            .await
-                            .map_err(from_spanner)?,
-                    };
+                        Some(txn) => txn.execute_query(statement).await,
+                        None => {
+                            crate::staleness::single_use(&client, bound)
+                                .execute_query(statement)
+                                .await
+                        }
+                    }
+                    .map_err(from_spanner)?;
                     stream_query(
                         runtime,
                         cancel,
@@ -889,7 +854,7 @@ impl Statement for SpannerStatement {
         Ok(())
     }
 
-    fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+    fn execute(&mut self) -> Result<ResultReader> {
         self.execute_counted().map(|(reader, _)| reader)
     }
 
@@ -1119,7 +1084,7 @@ fn split_batches(batches: Vec<RecordBatch>, max_rows: usize) -> Vec<RecordBatch>
 /// Drain a query's rows, discarding them; mid-stream failures still surface. The streaming layer
 /// wraps ADBC errors in `ArrowError::ExternalError`, so unwrap them to report what `execute`
 /// would.
-fn drain_discarding_rows(reader: Box<dyn RecordBatchReader + Send + 'static>) -> Result<()> {
+fn drain_discarding_rows(reader: ResultReader) -> Result<()> {
     for batch in reader {
         batch.map_err(|e| {
             if let ArrowError::ExternalError(inner) = e {
