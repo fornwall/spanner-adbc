@@ -67,20 +67,13 @@ pub(crate) fn non_empty_string_option(value: OptionValue, key: &str) -> Result<O
     Ok(Some(string_option(value, key)?).filter(|s| !s.is_empty()))
 }
 
-/// An option's string, kept for `get_option`, alongside its parsed value. Both change together
-/// through [`set`](Self::set).
+/// An option's trimmed string, kept for `get_option`, with its parsed value.
 #[derive(Debug, Clone)]
-pub(crate) struct RawParsed<T> {
-    raw: Option<String>,
-    parsed: Option<T>,
-}
+pub(crate) struct RawParsed<T>(Option<(String, T)>);
 
 impl<T> Default for RawParsed<T> {
     fn default() -> Self {
-        Self {
-            raw: None,
-            parsed: None,
-        }
+        Self(None)
     }
 }
 
@@ -94,22 +87,20 @@ impl<T> RawParsed<T> {
     ) -> Result<()> {
         let raw = string_option(value, key)?;
         let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            self.raw = None;
-            self.parsed = None;
-            return Ok(());
-        }
-        self.parsed = Some(parse(trimmed)?);
-        self.raw = Some(trimmed.to_string());
+        self.0 = if trimmed.is_empty() {
+            None
+        } else {
+            Some((trimmed.to_string(), parse(trimmed)?))
+        };
         Ok(())
     }
 
     pub(crate) fn raw(&self) -> Option<&str> {
-        self.raw.as_deref()
+        self.0.as_ref().map(|(raw, _)| raw.as_str())
     }
 
     pub(crate) fn parsed(&self) -> Option<&T> {
-        self.parsed.as_ref()
+        self.0.as_ref().map(|(_, parsed)| parsed)
     }
 }
 
