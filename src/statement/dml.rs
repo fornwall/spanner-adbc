@@ -8,10 +8,10 @@ use arrow_schema::{Schema, SchemaRef};
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::{BeginTransactionOption, ReadWriteTransaction};
 
-use super::{SpannerStatement, check_partitioned_dml};
+use super::{SpannerStatement, check_partitioned_dml, is_mutation_limit_exceeded};
 use crate::bind;
 use crate::connection::{lock_txn, runner_builder};
-use crate::error::{from_spanner, invalid_argument, invalid_state, not_implemented};
+use crate::error::{annotate, from_spanner, invalid_argument, invalid_state, not_implemented};
 use crate::runtime::block_on_cancellable;
 use crate::timeout::with_timeout;
 
@@ -85,7 +85,8 @@ impl SpannerStatement {
             &statements,
             &[],
             true,
-        )?;
+        )
+        .map_err(note_mutation_limit)?;
         Ok(Some(count))
     }
 
@@ -146,7 +147,8 @@ impl SpannerStatement {
                 crate::OPTION_RPC_TIMEOUT_UPDATE,
                 transaction,
             ),
-        )?;
+        )
+        .map_err(note_mutation_limit)?;
         self.config.commit_stats.record(mutation_count);
 
         let mut schema = None;
@@ -247,4 +249,19 @@ impl SpannerStatement {
             ),
         )
     }
+}
+
+/// Name the driver's ways past Spanner's per-transaction mutation limit, which Spanner's own
+/// message doesn't know about. Every bound row and `;`-separated statement shares one transaction.
+fn note_mutation_limit(error: Error) -> Error {
+    if !is_mutation_limit_exceeded(&error) {
+        return error;
+    }
+    annotate(error, |message| {
+        format!(
+            "{message} (all bound rows and statements of one execution run in one transaction: \
+             execute fewer at a time, set spanner.dml.partitioned to true for a large UPDATE or \
+             DELETE, or load inserts with bulk ingest, which commits in chunks)"
+        )
+    })
 }

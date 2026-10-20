@@ -723,6 +723,8 @@ mod manual_txn {
     enum CommitAction {
         Ok,
         Fail(tonic::Code),
+        /// Reject the commit as Spanner does one over its mutation limit.
+        TooManyMutations,
         /// Block until the test releases the gate, then fail with `UNAVAILABLE`.
         Hang,
     }
@@ -873,6 +875,9 @@ mod manual_txn {
             match commits(index) {
                 CommitAction::Ok => Ok(tonic::Response::new(v1::CommitResponse::default())),
                 CommitAction::Fail(code) => Err(tonic::Status::new(code, "mock commit failure")),
+                CommitAction::TooManyMutations => Err(tonic::Status::invalid_argument(
+                    "The transaction contains too many mutations. (Maximum number: 80000)",
+                )),
                 CommitAction::Hang => {
                     tokio::task::block_in_place(|| {
                         let deadline = Instant::now() + Duration::from_secs(30);
@@ -1017,6 +1022,23 @@ mod manual_txn {
         );
         assert_eq!(counted(ingest(&mut connection, 3)), (0, None));
         connection.commit().unwrap();
+    }
+
+    /// Spanner's mutation-limit error doesn't know the driver's remedies, so autocommit DML names
+    /// them.
+    #[test]
+    fn autocommit_dml_over_the_mutation_limit_names_the_remedies() {
+        let server = start_with(Box::new(|_| CommitAction::TooManyMutations));
+        let mut connection = connect(&server);
+        let mut statement = sql_statement(&mut connection, "UPDATE t SET c = 'x' WHERE TRUE");
+        let error = statement.execute_update().unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments, "{error}");
+        assert!(
+            error.message.contains("too many mutations")
+                && error.message.contains("spanner.dml.partitioned")
+                && error.message.contains("bulk ingest"),
+            "{error}"
+        );
     }
 
     /// A failed first query begins nothing, so it must not poison the manual transaction: with
