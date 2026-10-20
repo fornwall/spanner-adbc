@@ -89,12 +89,17 @@ fn run(
     let mut database = crate::driver::SpannerDatabase::new(runtime.clone());
     database.access_token = Some("admin-test-token".into());
     database.quota_project = Some("billing-project".into());
-    let credentials = database.build_credentials(false, true, None).unwrap();
+    let credentials = database
+        .build_credentials(
+            crate::driver::credentials::CredentialChoice::AccessToken,
+            None,
+        )
+        .unwrap();
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = ClientConfig::default();
         config.endpoint = Some(format!("http://{}", listener.local_addr().unwrap()));
-        config.cred = credentials;
+        config.cred = Some(credentials);
         let state = Arc::new(Mutex::new(State {
             responses: responses.into(),
             ..Default::default()

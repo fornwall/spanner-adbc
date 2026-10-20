@@ -14,11 +14,12 @@ use http::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use http::{Extensions, HeaderMap};
 
 use super::SpannerDatabase;
-use crate::error::{err, from_builder, invalid_argument};
+use crate::error::{err, invalid_argument};
 use crate::{
     OPTION_ACCESS_TOKEN, OPTION_IMPERSONATE_TARGET_PRINCIPAL, OPTION_KEYFILE, OPTION_KEYFILE_JSON,
     OPTION_QUOTA_PROJECT,
 };
+use std::borrow::Cow;
 use std::time::Duration;
 
 /// The header `google-cloud-auth` sends for `with_quota_project_id`; the access-token path adds it
@@ -32,8 +33,8 @@ pub(super) const DEFAULT_IMPERSONATION_LIFETIME_SECS: u64 = 3600;
 ///
 /// Separating selection from construction lets the precedence rules be tested offline. Variants
 /// carry no data, so a bearer token never ends up in a `Debug`-derived type.
-#[derive(Debug, PartialEq, Eq)]
-enum CredentialChoice {
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(super) enum CredentialChoice {
     /// Emulator mode, or Omni or a plaintext endpoint without a credential option. `connect`
     /// refuses emulator mode alongside any credential option, and every anonymous mode alongside
     /// a quota project.
@@ -93,7 +94,11 @@ impl SpannerDatabase {
 
     /// `emulator` is the resolved mode: the option or `SPANNER_EMULATOR_HOST`.
     /// `anonymous_default` replaces ADC for Omni and plaintext endpoints.
-    fn credential_choice(&self, emulator: bool, anonymous_default: bool) -> CredentialChoice {
+    pub(super) fn credential_choice(
+        &self,
+        emulator: bool,
+        anonymous_default: bool,
+    ) -> CredentialChoice {
         if emulator {
             CredentialChoice::Anonymous
         } else if self.access_token.is_some() {
@@ -109,78 +114,96 @@ impl SpannerDatabase {
         }
     }
 
-    /// Build the selected credential, or `None` to let the client resolve ADC itself.
+    /// Build the chosen credential. `credentials_json` is [`Self::credentials_json`].
     ///
     /// Must run inside the Tokio runtime, since the auth builders spawn token-cache tasks. No
-    /// token is fetched until first use.
+    /// token is fetched until first use. The options behind `choice` are set, so the empty
+    /// defaults below are never used.
     pub(super) fn build_credentials(
         &self,
-        emulator: bool,
-        anonymous_default: bool,
+        choice: CredentialChoice,
         credentials_json: Option<String>,
-    ) -> Result<Option<Credentials>> {
+    ) -> Result<Credentials> {
         let quota_project = self.quota_project.as_deref();
-        match self.credential_choice(emulator, anonymous_default) {
-            CredentialChoice::Anonymous => Ok(Some(AnonymousCredentials::new().build())),
-            CredentialChoice::AccessToken => self
-                .access_token
-                .as_deref()
-                .map(|token| build_static_token_credentials(token, quota_project))
-                .transpose(),
-            CredentialChoice::Impersonate => self
-                .impersonate_target_principal
-                .as_deref()
-                .map(|target| {
-                    // The quota project goes on the impersonated credential, not the source.
-                    let source = match &credentials_json {
-                        Some(json) => build_credentials_from_json(json, None)?,
-                        None => AdcCredentials::default().build().map_err(|e| {
-                            err(
-                                format!(
-                                    "failed to build Application Default Credentials to \
-                                     impersonate {target:?}: {}",
-                                    scrub_credential_error(&e)
-                                ),
-                                Status::InvalidArguments,
-                            )
-                        })?,
-                    };
-                    build_impersonated_credentials(
-                        source,
-                        target,
-                        &self.impersonate_delegates,
-                        &self.impersonate_scopes,
-                        Duration::from_secs(
-                            self.impersonate_lifetime_secs
-                                .unwrap_or(DEFAULT_IMPERSONATION_LIFETIME_SECS),
-                        ),
-                        quota_project,
-                    )
-                })
-                .transpose(),
-            CredentialChoice::Keyfile => credentials_json
-                .map(|json| build_credentials_from_json(&json, quota_project))
-                .transpose(),
-            // ADC is only built here when a quota project must be attached to it.
-            CredentialChoice::Adc => quota_project
-                .map(|project| {
-                    AdcCredentials::default()
-                        .with_quota_project_id(project)
-                        .build()
-                        .map_err(|e| {
-                            err(
-                                format!(
-                                    "failed to build Application Default Credentials with quota \
-                                     project {project:?}: {}",
-                                    scrub_credential_error(&e)
-                                ),
-                                Status::InvalidArguments,
-                            )
-                        })
-                })
-                .transpose(),
+        match choice {
+            CredentialChoice::Anonymous => Ok(AnonymousCredentials::new().build()),
+            CredentialChoice::AccessToken => build_static_token_credentials(
+                self.access_token.as_deref().unwrap_or_default(),
+                quota_project,
+            ),
+            CredentialChoice::Impersonate => {
+                // The quota project goes on the impersonated credential, not the source.
+                let source = match &credentials_json {
+                    Some(json) => build_credentials_from_json(json, None)?,
+                    None => build_adc(None)?,
+                };
+                build_impersonated_credentials(
+                    source,
+                    self.impersonate_target_principal
+                        .as_deref()
+                        .unwrap_or_default(),
+                    &self.impersonate_delegates,
+                    &self.impersonate_scopes,
+                    Duration::from_secs(
+                        self.impersonate_lifetime_secs
+                            .unwrap_or(DEFAULT_IMPERSONATION_LIFETIME_SECS),
+                    ),
+                    quota_project,
+                )
+            }
+            CredentialChoice::Keyfile => {
+                build_credentials_from_json(&credentials_json.unwrap_or_default(), quota_project)
+            }
+            CredentialChoice::Adc => build_adc(quota_project),
         }
     }
+}
+
+/// Wait until `credentials` supply a token, which their cache then keeps for the client.
+///
+/// The client retries a transient token failure until the connect deadline and then reports only
+/// a timeout, so retry here instead and keep the latest failure's cause in `failure`. A permanent
+/// failure is left to the client, which reports it in full.
+pub(super) async fn first_token(credentials: &Credentials, failure: &mut Option<String>) {
+    let mut delay = Duration::from_millis(250);
+    loop {
+        match credentials.headers(Extensions::new()).await {
+            Err(error) if error.is_transient() => *failure = Some(io_cause(&error)),
+            _ => {
+                *failure = None;
+                return;
+            }
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(4));
+    }
+}
+
+/// The innermost I/O error behind a token failure, such as a failed DNS lookup. Other errors in
+/// the chain can quote token responses, so they are left out.
+fn io_cause(error: &(dyn std::error::Error + 'static)) -> String {
+    std::iter::successors(Some(error), |e| e.source())
+        .filter_map(|e| e.downcast_ref::<std::io::Error>())
+        .last()
+        .map_or_else(|| "a transient error".to_owned(), ToString::to_string)
+}
+
+/// Application Default Credentials: `GOOGLE_APPLICATION_CREDENTIALS`, gcloud's credentials or
+/// the metadata server.
+fn build_adc(quota_project: Option<&str>) -> Result<Credentials> {
+    let mut builder = AdcCredentials::default();
+    if let Some(project) = quota_project {
+        builder = builder.with_quota_project_id(project);
+    }
+    builder.build().map_err(|e| {
+        err(
+            format!(
+                "failed to load Application Default Credentials: {}",
+                describe_build_error(&e)
+            ),
+            Status::InvalidArguments,
+        )
+    })
 }
 
 const SUPPORTED_CREDENTIAL_TYPES: &str =
@@ -238,48 +261,29 @@ fn build_credentials_from_json(json: &str, quota_project: Option<&str>) -> Resul
         err(
             format!(
                 "failed to build {credential_type} credentials: {}",
-                scrub_credential_error(&e)
+                describe_build_error(&e)
             ),
             Status::InvalidArguments,
         )
     })
 }
 
-/// Translate a client builder error. A client that cannot load ADC, for example from a missing
-/// `GOOGLE_APPLICATION_CREDENTIALS` file, gets the status of the driver's own ADC builds above
-/// instead of `Internal`.
-pub(super) fn from_client_builder(
-    error: google_cloud_gax::client_builder::Error,
-) -> adbc_core::error::Error {
-    if !error.is_default_credentials() {
-        return from_builder(error);
-    }
-    let detail = std::error::Error::source(&error)
-        .and_then(|source| source.downcast_ref::<google_cloud_auth::build_errors::Error>())
-        .map_or("the credentials could not be built", scrub_credential_error);
-    err(
-        format!("failed to build Application Default Credentials: {detail}"),
-        Status::InvalidArguments,
-    )
-}
-
-/// Describe a credential-builder error with a fixed phrase.
+/// Describe a credential-builder error without quoting the credential.
 ///
-/// The error's `Display` can include `serde_json` fragments of the credential JSON, such as a
-/// private key or refresh token, so it must never reach an ADBC error message.
-fn scrub_credential_error(error: &google_cloud_auth::build_errors::Error) -> &'static str {
-    if error.is_missing_field() {
-        "a required field is missing or has the wrong type"
+/// Parsing errors can include `serde_json` fragments of the credential JSON, such as a private
+/// key or refresh token, so they get a fixed phrase. Loading errors name a file and
+/// missing-field errors a field, which are safe and more useful verbatim.
+fn describe_build_error(error: &google_cloud_auth::build_errors::Error) -> Cow<'static, str> {
+    if error.is_loading() || error.is_missing_field() {
+        error.to_string().into()
     } else if error.is_parsing() {
-        "the credential JSON could not be parsed"
+        "the credential JSON could not be parsed".into()
     } else if error.is_unknown_type() {
-        "the credential type is unknown or invalid"
+        "the credential type is unknown or invalid".into()
     } else if error.is_not_supported() {
-        "the credential type is not supported for this use"
-    } else if error.is_loading() {
-        "the credentials could not be loaded"
+        "the credential type is not supported for this use".into()
     } else {
-        "the credentials could not be built"
+        "the credentials could not be built".into()
     }
 }
 
@@ -310,7 +314,7 @@ fn build_impersonated_credentials(
         err(
             format!(
                 "failed to build impersonated credentials for {target_principal:?}: {}",
-                scrub_credential_error(&e)
+                describe_build_error(&e)
             ),
             Status::InvalidArguments,
         )

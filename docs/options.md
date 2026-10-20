@@ -282,8 +282,10 @@ would be retried indefinitely. The 30-second default leaves room for a slow firs
 several retries of a transient failure.
 
 When the deadline expires, creating the connection returns `Timeout` with a message naming the
-database and endpoint. Nothing is cached, so the next connection tries again. `0` disables the
-deadline and `""` restores the default.
+database and endpoint. If the credentials never supplied an access token, for example because
+ADC found no credentials outside Google Cloud and fell back to the unreachable metadata server,
+it returns `Unauthenticated` instead and names the cause. Nothing is cached, so the next
+connection tries again. `0` disables the deadline and `""` restores the default.
 
 Connecting can't be interrupted: `AdbcConnectionCancel` only applies after `Init`, and Python
 handles Ctrl+C only once the call returns. Other connections on the same database wait while the

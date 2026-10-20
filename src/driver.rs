@@ -4,7 +4,7 @@ mod admin;
 mod credentials;
 mod uri;
 
-use credentials::from_client_builder;
+use credentials::{CredentialChoice, first_token};
 pub(crate) use uri::ensure_scheme;
 use uri::is_plaintext_endpoint;
 
@@ -18,7 +18,8 @@ use google_cloud_spanner::omni::{InstanceType, SpannerBuilderExt};
 
 use crate::connection::SpannerConnection;
 use crate::error::{
-    err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option,
+    err, from_builder, from_spanner, invalid_argument, invalid_state, option_not_set,
+    unknown_option,
 };
 use crate::options::{F64Range, f64_option, impl_typed_option_getters};
 use crate::runtime::{SharedRuntime, block_on, new_runtime};
@@ -187,6 +188,7 @@ impl SpannerDatabase {
             emulator,
             anonymous_default,
         } = self.resolve_target(emulator_host.as_deref())?;
+        let choice = self.credential_choice(emulator, anonymous_default);
 
         // Blocking file I/O, so read the key file before entering the runtime.
         let credentials_json = self.credentials_json()?;
@@ -200,22 +202,22 @@ impl SpannerDatabase {
             None => format!("{database} at the default Spanner endpoint"),
         };
 
+        let mut token_failure = None;
+        let token_failure_slot = &mut token_failure;
         let build = async move {
-            let mut builder = Spanner::builder().with_instance_type(self.instance_type);
+            // One credential, and so one token cache, for every channel and the admin client.
+            let credentials = self.build_credentials(choice, credentials_json)?;
+            first_token(&credentials, token_failure_slot).await;
+            let mut builder = Spanner::builder()
+                .with_instance_type(self.instance_type)
+                .with_credentials(credentials.clone());
             if let Some(endpoint) = endpoint.clone() {
                 builder = builder.with_endpoint(endpoint);
             }
-            // `None` selects ADC. Other modes pass explicit credentials, so the admin client
-            // cannot fall back to ADC either.
-            let credentials =
-                self.build_credentials(emulator, anonymous_default, credentials_json)?;
-            if let Some(credentials) = &credentials {
-                builder = builder.with_credentials(credentials.clone());
-            }
             let mut admin_config = ClientConfig::default();
             admin_config.endpoint = endpoint;
-            admin_config.cred = credentials;
-            let spanner = builder.build().await.map_err(from_client_builder)?;
+            admin_config.cred = Some(credentials);
+            let spanner = builder.build().await.map_err(from_builder)?;
             let client = spanner
                 .database_client(database.clone())
                 .build()
@@ -236,21 +238,43 @@ impl SpannerDatabase {
             return block_on(&self.runtime, build);
         };
         // The timer must be created inside the runtime.
-        block_on(&self.runtime, async {
-            tokio::time::timeout(limit, build)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(err(
-                        format!(
-                            "connecting to {target} timed out after {}s \
-                         ({OPTION_RPC_TIMEOUT_CONNECT}); check that the endpoint is reachable \
-                         and serves Spanner, or raise the timeout",
-                            limit.as_secs_f64()
-                        ),
-                        Status::Timeout,
-                    ))
-                })
-        })
+        let Ok(connected) = block_on(&self.runtime, async {
+            Ok(tokio::time::timeout(limit, build).await)
+        })?
+        else {
+            let expired = format!(
+                "connecting to {target} timed out after {}s ({OPTION_RPC_TIMEOUT_CONNECT})",
+                limit.as_secs_f64()
+            );
+            let Some(cause) = token_failure else {
+                return Err(err(
+                    format!(
+                        "{expired}; check that the endpoint is reachable and serves Spanner, or \
+                         raise the timeout"
+                    ),
+                    Status::Timeout,
+                ));
+            };
+            let (source, advice) = if choice == CredentialChoice::Adc {
+                (
+                    "Application Default Credentials",
+                    format!(
+                        "outside Google Cloud, run `gcloud auth application-default login` or \
+                         set GOOGLE_APPLICATION_CREDENTIALS or {OPTION_KEYFILE}"
+                    ),
+                )
+            } else {
+                (
+                    "the configured credentials",
+                    "check access to Google's authentication endpoints".to_owned(),
+                )
+            };
+            return Err(err(
+                format!("{expired}: {source} supplied no access token ({cause}); {advice}"),
+                Status::Unauthenticated,
+            ));
+        };
+        connected
     }
 
     /// The [`OPTION_RPC_TIMEOUT_CONNECT`] deadline; `None` when disabled with `0`.
@@ -439,7 +463,7 @@ impl DatabaseAdminState {
             .get_or_try_init(|| async {
                 admin::database_admin(self.config.clone())
                     .await
-                    .map_err(from_client_builder)
+                    .map_err(from_builder)
             })
             .await
     }

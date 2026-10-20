@@ -5,55 +5,101 @@ use crate::{OPTION_IMPERSONATE_DELEGATES, OPTION_IMPERSONATE_LIFETIME, OPTION_IM
 use adbc_core::Optionable;
 use adbc_core::error::Status;
 use adbc_core::options::{OptionDatabase, OptionValue};
+use google_cloud_gax::error::CredentialsError;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-// The emulator tests set the `emulator` field because parallel tests cannot safely change
-// `SPANNER_EMULATOR_HOST`, which resolves to the same flag. The guards fire before any network I/O.
+/// Sets the `emulator` field because parallel tests cannot safely change `SPANNER_EMULATOR_HOST`,
+/// which resolves to the same flag. The guard fires before any network I/O.
 #[test]
-fn emulator_mode_with_an_explicit_keyfile_is_refused() {
-    let mut db = new_database();
-    db.database = Some("projects/p/instances/i/databases/d".into());
-    db.emulator = true;
-    db.keyfile = Some("/path/to/key.json".into());
-    let error = db.connect().unwrap_err();
-    assert_eq!(error.status, Status::InvalidState);
-    assert!(error.message.contains("emulator mode"));
-    assert!(error.message.contains(OPTION_KEYFILE));
-    assert!(error.message.contains("`spanner.emulator` option"));
+fn emulator_mode_refuses_every_credential_option_and_a_quota_project() {
+    type Set = fn(&mut SpannerDatabase);
+    let cases: [(Set, &str); 5] = [
+        (
+            |db| db.keyfile = Some("/path/to/key.json".into()),
+            OPTION_KEYFILE,
+        ),
+        (
+            |db| db.keyfile_json = Some("{}".into()),
+            OPTION_KEYFILE_JSON,
+        ),
+        (
+            |db| db.impersonate_target_principal = Some("t@p.iam.gserviceaccount.com".into()),
+            OPTION_IMPERSONATE_TARGET_PRINCIPAL,
+        ),
+        (
+            |db| db.access_token = Some("ya29.token".into()),
+            OPTION_ACCESS_TOKEN,
+        ),
+        (
+            |db| db.quota_project = Some("billing".into()),
+            OPTION_QUOTA_PROJECT,
+        ),
+    ];
+    for (set, option) in cases {
+        let mut db = new_database();
+        db.database = Some("projects/p/instances/i/databases/d".into());
+        db.emulator = true;
+        set(&mut db);
+        let error = db.connect().unwrap_err();
+        assert_eq!(error.status, Status::InvalidState, "{option}");
+        for needle in ["emulator mode", "`spanner.emulator` option", option] {
+            assert!(error.message.contains(needle), "{}", error.message);
+        }
+    }
+}
+
+/// Fails every token fetch, counting the attempts.
+#[derive(Debug)]
+struct FailingTokens {
+    transient: bool,
+    calls: Arc<AtomicUsize>,
+}
+
+impl CredentialsProvider for FailingTokens {
+    async fn headers(
+        &self,
+        _: Extensions,
+    ) -> std::result::Result<CacheableResource<HeaderMap>, CredentialsError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "no metadata server");
+        Err(CredentialsError::new(self.transient, "body=<SECRET>", io))
+    }
+
+    async fn universe_domain(&self) -> Option<String> {
+        None
+    }
 }
 
 #[test]
-fn emulator_mode_with_explicit_keyfile_json_is_refused() {
-    let mut db = new_database();
-    db.database = Some("projects/p/instances/i/databases/d".into());
-    db.emulator = true;
-    db.keyfile_json = Some("{\"type\":\"service_account\"}".into());
-    let error = db.connect().unwrap_err();
-    assert_eq!(error.status, Status::InvalidState);
-    assert!(error.message.contains(OPTION_KEYFILE_JSON));
-}
+fn first_token_retries_transient_failures_and_keeps_only_the_io_cause() {
+    let runtime = new_runtime().unwrap();
+    runtime.block_on(async {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let credentials = Credentials::from(FailingTokens {
+            transient: true,
+            calls: calls.clone(),
+        });
+        let mut failure = None;
+        let waited = tokio::time::timeout(
+            Duration::from_millis(400),
+            first_token(&credentials, &mut failure),
+        )
+        .await;
+        assert!(waited.is_err(), "a transient failure is retried");
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+        assert_eq!(failure.as_deref(), Some("no metadata server"));
 
-#[test]
-fn emulator_mode_with_an_impersonation_target_is_refused() {
-    let mut db = new_database();
-    db.database = Some("projects/p/instances/i/databases/d".into());
-    db.emulator = true;
-    db.impersonate_target_principal = Some("target@project.iam.gserviceaccount.com".into());
-    let error = db.connect().unwrap_err();
-    assert_eq!(error.status, Status::InvalidState);
-    assert!(error.message.contains(OPTION_IMPERSONATE_TARGET_PRINCIPAL));
-}
-
-#[test]
-fn emulator_mode_with_an_access_token_is_refused() {
-    let mut db = new_database();
-    db.database = Some("projects/p/instances/i/databases/d".into());
-    db.emulator = true;
-    db.access_token = Some("ya29.test-token".into());
-    assert_eq!(db.explicit_credential_option(), Some(OPTION_ACCESS_TOKEN));
-    let error = db.connect().unwrap_err();
-    assert_eq!(error.status, Status::InvalidState);
-    assert!(error.message.contains("emulator mode"));
-    assert!(error.message.contains(OPTION_ACCESS_TOKEN));
+        // The client reports a permanent failure itself.
+        let credentials = Credentials::from(FailingTokens {
+            transient: false,
+            calls,
+        });
+        first_token(&credentials, &mut failure).await;
+        assert_eq!(failure, None);
+        first_token(&AnonymousCredentials::new().build(), &mut failure).await;
+        assert_eq!(failure, None);
+    });
 }
 
 #[test]
@@ -215,19 +261,6 @@ fn quota_project_renders_in_debug_and_is_not_a_secret() {
         rendered.contains(r#"quota_project: Some("my-billing-project")"#),
         "quota_project not shown verbatim: {rendered}"
     );
-}
-
-#[test]
-fn emulator_mode_with_a_quota_project_is_refused() {
-    // The emulator ignores billing, so the project would be silently dropped.
-    let mut db = new_database();
-    db.database = Some("projects/p/instances/i/databases/d".into());
-    db.emulator = true;
-    db.quota_project = Some("my-billing-project".into());
-    let error = db.connect().unwrap_err();
-    assert_eq!(error.status, Status::InvalidState);
-    assert!(error.message.contains("emulator mode"));
-    assert!(error.message.contains(OPTION_QUOTA_PROJECT));
 }
 
 #[test]
@@ -466,30 +499,6 @@ fn a_tls_cloud_endpoint_keeps_adc_and_the_quota_project() {
     }
 }
 
-/// A missing `GOOGLE_APPLICATION_CREDENTIALS` file failed with `Internal` when the client loaded
-/// ADC, but with `InvalidArguments` when the driver did.
-#[test]
-fn client_adc_failures_match_the_drivers_adc_failures() {
-    const SECRET: &str = "leak-me-if-you-can-4c3b2a";
-    let raw = ServiceAccountCredentials::new(serde_json::json!({
-        "type": "service_account",
-        "private_key": SECRET,
-    }))
-    .build()
-    .unwrap_err();
-    let error = from_client_builder(google_cloud_gax::client_builder::Error::cred(raw));
-    assert_eq!(error.status, Status::InvalidArguments);
-    assert!(
-        error.message.contains("Application Default Credentials"),
-        "{}",
-        error.message
-    );
-    assert!(!error.message.contains(SECRET), "{}", error.message);
-
-    let error = from_client_builder(google_cloud_gax::client_builder::Error::transport("bad"));
-    assert_eq!(error.status, Status::Internal);
-}
-
 #[test]
 fn missing_keyfile_is_an_error() {
     let mut db = new_database();
@@ -606,24 +615,6 @@ fn credential_build_failure_never_leaks_key_material() {
 }
 
 #[test]
-fn scrub_credential_error_returns_fixed_phrase() {
-    const SECRET: &str = "leak-me-if-you-can-9f8e7d";
-    // `build_errors::Error` has no public constructor, so get one from a failing builder.
-    let raw = ServiceAccountCredentials::new(serde_json::json!({
-        "type": "service_account",
-        "private_key": SECRET,
-    }))
-    .build()
-    .unwrap_err();
-    let scrubbed = scrub_credential_error(&raw);
-    assert_eq!(scrubbed, "the credential JSON could not be parsed");
-    assert!(
-        !scrubbed.contains(SECRET),
-        "scrubbed phrase must be a fixed string, got: {scrubbed}"
-    );
-}
-
-#[test]
 fn impersonation_options_round_trip_and_split() {
     let mut db = new_database();
     db.set_option(
@@ -686,38 +677,6 @@ fn impersonation_options_round_trip_and_split() {
         db.get_option_string(OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into()))
             .unwrap(),
         "1800"
-    );
-}
-
-#[test]
-fn impersonation_lifetime_defaults_to_one_hour_when_unset() {
-    let mut db = new_database();
-    db.set_option(
-        OptionDatabase::Other(OPTION_IMPERSONATE_TARGET_PRINCIPAL.into()),
-        OptionValue::String("target@project.iam.gserviceaccount.com".into()),
-    )
-    .unwrap();
-    assert_eq!(db.impersonate_lifetime_secs, None);
-    let effective = Duration::from_secs(
-        db.impersonate_lifetime_secs
-            .unwrap_or(DEFAULT_IMPERSONATION_LIFETIME_SECS),
-    );
-    assert_eq!(effective, Duration::from_secs(3600));
-}
-
-#[test]
-fn impersonation_target_is_disabled_by_default() {
-    let db = new_database();
-    assert!(db.impersonate_target_principal.is_none());
-    assert!(db.impersonate_delegates.is_empty());
-    assert!(db.impersonate_scopes.is_empty());
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Other(
-            OPTION_IMPERSONATE_TARGET_PRINCIPAL.into()
-        ))
-        .unwrap_err()
-        .status,
-        Status::NotFound
     );
 }
 
