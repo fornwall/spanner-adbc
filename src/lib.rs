@@ -88,6 +88,7 @@ mod nested;
 mod objects;
 mod options;
 mod query_options;
+mod reader;
 mod request;
 mod retry;
 mod runtime;

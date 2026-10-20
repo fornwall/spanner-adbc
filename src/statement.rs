@@ -30,9 +30,7 @@ use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, ReadWriteTr
 
 use crate::bind;
 use crate::connection::{SharedTxn, TxnKind, lock_txn, runner_builder};
-use crate::conversion::{
-    BoundStatementSource, result_set_to_batch, stream_bound_query, stream_query,
-};
+use crate::conversion::result_set_to_batch;
 use crate::driver::SharedDatabaseAdmin;
 use crate::error::{
     err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option, unsupported,
@@ -40,6 +38,7 @@ use crate::error::{
 use crate::options::{
     SharedConfig, bool_option, bool_option_unsettable, impl_typed_option_getters,
 };
+use crate::reader::{BoundStatementSource, stream_bound_query, stream_query};
 use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable};
 use crate::timeout::with_timeout;
 

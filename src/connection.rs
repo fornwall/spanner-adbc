@@ -16,13 +16,14 @@ use google_cloud_spanner::batch::Partition;
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::model::StructType;
 
-use crate::conversion::{TimestampPrecision, result_set_to_batch, stream_query};
+use crate::conversion::{TimestampPrecision, result_set_to_batch};
 use crate::driver::{Connected, SharedDatabaseAdmin};
 use crate::error::{
     annotate, err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option,
     unsupported,
 };
 use crate::options::{SharedConfig, impl_typed_option_getters};
+use crate::reader::stream_query;
 use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable};
 use crate::sql::qualified_table;
 use crate::statement::{DEFAULT_ROWS_PER_BATCH, SpannerStatement, is_mutation_limit_exceeded};
