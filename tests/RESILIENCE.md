@@ -30,8 +30,8 @@ manual dispatch and nightly. A failed nightly run opens or updates a tracking is
 | `limit_data` byte cap | `truncated_stream_surfaces_error_then_recovers` | Some rows arrive, then an error; truncation never looks like a complete result. A new query succeeds. |
 
 The streamed result is about 48 MB, well over the ~12 MB gRPC receive buffer, so most of it is
-fetched after `execute()` returns. Transport errors must have ADBC status `Internal` or `IO` and a
-message starting with `Spanner error:`.
+fetched after `execute()` returns. Transport errors must have ADBC status `IO` and a message
+starting with `Spanner error:`.
 
 ## Limitations
 
