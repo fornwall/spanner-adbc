@@ -227,33 +227,14 @@ pub(crate) fn check_ingest_values(batch: &RecordBatch) -> Result<()> {
     Ok(())
 }
 
-/// Whether [`scalar_binder`] accepts every value of `data_type` once it accepts the type. Types
-/// not listed here, such as dates, timestamps and decimals, are checked value by value.
+/// Whether every value of `data_type` converts once its type is accepted. An unsupported type
+/// fails on any row.
 fn values_always_convert(data_type: &DataType) -> bool {
     match dictionary_values(data_type) {
-        DataType::Null
-        | DataType::Boolean
-        | DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::Float16
-        | DataType::Float32
-        | DataType::Float64
-        | DataType::Utf8
-        | DataType::LargeUtf8
-        | DataType::Utf8View
-        | DataType::Binary
-        | DataType::LargeBinary
-        | DataType::BinaryView
-        | DataType::FixedSizeBinary(_) => true,
         DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
             values_always_convert(item.data_type())
         }
-        _ => false,
+        scalar => !matches!(scalar_binder(scalar), Some(ScalarBinder::Checked(_))),
     }
 }
 
@@ -298,7 +279,7 @@ fn cell_value(
         ),
         _ => {
             let bind = scalar_binder(data_type).ok_or_else(|| unsupported(target, data_type))?;
-            let value = bind(target, column, row)?;
+            let value = bind.encode(target, column, row)?;
             Ok((value, is_json_field(field).then(types::json)))
         }
     }
@@ -341,15 +322,30 @@ fn unsupported(target: Target<'_>, data_type: &DataType) -> adbc_core::error::Er
     ))
 }
 
-/// Scalar encoder for one array type, reused across all elements of a list.
+/// Scalar encoder for one array type, reused across all elements of a list. Only a `Checked`
+/// encoder can reject a value, so [`check_ingest_values`] tests the others on one row.
 ///
 /// Encoders map a valid cell through `Option::into`, which consumes owned strings where
 /// `ToValue` would copy them.
-type ScalarBinder = fn(Target<'_>, &dyn Array, usize) -> Result<Value>;
+#[derive(Clone, Copy)]
+enum ScalarBinder {
+    Total(fn(&dyn Array, usize) -> Value),
+    Checked(fn(Target<'_>, &dyn Array, usize) -> Result<Value>),
+}
+
+impl ScalarBinder {
+    fn encode(self, target: Target<'_>, array: &dyn Array, row: usize) -> Result<Value> {
+        match self {
+            Self::Total(encode) => Ok(encode(array, row)),
+            Self::Checked(encode) => encode(target, array, row),
+        }
+    }
+}
 
 /// Select the shared scalar encoder, or `None` for an unsupported type. Keep new type support
 /// aligned with [`scalar_type`] and the read mapping.
 fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
+    use ScalarBinder::{Checked, Total};
     Some(match data_type {
         // Spanner uses INT64; smaller integer and float widths widen losslessly.
         DataType::Int64 => primitive_binder::<Int64Type, i64>(),
@@ -363,35 +359,35 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
         DataType::Float64 => primitive_binder::<Float64Type, f64>(),
         DataType::Float32 => primitive_binder::<Float32Type, f64>(),
         DataType::Float16 => primitive_binder::<Float16Type, f64>(),
-        DataType::Boolean => |_, a, i| Ok(a.is_valid(i).then(|| a.as_boolean().value(i)).into()),
-        DataType::Utf8 => |_, a, i| Ok(a.is_valid(i).then(|| a.as_string::<i32>().value(i)).into()),
+        DataType::Boolean => Total(|a, i| a.is_valid(i).then(|| a.as_boolean().value(i)).into()),
+        DataType::Utf8 => Total(|a, i| a.is_valid(i).then(|| a.as_string::<i32>().value(i)).into()),
         DataType::LargeUtf8 => {
-            |_, a, i| Ok(a.is_valid(i).then(|| a.as_string::<i64>().value(i)).into())
+            Total(|a, i| a.is_valid(i).then(|| a.as_string::<i64>().value(i)).into())
         }
         DataType::Utf8View => {
-            |_, a, i| Ok(a.is_valid(i).then(|| a.as_string_view().value(i)).into())
+            Total(|a, i| a.is_valid(i).then(|| a.as_string_view().value(i)).into())
         }
         DataType::Binary => {
-            |_, a, i| Ok(a.is_valid(i).then(|| a.as_binary::<i32>().value(i)).into())
+            Total(|a, i| a.is_valid(i).then(|| a.as_binary::<i32>().value(i)).into())
         }
         DataType::LargeBinary => {
-            |_, a, i| Ok(a.is_valid(i).then(|| a.as_binary::<i64>().value(i)).into())
+            Total(|a, i| a.is_valid(i).then(|| a.as_binary::<i64>().value(i)).into())
         }
         DataType::BinaryView => {
-            |_, a, i| Ok(a.is_valid(i).then(|| a.as_binary_view().value(i)).into())
+            Total(|a, i| a.is_valid(i).then(|| a.as_binary_view().value(i)).into())
         }
-        DataType::FixedSizeBinary(_) => |_, a, i| {
-            Ok(a.is_valid(i)
+        DataType::FixedSizeBinary(_) => Total(|a, i| {
+            a.is_valid(i)
                 .then(|| a.as_fixed_size_binary().value(i))
-                .into())
-        },
-        DataType::Date32 => |target, a, i| {
+                .into()
+        }),
+        DataType::Date32 => Checked(|target, a, i| {
             a.is_valid(i)
                 .then(|| date_string(target, a.as_primitive::<Date32Type>().value(i).into()))
                 .transpose()
                 .map(Value::from)
-        },
-        DataType::Date64 => |target, a, i| {
+        }),
+        DataType::Date64 => Checked(|target, a, i| {
             a.is_valid(i)
                 .then(|| {
                     date_string(
@@ -401,7 +397,7 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
                 })
                 .transpose()
                 .map(Value::from)
-        },
+        }),
         DataType::Timestamp(TimeUnit::Second, _) => timestamp_binder::<TimestampSecondType>(),
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
             timestamp_binder::<TimestampMillisecondType>()
@@ -414,30 +410,32 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
         }
         // A larger scale, possible in an imported schema, would overflow `numeric_string`'s i128
         // divisor.
-        DataType::Decimal128(_, scale) if *scale <= 38 => |target, a, i| {
+        DataType::Decimal128(_, scale) if *scale <= 38 => Checked(|target, a, i| {
             a.is_valid(i)
                 .then(|| numeric_string(target, a.as_primitive(), i))
                 .transpose()
                 .map(Value::from)
-        },
+        }),
         // NullArray has no validity buffer, so its physical `is_valid` returns true.
-        DataType::Null => |_, _, _| Ok(Value::null()),
+        DataType::Null => Total(|_, _| Value::null()),
         // List elements, as in Polars' `List(Categorical)`. Top-level dictionaries are decoded
         // by `cell_value`, which also handles dictionaries of lists.
-        DataType::Dictionary(_, value) if scalar_binder(value).is_some() => |target, a, i| {
-            downcast_dictionary_array!(
-                a => match a.key(i) {
-                    Some(key) => {
-                        let values = a.values();
-                        let bind = scalar_binder(values.data_type())
-                            .ok_or_else(|| unsupported(target, values.data_type()))?;
-                        bind(target, values.as_ref(), key)
-                    }
-                    None => Ok(Value::null()),
-                },
-                _ => unreachable!("downcast_dictionary_array dispatched a non-dictionary"),
-            )
-        },
+        DataType::Dictionary(_, value) if scalar_binder(value).is_some() => {
+            Checked(|target, a, i| {
+                downcast_dictionary_array!(
+                    a => match a.key(i) {
+                        Some(key) => {
+                            let values = a.values();
+                            scalar_binder(values.data_type())
+                                .ok_or_else(|| unsupported(target, values.data_type()))?
+                                .encode(target, values.as_ref(), key)
+                        }
+                        None => Ok(Value::null()),
+                    },
+                    _ => unreachable!("downcast_dictionary_array dispatched a non-dictionary"),
+                )
+            })
+        }
         _ => return None,
     })
 }
@@ -448,20 +446,20 @@ where
     T: ArrowPrimitiveType,
     V: From<T::Native> + Into<Value>,
 {
-    |_, a, i| {
-        Ok(a.is_valid(i)
+    ScalarBinder::Total(|a, i| {
+        a.is_valid(i)
             .then(|| V::from(a.as_primitive::<T>().value(i)))
-            .into())
-    }
+            .into()
+    })
 }
 
 fn timestamp_binder<T: ArrowTimestampType>() -> ScalarBinder {
-    |target, a, i| {
+    ScalarBinder::Checked(|target, a, i| {
         a.is_valid(i)
             .then(|| timestamp_string(target, T::UNIT, a.as_primitive::<T>().value(i)))
             .transpose()
             .map(Value::from)
-    }
+    })
 }
 
 /// Validate a null dictionary cell's logical type and retain its JSON parameter type.
@@ -496,7 +494,7 @@ fn list_cell_value(
         // Consume the elements; `ToValue` would deep-copy them.
         Some((values, range)) => Value::from(
             range
-                .map(|i| bind(target, values, i))
+                .map(|i| bind.encode(target, values, i))
                 .collect::<Result<Vec<Value>>>()?,
         ),
     };
