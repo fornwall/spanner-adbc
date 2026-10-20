@@ -2532,31 +2532,16 @@ fn isolation_level_reaches_transaction_options_on_the_begin() {
         mock.expect_commit().returning(|_| commit_ok());
     });
 
-    // The requested level (`None` = never set) and the expected wire level.
-    let cases: [(Option<&str>, IsolationLevel); 8] = [
+    // The requested level (`None` = never set) and the expected wire level. Unit tests in
+    // src/connection/tests.rs cover the mapping of every ADBC level.
+    let cases: [(Option<&str>, IsolationLevel); 4] = [
         (None, IsolationLevel::Unspecified),
-        (
-            Some(ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE),
-            IsolationLevel::Serializable,
-        ),
         (
             Some(ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ),
             IsolationLevel::RepeatableRead,
         ),
         (
-            Some(ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED),
-            IsolationLevel::RepeatableRead,
-        ),
-        (
-            Some(ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED),
-            IsolationLevel::RepeatableRead,
-        ),
-        (
-            Some(ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT),
-            IsolationLevel::RepeatableRead,
-        ),
-        (
-            Some(ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE),
+            Some(ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE),
             IsolationLevel::Serializable,
         ),
         (
