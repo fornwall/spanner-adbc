@@ -32,7 +32,7 @@ tag-name = "v{{version}}"
 tag-message = "Release {{version}}"
 pre-release-commit-message = "Release {{version}}"
 # Check locally before tagging; libraries.yml also requires full emulator CI on the tag.
-pre-release-hook = ["sh", "-c", "cargo fmt --all --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test"]
+pre-release-hook = ["sh", "-c", "cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo build && cargo test"]
 # Keep the Python package version in sync; libraries.yml checks that it matches.
 pre-release-replacements = [
     { file = "python/spanner_adbc/_version.py", search = "__version__ = \"[0-9][^\"]*\"", replace = "__version__ = \"{{version}}\"", exactly = 1 },
