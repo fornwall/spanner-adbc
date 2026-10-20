@@ -4395,7 +4395,7 @@ fn ingest_operational_errors_keep_status_and_details_without_metadata_probes() {
         (tonic::Code::Unauthenticated, AdbcStatus::Unauthenticated),
         (tonic::Code::Cancelled, AdbcStatus::Cancelled),
         (tonic::Code::DeadlineExceeded, AdbcStatus::Timeout),
-        (tonic::Code::ResourceExhausted, AdbcStatus::Internal),
+        (tonic::Code::ResourceExhausted, AdbcStatus::IO),
         (tonic::Code::Unavailable, AdbcStatus::IO),
         (tonic::Code::Aborted, AdbcStatus::IO),
         (tonic::Code::Internal, AdbcStatus::Internal),

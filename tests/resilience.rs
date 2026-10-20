@@ -853,13 +853,13 @@ fn adbc_error_of(error: &ArrowError) -> &AdbcError {
 
 /// Asserts that `error` is the driver's rendering of a Spanner client transport failure, not an
 /// unrelated error. `error::from_spanner` prefixes `Spanner error:` and maps a transport error
-/// without a gRPC status, which is what an RST or truncation usually produces, to `Internal`.
-/// A gRPC `UNAVAILABLE` or `ABORTED` maps to `IO`. Which one a TCP fault becomes is up to the
-/// client.
+/// without a gRPC status, which is what an RST or truncation usually produces, to `IO`, as it
+/// does a gRPC `UNAVAILABLE` or `ABORTED`. A gRPC `INTERNAL` maps to `Internal`. Which one a TCP
+/// fault becomes is up to the client.
 fn assert_transport_error(error: &AdbcError, context: &str) {
     assert!(
         matches!(error.status, AdbcStatus::Internal | AdbcStatus::IO),
-        "{context} must fail with a transport status (Internal, or IO for a gRPC UNAVAILABLE), \
+        "{context} must fail with a transport status (IO, or Internal for a gRPC INTERNAL), \
          got {:?} (vendor_code {}): {}",
         error.status,
         error.vendor_code,

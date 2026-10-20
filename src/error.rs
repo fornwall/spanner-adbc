@@ -59,7 +59,6 @@ pub(crate) fn not_found(message: impl Into<String>) -> Error {
 /// Readers can only report [`ArrowError`](arrow_schema::ArrowError)s, so the driver boxes its
 /// [`Error`] in `ArrowError::ExternalError`. The C stream export uses this to recover the ADBC
 /// status, for example to report `ECANCELED` for a cancelled read.
-#[cfg(feature = "ffi")]
 pub(crate) fn chain<'a>(
     source: &'a (dyn std::error::Error + 'static),
 ) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
@@ -72,9 +71,10 @@ pub(crate) fn chain<'a>(
 /// callers can tell apart codes that share a status (for example `ABORTED` = 10). A duplicate key
 /// and other constraint violations become [`Status::Integrity`]. Errors without a status have
 /// `vendor_code` 0 and become [`Status::Unauthenticated`] for credential failures,
-/// [`Status::Timeout`] for client deadlines and [`Status::Internal`] otherwise. The C ABI's 1.1.0
-/// error layout reserves `vendor_code`, so `src/ffi/error.rs` passes a non-zero code there as the
-/// detail `adbc.spanner.vendor_code` instead.
+/// [`Status::Timeout`] for client deadlines, [`Status::IO`] for connection and transport failures
+/// and [`Status::Internal`] otherwise. The C ABI's 1.1.0 error layout reserves `vendor_code`, so
+/// `src/ffi/error.rs` passes a non-zero code there as the detail `adbc.spanner.vendor_code`
+/// instead.
 ///
 /// # Structured error details
 ///
@@ -92,44 +92,51 @@ pub(crate) fn chain<'a>(
 /// details, `details` is `None`, never `Some(vec![])`.
 pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
     // An exhausted retry policy wraps the last error instead of carrying its kind and status.
-    let client_errors = || {
-        std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {
-            e.source()
-        })
-        .filter_map(|e| e.downcast_ref::<google_cloud_spanner::Error>())
-    };
-    let without_status = if client_errors().any(google_cloud_spanner::Error::is_authentication) {
+    let client_errors =
+        || chain(&error).filter_map(|e| e.downcast_ref::<google_cloud_spanner::Error>());
+    if let Some(status) = client_errors().find_map(|e| e.status()) {
+        return service_error(
+            status.code as i32,
+            &status.message,
+            details_for_adbc(&status.details),
+        );
+    }
+    let status = if client_errors().any(google_cloud_spanner::Error::is_authentication) {
         Status::Unauthenticated
     } else if client_errors().any(google_cloud_spanner::Error::is_timeout) {
         Status::Timeout
+    } else if client_errors().any(|e| e.is_connect() || e.is_transport()) {
+        // adbc.h: IO covers "a remote service may be unavailable".
+        Status::IO
     } else {
         Status::Internal
     };
-    let (status, vendor_code, details, code) = client_errors().find_map(|e| e.status()).map_or(
-        (without_status, 0, None, None),
-        |status| {
-            (
-                status_for_rpc(status.code, &status.message),
-                status.code as i32,
-                details_for_adbc(&status.details),
-                Some(status.code),
-            )
-        },
-    );
-    let mut message = format!("Spanner error: {error}");
-    if code == Some(Code::PermissionDenied) {
-        message.push_str(PERMISSION_DENIED_GUIDANCE);
-    }
-    let mut adbc = err(message, status);
-    adbc.vendor_code = vendor_code;
-    adbc.details = details;
-    adbc
+    err(format!("Spanner error: {error}"), status)
 }
 
-/// Appended to `PERMISSION_DENIED` messages, which already name the missing permission. It names
-/// no role, since suggesting one risks steering callers to an over-broad grant.
-const PERMISSION_DENIED_GUIDANCE: &str =
-    "; grant an IAM role that includes it; see https://cloud.google.com/spanner/docs/iam";
+/// Build an ADBC error from a `google.rpc.Status` embedded in a `BatchWriteResponse`, matching
+/// [`from_spanner`] so bulk-ingest error handling is the same for both ingest paths.
+pub(crate) fn from_status_parts(code: i32, message: &str, details: &[Any]) -> Error {
+    let decoded: Vec<StatusDetails> = details.iter().map(StatusDetails::from).collect();
+    service_error(code, message, details_for_adbc(&decoded))
+}
+
+/// The error for a gRPC status, formatted `CODE: message` like grpc-java exceptions.
+fn service_error(code: i32, message: &str, details: Option<Vec<(String, Vec<u8>)>>) -> Error {
+    let grpc_code = Code::from(code);
+    let mut text = format!("Spanner error: {grpc_code}: {message}");
+    // The message already names the missing permission. Naming a role could steer callers to an
+    // over-broad grant.
+    if grpc_code == Code::PermissionDenied {
+        text.push_str(
+            " (grant an IAM role that includes it; see https://cloud.google.com/spanner/docs/iam)",
+        );
+    }
+    let mut error = err(text, status_for_rpc(grpc_code, message));
+    error.vendor_code = code;
+    error.details = details;
+    error
+}
 
 /// Map status details as described on [`from_spanner`]. Details that cannot be mapped are
 /// skipped rather than failing the error path.
@@ -149,21 +156,6 @@ fn map_detail(detail: &StatusDetails) -> Option<(String, Vec<u8>)> {
         .unwrap_or(type_url)
         .to_ascii_lowercase();
     Some((key, serde_json::to_vec(&value).ok()?))
-}
-
-/// Build an ADBC error from a `google.rpc.Status` embedded in a `BatchWriteResponse`, matching
-/// [`from_spanner`] so bulk-ingest error handling is the same for both ingest paths.
-pub(crate) fn from_status_parts(code: i32, message: &str, details: &[Any]) -> Error {
-    let status = status_for_rpc(Code::from(code), message);
-    let mut full = format!("Spanner batch-write error: {message}");
-    if Code::from(code) == Code::PermissionDenied {
-        full.push_str(PERMISSION_DENIED_GUIDANCE);
-    }
-    let decoded: Vec<StatusDetails> = details.iter().map(StatusDetails::from).collect();
-    let mut adbc = err(full, status);
-    adbc.vendor_code = code;
-    adbc.details = details_for_adbc(&decoded);
-    adbc
 }
 
 /// Translate a client builder error, which has no gRPC status, into an `Internal` error.
@@ -233,7 +225,10 @@ fn status_for_grpc_code(code: Code) -> Status {
         Code::Unknown => Status::Unknown,
         // As in the Flight SQL driver.
         Code::DataLoss => Status::IO,
-        // ResourceExhausted, Internal and Ok.
+        // Quota, throttling and memory limits. Like PostgreSQL's SQLSTATE class 53, which that
+        // driver reports as IO, and PEP 249's OperationalError.
+        Code::ResourceExhausted => Status::IO,
+        // Internal and Ok.
         _ => Status::Internal,
     }
 }
