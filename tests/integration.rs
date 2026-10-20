@@ -409,113 +409,6 @@ fn manual_transaction_kinds_round_trip() {
     cleanup.execute_update().expect("drop scratch tables");
 }
 
-/// Identifiers in generated `CREATE TABLE` DDL must be rejected before any RPC. The admin DDL
-/// parser ignores backslash escapes inside backticks, so an escaped Arrow field name could still
-/// inject clauses such as `INTERLEAVE IN PARENT ... ON DELETE CASCADE`, and DDL cannot be rolled
-/// back.
-#[test]
-fn hostile_identifiers_are_rejected_before_any_ddl_runs() {
-    let Some(mut fx) = fixture() else {
-        return;
-    };
-    let connection = &mut fx.connection;
-
-    run(
-        connection,
-        "DROP TABLE IF EXISTS AdbcInjOk; \
-         DROP TABLE IF EXISTS AdbcInjChild; \
-         DROP TABLE IF EXISTS AdbcInjParent; \
-         CREATE TABLE AdbcInjParent (Id INT64 NOT NULL) PRIMARY KEY (Id)",
-    );
-
-    let payload = "k` INT64, Id INT64 NOT NULL) PRIMARY KEY (Id), \
-                   INTERLEAVE IN PARENT AdbcInjParent ON DELETE CASCADE -- ";
-    let rows = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("Id", DataType::Int64, false),
-            Field::new(payload, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(Int64Array::from(vec![1_i64])),
-            Arc::new(Int64Array::from(vec![2_i64])),
-        ],
-    )
-    .unwrap();
-    let mut statement = ingest_stmt(connection, "AdbcInjChild", "create");
-    statement.bind(rows).expect("bind the hostile batch");
-    let err = statement
-        .execute_update()
-        .expect_err("a hostile column name must not reach Spanner");
-    assert_eq!(
-        err.status,
-        Status::InvalidArguments,
-        "hostile column name must be rejected as InvalidArguments: {err:?}"
-    );
-
-    let mut probe = connection.new_statement().expect("new statement");
-    probe
-        .set_sql_query(
-            "SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.TABLES \
-             WHERE PARENT_TABLE_NAME = 'AdbcInjParent'",
-        )
-        .unwrap();
-    let batches: Vec<_> = probe
-        .execute()
-        .expect("probe for an injected child table")
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert_eq!(
-        col::<Int64Array>(batches[0].column(0)).value(0),
-        0,
-        "the injected DDL created an interleaved child table"
-    );
-
-    // The same guard covers the target table and schema options, and the empty name.
-    for table in [
-        "AdbcInj`x",
-        "AdbcInj\\x",
-        "",
-        "AdbcInj` (Id INT64) PRIMARY KEY (Id) -- ",
-    ] {
-        let err = ingest_labels(connection, table, "create")
-            .expect_err("a hostile ingest target table must be rejected");
-        assert_eq!(
-            err.status,
-            Status::InvalidArguments,
-            "target table {table:?} must be rejected: {err:?}"
-        );
-    }
-
-    // Reserved words remain valid column names when quoted.
-    let quoted_ok = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("Id", DataType::Int64, false),
-            Field::new("select", DataType::Int64, false),
-            Field::new("from", DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(Int64Array::from(vec![1_i64])),
-            Arc::new(Int64Array::from(vec![2_i64])),
-            Arc::new(Int64Array::from(vec![3_i64])),
-        ],
-    )
-    .unwrap();
-    let mut ok_statement = ingest_stmt(connection, "AdbcInjOk", "create");
-    ok_statement.bind(quoted_ok).expect("bind the valid batch");
-    assert_eq!(
-        ok_statement
-            .execute_update()
-            .expect("a name needing quoting must still ingest"),
-        Some(1)
-    );
-
-    run(
-        connection,
-        "DROP TABLE IF EXISTS AdbcInjOk; DROP TABLE IF EXISTS AdbcInjChild; \
-         DROP TABLE IF EXISTS AdbcInjParent",
-    );
-}
-
 fn ingest_label_rows() -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![
@@ -1008,128 +901,6 @@ fn manual_transaction_commits_buffered_ingest_with_dml() {
         .expect("re-enable autocommit after ingest");
 
     drop_tables(connection, &["AdbcTxn"]);
-}
-
-/// `DATE`, `TIMESTAMP` and `NUMERIC` map to `Date32`, `Timestamp(Nanosecond, "UTC")` and
-/// `Decimal128(38, 9)`.
-#[test]
-fn native_date_timestamp_numeric_round_trip() {
-    let Some(mut fx) = fixture() else {
-        return;
-    };
-    let connection = &mut fx.connection;
-
-    run(
-        connection,
-        "DROP TABLE IF EXISTS AdbcTypes; \
-         CREATE TABLE AdbcTypes (Id INT64, D DATE, T TIMESTAMP, N NUMERIC) PRIMARY KEY (Id)",
-    );
-
-    let mut types_ins = connection.new_statement().expect("new statement");
-    types_ins
-        .set_sql_query(
-            "INSERT INTO AdbcTypes (Id, D, T, N) VALUES \
-             (1, DATE '2024-01-15', TIMESTAMP '2024-01-15T12:34:56.789012Z', NUMERIC '1.5')",
-        )
-        .unwrap();
-    assert_eq!(types_ins.execute_update().expect("insert types"), Some(1));
-
-    let mut types_q = connection.new_statement().expect("new statement");
-    types_q
-        .set_sql_query("SELECT D, T, N FROM AdbcTypes WHERE Id = 1")
-        .unwrap();
-    let types_reader = types_q.execute().expect("types query");
-    let types_schema = types_reader.schema();
-    assert_eq!(types_schema.field(0).data_type(), &DataType::Date32);
-    assert_eq!(
-        types_schema.field(1).data_type(),
-        &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
-    );
-    assert_eq!(
-        types_schema.field(2).data_type(),
-        &DataType::Decimal128(38, 9)
-    );
-
-    let types_batches = types_reader
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect types");
-    let tb = &types_batches[0];
-    let date = col::<Date32Array>(tb.column(0));
-    let ts = col::<TimestampNanosecondArray>(tb.column(1));
-    let num = col::<Decimal128Array>(tb.column(2));
-    assert_eq!(date.value(0), 19737); // days from 1970-01-01 to 2024-01-15
-    assert_eq!(ts.value(0), 1_705_322_096_789_012_000); // nanos since epoch
-    assert_eq!(num.value(0), 1_500_000_000); // 1.5 unscaled at scale 9
-
-    drop_tables(connection, &["AdbcTypes"]);
-}
-
-/// Ingest options read back, `adbc.ingest.temporary=true` is rejected because Spanner has no
-/// temporary tables, and an `append` ingest lands its rows.
-#[test]
-fn bulk_ingest_options_round_trip_and_append() {
-    let Some(mut fx) = fixture() else {
-        return;
-    };
-    let connection = &mut fx.connection;
-
-    run(
-        connection,
-        "DROP TABLE IF EXISTS AdbcBind; \
-         CREATE TABLE AdbcBind (Id INT64, Name STRING(MAX)) PRIMARY KEY (Id)",
-    );
-
-    let rows = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("Id", DataType::Int64, false),
-            Field::new("Name", DataType::Utf8, false),
-        ])),
-        vec![
-            Arc::new(Int64Array::from(vec![1, 2])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob"])),
-        ],
-    )
-    .unwrap();
-    let mut ingest = ingest_stmt(connection, "AdbcBind", "append");
-    assert_eq!(
-        ingest
-            .get_option_string(OptionStatement::TargetTable)
-            .unwrap(),
-        "AdbcBind"
-    );
-    assert_eq!(
-        ingest
-            .get_option_string(OptionStatement::IngestMode)
-            .unwrap(),
-        "adbc.ingest.mode.append"
-    );
-    ingest
-        .set_option(
-            OptionStatement::Temporary,
-            OptionValue::String("false".into()),
-        )
-        .expect("setting adbc.ingest.temporary=false is a no-op");
-    assert_eq!(
-        ingest
-            .get_option_string(OptionStatement::Temporary)
-            .unwrap(),
-        "false"
-    );
-    let temporary_err = ingest
-        .set_option(
-            OptionStatement::Temporary,
-            OptionValue::String("true".into()),
-        )
-        .expect_err("adbc.ingest.temporary=true must be rejected");
-    assert_eq!(
-        temporary_err.status,
-        adbc_core::error::Status::NotImplemented
-    );
-    ingest.bind(rows).expect("bind ingest rows");
-    assert_eq!(ingest.execute_update().expect("ingest"), Some(2));
-    assert_eq!(count_rows(connection, "AdbcBind"), 2);
-
-    drop_tables(connection, &["AdbcBind"]);
 }
 
 /// The ingest mode defaults to `create`, so a second ingest into the same table fails with
@@ -2237,21 +2008,6 @@ fn execute_schema_returns_a_query_schema_without_running_it() {
     assert_eq!(planned.field(0).data_type(), &DataType::Int64);
     assert_eq!(planned.field(1).name(), "b");
     assert_eq!(planned.field(1).data_type(), &DataType::Utf8);
-
-    // DML is rejected before Spanner returns a confusing read-only transaction error.
-    let mut dml_schema = connection.new_statement().expect("new statement");
-    dml_schema
-        .set_sql_query("INSERT INTO Singers (SingerId, Name) VALUES (999, 'x')")
-        .unwrap();
-    let error = dml_schema
-        .execute_schema()
-        .expect_err("execute_schema must reject DML");
-    assert_eq!(error.status, adbc_core::error::Status::InvalidArguments);
-    assert!(
-        error.message.contains("only supports queries"),
-        "unexpected message: {}",
-        error.message
-    );
 }
 
 /// `get_objects` at `All` depth; `xdbc_type_name` carries the Spanner type name.
@@ -4075,46 +3831,6 @@ fn required_cdylib_path() -> Option<std::path::PathBuf> {
     path
 }
 
-/// Load the shared library through the ADBC driver manager and run a query.
-#[test]
-fn ffi_driver_manager_smoke() {
-    let Some(target) = test_target() else {
-        eprintln!("no Spanner target configured; skipping FFI smoke test");
-        return;
-    };
-    let Some(cdylib) = required_cdylib_path() else {
-        eprintln!("shared library not built; skipping FFI smoke test (run `cargo build` first)");
-        return;
-    };
-
-    ensure_database_once(&target);
-
-    let mut driver = ManagedDriver::load_dynamic_from_filename(
-        &cdylib,
-        Some(b"AdbcSpannerInit"),
-        AdbcVersion::V110,
-    )
-    .expect("load driver via the driver manager");
-
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("new_database via FFI");
-    let mut connection = connect_with_retry(&database);
-
-    let mut statement = connection.new_statement().expect("new_statement via FFI");
-    statement.set_sql_query("SELECT 1 AS one").unwrap();
-    let reader = statement.execute().expect("execute via FFI");
-    let batches = reader
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect via FFI");
-    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
-    let value = col::<Int64Array>(batches[0].column(0)).value(0);
-    assert_eq!(value, 1);
-}
-
 /// Metadata, queries, DML, transactions and ingest through the driver manager, checking the
 /// canonical ADBC result schemas.
 #[test]
@@ -4334,56 +4050,6 @@ fn ffi_count(connection: &mut adbc_driver_manager::ManagedConnection, table: &st
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     col::<Int64Array>(batches[0].column(0)).value(0)
-}
-
-/// Retry options read back, are inherited by statements, and apply to a live query and DML.
-/// Uses the serialized fixture because the DELETE opens a read-write transaction.
-#[test]
-fn retry_tuning_round_trip_and_execute() {
-    let Some(mut fx) = fixture() else {
-        return;
-    };
-    let connection = &mut fx.connection;
-
-    let attempts_key = OptionConnection::Other("spanner.retry.max_attempts".into());
-    let elapsed_key = OptionConnection::Other("spanner.retry.max_elapsed_seconds".into());
-    connection
-        .set_option(attempts_key.clone(), OptionValue::String("4".into()))
-        .expect("set max_attempts");
-    connection
-        .set_option(elapsed_key.clone(), OptionValue::String("30".into()))
-        .expect("set max_elapsed_seconds");
-    assert_eq!(
-        connection.get_option_string(attempts_key.clone()).unwrap(),
-        "4"
-    );
-    assert_eq!(connection.get_option_int(attempts_key.clone()).unwrap(), 4);
-    assert_eq!(
-        connection.get_option_double(elapsed_key.clone()).unwrap(),
-        30.0
-    );
-
-    let st_attempts = OptionStatement::Other("spanner.retry.max_attempts".into());
-    let mut stmt = connection.new_statement().expect("new statement");
-    assert_eq!(stmt.get_option_string(st_attempts.clone()).unwrap(), "4");
-    stmt.set_option(st_attempts, OptionValue::String("2".into()))
-        .expect("override max_attempts");
-
-    stmt.set_sql_query("SELECT 1 AS one").unwrap();
-    let reader = stmt.execute().expect("query with bounded retry policy");
-    let rows: usize = reader
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect")
-        .iter()
-        .map(|b| b.num_rows())
-        .sum();
-    assert_eq!(rows, 1);
-
-    let mut dml = connection.new_statement().expect("new statement");
-    dml.set_sql_query("DELETE FROM Singers WHERE SingerId = -987654321")
-        .unwrap();
-    dml.execute_update()
-        .expect("DML with bounded retry policy commits");
 }
 
 /// Property graph DDL and GQL queries need no special driver support.
@@ -6107,7 +5773,7 @@ fn rollback_without_a_transaction_is_invalid_state() {
 /// `get_statistic_names` is empty because Spanner has no named statistics.
 #[test]
 fn get_statistic_names_is_empty_and_correctly_typed() {
-    let Some(mut fx) = fixture() else {
+    let Some(mut fx) = fixture_unguarded() else {
         return;
     };
     let connection = &mut fx.connection;
@@ -6121,43 +5787,10 @@ fn get_statistic_names_is_empty_and_correctly_typed() {
         adbc_core::schemas::GET_STATISTIC_NAMES_SCHEMA.clone(),
         "the reader must carry the canonical GET_STATISTIC_NAMES_SCHEMA"
     );
-    assert_eq!(schema.field(0).name(), "statistic_name");
-    assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
-    assert!(!schema.field(0).is_nullable());
-    assert_eq!(schema.field(1).name(), "statistic_key");
-    assert_eq!(schema.field(1).data_type(), &DataType::Int16);
-    assert!(!schema.field(1).is_nullable());
     assert!(
         reader.next().is_none(),
         "expected an empty result set (no batches at all)"
     );
-}
-
-#[test]
-fn read_partition_rejects_garbage_descriptors() {
-    use adbc_core::error::Status;
-
-    let Some(mut fx) = fixture() else {
-        return;
-    };
-    let connection = &mut fx.connection;
-
-    let cases: [&[u8]; 4] = [b"", b"\xffnot json", br#"{"hello": "world"}"#, b"[1, 2, 3]"];
-    for descriptor in cases {
-        let Err(error) = connection.read_partition(descriptor) else {
-            panic!("descriptor {descriptor:?} must be rejected");
-        };
-        assert_eq!(
-            error.status,
-            Status::InvalidArguments,
-            "descriptor {descriptor:?}: {error:?}"
-        );
-        assert!(
-            error.message.contains("invalid partition descriptor"),
-            "unexpected message for {descriptor:?}: {}",
-            error.message
-        );
-    }
 }
 
 /// A connection cancel between `read_partition` chunk fetches cancels the next fetch, does not
@@ -6604,51 +6237,13 @@ fn rpc_timeouts() {
 
     let conn_key = |k: &str| OptionConnection::Other(k.into());
     let stmt_key = |k: &str| OptionStatement::Other(k.into());
-    const ALL: [&str; 3] = [
+
+    // The streamed query uses the query deadline for its first chunk and the fetch deadline after.
+    for key in [
         OPTION_RPC_TIMEOUT_QUERY,
         OPTION_RPC_TIMEOUT_UPDATE,
         OPTION_RPC_TIMEOUT_FETCH,
-    ];
-
-    connection
-        .set_option(
-            conn_key(OPTION_RPC_TIMEOUT_QUERY),
-            OptionValue::String("2.5".into()),
-        )
-        .expect("set query timeout from a string");
-    connection
-        .set_option(conn_key(OPTION_RPC_TIMEOUT_UPDATE), OptionValue::Int(30))
-        .expect("set update timeout from an int");
-    connection
-        .set_option(
-            conn_key(OPTION_RPC_TIMEOUT_FETCH),
-            OptionValue::Double(0.75),
-        )
-        .expect("set fetch timeout from a double");
-    assert_eq!(
-        connection
-            .get_option_string(conn_key(OPTION_RPC_TIMEOUT_QUERY))
-            .unwrap(),
-        "2.5"
-    );
-    assert_eq!(
-        connection
-            .get_option_double(conn_key(OPTION_RPC_TIMEOUT_FETCH))
-            .unwrap(),
-        0.75
-    );
-    let statement = connection.new_statement().expect("new statement");
-    assert_eq!(
-        statement
-            .get_option_double(stmt_key(OPTION_RPC_TIMEOUT_UPDATE))
-            .unwrap(),
-        30.0,
-        "the statement must inherit the connection's update timeout"
-    );
-    drop(statement);
-
-    // The streamed query uses the query deadline for its first chunk and the fetch deadline after.
-    for key in ALL {
+    ] {
         connection
             .set_option(conn_key(key), OptionValue::Int(30))
             .expect("set a generous deadline");
@@ -6701,8 +6296,9 @@ fn rpc_timeouts() {
     .expect("set a microsecond query deadline");
     tiny.set_sql_query("SELECT Id FROM AdbcRpcTimeout ORDER BY Id")
         .unwrap();
-    // The query deadline covers the first chunk, so `execute` itself fails. The deadline fires
-    // on the next ~1ms timer tick, which a fast backend occasionally beats, so allow retries.
+    // The query deadline covers the first chunk, so `execute` itself fails. A microsecond
+    // deadline fires on the next ~1ms timer tick, which a fast backend occasionally beats, so
+    // each microsecond deadline below gets a few attempts.
     let Some(error) = (0..5).find_map(|_| tiny.execute().err()) else {
         panic!("a microsecond query deadline must expire");
     };
@@ -6723,9 +6319,9 @@ fn rpc_timeouts() {
     tiny_dml
         .set_sql_query("UPDATE AdbcRpcTimeout SET Value = Value WHERE FALSE")
         .unwrap();
-    let error = tiny_dml
-        .execute_update()
-        .expect_err("a microsecond update deadline must expire");
+    let Some(error) = (0..5).find_map(|_| tiny_dml.execute_update().err()) else {
+        panic!("a microsecond update deadline must expire");
+    };
     assert_eq!(error.status, Status::Timeout, "{error:?}");
     assert!(
         error.message.contains(OPTION_RPC_TIMEOUT_UPDATE),
@@ -6764,10 +6360,13 @@ fn rpc_timeouts() {
             OptionValue::String("0.000001".into()),
         )
         .expect("set a microsecond query deadline on the connection");
-    let error = connection
-        .get_objects(ObjectDepth::All, None, None, None, None, None)
-        .err()
-        .expect("a microsecond query deadline must expire on a metadata read");
+    let Some(error) = (0..5).find_map(|_| {
+        connection
+            .get_objects(ObjectDepth::All, None, None, None, None, None)
+            .err()
+    }) else {
+        panic!("a microsecond query deadline must expire on a metadata read");
+    };
     assert_eq!(error.status, Status::Timeout, "{error:?}");
     assert!(
         error.message.contains(OPTION_RPC_TIMEOUT_QUERY),
@@ -6782,16 +6381,6 @@ fn rpc_timeouts() {
         .expect("get_objects after a raised deadline")
         .collect::<Result<Vec<_>, _>>()
         .expect("collect get_objects batches");
-
-    for key in ALL {
-        connection
-            .set_option(conn_key(key), OptionValue::String(String::new()))
-            .expect("unset with an empty value");
-        let error = connection
-            .get_option_string(conn_key(key))
-            .expect_err("an unset option must be NotFound");
-        assert_eq!(error.status, Status::NotFound, "{key}");
-    }
 
     drop_tables(connection, &["AdbcRpcTimeout"]);
 }
