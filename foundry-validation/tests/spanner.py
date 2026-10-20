@@ -32,7 +32,13 @@ class SpannerQuirks(model.DriverQuirks):
         statement_get_parameter_schema=True,
         statement_prepare=True,
         statement_rows_affected=True,
-        supported_xdbc_fields=["xdbc_type_name", "xdbc_nullable", "xdbc_is_nullable"],
+        # xdbc_column_def is also filled, but null for columns without a DEFAULT.
+        supported_xdbc_fields=[
+            "xdbc_type_name",
+            "xdbc_nullable",
+            "xdbc_is_nullable",
+            "xdbc_is_generatedcolumn",
+        ],
         # The driver reports the database id as the ADBC catalog; the default schema is
         # the unnamed "" of GoogleSQL INFORMATION_SCHEMA.
         current_catalog="adbc-test",

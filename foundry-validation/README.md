@@ -36,9 +36,10 @@ requests. Every case must pass or skip with a reason; there are no expected fail
 
 - [`tests/spanner.py`](tests/spanner.py) declares capabilities, connection options, identifier
   quoting, `@pN` parameters and DDL overrides. Metadata tests expect catalog `adbc-test` and the
-  default schema `""`. Primary key, foreign key and CHECK constraints, XDBC type names and
-  nullability, named-schema metadata and ingest, and exact statistics are enabled. The
-  connection fixture creates `validation_schema` for schema-scoped tests.
+  default schema `""`. Primary key, foreign key and CHECK constraints, XDBC type names,
+  nullability and generated-column flags, named-schema metadata and ingest, and exact
+  statistics are enabled. The connection fixture creates `validation_schema` for schema-scoped
+  tests.
 - [`queries/spanner/`](queries/spanner/) overrides the upstream bind, select, literal and ingest
   cases with native type names, typed parameters, explicit `INSERT` column lists and
   deterministic ordering. The `.txtcase` files hold the expected schemas and skip reasons.
