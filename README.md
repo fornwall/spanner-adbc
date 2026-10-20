@@ -28,9 +28,8 @@ Connect to an existing database using [Application Default Credentials](#authent
 ```python
 import spanner_adbc.dbapi as spanner
 
-with spanner.connect(db_kwargs={
-    "uri": "spanner:///projects/my-project/instances/my-instance/databases/my-db",
-}) as conn:
+uri = "spanner:///projects/my-project/instances/my-instance/databases/my-db"
+with spanner.connect(uri) as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT 1 AS one")
         print(cur.fetch_arrow_table())
