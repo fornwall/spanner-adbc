@@ -8,7 +8,9 @@ use arrow_schema::{Schema, SchemaRef};
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::{BeginTransactionOption, ReadWriteTransaction};
 
-use super::{SpannerStatement, check_partitioned_dml, is_mutation_limit_exceeded};
+use super::{
+    SpannerStatement, check_partitioned_dml, commit_outcome_unknown, is_mutation_limit_exceeded,
+};
 use crate::bind;
 use crate::connection::{lock_txn, runner_builder};
 use crate::error::{annotate, from_spanner, invalid_argument, invalid_state, unsupported};
@@ -86,7 +88,7 @@ impl SpannerStatement {
             &[],
             true,
         )
-        .map_err(note_mutation_limit)?;
+        .map_err(note_dml_failure)?;
         Ok(Some(count))
     }
 
@@ -148,7 +150,7 @@ impl SpannerStatement {
                 transaction,
             ),
         )
-        .map_err(note_mutation_limit)?;
+        .map_err(note_dml_failure)?;
         self.config.commit_stats.record(mutation_count);
 
         let mut schema = None;
@@ -252,17 +254,18 @@ impl SpannerStatement {
     }
 }
 
-/// Name the driver's ways past Spanner's per-transaction mutation limit, which Spanner's own
-/// message doesn't know about. Every bound row and `;`-separated statement shares one transaction.
-fn note_mutation_limit(error: Error) -> Error {
-    if !is_mutation_limit_exceeded(&error) {
+/// Explain the two autocommit DML failures whose remedy isn't obvious: a commit whose outcome is
+/// unknown, and Spanner's per-transaction mutation limit, whose message doesn't know the driver's
+/// ways past it. Every bound row and `;`-separated statement shares one transaction.
+fn note_dml_failure(error: Error) -> Error {
+    let note = if commit_outcome_unknown(&error) {
+        "the transaction may still have been committed, so executing it again could apply it twice"
+    } else if is_mutation_limit_exceeded(&error) {
+        "all bound rows and statements of one execution run in one transaction: execute fewer at \
+         a time, set spanner.dml.partitioned to true for a large UPDATE or DELETE, or load inserts \
+         with bulk ingest, which commits in chunks"
+    } else {
         return error;
-    }
-    annotate(error, |message| {
-        format!(
-            "{message} (all bound rows and statements of one execution run in one transaction: \
-             execute fewer at a time, set spanner.dml.partitioned to true for a large UPDATE or \
-             DELETE, or load inserts with bulk ingest, which commits in chunks)"
-        )
-    })
+    };
+    annotate(error, |message| format!("{message} ({note})"))
 }

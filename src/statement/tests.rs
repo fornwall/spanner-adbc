@@ -975,6 +975,27 @@ mod manual_txn {
         );
     }
 
+    /// A commit that fails with `UNAVAILABLE` may have been applied, so retrying the DML could
+    /// apply it twice.
+    #[test]
+    fn autocommit_dml_with_an_unknown_commit_outcome_says_so() {
+        let server = start_with(Box::new(|_| CommitAction::Fail(tonic::Code::Unavailable)));
+        let mut connection = connect(&server);
+        let mut statement = sql_statement(&mut connection, "UPDATE t SET c = 'x' WHERE TRUE");
+        statement
+            .set_option(
+                OptionStatement::Other(crate::OPTION_RETRY_MAX_ATTEMPTS.into()),
+                OptionValue::from("1"),
+            )
+            .unwrap();
+        let error = statement.execute_update().unwrap_err();
+        assert_eq!(error.status, Status::IO, "{error}");
+        assert!(
+            error.message.contains("may still have been committed"),
+            "{error}"
+        );
+    }
+
     /// A failed first query begins nothing, so it must not poison the manual transaction: with
     /// an inline begin the client marks the unstarted transaction permanently failed.
     #[test]

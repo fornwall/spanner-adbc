@@ -113,6 +113,30 @@ fn mid_ingest_failure_notes_committed_rows() {
 }
 
 #[test]
+fn commit_outcome_is_unknown_after_a_timeout_cancel_or_transport_failure() {
+    let error = |status, vendor_code| {
+        let mut error = err("commit failed", status);
+        error.vendor_code = vendor_code;
+        error
+    };
+    for (status, vendor_code, unknown) in [
+        (Status::Timeout, 0, true),
+        (Status::Cancelled, 1, true),
+        (Status::IO, 0, true),
+        (Status::IO, Code::Unavailable as i32, true),
+        (Status::IO, Code::Aborted as i32, false),
+        (Status::IO, Code::ResourceExhausted as i32, false),
+        (Status::Integrity, Code::AlreadyExists as i32, false),
+    ] {
+        assert_eq!(
+            commit_outcome_unknown(&error(status, vendor_code)),
+            unknown,
+            "{status:?} {vendor_code}"
+        );
+    }
+}
+
+#[test]
 fn timed_out_or_cancelled_chunk_reports_unknown_outcome() {
     for status in [Status::Timeout, Status::Cancelled] {
         // The failing chunk may have landed even if no earlier chunk did.

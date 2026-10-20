@@ -6,6 +6,7 @@ use std::ops::Range;
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
 use arrow_array::{Array, RecordBatch};
+use google_cloud_gax::error::rpc::Code;
 use google_cloud_spanner::mutation::{Mutation, MutationGroup};
 
 use super::{SpannerStatement, string_option};
@@ -442,11 +443,10 @@ pub(super) fn ingest_mode_option(key: &OptionStatement, value: OptionValue) -> R
 /// Add to a failed autocommit ingest's error how many rows were already committed and remain in
 /// the table. On the BatchWrite path `committed` includes the failing chunk's applied groups.
 ///
-/// A timeout or cancellation drops the in-flight commit, which may still land, so the note then
-/// also warns that the failing chunk's outcome is unknown. Status, vendor code and details are
-/// preserved.
+/// When [`commit_outcome_unknown`], the note also warns that the failing chunk may have landed.
+/// Status, vendor code and details are preserved.
 fn note_rows_already_committed(error: Error, committed: i64) -> Error {
-    let outcome_unknown = matches!(error.status, Status::Timeout | Status::Cancelled);
+    let outcome_unknown = commit_outcome_unknown(&error);
     if committed == 0 && !outcome_unknown {
         return error;
     }
@@ -467,6 +467,17 @@ fn note_rows_already_committed(error: Error, committed: i64) -> Error {
         );
     }
     annotate(error, |message| format!("{message} ({note})"))
+}
+
+/// Whether a failed write may still have been committed. A timeout or cancel drops the in-flight
+/// commit, and a transport failure or `UNAVAILABLE` can follow a commit the server applied. Other
+/// `IO` codes, such as `ABORTED`, mean the commit was rejected.
+pub(crate) fn commit_outcome_unknown(error: &Error) -> bool {
+    match error.status {
+        Status::Timeout | Status::Cancelled => true,
+        Status::IO => [0, Code::Unavailable as i32].contains(&error.vendor_code),
+        _ => false,
+    }
 }
 
 /// Whether `error` is Spanner's per-commit mutation limit rejection, which an autocommit ingest

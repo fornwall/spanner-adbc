@@ -26,7 +26,9 @@ use crate::options::{SharedConfig, impl_typed_option_getters};
 use crate::reader::stream_query;
 use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable};
 use crate::sql::qualified_table;
-use crate::statement::{DEFAULT_ROWS_PER_BATCH, SpannerStatement, is_mutation_limit_exceeded};
+use crate::statement::{
+    DEFAULT_ROWS_PER_BATCH, SpannerStatement, commit_outcome_unknown, is_mutation_limit_exceeded,
+};
 use crate::timeout::with_timeout;
 
 mod exec;
@@ -580,12 +582,12 @@ pub(crate) fn decode_partition(descriptor: &[u8]) -> Result<PartitionDescriptor>
     })
 }
 
-/// Explain the two manual-commit failures whose remedy isn't obvious. A timeout or cancel drops
-/// an in-flight commit, which may still land, so committing the kept buffer again could apply it
-/// twice. A transaction over Spanner's mutation limit can never commit, since a manual
-/// transaction is applied whole while autocommit ingest is split into chunks.
+/// Explain the two manual-commit failures whose remedy isn't obvious. A commit whose outcome is
+/// unknown may have landed, so committing the kept buffer again could apply it twice. A
+/// transaction over Spanner's mutation limit can never commit, since a manual transaction is
+/// applied whole while autocommit ingest is split into chunks.
 fn note_commit_failure(error: Error) -> Error {
-    let note = if matches!(error.status, Status::Timeout | Status::Cancelled) {
+    let note = if commit_outcome_unknown(&error) {
         "the commit may still have been applied; the buffered work is kept, so committing again \
          could apply it twice; roll back to discard it"
     } else if is_mutation_limit_exceeded(&error) {

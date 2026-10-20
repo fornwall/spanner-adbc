@@ -10,8 +10,8 @@ mod dml;
 mod ingest;
 
 use dml::DmlOutcome;
-pub(crate) use ingest::is_mutation_limit_exceeded;
 use ingest::{check_target_catalog, ingest_mode_option};
+pub(crate) use ingest::{commit_outcome_unknown, is_mutation_limit_exceeded};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
