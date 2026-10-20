@@ -19,6 +19,9 @@ fn parses_exact_and_max_staleness_with_units() {
         ("exact:10", Duration::from_secs(10)),
         ("exact:2.5s", Duration::from_millis(2500)),
         (" exact : 1h ", Duration::from_secs(3600)),
+        ("exact:250us", Duration::from_micros(250)),
+        ("exact:3µs", Duration::from_micros(3)),
+        ("exact:7ns", Duration::from_nanos(7)),
         ("exact:0", Duration::ZERO),
     ] {
         assert_eq!(

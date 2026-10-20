@@ -747,3 +747,44 @@ fn execute_query_reports_the_dml_row_count_with_or_without_a_stream() {
         );
     }
 }
+
+/// `AdbcStatementNew` into a live statement must refuse rather than leak or replace it, and a
+/// connection's metadata entry points export their streams.
+#[test]
+fn a_live_connection_exports_metadata_and_refuses_a_second_statement_in_one_struct() {
+    use arrow_array::RecordBatchReader;
+    use arrow_array::ffi_stream::{FFI_ArrowArrayStream, RecordBatchStreamReader};
+
+    use crate::ffi::connection::connection_get_statistic_names;
+    use crate::ffi::test_support::{error_message, release_error, zeroed_error};
+
+    let mut mock = MockStatement::start();
+    let live = mock.statement.private_data;
+    let mut error = zeroed_error();
+    let status = unsafe {
+        statement_new(
+            &raw mut mock.connection,
+            &raw mut mock.statement,
+            &mut error,
+        )
+    };
+    assert_eq!(status, AdbcStatusCode::from(Status::InvalidState));
+    let message = error_message(&error).unwrap();
+    assert!(
+        message.contains("already holds a driver object"),
+        "{message}"
+    );
+    release_error(&mut error);
+    assert_eq!(mock.statement.private_data, live);
+
+    let mut out = FFI_ArrowArrayStream::empty();
+    let status =
+        unsafe { connection_get_statistic_names(&raw mut mock.connection, &raw mut out, null()) };
+    assert_eq!(status, ADBC_STATUS_OK);
+    let reader = RecordBatchStreamReader::try_new(out).unwrap();
+    assert_eq!(
+        reader.schema(),
+        adbc_core::schemas::GET_STATISTIC_NAMES_SCHEMA.clone()
+    );
+    assert_eq!(reader.count(), 0);
+}

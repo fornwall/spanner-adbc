@@ -182,14 +182,14 @@ fn access_token_is_write_only() {
 
 #[test]
 fn access_token_conflicts_with_other_credential_options() {
-    // Not tested through `connect()`: CI sets `SPANNER_EMULATOR_HOST`, so the emulator guard
-    // would fire first.
     let base = || {
         let mut db = new_database();
+        db.database = Some("projects/p/instances/i/databases/d".into());
         db.access_token = Some("ya29.test-token".into());
         db
     };
     assert_eq!(base().conflicting_credential_with_access_token(), None);
+    assert!(base().resolve_target(None).is_ok());
     for (mutate, expected) in [
         (
             Box::new(|db: &mut SpannerDatabase| db.keyfile = Some("/path/key.json".into()))
@@ -212,11 +212,11 @@ fn access_token_conflicts_with_other_credential_options() {
     ] {
         let mut db = base();
         mutate(&mut db);
-        assert_eq!(
-            db.conflicting_credential_with_access_token(),
-            Some(expected),
-            "conflict: {expected}"
-        );
+        let error = db.resolve_target(None).unwrap_err();
+        assert_eq!(error.status, Status::InvalidState, "{expected}");
+        for option in [OPTION_ACCESS_TOKEN, expected] {
+            assert!(error.message.contains(option), "{}", error.message);
+        }
     }
 }
 
