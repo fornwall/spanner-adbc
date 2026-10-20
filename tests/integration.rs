@@ -5692,6 +5692,11 @@ fn schema_fidelity_cases() -> Vec<SchemaFidelityCase> {
         case("Float64Col", "1.5", DataType::Float64),
         case("Float32Col", "CAST(1.25 AS FLOAT32)", DataType::Float32),
         case("StringCol", "'x'", DataType::Utf8),
+        case(
+            "UuidCol",
+            "CAST('11111111-2222-3333-4444-555555555555' AS UUID)",
+            DataType::Utf8,
+        ),
         case("BytesCol", "b'xyz'", DataType::Binary),
         case("DateCol", "DATE '2024-01-15'", DataType::Date32),
         case(
@@ -5714,6 +5719,11 @@ fn schema_fidelity_cases() -> Vec<SchemaFidelityCase> {
             list(item(DataType::Float32)),
         ),
         case("ArrStr", "['a', 'b']", list(item(DataType::Utf8))),
+        case(
+            "ArrUuid",
+            "[CAST('11111111-2222-3333-4444-555555555555' AS UUID)]",
+            list(item(DataType::Utf8)),
+        ),
         case("ArrBytes", "[b'x']", list(item(DataType::Binary))),
         case(
             "ArrDate",
