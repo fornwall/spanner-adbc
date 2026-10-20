@@ -252,6 +252,12 @@ fn every_database_a_driver_creates_shares_the_drivers_runtime() {
     // Separate drivers have separate runtimes, so the checks above are meaningful.
     let other = SpannerDriver::try_new().unwrap();
     assert!(!Arc::ptr_eq(&driver.runtime, &other.runtime));
+
+    // The C ABI's shared driver outlives a fork, so a child's new databases need a new runtime.
+    driver.runtime = crate::runtime::tests::forked_runtime();
+    let child = driver.new_database().unwrap();
+    assert!(!child.runtime.forked());
+    assert!(Arc::ptr_eq(&driver.runtime, &child.runtime));
 }
 
 #[test]

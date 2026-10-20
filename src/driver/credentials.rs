@@ -27,7 +27,7 @@ use std::time::Duration;
 const QUOTA_PROJECT_HEADER: &str = "x-goog-user-project";
 
 /// Matches the default of the `google-cloud-auth` impersonated builder and gcloud's `--lifetime`.
-pub(super) const DEFAULT_IMPERSONATION_LIFETIME_SECS: u64 = 3600;
+const DEFAULT_IMPERSONATION_LIFETIME_SECS: u64 = 3600;
 
 /// The credential flow selected by [`SpannerDatabase::credential_choice`], in precedence order.
 ///

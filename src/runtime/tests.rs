@@ -42,6 +42,26 @@ fn a_current_thread_caller_runtime_gets_an_error_instead_of_a_panic() {
     });
 }
 
+/// A runtime as a forked child sees it. No process has pid 0.
+pub(crate) fn forked_runtime() -> SharedRuntime {
+    let mut runtime = Arc::into_inner(new_runtime().unwrap()).unwrap();
+    runtime.pid = 0;
+    Arc::new(runtime)
+}
+
+/// A Python multiprocessing worker forked after connecting hung on its first call, since none
+/// of the runtime's threads exist in the child to drive I/O or timers.
+#[test]
+fn a_forked_child_gets_an_error_instead_of_a_hang() {
+    let runtime = forked_runtime();
+    assert!(runtime.forked());
+    let result: Result<i32> = block_on_cancellable(&runtime, &CancelSignal::new(), async { Ok(1) });
+    let error = result.unwrap_err();
+    assert_eq!(error.status, Status::InvalidState);
+    assert!(error.message.contains("forked"), "{}", error.message);
+    assert!(!new_runtime().unwrap().forked());
+}
+
 #[test]
 fn signal_from_another_thread_cancels_the_operation() {
     let runtime = new_runtime().unwrap();

@@ -53,6 +53,15 @@ impl SpannerDriver {
             runtime: new_runtime()?,
         })
     }
+
+    /// The runtime for a new database. A forked child, such as a Python multiprocessing worker,
+    /// gets a new one, since the parent's runtime threads do not exist there.
+    fn database_runtime(&mut self) -> Result<SharedRuntime> {
+        if self.runtime.forked() {
+            self.runtime = new_runtime()?;
+        }
+        Ok(self.runtime.clone())
+    }
 }
 
 impl Default for SpannerDriver {
@@ -69,14 +78,14 @@ impl Driver for SpannerDriver {
     type DatabaseType = SpannerDatabase;
 
     fn new_database(&mut self) -> Result<Self::DatabaseType> {
-        Ok(SpannerDatabase::new(self.runtime.clone()))
+        Ok(SpannerDatabase::new(self.database_runtime()?))
     }
 
     fn new_database_with_opts(
         &mut self,
         opts: impl IntoIterator<Item = (OptionDatabase, OptionValue)>,
     ) -> Result<Self::DatabaseType> {
-        let mut database = SpannerDatabase::new(self.runtime.clone());
+        let mut database = self.new_database()?;
         for (key, value) in opts {
             database.set_option(key, value)?;
         }
@@ -281,10 +290,7 @@ impl SpannerDatabase {
     fn connect_timeout(&self) -> Option<Duration> {
         match self.connect_timeout_secs {
             None => Some(DEFAULT_CONNECT_TIMEOUT),
-            // Validated when set, so the conversion cannot fail.
-            Some(secs) => (secs > 0.0)
-                .then(|| Duration::try_from_secs_f64(secs).ok())
-                .flatten(),
+            seconds => crate::timeout::as_duration(seconds),
         }
     }
 

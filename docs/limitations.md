@@ -40,10 +40,19 @@ the transaction back. Its locks stay held until Spanner aborts it as idle, norma
 
 ## Synchronous calls from Tokio
 
-The ADBC Rust traits are synchronous. The driver runs them on its own Tokio runtime with
-`block_on`, which panics when called from inside an async Tokio task. Dropping the last handle to
-a Rust driver from async code can also panic while the runtime shuts down.
+The ADBC Rust traits are synchronous, and the driver runs them on its own Tokio runtime. Called
+from a task on a multi-thread Tokio runtime, each call blocks its worker thread, after handing
+that worker's other tasks to another thread with `tokio::task::block_in_place`. A current-thread
+runtime, such as the `#[tokio::test]` default, can't do that, so calls there fail with
+`InvalidState`.
 
-In async applications, create, use and drop the driver and its handles inside
+In async applications, prefer to use the driver and its handles inside
 `tokio::task::spawn_blocking` or on a dedicated thread. That includes reading results. An async
 ADBC interface would remove this restriction.
+
+## Forked processes
+
+A forked child, such as a Python `multiprocessing` worker started with the `fork` method,
+inherits the driver's state but none of its runtime threads. Databases, connections and
+statements created before the fork fail with `InvalidState` in the child. Databases created in
+the child start a new runtime and work normally.

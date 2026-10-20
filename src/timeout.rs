@@ -33,8 +33,8 @@ impl RpcTimeouts {
     }
 }
 
-/// Values were validated when set, so conversion cannot fail.
-fn as_duration(seconds: Option<f64>) -> Option<Duration> {
+/// Convert a validated timeout option; unset and `0` mean no deadline.
+pub(crate) fn as_duration(seconds: Option<f64>) -> Option<Duration> {
     seconds
         .filter(|&seconds| seconds > 0.0)
         .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())

@@ -18,16 +18,28 @@ pub(crate) type SharedRuntime = Arc<DriverRuntime>;
 
 /// The driver's Tokio runtime.
 ///
-/// Tokio panics when a runtime is dropped inside another runtime's context, such as the last
-/// handle dropped by a Rust caller's async task, so it then shuts down in the background.
+/// A forked child inherits the runtime but none of its threads, so nothing would ever drive its
+/// tasks or timers there; [`block_on`] refuses it instead of hanging.
 #[derive(Debug)]
-pub(crate) struct DriverRuntime(Option<Runtime>);
+pub(crate) struct DriverRuntime {
+    /// Taken only when dropped.
+    runtime: Option<Runtime>,
+    /// The process that started the runtime's threads.
+    pid: u32,
+}
+
+impl DriverRuntime {
+    /// Whether this process is a fork of the one that started the runtime.
+    pub(crate) fn forked(&self) -> bool {
+        std::process::id() != self.pid
+    }
+}
 
 impl Deref for DriverRuntime {
     type Target = Runtime;
 
     fn deref(&self) -> &Runtime {
-        self.0
+        self.runtime
             .as_ref()
             .expect("the runtime is only taken when dropped")
     }
@@ -35,9 +47,15 @@ impl Deref for DriverRuntime {
 
 impl Drop for DriverRuntime {
     fn drop(&mut self) {
-        if let Some(runtime) = self.0.take()
-            && Handle::try_current().is_ok()
-        {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        if self.forked() {
+            // Shutting down would wait for threads that only exist in the parent.
+            std::mem::forget(runtime);
+        } else if Handle::try_current().is_ok() {
+            // Tokio panics when a runtime is dropped inside another runtime's context, such as
+            // the last handle dropped by a Rust caller's async task.
             runtime.shutdown_background();
         }
     }
@@ -157,7 +175,7 @@ fn cancelled_err() -> Error {
 
 /// Run `future` on the shared runtime, giving latched cancellation priority over completion.
 pub(crate) fn block_on_cancellable<T>(
-    runtime: &Runtime,
+    runtime: &DriverRuntime,
     cancel: &CancelSignal,
     future: impl Future<Output = Result<T>>,
 ) -> Result<T> {
@@ -179,7 +197,16 @@ pub(crate) fn block_on_cancellable<T>(
 /// Tokio panics when this happens inside another runtime's context, as it does for a Rust caller
 /// in an async task. A multi-thread caller runtime can hand off the blocked thread's work, but a
 /// current-thread one cannot.
-pub(crate) fn block_on<T>(runtime: &Runtime, future: impl Future<Output = Result<T>>) -> Result<T> {
+pub(crate) fn block_on<T>(
+    runtime: &DriverRuntime,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    if runtime.forked() {
+        return Err(invalid_state(
+            "this handle was created before the process forked, and the driver's threads only \
+             exist in the parent; create new databases and connections in the child",
+        ));
+    }
     let Ok(caller) = Handle::try_current() else {
         return runtime.block_on(future);
     };
@@ -266,8 +293,11 @@ pub(crate) fn new_runtime() -> Result<SharedRuntime> {
                 Status::Internal,
             )
         })?;
-    Ok(Arc::new(DriverRuntime(Some(runtime))))
+    Ok(Arc::new(DriverRuntime {
+        runtime: Some(runtime),
+        pid: std::process::id(),
+    }))
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
