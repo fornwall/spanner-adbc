@@ -62,7 +62,7 @@ with spanner.connect(
 ## Driver manifest (`driver="spanner"`)
 
 `spanner.connect()` loads the bundled library directly. To load the driver by name through the
-generic `adbc_driver_manager` (version 1.8.0 or later), install an
+generic `adbc_driver_manager` (version 1.9.0 or later), install an
 [ADBC driver manifest][manifests]:
 
 ```sh
@@ -82,7 +82,7 @@ with adbc_driver_manager.dbapi.connect(
     ...
 ```
 
-Recent driver managers also infer `spanner` from the URI scheme if you leave out `driver`.
+Version 1.11.0 and later also infer `spanner` from the URI scheme if you leave out `driver`.
 
 The manifest records the library's absolute path, so re-run the installer after upgrading,
 reinstalling or moving the environment. It goes to `<sys.prefix>/etc/adbc/drivers` in a
