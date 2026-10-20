@@ -491,7 +491,8 @@ fn date_string(name: &str, days: i32) -> Result<String> {
                 "cannot bind DATE parameter {name:?}: {days} days since 1970-01-01 is out of range; Spanner supports 0001-01-01 through 9999-12-31"
             ))
         })?;
-    Ok(date.format("%Y-%m-%d").to_string())
+    // `Display` writes `YYYY-MM-DD` for these years without parsing a format string per call.
+    Ok(date.to_string())
 }
 
 /// Read the raw `i64` at `row` from an Arrow timestamp `column` of the given `unit`.
