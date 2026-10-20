@@ -11,9 +11,7 @@ use google_cloud_spanner::mutation::{Mutation, MutationGroup};
 use super::{SpannerStatement, string_option};
 use crate::bind;
 use crate::connection::{TxnKind, lock_txn, write_mutations_txn};
-use crate::error::{
-    annotate, err, from_spanner, from_status_parts, invalid_state, not_implemented, unsupported,
-};
+use crate::error::{annotate, err, from_spanner, from_status_parts, invalid_state, unsupported};
 use crate::runtime::block_on_cancellable;
 use crate::timeout::with_timeout;
 
@@ -437,7 +435,11 @@ pub(super) fn ingest_mode_option(key: &OptionStatement, value: OptionValue) -> R
         ADBC_INGEST_OPTION_MODE_CREATE | "create" => Ok(IngestMode::Create),
         ADBC_INGEST_OPTION_MODE_CREATE_APPEND | "create_append" => Ok(IngestMode::CreateAppend),
         ADBC_INGEST_OPTION_MODE_REPLACE | "replace" => Ok(IngestMode::Replace),
-        other => Err(not_implemented(&format!("ingest mode {other:?}"))),
+        other => Err(unsupported(format!(
+            "ingest mode {other:?} is not supported; use {ADBC_INGEST_OPTION_MODE_CREATE}, \
+             {ADBC_INGEST_OPTION_MODE_APPEND}, {ADBC_INGEST_OPTION_MODE_CREATE_APPEND} or \
+             {ADBC_INGEST_OPTION_MODE_REPLACE}"
+        ))),
     }
 }
 
