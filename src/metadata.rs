@@ -1,4 +1,4 @@
-//! Shared metadata helpers: the statement builder for internal reads, table and catalog
+//! Shared metadata helpers: the statement builders for internal reads, table and catalog
 //! lookups, and the ADBC `LIKE` matcher.
 
 use adbc_core::error::{Error, Result, Status};
@@ -114,6 +114,38 @@ pub(crate) fn metadata_sql_builder(
     )
 }
 
+/// An `INFORMATION_SCHEMA` query: `select`, filtered by the driver-written `predicate` and by
+/// `column LIKE @pN` for each present pattern, then sorted by `order_by`.
+///
+/// Patterns are user data, so they are bound as parameters: formatting them into SQL caused a SQL
+/// injection in the Snowflake ADBC driver (apache/arrow-adbc#1338).
+pub(crate) fn filtered_query(
+    config: &SharedConfig,
+    select: &str,
+    predicate: Option<&str>,
+    filters: &[(&str, Option<&str>)],
+    order_by: &str,
+) -> SpannerSql {
+    let mut predicates: Vec<String> = predicate.map(str::to_string).into_iter().collect();
+    let mut patterns = Vec::new();
+    for (column, pattern) in filters {
+        if let Some(pattern) = pattern {
+            predicates.push(format!("{column} LIKE @p{}", patterns.len()));
+            // ADBC patterns have no escape character, but GoogleSQL treats `\` as one.
+            patterns.push(pattern.replace('\\', "\\\\"));
+        }
+    }
+    let mut sql = select.to_string();
+    if !predicates.is_empty() {
+        sql = format!("{sql} WHERE {}", predicates.join(" AND "));
+    }
+    let mut builder = metadata_sql_builder(config, format!("{sql} ORDER BY {order_by}"));
+    for (i, pattern) in patterns.into_iter().enumerate() {
+        builder = builder.add_param(format!("p{i}"), pattern);
+    }
+    builder.build()
+}
+
 /// Run a metadata statement on a shared read-only transaction, so all reads of one `get_objects`
 /// or `get_statistics` call see the same snapshot. Results hold no TIMESTAMPs, so the default
 /// precision is fine.
@@ -129,28 +161,29 @@ pub(crate) async fn query_txn(
     Ok(batch)
 }
 
-/// Column `index` of an `INFORMATION_SCHEMA` batch as a [`StringArray`].
-pub(crate) fn str_col(batch: &RecordBatch, index: usize) -> Result<&StringArray> {
-    // `RecordBatch::column` panics when out of range.
-    if index >= batch.num_columns() {
-        return Err(err(
-            format!(
-                "INFORMATION_SCHEMA batch has {} column(s); column {index} is out of range",
-                batch.num_columns()
-            ),
-            Status::Internal,
-        ));
-    }
+/// Column `index` of an `INFORMATION_SCHEMA` batch as a `T`.
+pub(crate) fn column<T: 'static>(batch: &RecordBatch, index: usize) -> Result<&T> {
     batch
-        .column(index)
-        .as_any()
-        .downcast_ref::<StringArray>()
+        .columns()
+        .get(index)
+        .and_then(|c| c.as_any().downcast_ref())
         .ok_or_else(|| {
             err(
-                format!("INFORMATION_SCHEMA column {index} is not a string"),
+                format!(
+                    "INFORMATION_SCHEMA column {index} is missing or not a {}",
+                    std::any::type_name::<T>()
+                ),
                 Status::Internal,
             )
         })
+}
+
+/// The first `N` columns of an `INFORMATION_SCHEMA` batch, which must be strings.
+pub(crate) fn str_cols<const N: usize>(batch: &RecordBatch) -> Result<[&StringArray; N]> {
+    let columns = (0..N)
+        .map(|i| column(batch, i))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(columns.try_into().expect("collected N columns"))
 }
 
 /// A compiled ADBC `LIKE` pattern, where `%` matches any run and `_` one character.

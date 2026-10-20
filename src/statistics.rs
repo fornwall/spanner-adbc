@@ -16,7 +16,7 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use google_cloud_spanner::client::DatabaseClient;
 
 use crate::error::err;
-use crate::metadata::{LikeMatcher, metadata_sql_builder, query_txn, str_col};
+use crate::metadata::{LikeMatcher, metadata_sql_builder, query_txn, str_cols};
 use crate::nested::{arrow_err, dense_union, field, list_item, list_of, struct_fields};
 use crate::options::SharedConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
@@ -28,20 +28,6 @@ const INT64_BRANCH: i8 = 0;
 
 /// Bound concurrent aggregate scans to limit load on Spanner.
 const STATISTICS_SCAN_CONCURRENCY: usize = 8;
-
-/// Column positions in the discovery queries; keep these aligned with their SELECT lists.
-mod tables_col {
-    // `SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES`
-    pub(super) const TABLE_SCHEMA: usize = 0;
-    pub(super) const TABLE_NAME: usize = 1;
-}
-mod columns_col {
-    // `SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SPANNER_TYPE FROM INFORMATION_SCHEMA.COLUMNS`
-    pub(super) const TABLE_SCHEMA: usize = 0;
-    pub(super) const TABLE_NAME: usize = 1;
-    pub(super) const COLUMN_NAME: usize = 2;
-    pub(super) const SPANNER_TYPE: usize = 3;
-}
 
 /// One computed statistic for a table (or one of its columns).
 pub(crate) struct Statistic {
@@ -151,16 +137,8 @@ fn prepare_tables(
     db_schema_matcher: Option<&LikeMatcher>,
     table_name_matcher: Option<&LikeMatcher>,
 ) -> Result<Vec<PreparedTable>> {
-    let (ts, tn) = (
-        str_col(table_batch, tables_col::TABLE_SCHEMA)?,
-        str_col(table_batch, tables_col::TABLE_NAME)?,
-    );
-    let (cts, ctn, ccn, ctype) = (
-        str_col(column_batch, columns_col::TABLE_SCHEMA)?,
-        str_col(column_batch, columns_col::TABLE_NAME)?,
-        str_col(column_batch, columns_col::COLUMN_NAME)?,
-        str_col(column_batch, columns_col::SPANNER_TYPE)?,
-    );
+    let [ts, tn] = str_cols(table_batch)?;
+    let [cts, ctn, ccn, ctype] = str_cols(column_batch)?;
 
     // Group columns once, preserving ordinal order within each table.
     let mut columns_by_table: HashMap<(&str, &str), Vec<(String, bool)>> = HashMap::new();

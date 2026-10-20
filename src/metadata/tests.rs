@@ -4,10 +4,13 @@ use std::sync::Arc;
 
 use adbc_core::error::Status;
 use adbc_core::options::OptionValue;
-use arrow_array::{ArrayRef, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 
-use super::{check_lookup_catalog, database_catalog, like_match, metadata_sql_builder, str_col};
+use super::{
+    check_lookup_catalog, column, database_catalog, filtered_query, like_match,
+    metadata_sql_builder, str_cols,
+};
 use crate::options::SharedConfig;
 
 #[test]
@@ -69,17 +72,42 @@ fn lookup_catalog_accepts_only_the_connections_own_catalog() {
     }
 }
 
+/// A batch that doesn't match its query's SELECT list is an `Internal` error, not a panic.
 #[test]
-fn str_col_errors_on_out_of_range_index() {
-    let empty = RecordBatch::new_empty(Arc::new(Schema::empty()));
-    let err = str_col(&empty, 0).unwrap_err();
-    assert_eq!(err.status, Status::Internal);
-
+fn column_lookups_reject_a_missing_or_mistyped_column() {
     let schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, true)]));
     let col: ArrayRef = Arc::new(StringArray::from(vec![Some("x")]));
     let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
-    assert!(str_col(&batch, 0).is_ok());
-    assert_eq!(str_col(&batch, 1).unwrap_err().status, Status::Internal);
+    let [c] = str_cols(&batch).unwrap();
+    assert_eq!(c.value(0), "x");
+
+    assert_eq!(str_cols::<2>(&batch).unwrap_err().status, Status::Internal);
+    let error = column::<Int64Array>(&batch, 0).unwrap_err();
+    assert_eq!(error.status, Status::Internal);
+    assert!(error.message.contains("column 0"), "{}", error.message);
+}
+
+#[test]
+fn filtered_query_binds_each_present_pattern() {
+    let config = SharedConfig::default();
+    let unfiltered = filtered_query(&config, "SELECT A FROM T", None, &[("A", None)], "A");
+    assert_eq!(unfiltered.sql(), "SELECT A FROM T ORDER BY A");
+
+    // Pattern text goes only into the parameters, with `\` escaped for GoogleSQL.
+    let filtered = filtered_query(
+        &config,
+        "SELECT A FROM T",
+        Some("X"),
+        &[("A", None), ("B", Some("Sing%")), ("C", Some(r"evil'\--%"))],
+        "A, B",
+    );
+    assert_eq!(
+        filtered.sql(),
+        "SELECT A FROM T WHERE X AND B LIKE @p0 AND C LIKE @p1 ORDER BY A, B"
+    );
+    let built = format!("{filtered:?}");
+    assert!(built.contains(r#"StringValue("Sing%")"#), "{built}");
+    assert!(built.contains(r#"StringValue("evil'\\\\--%")"#), "{built}");
 }
 
 /// Sets every option `metadata_sql_builder` forwards, plus tags, which it must not forward.

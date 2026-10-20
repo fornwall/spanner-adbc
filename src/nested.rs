@@ -7,7 +7,9 @@
 use std::sync::Arc;
 
 use adbc_core::error::{Error, Result, Status};
-use arrow_array::{ArrayRef, ListArray, UnionArray, new_empty_array};
+use arrow_array::{
+    ArrayRef, ListArray, StringArray, StructArray, UnionArray, new_empty_array, new_null_array,
+};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, FieldRef, Fields, UnionFields};
 
@@ -86,6 +88,30 @@ pub(crate) fn list_of_nullable(
     )
     .map_err(arrow_err)?;
     Ok(Arc::new(list))
+}
+
+/// A list of `list_field`'s struct items, with `lengths[i]` items in entry `i` and `nulls` marking
+/// null entries. `child` returns the array for each struct field, or `None` to leave it null.
+pub(crate) fn struct_list(
+    list_field: &FieldRef,
+    lengths: &[usize],
+    nulls: Option<NullBuffer>,
+    mut child: impl FnMut(&FieldRef) -> Result<Option<ArrayRef>>,
+) -> Result<ArrayRef> {
+    let item = list_item(list_field)?;
+    let fields = struct_fields(&item)?;
+    let len = lengths.iter().sum();
+    let children = fields
+        .iter()
+        .map(|f| Ok(child(f)?.unwrap_or_else(|| new_null_array(f.data_type(), len))))
+        .collect::<Result<Vec<_>>>()?;
+    let items = StructArray::try_new(fields, children, None).map_err(arrow_err)?;
+    list_of_nullable(item, lengths, Arc::new(items), nulls)
+}
+
+/// A non-null string array of `values`.
+pub(crate) fn strings<'a>(values: impl IntoIterator<Item = &'a str>) -> ArrayRef {
+    Arc::new(StringArray::from_iter_values(values))
 }
 
 /// Assemble a dense union of `fields`. `populated` supplies the children in use by type id; the
