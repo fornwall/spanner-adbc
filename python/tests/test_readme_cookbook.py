@@ -61,9 +61,9 @@ def cookbook_env(spanner_database):
 
     original = sp.connect
 
-    def redirected(db_kwargs=None, **kwargs):
+    def redirected(uri=None, db_kwargs=None, *args, **kwargs):
         merged = {**(db_kwargs or {}), **database_options(spanner_database)}
-        return original(db_kwargs=merged, **kwargs)
+        return original(None, merged, *args, **kwargs)
 
     sp.connect = redirected
     try:

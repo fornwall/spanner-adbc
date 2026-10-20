@@ -1,9 +1,7 @@
 """DBAPI cursors and Arrow/DataFrame helpers for the Spanner ADBC driver.
 
     import spanner_adbc.dbapi as spanner
-    with spanner.connect(
-        db_kwargs={"uri": "spanner:///projects/p/instances/i/databases/d"}
-    ) as conn:
+    with spanner.connect("spanner:///projects/p/instances/i/databases/d") as conn:
         df = conn.cursor().execute("SELECT * FROM Singers").fetch_df()
 
 Autocommit is off by default: call ``conn.commit()`` to apply buffered writes.
@@ -49,8 +47,12 @@ from . import (
     ConnectionOptions,
     DatabaseOptions,
     StatementOptions,
+    _db_kwargs,
     _driver_path,
 )
+
+Connection = adbc_driver_manager.dbapi.Connection
+Cursor = adbc_driver_manager.dbapi.Cursor
 
 # GoogleSQL marks parameters as `@name`; `?` is rejected. A mapping binds by name and a sequence
 # binds in order of first appearance. "named" is the closest PEP 249 style, but its `:name`
@@ -62,6 +64,8 @@ Binary = bytes
 
 __all__ = [
     "connect",
+    "Connection",
+    "Cursor",
     "DatabaseOptions",
     "ConnectionOptions",
     "StatementOptions",
@@ -94,22 +98,25 @@ __all__ = [
 
 
 def connect(
+    uri: str | None = None,
     db_kwargs: Mapping[str, str] | None = None,
     conn_kwargs: Mapping[str, str] | None = None,
+    *,
     autocommit: bool = False,
-) -> adbc_driver_manager.dbapi.Connection:
+) -> Connection:
     """Open a DBAPI 2.0 connection to a Spanner database.
 
     Parameters
     ----------
+    uri:
+        The database, such as ``spanner:///projects/p/instances/i/databases/d``.
+        Overrides ``DatabaseOptions.URI`` in *db_kwargs*.
     db_kwargs:
         Database options keyed by :class:`DatabaseOptions` members or raw strings.
-        Include ``DatabaseOptions.URI``, for example
-        ``spanner:///projects/p/instances/i/databases/d``. Pass credentials here;
-        inline credential JSON and access tokens are forbidden in URI parameters.
+        Pass credentials here; inline credential JSON and access tokens are
+        forbidden in URI parameters.
     conn_kwargs:
-        Connection-level options, keyed with the :class:`ConnectionOptions`
-        constants (``adbc.connection.*`` / ``spanner.*``).
+        Connection options keyed by :class:`ConnectionOptions` members.
     autocommit:
         ``False`` (the default) buffers writes until ``commit()``. Queries and
         writes cannot share a manual transaction. DDL always applies immediately.
@@ -117,7 +124,7 @@ def connect(
     return adbc_driver_manager.dbapi.connect(
         driver=_driver_path(),
         entrypoint=ENTRYPOINT,
-        db_kwargs=db_kwargs,
+        db_kwargs=_db_kwargs(uri, db_kwargs),
         conn_kwargs=conn_kwargs,
         autocommit=autocommit,
     )

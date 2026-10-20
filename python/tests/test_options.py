@@ -122,46 +122,34 @@ def test_option_enums_are_exported_without_aliases():
 
 
 def test_low_level_connect_accepts_option_members_directly(monkeypatch):
-    calls = []
-    database = object()
-
-    def make_database(**kwargs):
-        calls.append(kwargs)
-        return database
-
     monkeypatch.setattr(spanner_adbc, "_driver_path", lambda: "/driver.so")
-    monkeypatch.setattr(spanner_adbc.adbc_driver_manager, "AdbcDatabase", make_database)
-    options = {
-        DatabaseOptions.URI: "spanner:///projects/p/instances/i/databases/d",
-        DatabaseOptions.EMULATOR: "true",
+    monkeypatch.setattr(spanner_adbc.adbc_driver_manager, "AdbcDatabase", lambda **kwargs: kwargs)
+    options = {DatabaseOptions.URI: "spanner:///ignored", DatabaseOptions.EMULATOR: "true"}
+    assert spanner_adbc.connect("spanner:///projects/p/instances/i/databases/d", options) == {
+        "driver": "/driver.so",
+        "entrypoint": spanner_adbc.ENTRYPOINT,
+        "uri": "spanner:///projects/p/instances/i/databases/d",
+        "spanner.emulator": "true",
     }
-    assert spanner_adbc.connect(db_kwargs=options) is database
-    assert calls == [
-        {
-            "driver": "/driver.so",
-            "entrypoint": spanner_adbc.ENTRYPOINT,
-            "uri": "spanner:///projects/p/instances/i/databases/d",
-            "spanner.emulator": "true",
-        }
-    ]
+    assert options[DatabaseOptions.URI] == "spanner:///ignored"
 
 
 @pytest.mark.parametrize("autocommit", [False, True])
 def test_dbapi_connect_forwards_options(monkeypatch, autocommit):
     monkeypatch.setattr(spanner, "_driver_path", lambda: "/driver.so")
     monkeypatch.setattr(spanner.adbc_driver_manager.dbapi, "connect", lambda **kwargs: kwargs)
-    options = {DatabaseOptions.ACCESS_TOKEN: "token"}
+    options = {DatabaseOptions.URI: "spanner:///projects/p/instances/i/databases/d"}
     connection_options = {ConnectionOptions.REQUEST_TAG: "python-test"}
 
-    assert spanner.connect(options, connection_options, autocommit=autocommit) == {
+    assert spanner.connect(
+        db_kwargs=options, conn_kwargs=connection_options, autocommit=autocommit
+    ) == {
         "driver": "/driver.so",
         "entrypoint": spanner_adbc.ENTRYPOINT,
-        "db_kwargs": {"spanner.auth.access_token": "token"},
+        "db_kwargs": {"uri": "spanner:///projects/p/instances/i/databases/d"},
         "conn_kwargs": {"spanner.request.tag": "python-test"},
         "autocommit": autocommit,
     }
-    assert options == {DatabaseOptions.ACCESS_TOKEN: "token"}
-    assert connection_options == {ConnectionOptions.REQUEST_TAG: "python-test"}
 
 
 def test_connection_option_round_trips_through_kwargs(spanner_database):

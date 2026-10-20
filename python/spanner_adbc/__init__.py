@@ -29,23 +29,32 @@ ENTRYPOINT = "AdbcSpannerInit"
 
 
 def connect(
+    uri: str | None = None,
     db_kwargs: Mapping[str, str] | None = None,
 ) -> adbc_driver_manager.AdbcDatabase:
     """Create a low-level ADBC database handle for Spanner.
 
     Parameters
     ----------
+    uri:
+        The database, such as ``spanner:///projects/p/instances/i/databases/d``.
+        Overrides ``DatabaseOptions.URI`` in *db_kwargs*.
     db_kwargs:
-        Database options keyed by :class:`DatabaseOptions` members or raw strings.
-        ``DatabaseOptions.URI`` requires a URI such as
-        ``spanner:///projects/p/instances/i/databases/d``. Pass credentials and
-        emulator settings here too; see ``docs/options.md``.
+        Database options keyed by :class:`DatabaseOptions` members or raw strings,
+        such as credentials and emulator settings; see ``docs/options.md``.
 
     For a DBAPI 2.0 connection, prefer :func:`spanner_adbc.dbapi.connect`.
     """
     return adbc_driver_manager.AdbcDatabase(
-        driver=_driver_path(), entrypoint=ENTRYPOINT, **(db_kwargs or {})
+        driver=_driver_path(), entrypoint=ENTRYPOINT, **_db_kwargs(uri, db_kwargs)
     )
+
+
+def _db_kwargs(uri: str | None, db_kwargs: Mapping[str, str] | None) -> dict[str, str]:
+    options = dict(db_kwargs or {})
+    if uri is not None:
+        options[DatabaseOptions.URI] = uri
+    return options
 
 
 @functools.cache

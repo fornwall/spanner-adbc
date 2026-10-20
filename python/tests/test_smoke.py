@@ -37,7 +37,7 @@ def test_dbapi_module_globals_follow_pep_249():
     assert spanner_adbc.dbapi.paramstyle == "named"
     assert spanner_adbc.dbapi.Binary(b"\x00") == b"\x00"
     for name in (
-        "apilevel", "threadsafety", "paramstyle", "Date", "Time", "Timestamp",
+        "Connection", "Cursor", "apilevel", "threadsafety", "paramstyle", "Date", "Time", "Timestamp",
         "DateFromTicks", "TimeFromTicks", "TimestampFromTicks", "Binary",
         "STRING", "BINARY", "NUMBER", "DATETIME", "ROWID",
     ):

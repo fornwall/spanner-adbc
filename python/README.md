@@ -31,11 +31,8 @@ This example assumes an existing `Singers` table with `SingerId` and `FirstName`
 
 ```python
 import spanner_adbc.dbapi as spanner
-from spanner_adbc import DatabaseOptions
 
-with spanner.connect(
-    db_kwargs={DatabaseOptions.URI: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
-) as conn:
+with spanner.connect("spanner:///projects/p/instances/i/databases/d") as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers")
         df = cur.fetch_df()          # -> pandas.DataFrame
@@ -46,11 +43,8 @@ tuple, in the order the parameters first appear, rather than formatting them int
 
 ```python
 import spanner_adbc.dbapi as spanner
-from spanner_adbc import DatabaseOptions
 
-with spanner.connect(
-    db_kwargs={DatabaseOptions.URI: "spanner:///projects/p/instances/i/databases/d"},
-) as conn:
+with spanner.connect("spanner:///projects/p/instances/i/databases/d") as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT @name AS name, @id AS id", ("Alice", 42))
         assert cur.fetchone() == ("Alice", 42)
@@ -119,11 +113,10 @@ For the [Spanner emulator](https://cloud.google.com/spanner/docs/emulator), conn
 import spanner_adbc.dbapi as spanner
 from spanner_adbc import DatabaseOptions
 
-with spanner.connect(db_kwargs={
-    DatabaseOptions.URI: "spanner:///projects/p/instances/i/databases/d",
-    DatabaseOptions.ENDPOINT: "localhost:9010",
-    DatabaseOptions.EMULATOR: "true",
-}) as conn:
+with spanner.connect(
+    "spanner:///projects/p/instances/i/databases/d",
+    {DatabaseOptions.ENDPOINT: "localhost:9010", DatabaseOptions.EMULATOR: "true"},
+) as conn:
     ...
 ```
 
@@ -141,7 +134,8 @@ bare `host:port`) connect anonymously unless you pass explicit credentials, and 
 
 | `connect()` argument | Purpose |
 | --- | --- |
-| `db_kwargs` | Database options, including the required `uri` |
+| `uri` | The database, as `spanner:///projects/<p>/instances/<i>/databases/<d>` |
+| `db_kwargs` | Database options |
 | `conn_kwargs` | Connection options |
 | `autocommit` | `False` by default; see [transactions](#transactions) |
 
@@ -156,10 +150,10 @@ cursor options with `conn.cursor(adbc_stmt_kwargs={...})` or
 
 ```python
 import spanner_adbc.dbapi as spanner
-from spanner_adbc import ConnectionOptions, DatabaseOptions, StatementOptions
+from spanner_adbc import ConnectionOptions, StatementOptions
 
 with spanner.connect(
-    db_kwargs={DatabaseOptions.URI: "spanner:///projects/p/instances/i/databases/d"},
+    "spanner:///projects/p/instances/i/databases/d",
     conn_kwargs={ConnectionOptions.READ_STALENESS: "max:10s"},
     autocommit=True,  # bounded staleness on a single-use read
 ) as conn:
@@ -194,11 +188,8 @@ bulk ingest and partitioned DML.
 
 ```python
 import spanner_adbc.dbapi as spanner
-from spanner_adbc import DatabaseOptions
 
-with spanner.connect(
-    db_kwargs={DatabaseOptions.URI: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
-) as conn:
+with spanner.connect("spanner:///projects/p/instances/i/databases/d") as conn:
     with conn.cursor() as cur:
         # DDL applies immediately.
         cur.execute("DROP TABLE IF EXISTS Albums")
@@ -222,11 +213,8 @@ Fetch a PyArrow table:
 
 ```python
 import spanner_adbc.dbapi as spanner
-from spanner_adbc import DatabaseOptions
 
-with spanner.connect(
-    db_kwargs={DatabaseOptions.URI: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
-) as conn:
+with spanner.connect("spanner:///projects/p/instances/i/databases/d") as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers ORDER BY SingerId")
         table = cur.fetch_arrow_table()      # -> pyarrow.Table
@@ -237,11 +225,8 @@ results, iterate over record batches while the cursor and connection are open:
 
 ```python
 import spanner_adbc.dbapi as spanner
-from spanner_adbc import DatabaseOptions
 
-with spanner.connect(
-    db_kwargs={DatabaseOptions.URI: "spanner:///projects/p/instances/i/databases/d"},
-) as conn:
+with spanner.connect("spanner:///projects/p/instances/i/databases/d") as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers")
         with cur.fetch_record_batch() as batches:
@@ -254,11 +239,8 @@ Polars can read directly from the connection:
 ```python
 import polars as pl
 import spanner_adbc.dbapi as spanner
-from spanner_adbc import DatabaseOptions
 
-with spanner.connect(
-    db_kwargs={DatabaseOptions.URI: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
-) as conn:
+with spanner.connect("spanner:///projects/p/instances/i/databases/d") as conn:
     df = pl.read_database(
         "SELECT SingerId, FirstName FROM Singers ORDER BY SingerId",
         connection=conn,                     # an ADBC connection, not a URI
@@ -270,11 +252,8 @@ DuckDB can query a fetched Arrow table in-process:
 ```python
 import duckdb
 import spanner_adbc.dbapi as spanner
-from spanner_adbc import DatabaseOptions
 
-with spanner.connect(
-    db_kwargs={DatabaseOptions.URI: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
-) as conn:
+with spanner.connect("spanner:///projects/p/instances/i/databases/d") as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT SingerId, FirstName FROM Singers")
         singers = cur.fetch_arrow_table()
@@ -292,12 +271,11 @@ DataFrames to Arrow first:
 import pandas as pd
 import pyarrow as pa
 import spanner_adbc.dbapi as spanner
-from spanner_adbc import DatabaseOptions
 
 frame = pd.DataFrame({"SingerId": [10, 11], "FirstName": ["Carol", "Dave"]})
 
 with spanner.connect(
-    db_kwargs={DatabaseOptions.URI: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
+    "spanner:///projects/p/instances/i/databases/d",
     autocommit=True,                         # apply immediately; returns the row count
 ) as conn:
     with conn.cursor() as cur:
@@ -326,11 +304,8 @@ splits a large scan into partitions that can be read in parallel:
 
 ```python
 import spanner_adbc.dbapi as spanner
-from spanner_adbc import DatabaseOptions
 
-with spanner.connect(
-    db_kwargs={DatabaseOptions.URI: "spanner:///projects/my-project/instances/my-instance/databases/my-db"},
-) as conn:
+with spanner.connect("spanner:///projects/p/instances/i/databases/d") as conn:
     with conn.cursor() as cur:
         partitions, schema = cur.adbc_execute_partitions("SELECT SingerId FROM Singers")
 
