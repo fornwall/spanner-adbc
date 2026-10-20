@@ -666,26 +666,105 @@ pub(crate) fn parse_timestamp_micros(s: &str) -> Option<i64> {
     Some(secs * 1_000_000 + i64::from(nanos / 1_000))
 }
 
-/// Parse a Spanner `NUMERIC` (`[-]digits[.digits]`, at most 29 integer and 9 fractional digits)
-/// into an unscaled `i128` at scale 9. `None` if malformed or out of range.
-pub(crate) fn parse_numeric_i128(s: &str) -> Option<i128> {
-    let (negative, b) = match s.as_bytes() {
+/// Split off a leading `-` or `+`, returning whether it was `-`.
+fn split_sign(b: &[u8]) -> (bool, &[u8]) {
+    match b {
         [b'-', rest @ ..] => (true, rest),
-        b => (false, b),
-    };
+        [b'+', rest @ ..] => (false, rest),
+        _ => (false, b),
+    }
+}
+
+/// Split `b` after the run of ASCII digits it starts with.
+fn split_digits(b: &[u8]) -> (&[u8], &[u8]) {
+    b.split_at(
+        b.iter()
+            .position(|c| !c.is_ascii_digit())
+            .unwrap_or(b.len()),
+    )
+}
+
+/// Parse a Spanner `NUMERIC` into an unscaled `i128` at scale 9. Spanner sends
+/// `[-]digits[.digits]`, but the wire format also allows a `+`, an empty integer or fraction part
+/// and an exponent, as in `+.5e-3`. `None` if malformed, or if the value isn't exactly
+/// representable with 38 digits, 9 of them fractional.
+pub(crate) fn parse_numeric_i128(s: &str) -> Option<i128> {
+    let (negative, b) = split_sign(s.as_bytes());
+    let unscaled = decimal_numeric(b).or_else(|| scientific_numeric(b))?;
+    Some(if negative { -unscaled } else { unscaled })
+}
+
+/// The unsigned form Spanner sends, with at most 29 integer and 9 fractional digits. Skipping
+/// [`scientific_numeric`]'s normalization keeps the common case fast.
+fn decimal_numeric(b: &[u8]) -> Option<i128> {
     let (int, frac) = match b.iter().position(|&c| c == b'.') {
-        Some(i) if i + 1 < b.len() => (&b[..i], &b[i + 1..]),
-        Some(_) => return None,
+        Some(i) => (&b[..i], &b[i + 1..]),
         None => (b, &b[b.len()..]),
     };
-    let int_digits = usize::from(NUMERIC_PRECISION) - NUMERIC_SCALE as usize;
-    if !(1..=int_digits).contains(&int.len()) || frac.len() > NUMERIC_SCALE as usize {
+    if int.len() > 29 || frac.len() > 9 || int.len() + frac.len() == 0 {
         return None;
     }
     // `.25` is 250_000_000.
-    let frac = digits::<u32>(frac)? * 10_u32.pow(NUMERIC_SCALE as u32 - frac.len() as u32);
-    let unscaled = (digits::<u128>(int)? * 1_000_000_000 + u128::from(frac)) as i128;
-    Some(if negative { -unscaled } else { unscaled })
+    let frac = digits::<u32>(frac)? * 10_u32.pow(9 - frac.len() as u32);
+    Some((digits::<u128>(int)? * 1_000_000_000 + u128::from(frac)) as i128)
+}
+
+/// Any other unsigned value of the wire format, as in [`parse_numeric_i128`].
+fn scientific_numeric(b: &[u8]) -> Option<i128> {
+    let (int, b) = split_digits(b);
+    let (frac, b) = match b {
+        [b'.', rest @ ..] => split_digits(rest),
+        _ => (&b[..0], b),
+    };
+    let exponent = match b {
+        [] => 0,
+        [e, rest @ ..] if e | 0x20 == b'e' => {
+            let (negative, digits) = split_sign(rest);
+            if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            // Saturating stays exact: any nonzero value is out of range long before.
+            let n = digits.iter().fold(0_i32, |n, c| {
+                n.saturating_mul(10).saturating_add(i32::from(c - b'0'))
+            });
+            if negative { -n } else { n }
+        }
+        _ => return None,
+    };
+    if int.is_empty() && frac.is_empty() {
+        return None;
+    }
+    // Drop the zeros that only pad the significant digits, which don't count toward the 38.
+    // `scale` is the number of digits after the decimal point.
+    let leading = |b: &[u8]| b.iter().take_while(|&&c| c == b'0').count();
+    let trailing = |b: &[u8]| b.iter().rev().take_while(|&&c| c == b'0').count();
+    let mut scale = frac.len() as i64 - i64::from(exponent);
+    let int = &int[leading(int)..];
+    let frac = if int.is_empty() {
+        &frac[leading(frac)..]
+    } else {
+        frac
+    };
+    let (int, frac) = match trailing(frac) {
+        all if all == frac.len() => {
+            let zeros = trailing(int);
+            scale -= (all + zeros) as i64;
+            (&int[..int.len() - zeros], &frac[..0])
+        }
+        zeros => {
+            scale -= zeros as i64;
+            (int, &frac[..frac.len() - zeros])
+        }
+    };
+    if int.is_empty() && frac.is_empty() {
+        return Some(0);
+    }
+    let shift = u32::try_from(i64::from(NUMERIC_SCALE) - scale).ok()?;
+    if int.len() + frac.len() + shift as usize > usize::from(NUMERIC_PRECISION) {
+        return None;
+    }
+    let significand = digits::<u128>(int)? * 10_u128.pow(frac.len() as u32) + digits::<u128>(frac)?;
+    Some((significand * 10_u128.pow(shift)) as i128)
 }
 
 /// Convert a Spanner value to JSON, for rendering non-string values as text.

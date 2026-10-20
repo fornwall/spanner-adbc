@@ -333,6 +333,7 @@ fn malformed_values_are_errors_naming_the_type_and_value() {
         (DataType::Float64, "1e999".to_value(), "FLOAT64"),
         (DataType::Float32, f64::MAX.to_value(), "FLOAT32"),
         (DataType::Float32, "-1e39".to_value(), "FLOAT32"),
+        (DataType::Float32, "abc".to_value(), "FLOAT32"),
         (DataType::Date32, "0000-01-01".to_value(), "DATE"),
         (DataType::Date32, "2023-02-29".to_value(), "DATE"),
         // Malformed, not out of range.
@@ -382,6 +383,8 @@ fn noncanonical_text_is_rejected() {
         "2024-13-01",
         "2024-00-10",
         "2024-04-31",
+        "2024-0a-15",
+        "2024-01-1a",
     ] {
         assert_eq!(parse_date_days(s), None, "{s}");
     }
@@ -398,24 +401,272 @@ fn noncanonical_text_is_rejected() {
         "2024-01-15T23:60:00Z",
         "2024-01-15T23:59:60Z",
         "2024-01-15 12:34:56Z",
+        "2024-01-15T12:3a:56Z",
+        "2024-01-15T12:34:5aZ",
+        "2024-01-15T12:34:56.1aZ",
     ] {
         assert_eq!(parse_timestamp_micros(s), None, "{s}");
     }
     for s in [
         "",
         "-",
+        "+",
         ".",
         "-.",
-        ".5",
-        "-.5",
-        "5.",
-        "-5.",
-        "+3",
+        "e5",
+        ".e5",
+        "1e",
+        "1e+",
+        "1e5e5",
+        "1.2.3",
+        "+-1",
+        "--1",
         " 1",
-        "1e5",
+        "1 ",
+        "1.2a",
+        "0x10",
+        "NaN",
+        "Infinity",
         "0.0000000001",
+        "1e-10",
+        "25e-10",
+        "100000000000000000000000000000",
+        "1e29",
+        "1e2147483648",
     ] {
         assert_eq!(parse_numeric_i128(s), None, "{s:?}");
+    }
+}
+
+/// The wire format allows a `+`, an empty integer or fraction part and an exponent, though
+/// Spanner sends `[-]digits[.digits]`. Padding zeros don't count toward the 38 digits.
+#[test]
+fn numeric_accepts_every_form_of_the_wire_format() {
+    for (s, unscaled) in [
+        ("+3", 3_000_000_000),
+        (".5", 500_000_000),
+        ("-.5", -500_000_000),
+        ("5.", 5_000_000_000),
+        ("-5.", -5_000_000_000),
+        ("1e5", 100_000_000_000_000),
+        ("1E+5", 100_000_000_000_000),
+        ("+.5e-2", 5_000_000),
+        ("-1.e2", -100_000_000_000),
+        ("20e-10", 2),
+        ("1.5000000000", 1_500_000_000),
+        ("0e2147483648", 0),
+        ("-0.000", 0),
+        ("0000000000000000000000000000000000000001.5", 1_500_000_000),
+        (
+            "99999999999999999999999999999999999999e-9",
+            10_i128.pow(38) - 1,
+        ),
+        ("1e28", 10_i128.pow(37)),
+    ] {
+        assert_eq!(parse_numeric_i128(s), Some(unscaled), "{s:?}");
+    }
+}
+
+/// The decoders against independent references over random and malformed input: chrono for
+/// DATE and TIMESTAMP, and decimal point shifting on strings for NUMERIC.
+mod differential {
+    use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn config() -> ProptestConfig {
+        ProptestConfig {
+            cases: 4096,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        }
+    }
+
+    /// RFC 3339 `full-date` in Spanner's years 1-9999.
+    fn reference_date(s: &str) -> Option<i32> {
+        let b = s.as_bytes();
+        let shaped = b.len() == 10
+            && b.iter().enumerate().all(|(i, c)| match i {
+                4 | 7 => *c == b'-',
+                _ => c.is_ascii_digit(),
+            });
+        let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        (shaped && date.year() >= 1).then(|| (date - epoch).num_days() as i32)
+    }
+
+    /// RFC 3339 as Spanner sends it: uppercase `T` and `Z`, at most nine fractional digits, no
+    /// leap second, years 1-9999. chrono accepts the rest of RFC 3339.
+    fn reference_timestamp(s: &str) -> Option<DateTime<Utc>> {
+        let time = s.get(11..)?.strip_suffix('Z')?;
+        let fraction = time.split_once('.').map_or("", |(_, fraction)| fraction);
+        let t = DateTime::parse_from_rfc3339(s).ok()?.to_utc();
+        let spanner = s.as_bytes()[10] == b'T'
+            && fraction.len() <= 9
+            && t.year() >= 1
+            && t.nanosecond() < 1_000_000_000;
+        spanner.then_some(t)
+    }
+
+    /// The NUMERIC wire format, `[+-]` then digits with an optional `.` and at least one digit,
+    /// then an optional `[eE][+-]digits`, as an unscaled value at scale 9 if it fits exactly.
+    fn reference_numeric(s: &str) -> Option<i128> {
+        let (negative, s) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, s.strip_prefix('+').unwrap_or(s)),
+        };
+        let (mantissa, exponent) = match s.find(['e', 'E']) {
+            Some(i) => {
+                let exponent = &s[i + 1..];
+                let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+                if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                // Past any representable value, only the exponent's sign matters.
+                let huge = if exponent.starts_with('-') {
+                    -1 << 40
+                } else {
+                    1 << 40
+                };
+                (&s[..i], exponent.parse::<i64>().unwrap_or(huge))
+            }
+            None => (s, 0),
+        };
+        let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        let digits = format!("{int}{frac}");
+        if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        if digits.bytes().all(|c| c == b'0') {
+            return Some(0);
+        }
+        // The value is `digits * 10^(exponent - frac.len())`.
+        let shift = exponent + 9 - frac.len() as i64;
+        let unscaled = if shift >= 0 {
+            format!(
+                "{digits}{}",
+                "0".repeat(usize::try_from(shift.min(40)).unwrap())
+            )
+        } else {
+            let kept = (digits.len() as i64 + shift).max(0) as usize;
+            let (kept, dropped) = digits.split_at(kept);
+            if dropped.bytes().any(|c| c != b'0') {
+                return None;
+            }
+            kept.to_string()
+        };
+        let unscaled = unscaled.trim_start_matches('0');
+        if unscaled.len() > 38 {
+            return None;
+        }
+        let value: i128 = unscaled.parse().unwrap();
+        Some(if negative { -value } else { value })
+    }
+
+    fn check_date(s: &str) -> std::result::Result<(), TestCaseError> {
+        prop_assert_eq!(parse_date_days(s), reference_date(s), "{:?}", s);
+        Ok(())
+    }
+
+    fn check_timestamp(s: &str) -> std::result::Result<(), TestCaseError> {
+        let expected = reference_timestamp(s);
+        let micros = expected.map(|t| t.timestamp_micros());
+        prop_assert_eq!(parse_timestamp_micros(s), micros, "{:?}", s);
+        let nanos = expected.and_then(|t| t.timestamp_nanos_opt());
+        prop_assert_eq!(parse_timestamp_nanos(s), nanos, "{:?}", s);
+        Ok(())
+    }
+
+    fn check_numeric(s: &str) -> std::result::Result<(), TestCaseError> {
+        prop_assert_eq!(parse_numeric_i128(s), reference_numeric(s), "{:?}", s);
+        Ok(())
+    }
+
+    /// `|unscaled|` written with an exponent of `exponent`, moving the decimal point to match.
+    fn with_exponent(unscaled: u128, exponent: i32) -> String {
+        let digits = unscaled.to_string();
+        let after_point = 9 + exponent;
+        if after_point <= 0 {
+            return format!("{digits}{}e{exponent}", "0".repeat(-after_point as usize));
+        }
+        let padded = format!("{digits:0>width$}", width = after_point as usize);
+        let (int, frac) = padded.split_at(padded.len() - after_point as usize);
+        format!("{int}.{frac}e{exponent}")
+    }
+
+    proptest! {
+        #![proptest_config(config())]
+
+        #[test]
+        fn dates_match_chrono(
+            (year, month, day) in (0_u32..=9999, 0_u32..=13, 0_u32..=32),
+            noise in "[0-9 +-]?[0-9]{3,5}-[0-9]{1,3}-[0-9]{1,3}[ T]?",
+        ) {
+            let text = format!("{year:04}-{month:02}-{day:02}");
+            check_date(&text)?;
+            check_date(&noise)?;
+        }
+
+        #[test]
+        fn timestamps_match_chrono(
+            date in (1_i32..=9999, 1_u32..=12, 1_u32..=31)
+                .prop_filter_map("a real date", |(y, m, d)| NaiveDate::from_ymd_opt(y, m, d)),
+            (hour, minute, second) in (0_u32..24, 0_u32..60, 0_u32..60),
+            (nanos, digits) in (0_u32..1_000_000_000, 0_usize..=9),
+        ) {
+            let fraction = format!(".{nanos:09}");
+            let fraction = if digits == 0 { "" } else { &fraction[..=digits] };
+            let text = format!("{date}T{hour:02}:{minute:02}:{second:02}{fraction}Z");
+            prop_assert!(parse_timestamp_micros(&text).is_some(), "{:?}", text);
+            check_timestamp(&text)?;
+        }
+
+        #[test]
+        fn malformed_timestamps_match_chrono(
+            (year, month, day) in (0_u32..=9999, 0_u32..=13, 0_u32..=32),
+            (hour, minute, second) in (0_u32..=25, 0_u32..=61, 0_u32..=61),
+            separator in "[Tt ]",
+            fraction in "(\\.[0-9]{0,11})?",
+            zone in "Z|z|[+-][01][0-9]:[0-6][0-9]|",
+            junk in "[0-9TZtz:. +-]{0,32}",
+        ) {
+            let text = format!(
+                "{year:04}-{month:02}-{day:02}{separator}\
+                 {hour:02}:{minute:02}:{second:02}{fraction}{zone}"
+            );
+            check_timestamp(&text)?;
+            check_timestamp(&junk)?;
+        }
+
+        #[test]
+        fn numerics_match_the_reference(
+            (negative, digits) in (any::<bool>(), 0_u32..=38),
+            magnitude in any::<u128>(),
+            exponent in -45_i32..45,
+            noise in "[+-]?[0-9]{0,32}(\\.[0-9]{0,12})?([eE][+-]?[0-9]{0,3})?",
+            junk in "[0-9.eE+ -]{0,45}",
+        ) {
+            // Uniform in digit count, so short values are as common as long ones.
+            let unscaled = magnitude % 10_u128.pow(digits).max(1);
+            let signed = if negative { -(unscaled as i128) } else { unscaled as i128 };
+            let sign = if negative { "-" } else { "" };
+            let int = unscaled / 1_000_000_000;
+            let frac = format!("{:09}", unscaled % 1_000_000_000);
+            let frac = frac.trim_end_matches('0');
+            let canonical = if frac.is_empty() {
+                format!("{sign}{int}")
+            } else {
+                format!("{sign}{int}.{frac}")
+            };
+            prop_assert_eq!(parse_numeric_i128(&canonical), Some(signed), "{:?}", canonical);
+            let scientific = format!("{sign}{}", with_exponent(unscaled, exponent));
+            prop_assert_eq!(parse_numeric_i128(&scientific), Some(signed), "{:?}", scientific);
+            check_numeric(&canonical)?;
+            check_numeric(&scientific)?;
+            check_numeric(&noise)?;
+            check_numeric(&junk)?;
+        }
     }
 }
 
