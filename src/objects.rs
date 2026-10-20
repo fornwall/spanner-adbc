@@ -38,6 +38,8 @@ pub(crate) struct Column {
     /// The `DEFAULT` expression.
     default: Option<String>,
     generated: bool,
+    /// An identity column, which Spanner fills from a sequence.
+    identity: bool,
 }
 
 /// A column that a foreign key references.
@@ -89,7 +91,7 @@ const SCHEMATA_SQL: &str = "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA"
 const TABLES_SQL: &str =
     "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES";
 const COLUMNS_SQL: &str = "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, IS_NULLABLE, \
-     SPANNER_TYPE, COLUMN_DEFAULT, IS_GENERATED, ORDINAL_POSITION \
+     SPANNER_TYPE, COLUMN_DEFAULT, IS_GENERATED, IS_IDENTITY, ORDINAL_POSITION \
      FROM INFORMATION_SCHEMA.COLUMNS";
 
 /// Keeps only the columns `SELECT *` returns, so `get_objects` agrees with `get_table_schema`.
@@ -273,8 +275,17 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
 
     let mut columns: HashMap<(&str, &str), Vec<Column>> = HashMap::new();
     if let Some(batch) = &batches.columns {
-        let [schema, table, name, nullable, type_name, default, generated] = str_cols(batch)?;
-        let ordinal = column::<Int64Array>(batch, 7)?;
+        let [
+            schema,
+            table,
+            name,
+            nullable,
+            type_name,
+            default,
+            generated,
+            identity,
+        ] = str_cols(batch)?;
+        let ordinal = column::<Int64Array>(batch, 8)?;
         for r in (0..batch.num_rows()).filter(|&r| column_matches(name.value(r))) {
             columns
                 .entry((schema.value(r), table.value(r)))
@@ -286,6 +297,7 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
                     type_name: type_name.value(r).to_string(),
                     default: default.is_valid(r).then(|| default.value(r).to_string()),
                     generated: generated.value(r) == "ALWAYS",
+                    identity: identity.value(r) == "YES",
                 });
         }
     }
@@ -439,6 +451,9 @@ fn columns_list(field: &FieldRef, tables: &[&Table]) -> Result<ArrayRef> {
             )),
             "xdbc_is_generatedcolumn" => Some(Arc::new(BooleanArray::from_iter(
                 columns.iter().map(|c| Some(c.generated)),
+            ))),
+            "xdbc_is_autoincrement" => Some(Arc::new(BooleanArray::from_iter(
+                columns.iter().map(|c| Some(c.identity)),
             ))),
             _ => None,
         })

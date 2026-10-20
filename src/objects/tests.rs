@@ -76,6 +76,10 @@ fn sample_batches() -> ObjectBatches {
             ]),
         ),
         (
+            "IS_IDENTITY",
+            strs(vec![s("YES"), s("NO"), s("NO"), s("NO"), s("NO")]),
+        ),
+        (
             "ORDINAL_POSITION",
             Arc::new(Int64Array::from(vec![1, 2, 3, 1, 2])),
         ),
@@ -434,6 +438,12 @@ fn build_reports_column_metadata_and_foreign_key_usages() {
     assert_eq!(
         generated.iter().collect::<Vec<_>>(),
         [Some(false), Some(false), Some(true)]
+    );
+    let identity = child(&columns, "xdbc_is_autoincrement");
+    let identity = identity.as_any().downcast_ref::<BooleanArray>().unwrap();
+    assert_eq!(
+        identity.iter().collect::<Vec<_>>(),
+        [Some(true), Some(false), Some(false)]
     );
     assert_eq!(child(&columns, "xdbc_data_type").null_count(), 3);
 
