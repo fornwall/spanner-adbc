@@ -2256,8 +2256,8 @@ fn manual_ingest_conversion_failure_leaves_txn_buffer_untouched() {
     let commit_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
     let sizes_in_mock = commit_sizes.clone();
     let server = MockServer::start(move |mock| {
-        // Serves the append remap's exists-probe and the query after the failure.
-        serve_streaming_sql_begin_aware(mock, &["v0"], None);
+        // Serves the append target's column probe and the query after the failure.
+        serve_streaming_sql_begin_aware(mock, &["d"], None);
         serve_begin_transaction(mock);
         mock.expect_commit().returning(move |request| {
             sizes_in_mock
@@ -4316,7 +4316,8 @@ fn ingest_table_probe_inherits_read_options_without_tags() {
     let queries = Arc::new(Mutex::new(Vec::new()));
     let recorded = queries.clone();
     let server = MockServer::start(move |mock| {
-        serve_streaming_sql_begin_aware(mock, &["MockTable"], Some(recorded));
+        // The probe finds the ingested column.
+        serve_streaming_sql_begin_aware(mock, &["c"], Some(recorded));
     });
     let mut connection = server.connect();
     for (key, value) in [

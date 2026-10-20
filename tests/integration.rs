@@ -856,7 +856,7 @@ fn bulk_ingest_append_failures_remap_to_the_adbc_contract() {
     .unwrap();
     let mut ingest_missing = ingest_stmt(connection, "AdbcNoSuchIngestTable", "append");
     ingest_missing
-        .bind(missing_rows)
+        .bind(missing_rows.clone())
         .expect("bind rows for missing-table ingest");
     let missing_err = ingest_missing
         .execute_update()
@@ -878,7 +878,7 @@ fn bulk_ingest_append_failures_remap_to_the_adbc_contract() {
     .unwrap();
     let mut ingest_mismatch = ingest_stmt(connection, "AdbcBind", "append");
     ingest_mismatch
-        .bind(mismatch_rows)
+        .bind(mismatch_rows.clone())
         .expect("bind rows for schema-mismatch ingest");
     let mismatch_err = ingest_mismatch
         .execute_update()
@@ -889,6 +889,41 @@ fn bulk_ingest_append_failures_remap_to_the_adbc_contract() {
         "append with an incompatible schema must be AlreadyExists, got: {mismatch_err:?}"
     );
     assert_eq!(count_rows(connection, "AdbcBind"), 2);
+
+    // A manual ingest buffers its inserts, so it checks the table before buffering.
+    let set_autocommit = |connection: &mut SpannerConnection, on: &str| {
+        connection
+            .set_option(OptionConnection::AutoCommit, OptionValue::String(on.into()))
+            .unwrap();
+    };
+    set_autocommit(connection, "false");
+    for (table, rows, status) in [
+        ("AdbcNoSuchIngestTable", missing_rows, Status::NotFound),
+        ("AdbcBind", mismatch_rows, Status::AlreadyExists),
+    ] {
+        let mut ingest = ingest_stmt(connection, table, "append");
+        ingest.bind(rows).unwrap();
+        let error = ingest.execute_update().unwrap_err();
+        assert_eq!(error.status, status, "{table}: {error}");
+    }
+    // Column names match case-insensitively.
+    let rows = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("NAME", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![3])),
+            Arc::new(StringArray::from(vec!["Carol"])),
+        ],
+    )
+    .unwrap();
+    let mut ingest = ingest_stmt(connection, "AdbcBind", "append");
+    ingest.bind(rows).unwrap();
+    assert_eq!(ingest.execute_update().unwrap(), None);
+    connection.commit().unwrap();
+    set_autocommit(connection, "true");
+    assert_eq!(count_rows(connection, "AdbcBind"), 3);
 
     drop_tables(connection, &["AdbcBind"]);
 }

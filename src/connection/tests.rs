@@ -617,14 +617,14 @@ mod manual_commit_limit {
                 "The transaction contains too many mutations. (Maximum number: 80000)",
             ))
         });
-        // The append's check that its table exists finds it.
+        // The append's check of its table finds the ingested column.
         mock.expect_execute_streaming_sql().returning(|_| {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             tx.try_send(Ok(v1::PartialResultSet {
                 metadata: Some(v1::ResultSetMetadata {
                     row_type: Some(v1::StructType {
                         fields: vec![v1::struct_type::Field {
-                            name: "TABLE_NAME".into(),
+                            name: "COLUMN_NAME".into(),
                             r#type: Some(v1::Type {
                                 code: v1::TypeCode::String as i32,
                                 ..Default::default()
@@ -634,7 +634,7 @@ mod manual_commit_limit {
                     ..Default::default()
                 }),
                 values: vec![prost_types::Value {
-                    kind: Some(prost_types::value::Kind::StringValue("t".into())),
+                    kind: Some(prost_types::value::Kind::StringValue("Id".into())),
                 }],
                 last: true,
                 ..Default::default()

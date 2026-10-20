@@ -1,6 +1,7 @@
 //! Bulk ingest: `adbc.ingest.*` option parsing, create/replace table DDL, and the mutation write
 //! paths (chunked write-only commits, or non-atomic BatchWrite).
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use adbc_core::error::{Error, Result, Status};
@@ -15,6 +16,12 @@ use crate::connection::{TxnKind, lock_txn, write_mutations_txn};
 use crate::error::{annotate, err, from_spanner, from_status_parts, invalid_state, unsupported};
 use crate::runtime::block_on_cancellable;
 use crate::timeout::with_timeout;
+
+/// The left join keeps a row, with a NULL column name, for a table without columns.
+const TABLE_COLUMNS_SQL: &str = "SELECT c.COLUMN_NAME FROM INFORMATION_SCHEMA.TABLES t \
+     LEFT JOIN INFORMATION_SCHEMA.COLUMNS c \
+     ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME \
+     WHERE LOWER(t.TABLE_SCHEMA) = LOWER(@schema) AND LOWER(t.TABLE_NAME) = LOWER(@table)";
 
 impl SpannerStatement {
     /// DDL to run before an ingest in the create/replace modes; `None` for append.
@@ -154,11 +161,11 @@ impl SpannerStatement {
             self.run_ddl(ddl)
                 .map_err(|error| self.remap_ingest_ddl_error(table, error))?;
         }
-        // No insert reports a missing table at execution when there are no rows, or when the
-        // inserts are buffered until commit.
+        // No insert reports a missing table or column at execution when there are no rows, or
+        // when the inserts are buffered until commit.
         if self.bound.iter().all(|batch| batch.num_rows() == 0) || !lock_txn(&self.txn).autocommit()
         {
-            self.check_append_target_exists(table)?;
+            self.check_append_target(table)?;
         }
         self.run_ingest_mutations(table)
             .map_err(|error| self.remap_ingest_append_error(table, error))
@@ -276,18 +283,72 @@ impl SpannerStatement {
         Ok(Some(total))
     }
 
-    /// Return `NotFound` for an `append` into a missing table, as ADBC requires. The other modes
-    /// create the table. If the probe fails, the ingest proceeds.
-    fn check_append_target_exists(&self, table: &str) -> Result<()> {
-        if matches!(self.ingest_mode, Some(IngestMode::Append))
-            && matches!(self.ingest_table_exists(table), Ok(false))
-        {
-            return Err(err(
-                format!("bulk ingest append target table {table:?} not found"),
-                Status::NotFound,
-            ));
+    /// Check an `append` target for what ADBC requires: `NotFound` for a missing table and
+    /// `AlreadyExists` for a bound column it lacks. The other modes create the table. If the
+    /// probe fails, the ingest proceeds.
+    fn check_append_target(&self, table: &str) -> Result<()> {
+        if self.ingest_mode != Some(IngestMode::Append) {
+            return Ok(());
         }
-        Ok(())
+        let columns = match self.append_target_columns(table) {
+            Ok(Some(columns)) => columns,
+            Ok(None) => {
+                return Err(err(
+                    format!("bulk ingest append target table {table:?} not found"),
+                    Status::NotFound,
+                ));
+            }
+            Err(_) => return Ok(()),
+        };
+        let missing = self.bound_ingest_schema().and_then(|schema| {
+            let mut names = schema.fields().iter().map(|field| field.name());
+            names
+                .find(|name| !columns.contains(&name.to_ascii_lowercase()))
+                .cloned()
+        });
+        match missing {
+            Some(name) => Err(err(
+                format!(
+                    "bulk ingest append into table {table:?} failed: the bound data is \
+                     incompatible with the existing table's schema, which has no column {name:?}"
+                ),
+                Status::AlreadyExists,
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The lowercased column names of `table` in the ingest target schema, or `None` if there is
+    /// no such table. Spanner names are case-insensitive ASCII.
+    fn append_target_columns(&self, table: &str) -> Result<Option<HashSet<String>>> {
+        let statement = crate::metadata::metadata_sql_builder(&self.config, TABLE_COLUMNS_SQL)
+            .add_param("schema", self.target_db_schema.as_deref().unwrap_or(""))
+            .add_param("table", table)
+            .build();
+        let client = self.client.clone();
+        block_on_cancellable(
+            &self.runtime,
+            &self.cancel.current(),
+            with_timeout(
+                self.config.timeouts.query_timeout(),
+                crate::OPTION_RPC_TIMEOUT_QUERY,
+                async move {
+                    let mut rows = crate::staleness::single_use(&client, None)
+                        .execute_query(statement)
+                        .await
+                        .map_err(from_spanner)?;
+                    let mut columns = None;
+                    while let Some(row) = rows.next().await {
+                        let row = row.map_err(from_spanner)?;
+                        let columns = columns.get_or_insert_with(HashSet::new);
+                        if let Some(name) = row.raw_values().first().and_then(|v| v.as_str()) {
+                            columns.insert(name.to_ascii_lowercase());
+                        }
+                    }
+                    Ok(columns)
+                },
+            ),
+        )
     }
 
     /// Build insert mutations for the flattened row range `[start, end)` of the bound batches.

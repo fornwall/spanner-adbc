@@ -714,9 +714,9 @@ mod manual_txn {
     }
 
     /// Queries on `Missing` fail with `INVALID_ARGUMENT`, as Spanner reports an unknown table, and
-    /// a table-existence probe finds no `Missing` table. Other queries return one row, and the
-    /// transaction id when they begin inline. Batch DML
-    /// reports one row per statement; commits follow `commits`.
+    /// a table probe finds no `Missing` table and column `C` in any other. Other queries return
+    /// one row, and the transaction id when they begin inline. Batch DML reports one row per
+    /// statement; commits follow `commits`.
     fn start_with(commits: CommitScript) -> MockServer {
         let recorded = Arc::new(Recorded::default());
         let selectors = Selectors::default();
@@ -734,12 +734,13 @@ mod manual_txn {
                 if request.sql.contains("Missing") {
                     return Err(tonic::Status::invalid_argument("Table not found: Missing"));
                 }
-                let probes_missing = request
+                let probed_table = request
                     .params
                     .as_ref()
                     .and_then(|params| params.fields.get("table"))
-                    .is_some_and(|table| {
-                        table.kind == Some(prost_types::value::Kind::StringValue("Missing".into()))
+                    .and_then(|table| match &table.kind {
+                        Some(prost_types::value::Kind::StringValue(name)) => Some(name.clone()),
+                        _ => None,
                     });
                 let id = {
                     let mut begun = begun.lock().unwrap();
@@ -747,8 +748,14 @@ mod manual_txn {
                     format!("ro-{begun}")
                 };
                 let mut response = result(inline_begin, id.as_bytes());
-                if probes_missing {
-                    response.values.clear();
+                match probed_table.as_deref() {
+                    Some("Missing") => response.values.clear(),
+                    Some(_) => {
+                        response.values = vec![prost_types::Value {
+                            kind: Some(prost_types::value::Kind::StringValue("C".into())),
+                        }]
+                    }
+                    None => {}
                 }
                 let (tx, rx) = tokio::sync::mpsc::channel(1);
                 tx.try_send(Ok(response)).unwrap();
@@ -999,10 +1006,11 @@ mod manual_txn {
         }
     }
 
-    /// ADBC requires `NotFound` for an append into a missing table, but a buffered insert would
-    /// only fail at commit, so a manual ingest checks for the table first and buffers nothing.
+    /// ADBC requires `NotFound` for an append into a missing table and `AlreadyExists` for a
+    /// column the table lacks, but a buffered insert would only fail at commit, so a manual
+    /// ingest checks the table first and buffers nothing.
     #[test]
-    fn manual_append_into_a_missing_table_fails_at_execution() {
+    fn manual_append_into_a_mismatched_table_fails_at_execution() {
         let server = start();
         let mut connection = manual(&server);
         let mut statement = ingest(&mut connection, 2);
@@ -1011,6 +1019,25 @@ mod manual_txn {
             .unwrap();
         let error = statement.execute_update().unwrap_err();
         assert_eq!(error.status, Status::NotFound, "{error}");
+
+        let mut statement = connection.new_statement().unwrap();
+        statement
+            .set_option(OptionStatement::TargetTable, OptionValue::from("t"))
+            .unwrap();
+        statement
+            .set_option(OptionStatement::IngestMode, OptionValue::from("append"))
+            .unwrap();
+        let schema = Schema::new(vec![
+            Field::new("c", DataType::Utf8, true),
+            Field::new("extra", DataType::Utf8, true),
+        ]);
+        statement
+            .bind(RecordBatch::new_empty(Arc::new(schema)))
+            .unwrap();
+        let error = statement.execute_update().unwrap_err();
+        assert_eq!(error.status, Status::AlreadyExists, "{error}");
+        assert!(error.message.contains("no column \"extra\""), "{error}");
+
         connection.commit().unwrap();
         assert!(server.recorded.commits.lock().unwrap().is_empty());
     }
