@@ -11,7 +11,7 @@ use arrow_array::ffi::to_ffi;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatchIterator};
 
 use super::*;
-use crate::ffi::abi::AdbcDatabase;
+use crate::ffi::abi::{ADBC_STATUS_OK, AdbcDatabase};
 use crate::ffi::options::{
     get_option_bytes, get_option_double, get_option_int, get_option_string, release_handle,
     set_option_bytes, set_option_double, set_option_int, set_option_string,

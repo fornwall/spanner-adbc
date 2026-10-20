@@ -8,7 +8,7 @@ use adbc_core::Optionable;
 use adbc_core::error::Result;
 use adbc_core::options::OptionValue;
 
-use super::abi::{ADBC_STATUS_OK, AdbcError, AdbcStatusCode};
+use super::abi::{AdbcError, AdbcStatusCode};
 use super::guard::{
     byte_slice, missing_argument, required_str, write_bytes, write_out, write_string,
 };
@@ -125,16 +125,14 @@ pub(super) unsafe extern "C" fn new_handle<H: FfiHandle>(
 where
     H::State: Default,
 {
-    match unsafe { checked(handle) } {
-        Ok(handle) if !handle.private_data().is_null() => {
-            finish(Err(already_populated(H::KIND)), error)
+    let outcome = unsafe { checked(handle) }.and_then(|handle| {
+        if !handle.private_data().is_null() {
+            return Err(already_populated(H::KIND));
         }
-        Ok(handle) => {
-            *handle.private_data_mut() = Exported::into_private_data(H::State::default());
-            ADBC_STATUS_OK
-        }
-        Err(failure) => finish(Err(failure), error),
-    }
+        *handle.private_data_mut() = Exported::into_private_data(H::State::default());
+        Ok(())
+    });
+    unsafe { finish(outcome, error) }
 }
 
 /// Every `*Release`.
@@ -150,7 +148,7 @@ pub(super) unsafe extern "C" fn release_handle<H: FfiHandle>(
         Ok(handle) => unsafe {
             super::handle::release::<H::State>(handle.private_data_mut(), H::KIND, error)
         },
-        Err(failure) => finish(Err(failure), error),
+        Err(failure) => unsafe { finish(Err(failure), error) },
     }
 }
 
@@ -198,7 +196,7 @@ pub(super) unsafe extern "C" fn set_option_string<H: FfiHandle>(
     // Checked before the handle, so a null value is a bad argument even on a released handle.
     let value = match unsafe { required_str(value, "value") } {
         Ok(value) => OptionValue::String(value.to_string()),
-        Err(failure) => return finish(Err(failure), error),
+        Err(failure) => return unsafe { finish(Err(failure), error) },
     };
     unsafe { set_option(handle, key, value, error) }
 }
@@ -215,7 +213,7 @@ pub(super) unsafe extern "C" fn set_option_bytes<H: FfiHandle>(
 ) -> AdbcStatusCode {
     let value = match unsafe { byte_slice(value, length, "value") } {
         Ok(value) => OptionValue::Bytes(value.to_vec()),
-        Err(failure) => return finish(Err(failure), error),
+        Err(failure) => return unsafe { finish(Err(failure), error) },
     };
     unsafe { set_option(handle, key, value, error) }
 }

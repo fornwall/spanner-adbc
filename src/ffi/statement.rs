@@ -13,10 +13,8 @@ use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use arrow_array::{RecordBatch, StructArray};
 use arrow_schema::{DataType, Schema};
 
-use super::abi::{
-    ADBC_STATUS_OK, AdbcConnection, AdbcError, AdbcPartitions, AdbcStatement, AdbcStatusCode,
-};
-use super::guard::{byte_slice, catch, required_output, required_str, write_out};
+use super::abi::{AdbcConnection, AdbcError, AdbcPartitions, AdbcStatement, AdbcStatusCode};
+use super::guard::{byte_slice, catch, missing_argument, required_output, required_str, write_out};
 use super::handle::{Exported, finish};
 use super::import::{BoundStreamReader, contain_import, validate_imported};
 use super::options::{FfiHandle, already_populated, slot_of, with_state};
@@ -61,27 +59,20 @@ pub(super) unsafe extern "C" fn statement_new(
     statement: *mut AdbcStatement,
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
-    let Some(statement) = (unsafe { statement.as_mut() }) else {
-        return finish(Err(invalid_argument("statement must not be null")), error);
-    };
-    if !statement.private_data.is_null() {
-        return finish(Err(already_populated(KIND)), error);
-    }
     // A panic here poisons the borrowed connection; the statement has no state yet.
-    let created = catch(|| {
+    let outcome = catch(|| {
+        let statement = unsafe { statement.as_mut() }.ok_or_else(|| missing_argument(KIND))?;
+        if !statement.private_data.is_null() {
+            return Err(already_populated(KIND));
+        }
         let mut connection = unsafe { super::options::borrow(connection) }?;
         let state = connection.ready(super::connection::KIND)?.new_statement()?;
         // Stored outside the state lock so a running call can be cancelled.
         let cancel = state.get_cancel_handle();
-        Ok((state, cancel))
+        statement.private_data = Exported::into_private_data_with_cancel(state, Some(cancel));
+        Ok(())
     });
-    match created {
-        Ok((state, cancel)) => {
-            statement.private_data = Exported::into_private_data_with_cancel(state, Some(cancel));
-            ADBC_STATUS_OK
-        }
-        Err(failure) => finish(Err(failure), error),
-    }
+    unsafe { finish(outcome, error) }
 }
 
 /// # Safety

@@ -114,23 +114,21 @@ fn vtable() -> AdbcDriver {
 }
 
 /// # Safety
-/// `driver` must be null or point to a valid `AdbcDriver` this driver initialized.
-// Guard-exempt: only pointer operations on the caller's struct; `finish` contains its own panics.
+/// `driver` must be null or point to a vtable this driver initialized, at either revision.
+// Guard-exempt: only pointer operations on the caller's struct.
 unsafe extern "C" fn release_driver(
     driver: *mut AdbcDriver,
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
-    let Some(driver) = (unsafe { driver.as_mut() }) else {
+    if driver.is_null() {
         return ADBC_STATUS_OK;
-    };
-    if driver.release.take().is_none() {
-        return finish(
-            Err(Error::with_message_and_status(
-                "driver is already released",
-                Status::InvalidState,
-            )),
-            error,
-        );
+    }
+    // A field place rather than `&mut AdbcDriver`, which would span the 1.1.0 tail that a 1.0.0
+    // caller did not allocate.
+    if unsafe { (*driver).release.take() }.is_none() {
+        let failure =
+            Error::with_message_and_status("driver is already released", Status::InvalidState);
+        return unsafe { finish(Err(failure), error) };
     }
     ADBC_STATUS_OK
 }
@@ -139,50 +137,36 @@ unsafe extern "C" fn release_driver(
 ///
 /// # Safety
 /// `driver` must point to an `AdbcDriver` allocation of at least the size implied by `version`.
-// Guard-exempt, as are the two exported wrappers: builds and copies a table of function pointers;
-// `finish` contains its own panics.
+// Guard-exempt, as are the two exported wrappers: builds and copies a table of function pointers.
 unsafe fn init(version: c_int, driver: *mut c_void, error: *mut AdbcError) -> AdbcStatusCode {
     if driver.is_null() {
-        return finish(
-            Err(crate::error::invalid_argument("driver must not be null")),
-            error,
-        );
+        let failure = crate::error::invalid_argument("driver must not be null");
+        return unsafe { finish(Err(failure), error) };
     }
-
-    let table = vtable();
-    match version {
-        ADBC_VERSION_1_1_0 => unsafe {
-            std::ptr::write_unaligned(driver.cast::<AdbcDriver>(), table);
-        },
-        ADBC_VERSION_1_0_0 => {
-            // The caller allocated only the 1.0.0 prefix. Truncating leaks nothing: the 1.1.0
-            // tail holds only function pointers.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    (&raw const table).cast::<u8>(),
-                    driver.cast::<u8>(),
-                    ADBC_DRIVER_1_0_0_SIZE,
-                );
-            }
-        }
+    let size = match version {
+        ADBC_VERSION_1_1_0 => size_of::<AdbcDriver>(),
+        // Truncating leaks nothing: the 1.1.0 tail holds only function pointers.
+        ADBC_VERSION_1_0_0 => ADBC_DRIVER_1_0_0_SIZE,
         _ => {
             // adbc.h tells callers to retry with an older version on NOT_IMPLEMENTED.
-            return finish(
-                Err(Error::with_message_and_status(
-                    format!(
-                        "unsupported ADBC version {version}; this driver implements \
-                         {ADBC_VERSION_1_0_0} and {ADBC_VERSION_1_1_0}"
-                    ),
-                    Status::NotImplemented,
-                )),
-                error,
+            let failure = Error::with_message_and_status(
+                format!(
+                    "unsupported ADBC version {version}; this driver implements \
+                     {ADBC_VERSION_1_0_0} and {ADBC_VERSION_1_1_0}"
+                ),
+                Status::NotImplemented,
             );
+            return unsafe { finish(Err(failure), error) };
         }
+    };
+    let table = vtable();
+    unsafe {
+        std::ptr::copy_nonoverlapping((&raw const table).cast::<u8>(), driver.cast::<u8>(), size);
     }
     ADBC_STATUS_OK
 }
 
-/// The driver's entry point, named after the shared library.
+/// The driver's own entry point, for callers that name it.
 ///
 /// # Safety
 /// See [`init`].

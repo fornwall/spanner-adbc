@@ -194,7 +194,7 @@ where
         // The guard must unwind before `catch` handles a panic so the mutex records poisoning.
         f(&mut state)
     });
-    finish(outcome, error)
+    unsafe { finish(outcome, error) }
 }
 
 /// Cancel the object's in-flight operation without taking its state lock, so a blocked call can
@@ -220,7 +220,7 @@ pub(crate) unsafe fn cancel<S>(
             None => Err(uninitialized(kind)),
         }
     });
-    finish(outcome, error)
+    unsafe { finish(outcome, error) }
 }
 
 /// Install the cancel handle of a newly initialized state. Statements pass theirs to
@@ -262,30 +262,28 @@ pub(crate) unsafe fn release<S>(
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
     let taken = std::mem::replace(slot, std::ptr::null_mut());
-    if taken.is_null() {
-        return finish(Err(uninitialized(kind)), error);
-    }
-    // Dropping driver state runs arbitrary code, such as closing clients.
-    let outcome = catch(|| {
-        drop(unsafe { Arc::from_raw(taken.cast_const().cast::<Exported<S>>()) });
-        Ok(())
-    });
-    finish(outcome, error)
+    let outcome = if taken.is_null() {
+        Err(uninitialized(kind))
+    } else {
+        // Dropping driver state runs arbitrary code, such as closing clients.
+        catch(|| {
+            drop(unsafe { Arc::from_raw(taken.cast_const().cast::<Exported<S>>()) });
+            Ok(())
+        })
+    };
+    unsafe { finish(outcome, error) }
 }
 
 /// Convert a driver result into a status code, exporting the error when there is one.
-pub(crate) fn finish(result: Result<()>, error: *mut AdbcError) -> AdbcStatusCode {
+///
+/// # Safety
+/// `error` must be null or point to an `AdbcError` that [`export_error`] accepts.
+pub(crate) unsafe fn finish(result: Result<()>, error: *mut AdbcError) -> AdbcStatusCode {
     match result {
         Ok(()) => ADBC_STATUS_OK,
         Err(failure) => {
             let status = AdbcStatusCode::from(failure.status);
-            // Exporting can run the caller's previous release callback. If that panics, the
-            // status still reports the original failure.
-            let contained = catch(|| {
-                unsafe { export_error(error, failure) };
-                Ok(())
-            });
-            drop(contained);
+            unsafe { export_error(error, failure) };
             status
         }
     }
