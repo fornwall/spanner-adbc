@@ -444,8 +444,10 @@ impl SpannerStatement {
     /// Body of `execute` for SQL, split out so the caller clears bound data however it ends.
     /// Also returns the affected-row count, as [`execute_counted`](Self::execute_counted) does.
     fn run_sql(&self, sql: &str) -> Result<(ResultReader, Option<i64>)> {
+        let statements = crate::sql::split_statements(sql);
+        check_batch(&statements)?;
         if crate::sql::is_ddl(sql) {
-            self.run_ddl(crate::sql::split_statements(sql))?;
+            self.run_ddl(statements)?;
             return Ok((Self::empty_reader(), None));
         }
         // Clients such as the Python DBAPI and R send every statement through `ExecuteQuery`, so
@@ -493,30 +495,6 @@ impl SpannerStatement {
         let result = self.run_sql(&sql);
         self.clear_bound();
         result
-    }
-
-    /// Body of `execute_update` for SQL, split out so the caller clears bound data however it
-    /// ends.
-    fn run_sql_update(&self, sql: &str) -> Result<Option<i64>> {
-        if crate::sql::is_ddl(sql) {
-            self.run_ddl(crate::sql::split_statements(sql))?;
-            return Ok(None);
-        }
-        // A query: `adbc.h` allows executing any statement without a result set, so run it like
-        // `execute` and discard the rows. On the DML path it would fail in `ExecuteBatchDml`, or
-        // in a manual transaction be buffered and break the commit.
-        if !crate::sql::is_dml(sql) {
-            // A `;`-batch starting with a query is rejected like any other mixed batch.
-            check_all_dml_batch(&crate::sql::split_statements(sql))?;
-            let reader = self.execute_query_reader(sql)?;
-            drain_discarding_rows(reader)?;
-            return Ok(None);
-        }
-        match self.run_dml(sql)? {
-            // This interface only reports the count, so returned rows are discarded.
-            DmlOutcome::Returning { affected, .. } => Ok(Some(affected)),
-            DmlOutcome::Plain(count) => Ok(count),
-        }
     }
 
     /// Build a query statement for `sql`, binding the first bound parameter row if there is one;
@@ -915,18 +893,12 @@ impl Statement for SpannerStatement {
         self.execute_counted().map(|(reader, _)| reader)
     }
 
+    /// `adbc.h` allows executing any statement without a result set, so a query runs as in
+    /// `execute` and its rows, like those of `THEN RETURN`, are discarded.
     fn execute_update(&mut self) -> Result<Option<i64>> {
-        self.cancel.begin_operation();
-        if self.sql.is_none()
-            && let Some(table) = self.target_table.clone()
-        {
-            return self.run_ingest(&table);
-        }
-        self.check_bound_has_destination()?;
-        let sql = self.sql()?;
-        let result = self.run_sql_update(&sql);
-        self.clear_bound();
-        result
+        let (reader, count) = self.execute_counted()?;
+        drain_discarding_rows(reader)?;
+        Ok(count)
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
@@ -1060,19 +1032,35 @@ fn check_query_only(sql: &str, entry_point: &str, dml_rationale: &str) -> Result
     Ok(())
 }
 
-/// `ExecuteBatchDml` accepts only DML, so reject mixed `;`-batches before anything is buffered:
-/// one bad statement in a manual transaction would block its commit until rollback. Single
-/// statements pass.
-fn check_all_dml_batch(statements: &[String]) -> Result<()> {
-    if statements.len() > 1
-        && let Some(other) = statements.iter().find(|s| !crate::sql::is_dml(s))
-    {
-        return Err(invalid_argument(format!(
+/// Reject a `;`-separated batch that mixes statement kinds before anything runs or is buffered.
+/// `UpdateDatabaseDdl` accepts only DDL and `ExecuteBatchDml` only DML, and one bad statement
+/// buffered in a manual transaction would block its commit until rollback. Queries can't be
+/// batched at all. Single statements pass.
+fn check_batch(statements: &[String]) -> Result<()> {
+    let [first, _, ..] = statements else {
+        return Ok(());
+    };
+    let ddl = crate::sql::is_ddl(first);
+    let Some(other) = statements.iter().find(|s| {
+        if ddl {
+            !crate::sql::is_ddl(s)
+        } else {
+            !crate::sql::is_dml(s)
+        }
+    }) else {
+        return Ok(());
+    };
+    Err(invalid_argument(if ddl {
+        format!(
+            "a `;`-separated DDL batch must be all DDL, but it contains {other:?}: run DML and \
+             queries as individual statements"
+        )
+    } else {
+        format!(
             "a `;`-separated statement batch must be all-DML (INSERT/UPDATE/DELETE), but it \
              contains {other:?}: run queries and DDL as individual statements"
-        )));
-    }
-    Ok(())
+        )
+    }))
 }
 
 /// Reject what Partitioned DML can't express, with a clearer error than Spanner's. It runs one

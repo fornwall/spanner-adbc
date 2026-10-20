@@ -168,34 +168,44 @@ fn execute_partitions_guard_rejects_ddl_and_dml() {
 }
 
 #[test]
-fn all_dml_batch_guard_rejects_mixed_batches_and_passes_single_statements() {
+fn batch_guard_rejects_mixed_batches_and_passes_single_statements() {
     let split = |sql: &str| crate::sql::split_statements(sql);
-    // Single statements pass whatever their kind, as do all-DML batches.
+    // Single statements pass whatever their kind, as do all-DML and all-DDL batches.
     for sql in [
         "SELECT 1",
         "INSERT INTO t (id) VALUES (1)",
         "DELETE FROM t WHERE true; INSERT INTO t (id) VALUES (1)",
         "@{PDML_MAX_PARALLELISM=1} DELETE FROM t WHERE true; update t set c = 1 where true",
+        "DROP TABLE t; CREATE TABLE t (id INT64) PRIMARY KEY (id)",
         "",
     ] {
-        check_all_dml_batch(&split(sql)).unwrap_or_else(|e| panic!("should pass: {sql}: {e}"));
+        check_batch(&split(sql)).unwrap_or_else(|e| panic!("should pass: {sql}: {e}"));
     }
-    for (sql, offending) in [
-        ("DELETE FROM t WHERE true; SELECT 1", "SELECT 1"),
-        ("SELECT 1; DELETE FROM t WHERE true", "SELECT 1"),
-        ("DELETE FROM t WHERE true; DROP TABLE t", "DROP TABLE t"),
-        ("SELECT 1; SELECT 2", "SELECT 1"),
+    for (sql, offending, kind) in [
+        ("DELETE FROM t WHERE true; SELECT 1", "SELECT 1", "all-DML"),
+        ("SELECT 1; DELETE FROM t WHERE true", "SELECT 1", "all-DML"),
+        (
+            "DELETE FROM t WHERE true; DROP TABLE t",
+            "DROP TABLE t",
+            "all-DML",
+        ),
+        ("SELECT 1; SELECT 2", "SELECT 1", "all-DML"),
+        (
+            "CREATE TABLE t (id INT64) PRIMARY KEY (id); INSERT INTO t (id) VALUES (1)",
+            "INSERT INTO t (id) VALUES (1)",
+            "all DDL",
+        ),
     ] {
-        let error = check_all_dml_batch(&split(sql)).unwrap_err();
+        let error = check_batch(&split(sql)).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "{sql}");
         assert!(
-            error.message.contains("all-DML") && error.message.contains(offending),
+            error.message.contains(kind) && error.message.contains(offending),
             "unexpected message for {sql}: {}",
             error.message
         );
     }
     // A `;` inside a literal doesn't separate statements.
-    check_all_dml_batch(&split("SELECT 'a;b'")).unwrap();
+    check_batch(&split("SELECT 'a;b'")).unwrap();
 }
 
 #[test]

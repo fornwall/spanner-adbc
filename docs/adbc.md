@@ -90,10 +90,10 @@ count, or -1 for `None`, whether or not the caller requests a result stream. The
 requests one for every `execute`, so `cursor.rowcount` reports DML counts too.
 
 [sql.rs](../src/sql.rs) classifies SQL by its first keyword and splits `;`-separated batches. A
-DML batch must contain only DML and runs atomically through `ExecuteBatchDml`. DDL goes through
-the Database Admin API. DML with `THEN RETURN` needs autocommit and can't be part of a batch.
-Autocommit is the default; see [transactions](transactions.md#adbc-transactions) for manual
-mode.
+DML batch must contain only DML and runs atomically through `ExecuteBatchDml`. A DDL batch must
+contain only DDL and goes through the Database Admin API. DML with `THEN RETURN` needs autocommit
+and can't be part of a batch. Autocommit is the default; see
+[transactions](transactions.md#adbc-transactions) for manual mode.
 
 ### Result types
 

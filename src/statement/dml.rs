@@ -8,7 +8,7 @@ use arrow_schema::{Schema, SchemaRef};
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::{BeginTransactionOption, ReadWriteTransaction};
 
-use super::{SpannerStatement, check_all_dml_batch, check_partitioned_dml};
+use super::{SpannerStatement, check_partitioned_dml};
 use crate::bind;
 use crate::connection::{lock_txn, runner_builder};
 use crate::error::{from_spanner, invalid_argument, invalid_state, not_implemented};
@@ -33,7 +33,6 @@ impl SpannerStatement {
     /// queries, so this uses `sql_builder`.
     fn build_bound_statements(&self, sql: &str) -> Result<Vec<SpannerSql>> {
         let parts = crate::sql::split_statements(sql);
-        check_all_dml_batch(&parts)?;
         if parts.len() > 1 {
             return Err(invalid_argument(
                 "bound parameters require a single DML statement; execute each statement separately",
@@ -57,14 +56,12 @@ impl SpannerStatement {
         Ok(statements)
     }
 
-    /// Bind a single statement or split an unbound DML batch, rejecting mixed SQL before buffering.
+    /// Bind a single statement or split an unbound DML batch.
     fn build_dml_statements(&self, sql: &str) -> Result<Vec<SpannerSql>> {
         if !self.bound.is_empty() {
             return self.build_bound_statements(sql);
         }
-        let statements = crate::sql::split_statements(sql);
-        check_all_dml_batch(&statements)?;
-        Ok(statements
+        Ok(crate::sql::split_statements(sql)
             .into_iter()
             .map(|s| self.sql_builder(&s).build())
             .collect())
