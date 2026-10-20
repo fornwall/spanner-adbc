@@ -25,7 +25,7 @@ use crate::error::{
 use crate::options::{SharedConfig, impl_typed_option_getters};
 use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable};
 use crate::sql::qualified_table;
-use crate::statement::{DEFAULT_ROWS_PER_BATCH, SpannerStatement};
+use crate::statement::{DEFAULT_ROWS_PER_BATCH, SpannerStatement, is_mutation_limit_exceeded};
 use crate::timeout::with_timeout;
 
 mod exec;
@@ -122,7 +122,7 @@ impl SpannerConnection {
                 &self.config,
                 mutations.iter().cloned(),
             )
-            .map_err(note_commit_outcome_unknown);
+            .map_err(note_commit_failure);
         }
         run_batch_txn(
             &self.runtime,
@@ -134,7 +134,7 @@ impl SpannerConnection {
             // Not the transaction's last request: Spanner applies the mutations at commit.
             false,
         )
-        .map_err(note_commit_outcome_unknown)?;
+        .map_err(note_commit_failure)?;
         Ok(())
     }
 }
@@ -586,18 +586,21 @@ pub(crate) fn decode_partition(descriptor: &[u8]) -> Result<PartitionDescriptor>
     })
 }
 
-/// A timeout or cancel drops an in-flight commit, which may still land. The buffer is kept, so
-/// warn that committing it again could apply the work twice.
-fn note_commit_outcome_unknown(error: Error) -> Error {
-    if !matches!(error.status, Status::Timeout | Status::Cancelled) {
+/// Explain the two manual-commit failures whose remedy isn't obvious. A timeout or cancel drops
+/// an in-flight commit, which may still land, so committing the kept buffer again could apply it
+/// twice. A transaction over Spanner's mutation limit can never commit, since a manual
+/// transaction is applied whole while autocommit ingest is split into chunks.
+fn note_commit_failure(error: Error) -> Error {
+    let note = if matches!(error.status, Status::Timeout | Status::Cancelled) {
+        "the commit may still have been applied; the buffered work is kept, so committing again \
+         could apply it twice; roll back to discard it"
+    } else if is_mutation_limit_exceeded(&error) {
+        "a manual transaction commits all of its buffered work at once; roll back, then commit \
+         smaller transactions or ingest with autocommit enabled, which commits in chunks"
+    } else {
         return error;
-    }
-    annotate(error, |message| {
-        format!(
-            "{message} (the commit may still have been applied; the buffered work is kept, so \
-             committing again could apply it twice; roll back to discard it)"
-        )
-    })
+    };
+    annotate(error, |message| format!("{message} ({note})"))
 }
 
 /// Accept setting the current catalog or schema to its `fixed` value as a no-op. Other values are

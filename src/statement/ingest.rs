@@ -504,7 +504,7 @@ fn note_rows_already_committed(error: Error, committed: i64) -> Error {
 /// wording that has survived each increase of the limit. Other `INVALID_ARGUMENT`s, such as bad
 /// values or schema mismatches, must propagate to the ingest error remapping. The commit size
 /// limit isn't matched: the byte budget keeps chunks well under it, and its wording is less stable.
-fn is_mutation_limit_exceeded(error: &Error) -> bool {
+pub(crate) fn is_mutation_limit_exceeded(error: &Error) -> bool {
     error.status == Status::InvalidArguments
         && error
             .message

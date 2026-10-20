@@ -691,3 +691,69 @@ mod partition_retry {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
+
+/// A manual commit against a mock server that rejects every commit as over the mutation limit.
+mod manual_commit_limit {
+    use std::sync::Arc;
+
+    use adbc_core::constants::ADBC_INGEST_OPTION_MODE_APPEND;
+    use adbc_core::error::Status;
+    use adbc_core::options::{OptionConnection, OptionStatement, OptionValue};
+    use adbc_core::{Connection, Optionable, Statement};
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use spanner_grpc_mock::MockSpanner;
+    use spanner_grpc_mock::google::spanner::v1;
+
+    use super::table_schema_probe::{Requests, connect, serve};
+
+    /// Retrying such a commit can't help, so the error says how to get the rows in.
+    #[test]
+    fn an_oversized_manual_commit_points_to_autocommit_ingest() {
+        let mut mock = MockSpanner::new();
+        mock.expect_begin_transaction().returning(|_| {
+            Ok(tonic::Response::new(v1::Transaction {
+                id: b"txn".to_vec(),
+                ..Default::default()
+            }))
+        });
+        mock.expect_commit().returning(|_| {
+            Err(tonic::Status::invalid_argument(
+                "The transaction contains too many mutations. (Maximum number: 80000)",
+            ))
+        });
+        let server = serve(mock, Requests::default());
+        let mut connection = connect(&server);
+        connection
+            .set_option(OptionConnection::AutoCommit, "false".into())
+            .unwrap();
+
+        let mut ingest = connection.new_statement().unwrap();
+        ingest
+            .set_option(OptionStatement::TargetTable, "t".into())
+            .unwrap();
+        ingest
+            .set_option(
+                OptionStatement::IngestMode,
+                ADBC_INGEST_OPTION_MODE_APPEND.into(),
+            )
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)]));
+        let rows = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]);
+        ingest.bind(rows.unwrap()).unwrap();
+        assert_eq!(ingest.execute_update().unwrap(), None, "buffered");
+
+        let error = connection.commit().unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(
+            error.message.contains("too many mutations")
+                && error.message.contains("ingest with autocommit enabled"),
+            "{}",
+            error.message
+        );
+        connection.rollback().unwrap();
+        connection
+            .set_option(OptionConnection::AutoCommit, OptionValue::from("true"))
+            .expect("nothing is left to commit");
+    }
+}

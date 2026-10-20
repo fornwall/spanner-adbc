@@ -10,6 +10,7 @@ mod dml;
 mod ingest;
 
 use dml::DmlOutcome;
+pub(crate) use ingest::is_mutation_limit_exceeded;
 use ingest::{check_target_catalog, ingest_batch_write_option, ingest_mode_option};
 
 use std::collections::BTreeMap;
