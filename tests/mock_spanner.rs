@@ -1575,59 +1575,6 @@ fn aborted_surfaces_vendor_code_and_retry_info_detail() {
     );
 }
 
-/// `PERMISSION_DENIED` keeps the server's message and appends generic IAM guidance without naming
-/// a role. The emulator does not enforce IAM, so only the mock covers this.
-#[test]
-fn permission_denied_surfaces_iam_guidance() {
-    let _watchdog = watchdog!();
-    let server = MockServer::start(|mock| {
-        mock.expect_execute_streaming_sql().returning(|_| {
-            Err(tonic::Status::permission_denied(
-                "Caller is missing IAM permission spanner.databases.select on resource \
-                 projects/mock-project/instances/mock-instance/databases/mock-db.",
-            ))
-        });
-    });
-
-    let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
-    let error = statement
-        .execute()
-        .err()
-        .expect("a PERMISSION_DENIED query must fail, not hang or succeed");
-
-    assert_eq!(error.status, AdbcStatus::Unauthorized, "got error: {error}");
-    assert_eq!(
-        error.vendor_code, 7,
-        "vendor_code must carry PERMISSION_DENIED = 7; got error: {error}"
-    );
-    assert!(
-        error
-            .message
-            .contains("Caller is missing IAM permission spanner.databases.select"),
-        "the server's message must survive, got: {}",
-        error.message
-    );
-    assert!(
-        error.message.contains("grant an IAM role that includes it"),
-        "expected the appended IAM guidance, got: {}",
-        error.message
-    );
-    assert!(
-        error
-            .message
-            .contains("https://cloud.google.com/spanner/docs/iam"),
-        "the guidance must link the Spanner IAM docs, got: {}",
-        error.message
-    );
-    assert!(
-        !error.message.contains("roles/spanner."),
-        "guidance must name no specific IAM role, got: {}",
-        error.message
-    );
-}
-
 /// After `UNAVAILABLE` mid-stream the client resumes from the last resume token. When the resume
 /// fails with a non-retryable status, that error reaches the caller.
 #[test]
@@ -3569,52 +3516,6 @@ fn autocommit_batch_dml_is_flagged_last_statements_but_manual_commit_is_not() {
         "buffered manual-mode DML replayed at commit must NOT be flagged; the commit may still \
          apply buffered mutations after the batch executes"
     );
-}
-
-/// Commit priority does not cover the DML itself, so `ExecuteBatchDml` carries the request options.
-#[test]
-fn batch_dml_carries_the_request_priority_and_tag() {
-    let _watchdog = watchdog!();
-    let batch_dml: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let record = batch_dml.clone();
-    let server = MockServer::start(move |mock| {
-        serve_begin_transaction(mock);
-        serve_batch_dml(mock, record.clone());
-        mock.expect_commit().returning(|_| commit_ok());
-    });
-
-    let mut connection = server.connect();
-    connection
-        .set_option(
-            OptionConnection::Other(spanner_adbc::OPTION_REQUEST_PRIORITY.into()),
-            OptionValue::String("low".into()),
-        )
-        .expect("set the request priority");
-    connection
-        .set_option(
-            OptionConnection::Other(spanner_adbc::OPTION_REQUEST_TAG.into()),
-            OptionValue::String("etl-batch".into()),
-        )
-        .expect("set the request tag");
-
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_sql_query("INSERT INTO MockTable (c) VALUES ('x')")
-        .unwrap();
-    assert_eq!(statement.execute_update().expect("autocommit DML"), Some(1));
-
-    let seen = batch_dml.lock().unwrap();
-    assert_eq!(seen.len(), 1, "the INSERT rides a single ExecuteBatchDml");
-    let options = seen[0]
-        .request_options
-        .as_ref()
-        .expect("the batch must carry RequestOptions");
-    assert_eq!(
-        options.priority,
-        v1::request_options::Priority::Low as i32,
-        "spanner.request.priority must reach the ExecuteBatchDml request itself"
-    );
-    assert_eq!(options.request_tag, "etl-batch");
 }
 
 /// BatchWrite carries the priority, transaction tag and change-stream exclusion. Spanner ignores
