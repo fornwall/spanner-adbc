@@ -1,2 +1,2 @@
-# cargo-release and the wheel build workflow keep this in sync with Cargo.toml.
+# cargo-release keeps this in sync with Cargo.toml; the wheel build workflow checks it.
 __version__ = "0.9.0"

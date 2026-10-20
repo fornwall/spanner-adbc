@@ -356,16 +356,19 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Sync wheel version to the crate
+      # cargo-release updates _version.py with Cargo.toml, and version-gate checks release tags.
+      - name: Check the wheel version matches the crate
         shell: bash
-        working-directory: python
         run: |
           set -euo pipefail
-          # Stamp wheels with the Cargo.toml version; version-gate checks release tags.
-          crate_version="$(cargo metadata --no-deps --format-version 1 --manifest-path ../Cargo.toml \
+          crate_version="$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "spanner-adbc") | .version')"
-          echo "__version__ = \"${crate_version}\"" > spanner_adbc/_version.py
-          echo "wheel version: ${crate_version}"
+          wheel_version="$(python -c 'import runpy; print(runpy.run_path("python/spanner_adbc/_version.py")["__version__"])')"
+          echo "wheel version: ${wheel_version}"
+          if [ "$wheel_version" != "$crate_version" ]; then
+            echo "::error::python/spanner_adbc/_version.py has ${wheel_version} but Cargo.toml has ${crate_version}; bump versions with cargo-release" >&2
+            exit 1
+          fi
 
       - name: Build wheels
         shell: bash

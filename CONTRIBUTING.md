@@ -102,7 +102,7 @@ cargo release patch --execute  # bump, commit, tag and push
 ```
 
 The pre-release hook runs fmt, clippy and `cargo test`, and cargo-release also updates the
-fallback version in `python/spanner_adbc/_version.py`.
+Python package version in `python/spanner_adbc/_version.py`.
 
 Pushing a `vX.Y.Z` tag starts `.github/workflows/libraries.yml`. It checks that the tag matches
 the crate version and that CI and both validation workflows passed for the tagged commit,
