@@ -143,28 +143,38 @@ fn bind_one(
 /// Type an already-validated binding. Arrow `Null` (including list elements) needs SQL context.
 /// Keep this separate from value encoding: mutation values take their type from the target table.
 fn parameter_type(data_type: &DataType) -> Option<Type> {
-    Some(match dictionary_values(data_type) {
-        DataType::Boolean => types::bool(),
+    match dictionary_values(data_type) {
+        DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
+            Some(types::array(parameter_type(item.data_type())?))
+        }
+        scalar => scalar_type(scalar).map(|(spanner_type, _)| spanner_type),
+    }
+}
+
+/// The Spanner type and DDL column type of a scalar that [`scalar_binder`] accepts. Arrow `Null`
+/// has neither.
+fn scalar_type(data_type: &DataType) -> Option<(Type, &'static str)> {
+    Some(match data_type {
+        DataType::Boolean => (types::bool(), "BOOL"),
         DataType::Int8
         | DataType::Int16
         | DataType::Int32
         | DataType::Int64
         | DataType::UInt8
         | DataType::UInt16
-        | DataType::UInt32 => types::int64(),
-        DataType::Float16 | DataType::Float32 => types::float32(),
-        DataType::Float64 => types::float64(),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => types::string(),
+        | DataType::UInt32 => (types::int64(), "INT64"),
+        DataType::Float16 | DataType::Float32 => (types::float32(), "FLOAT32"),
+        DataType::Float64 => (types::float64(), "FLOAT64"),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            (types::string(), "STRING(MAX)")
+        }
         DataType::Binary
         | DataType::LargeBinary
         | DataType::BinaryView
-        | DataType::FixedSizeBinary(_) => types::bytes(),
-        DataType::Date32 | DataType::Date64 => types::date(),
-        DataType::Timestamp(_, _) => types::timestamp(),
-        DataType::Decimal128(_, _) => types::numeric(),
-        DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
-            types::array(parameter_type(item.data_type())?)
-        }
+        | DataType::FixedSizeBinary(_) => (types::bytes(), "BYTES(MAX)"),
+        DataType::Date32 | DataType::Date64 => (types::date(), "DATE"),
+        DataType::Timestamp(_, _) => (types::timestamp(), "TIMESTAMP"),
+        DataType::Decimal128(_, _) => (types::numeric(), "NUMERIC"),
         _ => return None,
     })
 }
@@ -338,7 +348,7 @@ fn unsupported(target: Target<'_>, data_type: &DataType) -> adbc_core::error::Er
 type ScalarBinder = fn(Target<'_>, &dyn Array, usize) -> Result<Value>;
 
 /// Select the shared scalar encoder, or `None` for an unsupported type. Keep new type support
-/// aligned with [`spanner_column_type`] and the read mapping.
+/// aligned with [`scalar_type`] and the read mapping.
 fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
     Some(match data_type {
         // Spanner uses INT64; smaller integer and float widths widen losslessly.
@@ -593,33 +603,21 @@ fn spanner_column_type(field: &Field) -> Result<String> {
     if is_json_field(field) {
         return Ok("JSON".to_string());
     }
-    Ok(match dictionary_values(field.data_type()) {
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "INT64".to_string(),
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => "INT64".to_string(),
-        DataType::Float16 | DataType::Float32 => "FLOAT32".to_string(),
-        DataType::Float64 => "FLOAT64".to_string(),
-        DataType::Boolean => "BOOL".to_string(),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "STRING(MAX)".to_string(),
-        DataType::Binary
-        | DataType::LargeBinary
-        | DataType::BinaryView
-        | DataType::FixedSizeBinary(_) => "BYTES(MAX)".to_string(),
-        DataType::Date32 | DataType::Date64 => "DATE".to_string(),
-        DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
-        DataType::Decimal128(_, scale) if *scale <= 38 => "NUMERIC".to_string(),
+    match dictionary_values(field.data_type()) {
         // List binding accepts scalar elements only, including for null or empty lists.
         DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _)
             if scalar_binder(item.data_type()).is_some() =>
         {
-            format!("ARRAY<{}>", spanner_column_type(item)?)
+            Ok(format!("ARRAY<{}>", spanner_column_type(item)?))
         }
-        other => {
-            return Err(invalid_argument(format!(
+        other => match scalar_binder(other).and(scalar_type(other)) {
+            Some((_, column_type)) => Ok(column_type.to_string()),
+            None => Err(invalid_argument(format!(
                 "cannot create a Spanner column for Arrow type {other}; cast it to a type with a \
                  Spanner equivalent before ingesting"
-            )));
-        }
-    })
+            ))),
+        },
+    }
 }
 
 /// Build ingest DDL, optionally qualified by schema and guarded by `IF NOT EXISTS`.
