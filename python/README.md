@@ -159,7 +159,8 @@ pandas can't pass `params` to an ADBC connection, so bind parameters with `cur.e
 `cur.fetch_df()` instead. `pd.read_sql_table()` and `to_sql(if_exists="replace")` fail because
 pandas quotes table names with `"`, which GoogleSQL reads as a string. Polars'
 `read_database_uri()` doesn't work either, since it looks for a module named
-`adbc_driver_spanner`. In manual mode, end a read with `conn.rollback()` before writing.
+`adbc_driver_spanner`. Both libraries write through [bulk ingest](#bulk-ingest), so use
+autocommit for large writes. In manual mode, end a read with `conn.rollback()` before writing.
 
 DuckDB can query fetched Arrow data in-process:
 
@@ -193,8 +194,12 @@ with spanner.connect("spanner:///projects/p/instances/i/databases/d", autocommit
 
 The modes are `create` (the default), `append`, `create_append` and `replace`. Tables that ingest
 creates have Spanner's hidden `rowid` as primary key, so create the table yourself to choose the
-key. Autocommit ingest can commit in several chunks, so a failed load can leave rows behind. In
-manual mode, ingest returns -1 and the rows apply at `commit()`.
+key.
+
+With `autocommit=True`, ingest commits in chunks, so a failed load can leave rows behind. In
+manual mode, ingest returns -1 and the rows apply at `commit()` in one commit, which Spanner caps
+at 80,000 mutations: one per cell, plus index entries. Use autocommit for large loads, including
+pandas' `to_sql()` and Polars' `write_database()`.
 
 ## Partitioned reads
 

@@ -13,6 +13,10 @@ buffers manual writes until commit, can't mix them with snapshot queries, and ca
 read-your-writes. Explicit transaction handles in the client would allow this; see
 `src/spanner/src/transaction_runner.rs` and `src/spanner/src/read_write_transaction.rs` upstream.
 
+A manual commit also applies all buffered work at once, so it is capped at Spanner's 80,000
+mutations per commit, while autocommit ingest commits in chunks. Python DB-API connections start
+in manual mode, so large pandas or Polars writes need `autocommit=True`.
+
 ## Streaming retries ignore the elapsed-time limit
 
 The client's query and BatchWrite retry loops create a fresh `RetryState` for each retry
