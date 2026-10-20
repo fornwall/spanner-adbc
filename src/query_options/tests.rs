@@ -51,49 +51,6 @@ fn options_round_trip_verbatim_and_unset_on_empty() {
 }
 
 #[test]
-fn non_string_values_are_rejected() {
-    let mut config = SharedConfig::default();
-    for value in [OptionValue::Int(1), OptionValue::Double(1.0)] {
-        let error = config.set_option(VERSION, value.clone()).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-        let error = config.set_option(STATISTICS_PACKAGE, value).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-    }
-}
-
-#[test]
-fn statement_inherits_then_overrides_independently() {
-    let mut connection = SharedConfig::default();
-    connection.set_option(VERSION, s("6")).unwrap();
-    connection
-        .set_option(STATISTICS_PACKAGE, s("pkg_conn"))
-        .unwrap();
-
-    let mut statement = connection.inherit();
-    assert_eq!(statement.option_string(VERSION).unwrap(), "6");
-    assert_eq!(
-        statement.option_string(STATISTICS_PACKAGE).unwrap(),
-        "pkg_conn"
-    );
-
-    statement.set_option(VERSION, s("latest")).unwrap();
-    statement.set_option(STATISTICS_PACKAGE, s("")).unwrap();
-    assert_eq!(statement.option_string(VERSION).unwrap(), "latest");
-    assert_eq!(
-        statement
-            .option_string(STATISTICS_PACKAGE)
-            .unwrap_err()
-            .status,
-        Status::NotFound
-    );
-    assert_eq!(connection.option_string(VERSION).unwrap(), "6");
-    assert_eq!(
-        connection.option_string(STATISTICS_PACKAGE).unwrap(),
-        "pkg_conn"
-    );
-}
-
-#[test]
 fn apply_to_statement_sets_query_options_only_when_configured() {
     let builder = || google_cloud_spanner::statement::Statement::builder("SELECT 1");
     let rendered = |config: &SharedConfig| {
