@@ -3,24 +3,6 @@ use adbc_core::error::Status;
 use arrow_array::Array;
 
 #[test]
-fn ingest_temporary_accepts_false_and_rejects_true() {
-    let check_ingest_temporary = |value| {
-        check_unsupported_true(
-            value,
-            "adbc.ingest.temporary",
-            "setting adbc.ingest.temporary to true: Spanner has no temporary tables; leave it \
-             unset or false",
-        )
-    };
-    check_ingest_temporary(OptionValue::String("false".into())).unwrap();
-    let error = check_ingest_temporary(OptionValue::String("true".into())).unwrap_err();
-    assert_eq!(error.status, Status::NotImplemented);
-    // Invalid values fail boolean parsing before the feature check.
-    let error = check_ingest_temporary(OptionValue::String("TRUE".into())).unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-}
-
-#[test]
 fn partitioned_dml_accepts_a_single_statement() {
     for sql in [
         "UPDATE Singers SET Active = true WHERE Active = false",
@@ -374,6 +356,57 @@ mod mock {
                 assert_eq!(statement.get_option_string(key.clone()).unwrap(), expected);
             }
         }
+    }
+
+    /// Requests the driver can't serve fail with an actionable error before any RPC.
+    #[test]
+    fn unsupported_requests_fail_before_any_rpc() {
+        let server = start();
+        let mut connection = connect(&server);
+        let mut statement = connection.new_statement().unwrap();
+
+        // Generic clients set the spec default `false`.
+        let temporary = |value: &str| OptionValue::String(value.into());
+        statement
+            .set_option(OptionStatement::Temporary, temporary("false"))
+            .unwrap();
+        let error = statement
+            .set_option(OptionStatement::Temporary, temporary("true"))
+            .unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented);
+        assert!(error.message.contains("no temporary tables"), "{error}");
+        // Invalid values fail boolean parsing before the feature check.
+        let error = statement
+            .set_option(OptionStatement::Temporary, temporary("TRUE"))
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+
+        let error = statement.set_substrait_plan(b"plan").unwrap_err();
+        assert_eq!(error.status, Status::NotImplemented);
+        assert!(error.message.contains("set_sql_query"), "{error}");
+
+        statement
+            .set_sql_query("INSERT INTO t (c) VALUES (1)")
+            .unwrap();
+        let error = statement.execute_schema().unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(
+            error
+                .message
+                .contains("execute_schema only supports queries"),
+            "{error}"
+        );
+
+        statement
+            .set_sql_query(
+                "INSERT INTO t (c) VALUES (1) THEN RETURN c; \
+                 INSERT INTO t (c) VALUES (2) THEN RETURN c",
+            )
+            .unwrap();
+        let error = statement.execute().err().unwrap();
+        assert_eq!(error.status, Status::NotImplemented);
+        assert!(error.message.contains("execute each statement"), "{error}");
+        assert_eq!(rpc_count(&server), 0);
     }
 
     /// The DBAPI reuses one statement for SQL and ingest and sets the schema only when given one,
@@ -1004,6 +1037,38 @@ mod manual_txn {
                 "{sql}: later queries share the transaction the first successful query began"
             );
         }
+    }
+
+    /// A query bound to several rows runs each row's statement in the manual transaction's
+    /// snapshot, and a failed first statement leaves it unbegun, as for a single query.
+    #[test]
+    fn multi_row_query_shares_the_manual_read_transaction() {
+        use v1::transaction_selector::Selector;
+
+        let server = start();
+        let mut connection = manual(&server);
+        let mut bound_query = |sql: &str| {
+            let mut statement = connection.new_statement().unwrap();
+            statement.set_sql_query(sql).unwrap();
+            let rows = arrow_array::Int64Array::from(vec![1, 2]);
+            let schema = Schema::new(vec![Field::new("p", DataType::Int64, false)]);
+            statement
+                .bind(RecordBatch::try_new(Arc::new(schema), vec![Arc::new(rows)]).unwrap())
+                .unwrap();
+            let reader = statement.execute()?;
+            Ok::<usize, adbc_core::error::Error>(reader.map(|b| b.unwrap().num_rows()).sum())
+        };
+        let error = bound_query("SELECT c FROM Missing WHERE c = @p").unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments, "{error}");
+        assert_eq!(bound_query("SELECT c FROM t WHERE c = @p").unwrap(), 2);
+
+        let selectors = server.selectors.lock().unwrap();
+        let selectors: Vec<_> = selectors.iter().map(|(_, selector)| selector).collect();
+        assert!(matches!(
+            selectors[..],
+            [Some(Selector::Begin(_)), Some(Selector::Begin(_)), _]
+        ));
+        assert_eq!(selectors[2], &Some(Selector::Id(b"ro-1".to_vec())));
     }
 
     /// ADBC requires `NotFound` for an append into a missing table and `AlreadyExists` for a
