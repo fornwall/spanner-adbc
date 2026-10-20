@@ -1,16 +1,20 @@
 use super::*;
-use arrow_array::{ListArray, StringArray, StructArray};
+use arrow_array::{ListArray, StructArray};
 
 const CATALOG: &str = "adbc-test";
 
-/// A batch of string columns, in SELECT-list order; `None` is NULL.
-fn str_batch(columns: &[(&str, Vec<Option<&str>>)]) -> RecordBatch {
-    RecordBatch::try_from_iter(columns.iter().map(|(name, values)| {
-        (
-            *name,
-            Arc::new(StringArray::from(values.clone())) as ArrayRef,
-        )
-    }))
+/// A string column; `None` is NULL.
+fn strs(values: Vec<Option<&str>>) -> ArrayRef {
+    Arc::new(StringArray::from(values))
+}
+
+/// A batch of string columns, in SELECT-list order.
+fn str_batch(columns: Vec<(&str, Vec<Option<&str>>)>) -> RecordBatch {
+    RecordBatch::try_from_iter(
+        columns
+            .into_iter()
+            .map(|(name, values)| (name, strs(values))),
+    )
     .unwrap()
 }
 
@@ -21,45 +25,65 @@ fn s(value: &str) -> Option<&str> {
 /// An `All`-depth fetch: the unnamed schema holds `Users` and `Orgs`, with a two-column foreign
 /// key from `Users` to the primary key of `Orgs`, and `INFORMATION_SCHEMA` holds one view.
 fn sample_batches() -> ObjectBatches {
-    let columns = str_batch(&[
-        ("TABLE_SCHEMA", vec![s(""); 5]),
+    let columns = RecordBatch::try_from_iter([
+        ("TABLE_SCHEMA", strs(vec![s(""); 5])),
         (
             "TABLE_NAME",
-            vec![s("Users"), s("Users"), s("Users"), s("Orgs"), s("Orgs")],
+            strs(vec![
+                s("Users"),
+                s("Users"),
+                s("Users"),
+                s("Orgs"),
+                s("Orgs"),
+            ]),
         ),
         (
             "COLUMN_NAME",
-            vec![s("Id"), s("OrgRegion"), s("OrgId"), s("Region"), s("Id")],
+            strs(vec![
+                s("Id"),
+                s("OrgRegion"),
+                s("OrgId"),
+                s("Region"),
+                s("Id"),
+            ]),
         ),
         (
             "IS_NULLABLE",
-            vec![s("NO"), s("YES"), s("YES"), s("NO"), s("NO")],
+            strs(vec![s("NO"), s("YES"), s("YES"), s("NO"), s("NO")]),
         ),
         (
             "SPANNER_TYPE",
-            vec![
+            strs(vec![
                 s("INT64"),
                 s("STRING(MAX)"),
                 s("INT64"),
                 s("STRING(10)"),
                 s("INT64"),
-            ],
+            ]),
         ),
-    ]);
-    let ordinal: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 1, 2]));
-    let columns = RecordBatch::try_from_iter(
-        columns
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .zip(columns.columns().iter().cloned())
-            .chain([("ORDINAL_POSITION".to_string(), ordinal)]),
-    )
+        (
+            "COLUMN_DEFAULT",
+            strs(vec![None, s("'eu'"), None, None, None]),
+        ),
+        (
+            "IS_GENERATED",
+            strs(vec![
+                s("NEVER"),
+                s("NEVER"),
+                s("ALWAYS"),
+                s("NEVER"),
+                s("NEVER"),
+            ]),
+        ),
+        (
+            "ORDINAL_POSITION",
+            Arc::new(Int64Array::from(vec![1, 2, 3, 1, 2])),
+        ),
+    ])
     .unwrap();
     ObjectBatches {
-        schemata: str_batch(&[("SCHEMA_NAME", vec![s(""), s("INFORMATION_SCHEMA")])]),
-        tables: Some(str_batch(&[
+        schemata: str_batch(vec![("SCHEMA_NAME", vec![s(""), s("INFORMATION_SCHEMA")])]),
+        tables: Some(str_batch(vec![
             ("TABLE_SCHEMA", vec![s(""), s(""), s("INFORMATION_SCHEMA")]),
             ("TABLE_NAME", vec![s("Users"), s("Orgs"), s("TABLES")]),
             (
@@ -69,7 +93,7 @@ fn sample_batches() -> ObjectBatches {
         ])),
         columns: Some(columns),
         // In the query's ORDER BY order. The check constraint has no key columns.
-        constraints: Some(str_batch(&[
+        constraints: Some(str_batch(vec![
             ("TABLE_SCHEMA", vec![s(""); 6]),
             (
                 "TABLE_NAME",
@@ -359,18 +383,21 @@ fn filters_matching_nothing_yield_empty_lists_not_null() {
 }
 
 #[test]
-fn build_reports_column_types_nullability_and_foreign_key_usages() {
+fn build_reports_column_metadata_and_foreign_key_usages() {
     let schemas = assemble_objects(&sample_batches(), &no_filters()).unwrap();
     let batch = build(ObjectDepth::All, CATALOG, schemas).unwrap();
     let tables = child_list(schemas_list(&batch), "db_schema_tables");
-    let string_child = |list: &ListArray, name: &str| {
+    let child = |list: &ListArray, name: &str| {
         let first = list.value(0);
         let first = first.as_any().downcast_ref::<StructArray>().unwrap();
-        let strings = first.column_by_name(name).unwrap();
+        first.column_by_name(name).unwrap().clone()
+    };
+    let string_child = |list: &ListArray, name: &str| {
+        let strings = child(list, name);
         let strings = strings.as_any().downcast_ref::<StringArray>().unwrap();
         strings
             .iter()
-            .map(|v| v.expect("non-null").to_string())
+            .map(|v| v.unwrap_or("NULL").to_string())
             .collect::<Vec<_>>()
     };
 
@@ -383,6 +410,20 @@ fn build_reports_column_types_nullability_and_foreign_key_usages() {
         string_child(&columns, "xdbc_is_nullable"),
         ["NO", "YES", "YES"]
     );
+    let nullable = child(&columns, "xdbc_nullable");
+    let nullable = nullable.as_any().downcast_ref::<Int16Array>().unwrap();
+    assert_eq!(nullable.values().to_vec(), [0, 1, 1]);
+    assert_eq!(
+        string_child(&columns, "xdbc_column_def"),
+        ["NULL", "'eu'", "NULL"]
+    );
+    let generated = child(&columns, "xdbc_is_generatedcolumn");
+    let generated = generated.as_any().downcast_ref::<BooleanArray>().unwrap();
+    assert_eq!(
+        generated.iter().collect::<Vec<_>>(),
+        [Some(false), Some(false), Some(true)]
+    );
+    assert_eq!(child(&columns, "xdbc_data_type").null_count(), 3);
 
     // The spec and the validation suite expect a NULL usage list for constraints other than
     // foreign keys.

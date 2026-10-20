@@ -11,7 +11,10 @@ use std::sync::Arc;
 use adbc_core::error::Result;
 use adbc_core::options::ObjectDepth;
 use adbc_core::schemas::GET_OBJECTS_SCHEMA;
-use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch, new_null_array};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    new_null_array,
+};
 use arrow_buffer::NullBuffer;
 use arrow_schema::FieldRef;
 use futures_util::try_join;
@@ -32,6 +35,9 @@ pub(crate) struct Column {
     nullable: bool,
     /// `SPANNER_TYPE`, e.g. `STRING(MAX)`; reported as `xdbc_type_name`.
     type_name: String,
+    /// The `DEFAULT` expression.
+    default: Option<String>,
+    generated: bool,
 }
 
 /// A column that a foreign key references.
@@ -82,7 +88,8 @@ const SCHEMATA_SQL: &str = "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA"
 const TABLES_SQL: &str =
     "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES";
 const COLUMNS_SQL: &str = "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, IS_NULLABLE, \
-     SPANNER_TYPE, ORDINAL_POSITION FROM INFORMATION_SCHEMA.COLUMNS";
+     SPANNER_TYPE, COLUMN_DEFAULT, IS_GENERATED, ORDINAL_POSITION \
+     FROM INFORMATION_SCHEMA.COLUMNS";
 
 /// Keeps only the columns `SELECT *` returns, so `get_objects` agrees with `get_table_schema`.
 /// Spanner hides the implicit `rowid` key that bulk ingest creates for tables without a primary
@@ -258,8 +265,8 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
 
     let mut columns: HashMap<(&str, &str), Vec<Column>> = HashMap::new();
     if let Some(batch) = &batches.columns {
-        let [schema, table, name, nullable, type_name] = str_cols(batch)?;
-        let ordinal = column::<Int64Array>(batch, 5)?;
+        let [schema, table, name, nullable, type_name, default, generated] = str_cols(batch)?;
+        let ordinal = column::<Int64Array>(batch, 7)?;
         for r in (0..batch.num_rows()).filter(|&r| column_matches(name.value(r))) {
             columns
                 .entry((schema.value(r), table.value(r)))
@@ -269,6 +276,8 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
                     ordinal: ordinal.value(r) as i32,
                     nullable: nullable.value(r).eq_ignore_ascii_case("YES"),
                     type_name: type_name.value(r).to_string(),
+                    default: default.is_valid(r).then(|| default.value(r).to_string()),
+                    generated: generated.value(r) == "ALWAYS",
                 });
         }
     }
@@ -397,7 +406,7 @@ fn tables_list(
     })
 }
 
-/// Each table's `table_columns`. The `xdbc_*` fields Spanner has no value for stay null.
+/// Each table's `table_columns`. The other `xdbc_*` fields stay null.
 fn columns_list(field: &FieldRef, tables: &[&Table]) -> Result<ArrayRef> {
     let lengths: Vec<usize> = tables.iter().map(|t| t.columns.len()).collect();
     let columns: Vec<&Column> = tables.iter().flat_map(|t| &t.columns).collect();
@@ -408,11 +417,21 @@ fn columns_list(field: &FieldRef, tables: &[&Table]) -> Result<ArrayRef> {
                 columns.iter().map(|c| c.ordinal),
             ))),
             "xdbc_type_name" => Some(strings(columns.iter().map(|c| c.type_name.as_str()))),
+            // JDBC's `columnNoNulls` (0) and `columnNullable` (1).
+            "xdbc_nullable" => Some(Arc::new(Int16Array::from_iter_values(
+                columns.iter().map(|c| i16::from(c.nullable)),
+            ))),
+            "xdbc_column_def" => Some(Arc::new(StringArray::from_iter(
+                columns.iter().map(|c| c.default.as_deref()),
+            ))),
             "xdbc_is_nullable" => Some(strings(
                 columns
                     .iter()
                     .map(|c| if c.nullable { "YES" } else { "NO" }),
             )),
+            "xdbc_is_generatedcolumn" => Some(Arc::new(BooleanArray::from_iter(
+                columns.iter().map(|c| Some(c.generated)),
+            ))),
             _ => None,
         })
     })
