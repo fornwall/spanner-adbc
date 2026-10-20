@@ -44,10 +44,11 @@ removes the container. The tests use `test-project/test-instance/adbc-test`.
 
 The script never touches a container it didn't create. If the container name is taken, it
 fails; pick another with `SPANNER_EMULATOR_CONTAINER` (and `TOXIPROXY_CONTAINER` for fault
-tests). The pinned client's admin API needs ports 9010 and 9020, so the script always publishes
-those and only one copy can run at a time. To run emulators in parallel, start each container
-yourself under its own name and point `SPANNER_EMULATOR_HOST` at its Docker network IP on port
-9010.
+tests). The tests set up their instance and database with the pinned client's REST admin API,
+which it finds by replacing port 9010 in `SPANNER_EMULATOR_HOST` with 9020. So the script always
+publishes those two ports and only one copy can run at a time. To run emulators in parallel,
+start each container yourself under its own name and point `SPANNER_EMULATOR_HOST` at its Docker
+network IP on port 9010.
 
 ### Omni
 
