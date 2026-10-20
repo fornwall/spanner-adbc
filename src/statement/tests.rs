@@ -7,7 +7,7 @@ fn ingest_temporary_accepts_false_and_rejects_true() {
     let check_ingest_temporary = |value| {
         check_unsupported_true(
             value,
-            "option adbc.ingest.temporary",
+            "adbc.ingest.temporary",
             "setting adbc.ingest.temporary to true: Spanner has no temporary tables; leave it \
              unset or false",
         )
@@ -232,7 +232,7 @@ fn bool_option_rejects_non_bool_values() {
         "maybe", "", "2", "t", "on", "TRUE", "True", "FALSE", "False", "1", "0", "yes", "no",
         "YES", "NO",
     ] {
-        let error = bool_option(OptionValue::String(bad.into()), "option o").unwrap_err();
+        let error = bool_option(OptionValue::String(bad.into()), "o").unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
     }
     for bad in [
@@ -240,21 +240,21 @@ fn bool_option_rejects_non_bool_values() {
         OptionValue::Int(1),
         OptionValue::Double(1.0),
     ] {
-        let error = bool_option(bad, "option o").unwrap_err();
+        let error = bool_option(bad, "o").unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
     }
 }
 
 #[test]
 fn rows_per_batch_option_accepts_positive_ints_and_strings() {
-    let parse = |value| crate::options::positive_usize(value, "option spanner.rows_per_batch");
+    let parse = |value| crate::options::positive_usize(value, crate::OPTION_ROWS_PER_BATCH);
     assert_eq!(parse(OptionValue::Int(1)).unwrap(), 1);
     assert_eq!(parse(OptionValue::String("8192".into())).unwrap(), 8192);
 }
 
 #[test]
 fn rows_per_batch_option_rejects_zero_negative_and_malformed() {
-    let parse = |value| crate::options::positive_usize(value, "option spanner.rows_per_batch");
+    let parse = |value| crate::options::positive_usize(value, crate::OPTION_ROWS_PER_BATCH);
     let error = parse(OptionValue::Int(0)).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     let error = parse(OptionValue::Int(-8192)).unwrap_err();

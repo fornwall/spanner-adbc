@@ -215,7 +215,7 @@ pub(crate) use impl_typed_option_getters;
 /// Option-settable configuration carried by a
 /// [`SpannerConnection`](crate::connection::SpannerConnection) and inherited by each
 /// [`SpannerStatement`](crate::statement::SpannerStatement) it creates.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct SharedConfig {
     /// `adbc.connection.readonly`: writes, including commits of buffered work, fail with
     /// `InvalidState`. Shared so that toggling it on the connection reaches existing statements.
@@ -232,24 +232,6 @@ pub(crate) struct SharedConfig {
     /// Per object, not inherited: a statement records its autocommit commits, a connection its
     /// manual-mode commit.
     pub(crate) commit_stats: CommitStats,
-}
-
-impl Default for SharedConfig {
-    fn default() -> Self {
-        Self {
-            read_only: Arc::new(AtomicBool::new(false)),
-            // `IsolationLevel` has no `Default`, so this impl cannot be derived.
-            isolation: IsolationLevel::Unspecified,
-            read_staleness: ReadStaleness::default(),
-            request: RequestConfig::default(),
-            directed_read: DirectedRead::default(),
-            query_options: QueryOptionsConfig::default(),
-            timestamp_precision: TimestampPrecision::default(),
-            timeouts: RpcTimeouts::default(),
-            retry: RetryConfig::default(),
-            commit_stats: CommitStats::default(),
-        }
-    }
 }
 
 impl SharedConfig {
