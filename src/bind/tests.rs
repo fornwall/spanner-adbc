@@ -495,6 +495,16 @@ fn lists_bind_as_arrays_of_their_element_type() {
             array_type
         )
     );
+    // pyarrow and Polars type `[]` and `[None]` as `List(Null)`. Spanner rejects an ARRAY type
+    // without an element type, so these bind untyped and take their type from the SQL.
+    let nulls = ListArray::new(
+        Arc::new(Field::new("item", DataType::Null, true)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 1])),
+        Arc::new(NullArray::new(1)),
+        None,
+    );
+    assert_eq!(param(&nulls, 0), (Value::from(vec![Value::null()]), None));
+    assert_eq!(param(&nulls, 1), (Value::from(Vec::<Value>::new()), None));
 }
 
 #[test]
