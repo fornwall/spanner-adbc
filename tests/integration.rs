@@ -1089,9 +1089,15 @@ fn ingest_create_modes_and_the_implicit_hidden_key() {
         vec!["Id", "Label"],
         "get_objects must not list the implicit hidden key column"
     );
-    assert!(
-        objects_constraints.is_empty(),
-        "get_objects must not list the implicit key's own constraints: {objects_constraints:?}"
+    // The ingested fields are non-nullable, and Spanner reports NOT NULL columns as CHECK
+    // constraints. The implicit key's own constraints stay hidden.
+    assert_eq!(
+        objects_constraints,
+        vec![
+            "CK_IS_NOT_NULL_AdbcCreate_Id",
+            "CK_IS_NOT_NULL_AdbcCreate_Label"
+        ],
+        "get_objects must not list the implicit key's own constraints"
     );
     let created_ids = col::<Int64Array>(created[0].column(0));
     let created_labels = col::<StringArray>(created[0].column(1));

@@ -189,8 +189,18 @@ pub(crate) fn insert_mutation(table: &str, batch: &RecordBatch, row: usize) -> R
 /// Run the mutation value conversion over `batch` and discard the values, so an ingest can reject
 /// a bad value before its DDL runs. A column whose values always convert once its type is accepted
 /// is checked on its first row only.
+///
+/// A non-nullable field becomes a `NOT NULL` column, so its nulls are bad values too. Arrow only
+/// checks physical nulls, which miss a valid dictionary key that selects a null value.
 pub(crate) fn check_ingest_values(batch: &RecordBatch) -> Result<()> {
     for (field, column) in batch.schema_ref().fields().iter().zip(batch.columns()) {
+        if !field.is_nullable() && column.logical_null_count() > 0 {
+            return Err(invalid_argument(format!(
+                "ingest column {:?} is non-nullable, so it is created NOT NULL, but it contains \
+                 nulls; mark the field nullable or remove the nulls",
+                field.name()
+            )));
+        }
         let rows = if values_always_convert(column.data_type()) {
             batch.num_rows().min(1)
         } else {
@@ -583,7 +593,11 @@ pub(crate) fn create_table_sql(
     for field in schema.fields() {
         let column_type = spanner_column_type(field)
             .map_err(|e| annotate(e, |m| format!("ingest column {:?}: {m}", field.name())))?;
-        columns.push(format!("{} {}", quote_ident(field.name())?, column_type));
+        let not_null = if field.is_nullable() { "" } else { " NOT NULL" };
+        columns.push(format!(
+            "{} {column_type}{not_null}",
+            quote_ident(field.name())?
+        ));
     }
     let guard = if if_not_exists { "IF NOT EXISTS " } else { "" };
     Ok(format!(

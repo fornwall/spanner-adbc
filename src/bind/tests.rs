@@ -726,13 +726,13 @@ fn ingest_ddl_rejects_types_the_value_encoder_cannot_bind() {
 #[test]
 fn builds_create_table_sql() {
     let schema = Schema::new(vec![
-        Field::new("idx", DataType::Int64, true),
+        Field::new("idx", DataType::Int64, false),
         Field::new("name", DataType::Utf8, true),
     ]);
-    // No PRIMARY KEY: Spanner adds a hidden rowid key.
+    // No PRIMARY KEY: Spanner adds a hidden rowid key. Arrow nullability carries over.
     assert_eq!(
         create_table_sql("my_table", None, &schema, false).unwrap(),
-        "CREATE TABLE `my_table` (`idx` INT64, `name` STRING(MAX))"
+        "CREATE TABLE `my_table` (`idx` INT64 NOT NULL, `name` STRING(MAX))"
     );
     assert!(
         create_table_sql("t", None, &schema, true)
@@ -812,6 +812,23 @@ fn ingest_value_check_fails_where_mutation_building_would() {
     }
     let unsupported = column_batch(Arc::new(UInt64Array::from(vec![1])));
     assert!(check_ingest_values(&unsupported).is_err());
+    // A non-nullable column would be created NOT NULL. Arrow accepts this one because the
+    // dictionary's keys are all valid.
+    let null_value = DictionaryArray::new(
+        Int8Array::from(vec![0, 1]),
+        Arc::new(StringArray::from(vec![Some("a"), None])),
+    );
+    let b = batch(
+        vec![Field::new("label", null_value.data_type().clone(), false)],
+        vec![Arc::new(null_value)],
+    );
+    let error = check_ingest_values(&b).unwrap_err();
+    assert_eq!(error.status, Status::InvalidArguments);
+    assert!(
+        error.message.contains("\"label\" is non-nullable"),
+        "{error}"
+    );
+    assert!(check_ingest_values(&b.slice(0, 1)).is_ok());
 }
 
 #[test]
