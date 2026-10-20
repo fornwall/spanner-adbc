@@ -6,44 +6,6 @@ pub(super) fn new_database() -> SpannerDatabase {
 }
 
 #[test]
-fn ensure_scheme_adds_http_prefix() {
-    assert_eq!(ensure_scheme("localhost:9010"), "http://localhost:9010");
-    assert_eq!(ensure_scheme("http://host:1"), "http://host:1");
-    assert_eq!(ensure_scheme("https://host:1"), "https://host:1");
-}
-
-#[test]
-fn database_options_round_trip() {
-    let mut db = new_database();
-    db.set_option(
-        OptionDatabase::Uri,
-        OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
-    )
-    .unwrap();
-    db.set_option(
-        OptionDatabase::Other(OPTION_ENDPOINT.into()),
-        OptionValue::String("http://localhost:9010".into()),
-    )
-    .unwrap();
-    db.set_option(
-        OptionDatabase::Other(OPTION_EMULATOR.into()),
-        OptionValue::String("true".into()),
-    )
-    .unwrap();
-
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Uri).unwrap(),
-        "spanner:///projects/p/instances/i/databases/d"
-    );
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Other(OPTION_ENDPOINT.into()))
-            .unwrap(),
-        "http://localhost:9010"
-    );
-    assert!(db.emulator);
-}
-
-#[test]
 fn omni_options_validate_before_connecting() {
     let mut db = new_database();
     let key = || OptionDatabase::Other(OPTION_INSTANCE_TYPE.into());
@@ -84,69 +46,44 @@ fn omni_options_validate_before_connecting() {
     );
 }
 
+/// Credentials show only whether they are set, and the client stack only whether it is built;
+/// tests/mock_spanner.rs covers a built stack.
 #[test]
 fn debug_redacts_credential_fields() {
+    let db = new_database();
+    let rendered = format!("{db:?}");
+    for absent in ["keyfile: None", "access_token: None", "connected: None"] {
+        assert!(rendered.contains(absent), "{rendered}");
+    }
+
     let mut db = new_database();
     db.database = Some("projects/p/instances/i/databases/d".into());
     db.keyfile = Some("/etc/secret/key.json".into());
     db.keyfile_json = Some(r#"{"private_key":"SUPER-SECRET-PRIVATE-KEY"}"#.into());
     db.access_token = Some("ya29.LIVE-BEARER-TOKEN".into());
-
+    db.quota_project = Some("my-billing-project".into());
     let rendered = format!("{db:?}");
+    for secret in [
+        "SUPER-SECRET-PRIVATE-KEY",
+        "ya29.LIVE-BEARER-TOKEN",
+        "/etc/secret/key.json",
+    ] {
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+    for field in ["keyfile", "keyfile_json", "access_token"] {
+        assert!(
+            rendered.contains(&format!(r#"{field}: Some("<redacted>")"#)),
+            "{rendered}"
+        );
+    }
+    // A project ID is not a secret.
+    for shown in [
+        "projects/p/instances/i/databases/d",
+        r#"quota_project: Some("my-billing-project")"#,
+    ] {
+        assert!(rendered.contains(shown), "{rendered}");
+    }
 
-    assert!(
-        !rendered.contains("SUPER-SECRET-PRIVATE-KEY"),
-        "keyfile_json leaked: {rendered}"
-    );
-    assert!(
-        !rendered.contains("ya29.LIVE-BEARER-TOKEN"),
-        "access_token leaked: {rendered}"
-    );
-    assert!(
-        !rendered.contains("/etc/secret/key.json"),
-        "keyfile leaked: {rendered}"
-    );
-    assert!(
-        rendered.contains(r#"keyfile: Some("<redacted>")"#),
-        "keyfile presence not shown: {rendered}"
-    );
-    assert!(
-        rendered.contains(r#"keyfile_json: Some("<redacted>")"#),
-        "keyfile_json presence not shown: {rendered}"
-    );
-    assert!(
-        rendered.contains(r#"access_token: Some("<redacted>")"#),
-        "access_token presence not shown: {rendered}"
-    );
-    assert!(
-        rendered.contains("projects/p/instances/i/databases/d"),
-        "database not shown: {rendered}"
-    );
-}
-
-#[test]
-fn debug_shows_none_for_absent_credentials() {
-    let db = new_database();
-    let rendered = format!("{db:?}");
-    assert!(
-        rendered.contains("keyfile: None"),
-        "absent keyfile not shown: {rendered}"
-    );
-    assert!(
-        rendered.contains("access_token: None"),
-        "absent access_token not shown: {rendered}"
-    );
-}
-
-#[test]
-fn debug_renders_the_client_stack_cache_presence_only() {
-    // A built stack renders as `<client stack>`; tests/mock_spanner.rs covers that case.
-    let db = new_database();
-    let rendered = format!("{db:?}");
-    assert!(
-        rendered.contains("connected: None"),
-        "absent client stack not shown: {rendered}"
-    );
     // Driver managers share databases across threads.
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<SpannerDatabase>();
@@ -221,10 +158,11 @@ fn boolean_options_reject_int_typed_sets() {
 }
 
 #[test]
-fn connecting_without_a_database_path_is_an_error() {
+fn connecting_without_a_uri_names_the_accepted_form() {
     let db = new_database();
     let error = db.connect().unwrap_err();
     assert_eq!(error.status, Status::InvalidState);
+    assert!(error.message.contains(URI_FORM), "{}", error.message);
 }
 
 #[test]
@@ -317,8 +255,9 @@ fn every_database_a_driver_creates_shares_the_drivers_runtime() {
 }
 
 #[test]
-fn ensure_scheme_keeps_any_explicit_scheme() {
+fn ensure_scheme_adds_http_only_without_a_scheme() {
     assert_eq!(ensure_scheme(" localhost:9010 "), "http://localhost:9010");
+    assert_eq!(ensure_scheme("http://host:1"), "http://host:1");
     assert_eq!(ensure_scheme("[::1]:9010"), "http://[::1]:9010");
     assert_eq!(ensure_scheme("HTTPS://host:1"), "HTTPS://host:1");
     assert_eq!(ensure_scheme(""), "");

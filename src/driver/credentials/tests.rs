@@ -257,17 +257,6 @@ fn quota_project_option_round_trips_and_unsets() {
 }
 
 #[test]
-fn quota_project_renders_in_debug_and_is_not_a_secret() {
-    let mut db = new_database();
-    db.quota_project = Some("my-billing-project".into());
-    let rendered = format!("{db:?}");
-    assert!(
-        rendered.contains(r#"quota_project: Some("my-billing-project")"#),
-        "quota_project not shown verbatim: {rendered}"
-    );
-}
-
-#[test]
 fn access_token_credentials_send_the_quota_project_header() {
     // The builder paths send the same header but only produce headers after a network token
     // fetch, so this is the one offline check of it.

@@ -6,7 +6,7 @@ mod uri;
 
 use credentials::{CredentialChoice, first_token};
 pub(crate) use uri::ensure_scheme;
-use uri::is_plaintext_endpoint;
+use uri::{URI_FORM, is_plaintext_endpoint};
 
 use adbc_core::error::{Result, Status};
 use adbc_core::options::{OptionDatabase, OptionValue};
@@ -292,10 +292,9 @@ impl SpannerDatabase {
     /// value of `SPANNER_EMULATOR_HOST`.
     fn resolve_target(&self, emulator_host: Option<&str>) -> Result<Target> {
         let database = self.database.clone().ok_or_else(|| {
-            invalid_state(
-                "Spanner database path is not set; provide the `uri` option \
-                 (projects/<p>/instances/<i>/databases/<d>)",
-            )
+            invalid_state(format!(
+                "the `uri` option is not set; set it to a URI such as `{URI_FORM}`"
+            ))
         })?;
 
         let mut endpoint = self

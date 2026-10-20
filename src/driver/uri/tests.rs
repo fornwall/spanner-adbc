@@ -8,12 +8,21 @@ fn set_uri(db: &mut SpannerDatabase, uri: &str) -> Result<()> {
     db.set_option(OptionDatabase::Uri, OptionValue::String(uri.into()))
 }
 
+/// What users paste from other tools gets the accepted form back.
 #[test]
-fn a_bare_database_path_is_rejected() {
-    let mut db = new_database();
-    let error = set_uri(&mut db, DB_PATH).unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-    assert!(error.message.contains("spanner:///projects/"));
+fn a_uri_without_the_spanner_scheme_names_the_accepted_form() {
+    for uri in [
+        DB_PATH.to_owned(),
+        format!("spanner:{DB_PATH}"),
+        format!("spanner:/{DB_PATH}"),
+        format!("cloudspanner:///{DB_PATH}"),
+        format!("jdbc:cloudspanner:/{DB_PATH};autoConfigEmulator=true"),
+        format!("spanner+spanner:///{DB_PATH}"),
+    ] {
+        let error = set_uri(&mut new_database(), &uri).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments, "{uri}");
+        assert!(error.message.contains(URI_FORM), "{}", error.message);
+    }
 }
 
 #[test]
@@ -70,46 +79,11 @@ fn a_scheme_uri_sets_the_database_path() {
 }
 
 #[test]
-fn a_scheme_uri_without_two_slashes_is_rejected() {
-    for uri in [format!("spanner:{DB_PATH}"), format!("spanner:/{DB_PATH}")] {
-        let mut db = new_database();
-        let error = set_uri(&mut db, &uri).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments, "uri: {uri}");
-        assert!(error.message.contains("spanner://"), "uri: {uri}");
-    }
-}
-
-#[test]
-fn a_cloudspanner_scheme_is_not_recognised() {
-    // The JDBC driver's scheme.
-    let mut db = new_database();
-    let uri = format!("cloudspanner:///{DB_PATH}?spanner.emulator=true");
-    let error = set_uri(&mut db, &uri).unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-}
-
-#[test]
 fn a_host_authority_becomes_the_endpoint() {
     let mut db = new_database();
     set_uri(&mut db, &format!("spanner://emu-host:9010/{DB_PATH}")).unwrap();
     assert_eq!(db.database.as_deref(), Some(DB_PATH));
     assert_eq!(db.endpoint.as_deref(), Some("emu-host:9010"));
-}
-
-#[test]
-fn query_parameters_set_database_options() {
-    let mut db = new_database();
-    set_uri(
-        &mut db,
-        &format!(
-            "spanner:///{DB_PATH}?spanner.endpoint=http://localhost:9010\
-             &spanner.emulator=true"
-        ),
-    )
-    .unwrap();
-    assert_eq!(db.database.as_deref(), Some(DB_PATH));
-    assert_eq!(db.endpoint.as_deref(), Some("http://localhost:9010"));
-    assert!(db.emulator);
 }
 
 #[test]
@@ -193,6 +167,10 @@ fn a_uri_set_after_an_explicit_option_overwrites_only_what_it_carries() {
     );
     assert_eq!(db.endpoint.as_deref(), Some("http://from-uri:9010"));
     assert!(db.emulator);
+    assert_eq!(
+        db.get_option_string(OptionDatabase::Uri).unwrap(),
+        "spanner:///projects/p2/instances/i2/databases/d2"
+    );
 }
 
 #[test]
@@ -257,7 +235,16 @@ fn secret_bearing_query_parameters_are_rejected() {
 #[test]
 fn a_rejected_uri_leaves_the_configuration_untouched() {
     let mut db = new_database();
-    set_uri(&mut db, &format!("spanner:///{DB_PATH}")).unwrap();
+    let error = set_uri(&mut db, "bogus").unwrap_err();
+    assert_eq!(error.status, Status::InvalidArguments);
+    assert_eq!(
+        db.get_option_string(OptionDatabase::Uri)
+            .unwrap_err()
+            .status,
+        Status::NotFound
+    );
+    let good = format!("spanner:///{DB_PATH}");
+    set_uri(&mut db, &good).unwrap();
     db.set_option(
         OptionDatabase::Other(OPTION_ENDPOINT.into()),
         OptionValue::String("http://kept:9010".into()),
@@ -281,6 +268,7 @@ fn a_rejected_uri_leaves_the_configuration_untouched() {
             "uri: {bad}"
         );
         assert!(!db.emulator, "uri: {bad}");
+        assert_eq!(db.get_option_string(OptionDatabase::Uri).unwrap(), good);
     }
 }
 
@@ -342,47 +330,6 @@ fn a_uri_fragment_is_rejected() {
 }
 
 #[test]
-fn get_option_uri_returns_the_uri_verbatim() {
-    // adbc.h: `GetOption` returns the option value as set.
-    let uri = format!(
-        "spanner:///{DB_PATH}?spanner.endpoint=http://localhost:9010&spanner.emulator=true"
-    );
-    let mut db = new_database();
-    set_uri(&mut db, &uri).unwrap();
-    assert_eq!(db.get_option_string(OptionDatabase::Uri).unwrap(), uri);
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Other(OPTION_ENDPOINT.into()))
-            .unwrap(),
-        "http://localhost:9010"
-    );
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Other(OPTION_EMULATOR.into()))
-            .unwrap(),
-        "true"
-    );
-}
-
-#[test]
-fn get_option_uri_is_not_found_until_a_uri_is_set() {
-    let db = new_database();
-    let error = db.get_option_string(OptionDatabase::Uri).unwrap_err();
-    assert_eq!(error.status, Status::NotFound);
-}
-
-#[test]
-fn the_last_uri_set_is_the_one_returned() {
-    let mut db = new_database();
-    set_uri(&mut db, &format!("spanner:///{DB_PATH}")).unwrap();
-    let last = "spanner://host:9010/projects/p2/instances/i2/databases/d2?spanner.emulator=true";
-    set_uri(&mut db, last).unwrap();
-    assert_eq!(db.get_option_string(OptionDatabase::Uri).unwrap(), last);
-    assert_eq!(
-        db.database.as_deref(),
-        Some("projects/p2/instances/i2/databases/d2")
-    );
-}
-
-#[test]
 fn a_uri_survives_a_set_get_set_replay() {
     // Dumping options and replaying them must reproduce the same state.
     let uri = format!(
@@ -395,6 +342,16 @@ fn a_uri_survives_a_set_get_set_replay() {
     set_uri(&mut db, &uri).unwrap();
     let dumped = db.get_option_string(OptionDatabase::Uri).unwrap();
     assert_eq!(dumped, uri);
+    assert_eq!(
+        db.get_option_string(OptionDatabase::Other(OPTION_ENDPOINT.into()))
+            .unwrap(),
+        "http://localhost:9010"
+    );
+    assert_eq!(
+        db.get_option_string(OptionDatabase::Other(OPTION_EMULATOR.into()))
+            .unwrap(),
+        "true"
+    );
 
     let mut replayed = new_database();
     set_uri(&mut replayed, &dumped).unwrap();
@@ -406,28 +363,6 @@ fn a_uri_survives_a_set_get_set_replay() {
     assert_eq!(replayed.endpoint, db.endpoint);
     assert_eq!(replayed.emulator, db.emulator);
     assert_eq!(replayed.keyfile, db.keyfile);
-}
-
-#[test]
-fn a_rejected_uri_is_never_retrievable() {
-    let mut db = new_database();
-    for bad in [
-        format!("spanner:///{DB_PATH}?{OPTION_ACCESS_TOKEN}=ya29.uri-token"),
-        format!("spanner:///{DB_PATH}?{OPTION_KEYFILE_JSON}=%7B%7D"),
-        format!("spanner:///{DB_PATH}?bogus.key=1"),
-        format!("spanner:/{DB_PATH}"),
-        DB_PATH.to_string(),
-    ] {
-        assert!(set_uri(&mut db, &bad).is_err(), "uri: {bad}");
-        let error = db.get_option_string(OptionDatabase::Uri).unwrap_err();
-        assert_eq!(error.status, Status::NotFound, "uri: {bad}");
-    }
-
-    // Nor does a rejected URI replace a stored one.
-    let good = format!("spanner:///{DB_PATH}");
-    set_uri(&mut db, &good).unwrap();
-    assert!(set_uri(&mut db, &format!("spanner:///{DB_PATH}?bogus.key=1")).is_err());
-    assert_eq!(db.get_option_string(OptionDatabase::Uri).unwrap(), good);
 }
 
 #[test]

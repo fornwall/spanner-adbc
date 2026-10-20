@@ -20,11 +20,10 @@ impl SpannerDatabase {
     pub(super) fn set_uri_option(&mut self, value: String) -> Result<()> {
         let remainder = connection_uri_remainder(&value).ok_or_else(|| {
             // Never quote an invalid URI: it may contain credentials we have not validated.
-            invalid_argument(
-                "the `uri` option requires a `spanner://` connection URI; use \
-                 `spanner:///projects/<project>/instances/<instance>/databases/<database>` \
-                 (three slashes when no endpoint host is intended)",
-            )
+            invalid_argument(format!(
+                "the `uri` option takes a URI such as `{URI_FORM}`, or \
+                 `spanner://<host>:<port>/projects/...` for an emulator or another endpoint"
+            ))
         })?;
         let parsed = parse_connection_uri(remainder)?;
         // Validate values against a scratch database before touching the real configuration.
@@ -85,13 +84,17 @@ const URI_QUERY_OPTIONS: [&str; 10] = [
 /// Secret values must use dedicated, write-only options, since URIs are commonly logged.
 const URI_SECRET_OPTIONS: [&str; 2] = [OPTION_KEYFILE_JSON, OPTION_ACCESS_TOKEN];
 
-/// URI schemes are ASCII case-insensitive (RFC 3986).
+/// The URI form that error messages suggest.
+pub(super) const URI_FORM: &str =
+    "spanner:///projects/<project>/instances/<instance>/databases/<database>";
+
+/// The part after `spanner://`. URI schemes are ASCII case-insensitive (RFC 3986).
 fn connection_uri_remainder(value: &str) -> Option<&str> {
-    const SCHEME: &str = "spanner:";
+    const PREFIX: &str = "spanner://";
     value
-        .get(..SCHEME.len())
-        .filter(|prefix| prefix.eq_ignore_ascii_case(SCHEME))
-        .map(|_| &value[SCHEME.len()..])
+        .get(..PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+        .map(|_| &value[PREFIX.len()..])
 }
 
 struct ParsedConnectionUri {
@@ -100,7 +103,7 @@ struct ParsedConnectionUri {
     params: Vec<(String, String)>,
 }
 
-/// Parse the portion after `spanner:`. Require `//`, a full database path and known query keys.
+/// Parse the portion after `spanner://`. Require a full database path and known query keys.
 /// Empty authority means no endpoint; query parameters retain their source order.
 fn parse_connection_uri(remainder: &str) -> Result<ParsedConnectionUri> {
     if remainder.contains('#') {
@@ -109,16 +112,7 @@ fn parse_connection_uri(remainder: &str) -> Result<ParsedConnectionUri> {
         ));
     }
     let (before_query, query) = remainder.split_once('?').unwrap_or((remainder, ""));
-    let after_authority = before_query.strip_prefix("//").ok_or_else(|| {
-        invalid_argument(
-            "the `uri` option requires two slashes after `spanner:`; use \
-             `spanner:///projects/<project>/instances/<instance>/databases/<database>` \
-             (three slashes when no endpoint host is intended)",
-        )
-    })?;
-    let (authority, path) = after_authority
-        .split_once('/')
-        .unwrap_or((after_authority, ""));
+    let (authority, path) = before_query.split_once('/').unwrap_or((before_query, ""));
     if authority.contains('@') {
         return Err(invalid_argument(
             "connection URI userinfo is not supported; pass credentials through the \
