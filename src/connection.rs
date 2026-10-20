@@ -120,17 +120,6 @@ impl SpannerConnection {
             return Ok(());
         };
         self.cancel.begin_operation();
-        if statements.is_empty() {
-            // Mutations-only commits use the client's replay protection.
-            return write_mutations_txn(
-                &self.runtime,
-                &self.client,
-                &self.cancel.current(),
-                &self.config,
-                mutations.iter().cloned(),
-            )
-            .map_err(note_commit_failure);
-        }
         run_batch_txn(
             &self.runtime,
             &self.client,

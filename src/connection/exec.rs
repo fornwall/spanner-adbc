@@ -67,7 +67,7 @@ pub(super) fn isolation_to_adbc_string(isolation: &IsolationLevel) -> &'static s
 }
 
 /// Apply DML `statements` and `mutations` atomically in one read/write transaction, returning the
-/// statements' total affected-row count.
+/// statements' total affected-row count. Mutations alone go through [`write_mutations_txn`].
 ///
 /// The statements run as one `ExecuteBatchDml`; Spanner applies the mutations at commit, after
 /// every statement. The runner replays the closure on abort.
@@ -87,20 +87,19 @@ pub(crate) fn run_batch_txn(
     mutations: &[Mutation],
     last_statements: bool,
 ) -> Result<i64> {
-    if statements.is_empty() && mutations.is_empty() {
-        return Ok(0);
+    if statements.is_empty() {
+        return write_mutations_txn(runtime, client, cancel, config, mutations.iter().cloned())
+            .map(|()| 0);
     }
     // Commit priority and transaction tag go on the runner, the request tag on the batch.
-    let batch = (!statements.is_empty()).then(|| {
-        let mut batch = config
-            .retry
-            .apply_to_batch_dml(config.request.apply_to_batch_dml(BatchDmlBuilder::new()))
-            .set_last_statements(last_statements);
-        for statement in statements {
-            batch = batch.add_statement(statement.clone());
-        }
-        batch.build()
-    });
+    let mut batch = config
+        .retry
+        .apply_to_batch_dml(config.request.apply_to_batch_dml(BatchDmlBuilder::new()))
+        .set_last_statements(last_statements);
+    for statement in statements {
+        batch = batch.add_statement(statement.clone());
+    }
+    let batch = batch.build();
     let runner = runner_builder(
         client,
         config.isolation.clone(),
@@ -112,9 +111,6 @@ pub(crate) fn run_batch_txn(
         let outcome = runner
             .run(async |transaction: ReadWriteTransaction| {
                 transaction.buffer(mutations.iter().cloned())?;
-                let Some(batch) = &batch else {
-                    return Ok(0);
-                };
                 let counts = transaction.execute_batch_update(batch.clone()).await?;
                 Ok(counts.into_iter().sum::<i64>())
             })
