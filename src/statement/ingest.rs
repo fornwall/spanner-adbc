@@ -1,6 +1,8 @@
 //! Bulk ingest: `adbc.ingest.*` option parsing, create/replace table DDL, and the mutation write
 //! paths (chunked write-only commits, or non-atomic BatchWrite).
 
+use std::ops::Range;
+
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
 use arrow_array::{Array, RecordBatch};
@@ -247,26 +249,12 @@ impl SpannerStatement {
             // Autocommit was enabled (committing the manual transaction) while building; fall
             // through to the autocommit path.
         }
-        // Cut the flattened rows into `[start, end)` chunks. Mutations are built from the batches
-        // per chunk, so nothing is copied up front in case a chunk has to be split.
+        // Mutations are built from the batches per chunk, so nothing is copied up front in case a
+        // chunk has to be split.
         let mut total = 0_i64;
-        let mut budget = IngestChunkBudget::default();
-        let mut chunk_start = 0_usize;
-        let mut row_index = 0_usize;
-        for batch in &self.bound {
-            let columns = batch.num_columns();
-            let row_bytes = estimated_row_bytes(batch);
-            for _ in 0..batch.num_rows() {
-                if !budget.fits(columns, row_bytes) {
-                    total += self.commit_ingest_range(&target, chunk_start, row_index, total)?;
-                    budget = IngestChunkBudget::default();
-                    chunk_start = row_index;
-                }
-                budget.add(columns, row_bytes);
-                row_index += 1;
-            }
+        for chunk in chunk_ranges(&self.bound) {
+            total += self.commit_ingest_range(&target, chunk.start, chunk.end, total)?;
         }
-        total += self.commit_ingest_range(&target, chunk_start, row_index, total)?;
         self.check_empty_append_target(table, total)?;
         Ok(Some(total))
     }
@@ -322,9 +310,6 @@ impl SpannerStatement {
         end: usize,
         prior_total: i64,
     ) -> Result<i64> {
-        if start >= end {
-            return Ok(0);
-        }
         if self.ingest_batch_write {
             // BatchWrite applies each row's group independently, so the per-commit mutation
             // limit, and the split that works around it, don't apply.
@@ -376,9 +361,6 @@ impl SpannerStatement {
     /// a group fails to count every confirmed write. Errors are annotated outside the
     /// cancellation/timeout boundary so interrupted streams also report confirmed rows.
     fn batch_write_chunk(&self, mutations: Vec<Mutation>, prior_total: i64) -> Result<i64> {
-        if mutations.is_empty() {
-            return Ok(0);
-        }
         let groups: Vec<MutationGroup> = mutations
             .into_iter()
             .map(|m| MutationGroup::new(vec![m]))
@@ -530,29 +512,33 @@ const INGEST_CHUNK_MUTATION_LIMIT: u64 = 20_000;
 /// gRPC request limits, because the per-row estimate is rough.
 const INGEST_CHUNK_BYTE_BUDGET: u64 = 4 * 1024 * 1024;
 
-/// Running mutation and byte totals of one ingest chunk; each row costs its column count in
-/// mutations.
-#[derive(Default)]
-struct IngestChunkBudget {
-    rows: u64,
-    mutations: u64,
-    bytes: u64,
-}
-
-impl IngestChunkBudget {
-    /// Whether another row fits. The first row always fits, so an oversized row gets a chunk of its
-    /// own instead of an empty chunk.
-    fn fits(&self, columns: usize, row_bytes: usize) -> bool {
-        self.rows == 0
-            || (self.mutations.saturating_add(columns as u64) <= INGEST_CHUNK_MUTATION_LIMIT
-                && self.bytes.saturating_add(row_bytes as u64) <= INGEST_CHUNK_BYTE_BUDGET)
+/// Cut the bound rows, numbered across batches, into non-empty chunks for one commit each. Each
+/// row costs its column count in mutations.
+fn chunk_ranges(batches: &[RecordBatch]) -> Vec<Range<usize>> {
+    let mut chunks = Vec::new();
+    let (mut start, mut row) = (0, 0);
+    let (mut mutations, mut bytes) = (0_u64, 0_u64);
+    for batch in batches {
+        let columns = batch.num_columns() as u64;
+        let row_bytes = estimated_row_bytes(batch) as u64;
+        for _ in 0..batch.num_rows() {
+            // A chunk's first row always fits, so an oversized row gets a chunk of its own.
+            if row > start
+                && (mutations + columns > INGEST_CHUNK_MUTATION_LIMIT
+                    || bytes + row_bytes > INGEST_CHUNK_BYTE_BUDGET)
+            {
+                chunks.push(start..row);
+                (start, mutations, bytes) = (row, 0, 0);
+            }
+            mutations += columns;
+            bytes += row_bytes;
+            row += 1;
+        }
     }
-
-    fn add(&mut self, columns: usize, row_bytes: usize) {
-        self.rows += 1;
-        self.mutations = self.mutations.saturating_add(columns as u64);
-        self.bytes = self.bytes.saturating_add(row_bytes as u64);
+    if row > start {
+        chunks.push(start..row);
     }
+    chunks
 }
 
 #[cfg(test)]

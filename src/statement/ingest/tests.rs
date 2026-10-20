@@ -1,60 +1,83 @@
-use super::*;
-use adbc_core::error::Status;
+#![allow(
+    clippy::single_range_in_vec_init,
+    reason = "a list of one chunk is a single range"
+)]
 
-/// Row counts of the chunks `run_ingest_mutations` would cut for `rows` identical rows.
-fn chunk_lengths(rows: usize, columns: usize, row_bytes: usize) -> Vec<usize> {
-    let mut lengths = Vec::new();
-    let mut current = 0_usize;
-    let mut budget = IngestChunkBudget::default();
-    for _ in 0..rows {
-        if !budget.fits(columns, row_bytes) {
-            lengths.push(current);
-            current = 0;
-            budget = IngestChunkBudget::default();
-        }
-        current += 1;
-        budget.add(columns, row_bytes);
-    }
-    if current > 0 {
-        lengths.push(current);
-    }
-    lengths
+use std::sync::Arc;
+
+use adbc_core::error::Status;
+use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatchOptions, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+
+use super::*;
+
+/// A batch of `rows` rows with `columns` Int64 columns, 8 bytes per cell.
+fn int_batch(rows: usize, columns: usize) -> RecordBatch {
+    let fields: Vec<Field> = (0..columns)
+        .map(|i| Field::new(format!("c{i}"), DataType::Int64, false))
+        .collect();
+    let arrays: Vec<ArrayRef> = (0..columns)
+        .map(|_| Arc::new(Int64Array::from(vec![0_i64; rows])) as ArrayRef)
+        .collect();
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        arrays,
+        &RecordBatchOptions::new().with_row_count(Some(rows)),
+    )
+    .unwrap()
+}
+
+/// A batch of `rows` rows with one binary column of `bytes`-byte values.
+fn binary_batch(rows: usize, bytes: usize) -> RecordBatch {
+    let value = vec![0_u8; bytes];
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("b", DataType::Binary, false)])),
+        vec![Arc::new(BinaryArray::from_iter_values(
+            std::iter::repeat_n(&value, rows),
+        ))],
+    )
+    .unwrap()
 }
 
 #[test]
-fn ingest_chunks_cut_at_the_mutation_limit() {
-    // With negligible row sizes, the mutation budget decides.
+fn ingest_chunks_cut_at_the_mutation_limit_across_batches() {
     let per_chunk = (INGEST_CHUNK_MUTATION_LIMIT / 10) as usize;
-    assert_eq!(chunk_lengths(per_chunk, 10, 1), vec![per_chunk]);
-    assert_eq!(chunk_lengths(per_chunk + 1, 10, 1), vec![per_chunk, 1]);
+    assert_eq!(chunk_ranges(&[int_batch(per_chunk, 10)]), [0..per_chunk]);
     assert_eq!(
-        chunk_lengths(3 * per_chunk - 1, 10, 1),
-        vec![per_chunk, per_chunk, per_chunk - 1]
+        chunk_ranges(&[int_batch(per_chunk + 1, 10)]),
+        [0..per_chunk, per_chunk..per_chunk + 1]
+    );
+    // Rows are numbered across batches, and a chunk can span them.
+    let half = per_chunk / 2 + 1;
+    assert_eq!(
+        chunk_ranges(&[int_batch(half, 10), int_batch(0, 10), int_batch(half, 10)]),
+        [0..per_chunk, per_chunk..2 * half]
     );
     // 20,000 / 3 rounds down.
-    assert_eq!(chunk_lengths(6_667, 3, 1), vec![6_666, 1]);
+    assert_eq!(
+        chunk_ranges(&[int_batch(6_667, 3)]),
+        [0..6_666, 6_666..6_667]
+    );
 }
 
 #[test]
 fn ingest_chunks_cut_at_the_byte_budget() {
-    let mib = 1024 * 1024;
-    let per_chunk = (INGEST_CHUNK_BYTE_BUDGET / mib as u64) as usize;
-    assert_eq!(chunk_lengths(per_chunk, 2, mib), vec![per_chunk]);
-    assert_eq!(
-        chunk_lengths(2 * per_chunk + 1, 2, mib),
-        vec![per_chunk, per_chunk, 1]
-    );
+    // Two rows of just under 2 MiB fit the 4 MiB budget; a third doesn't.
+    let batch = binary_batch(5, 2 * 1024 * 1024 - 8);
+    assert_eq!(chunk_ranges(&[batch]), [0..2, 2..4, 4..5]);
 }
 
 #[test]
 fn ingest_chunks_never_starve_on_an_oversized_row() {
-    assert_eq!(chunk_lengths(3, usize::MAX, usize::MAX), vec![1, 1, 1]);
-    assert_eq!(chunk_lengths(100_000, 0, 0), vec![100_000]);
+    let batch = binary_batch(3, INGEST_CHUNK_BYTE_BUDGET as usize + 1);
+    assert_eq!(chunk_ranges(&[batch]), [0..1, 1..2, 2..3]);
+    assert_eq!(chunk_ranges(&[int_batch(100_000, 0)]), [0..100_000]);
 }
 
 #[test]
 fn ingest_of_zero_rows_emits_no_chunks() {
-    assert_eq!(chunk_lengths(0, 10, 100), Vec::<usize>::new());
+    assert!(chunk_ranges(&[]).is_empty());
+    assert!(chunk_ranges(&[int_batch(0, 10)]).is_empty());
 }
 
 #[test]
@@ -197,11 +220,6 @@ fn ingest_mode_parses_both_spellings_and_rejects_unknown() {
 /// rows in a commit of its own.
 #[test]
 fn row_size_estimate_counts_only_a_slices_rows() {
-    use std::sync::Arc;
-
-    use arrow_array::{Int64Array, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
-
     let rows = 200_000;
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
@@ -220,9 +238,5 @@ fn row_size_estimate_counts_only_a_slices_rows() {
     let slice = batch.slice(1_000, 10);
     assert_eq!(estimated_row_bytes(&slice), 44);
     assert_eq!(estimated_row_bytes(&batch), 44);
-    let mut budget = IngestChunkBudget::default();
-    for _ in 0..slice.num_rows() {
-        assert!(budget.fits(slice.num_columns(), estimated_row_bytes(&slice)));
-        budget.add(slice.num_columns(), estimated_row_bytes(&slice));
-    }
+    assert_eq!(chunk_ranges(&[slice]), [0..10]);
 }
