@@ -15,8 +15,8 @@ GoogleSQL databases are supported, not the PostgreSQL dialect.
 
 ## Install
 
-Requires Python 3.11 or later. Wheels bundle the native driver; see
-[supported platforms](#supported-platforms).
+Requires Python 3.11 or later and adbc-driver-manager 1.8 or later, which pip installs. Wheels
+bundle the native driver; see [supported platforms](#supported-platforms).
 
 ```sh
 pip install "spanner-adbc[dbapi]"  # includes PyArrow and pandas
@@ -63,9 +63,14 @@ to `"true"` and `DatabaseOptions.ENDPOINT` to its `host:port`. For Spanner Omni,
 `DatabaseOptions.INSTANCE_TYPE` to `"omni"` and `DatabaseOptions.ENDPOINT` to the server.
 [Authentication][auth] covers the credential options and when the driver connects anonymously.
 
+Connections don't carry over into a forked process. With `multiprocessing`'s `fork` start
+method, the default on Linux before Python 3.14, connect in each worker; see
+[forked processes][fork].
+
 [adc]: https://docs.cloud.google.com/docs/authentication/application-default-credentials
 [emulator]: https://docs.cloud.google.com/spanner/docs/emulator
 [auth]: https://github.com/fornwall/spanner-adbc/blob/main/README.md#authentication
+[fork]: https://github.com/fornwall/spanner-adbc/blob/main/docs/limitations.md#forked-processes
 
 ## Options
 
@@ -124,10 +129,20 @@ with spanner.connect("spanner:///projects/p/instances/i/databases/d") as conn:
 See [transactions](https://github.com/fornwall/spanner-adbc/blob/main/docs/transactions.md) for
 the details.
 
+## Errors
+
+Errors are the PEP 249 exceptions that `adbc_driver_manager.dbapi` raises for each ADBC status,
+also exported by `spanner_adbc.dbapi`. [Errors][errors] lists the status for each Spanner error
+code, and `exc.details` includes the numeric code as `spanner.vendor_code`.
+
+[errors]: https://github.com/fornwall/spanner-adbc/blob/main/docs/adbc.md#errors
+
 ## DataFrames
 
-`fetch_arrow_table()`, `fetch_df()` and `fetch_polars()` load the whole result into memory.
-`fetch_record_batch()` streams it while the cursor is open:
+`fetch_arrow_table()` and `fetch_df()` load the whole result into memory, and
+`fetch_record_batch()` streams it while the cursor is open. With Polars 2.0, `fetch_polars()`
+returns a struct `Series` rather than a DataFrame, so use `pl.from_arrow(cur.fetch_arrow_table())`
+or `pl.read_database()` instead.
 
 ```python
 import spanner_adbc.dbapi as spanner
@@ -162,6 +177,11 @@ pandas quotes table names with `"`, which GoogleSQL reads as a string. Polars'
 `adbc_driver_spanner`. Both libraries write through [bulk ingest](#bulk-ingest), so use
 autocommit for large writes. In manual mode, end a read with `conn.rollback()` before writing.
 
+Results follow the [type mapping][types]. Polars 2.0 reads JSON columns as
+`Extension('arrow.json', String)`. Spanner allows duplicate `STRUCT` field names: pandas and
+DuckDB keep only the last field of each name, and Polars raises `DuplicateError` when unnesting
+such a struct.
+
 DuckDB can query fetched Arrow data in-process:
 
 ```python
@@ -175,6 +195,8 @@ with spanner.connect("spanner:///projects/p/instances/i/databases/d") as conn:
 
 print(duckdb.sql("SELECT COUNT(*) FROM singers").fetchone())
 ```
+
+[types]: https://github.com/fornwall/spanner-adbc/blob/main/README.md#type-mapping
 
 ## Bulk ingest
 
@@ -267,10 +289,12 @@ Rust; it packages the one library staged in `python/spanner_adbc/`, such as
 `libspanner_adbc.so` on Linux:
 
 ```sh
-cargo build --release
+cargo build --release --features strip-logging
 cp target/release/libspanner_adbc.so python/spanner_adbc/
 pip install './python[dbapi]'
 ```
+
+The release wheels use the `strip-logging` feature, which only makes the library smaller.
 
 See [CONTRIBUTING.md](https://github.com/fornwall/spanner-adbc/blob/main/CONTRIBUTING.md) for
 development and releases.
