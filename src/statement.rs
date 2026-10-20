@@ -983,20 +983,19 @@ fn string_option(key: &OptionStatement, value: OptionValue) -> Result<String> {
 
 /// Reject DDL and DML in the query-only entry points. DML, including `THEN RETURN`, would
 /// otherwise fail with Spanner's read-write transaction error, which suggests the transaction mode
-/// is at fault. `dml_rationale` completes "DML (INSERT/UPDATE/DELETE) cannot be".
+/// is at fault. `dml_rationale` completes "DML (INSERT/UPDATE/DELETE), which cannot be".
 fn check_query_only(sql: &str, entry_point: &str, dml_rationale: &str) -> Result<()> {
-    if crate::sql::is_ddl(sql) {
-        return Err(invalid_argument(format!(
-            "{entry_point} is only valid for queries"
-        )));
-    }
-    if crate::sql::is_dml(sql) {
-        return Err(invalid_argument(format!(
-            "{entry_point} only supports queries: DML (INSERT/UPDATE/DELETE) cannot be \
-             {dml_rationale}; run it via execute or execute_update instead"
-        )));
-    }
-    Ok(())
+    let what = if crate::sql::is_ddl(sql) {
+        "DDL".to_string()
+    } else if crate::sql::is_dml(sql) {
+        format!("DML (INSERT/UPDATE/DELETE), which cannot be {dml_rationale}")
+    } else {
+        return Ok(());
+    };
+    Err(invalid_argument(format!(
+        "{entry_point} only supports queries, not {what}; run it via execute or execute_update \
+         instead"
+    )))
 }
 
 /// Reject a `;`-separated batch that mixes statement kinds before anything runs or is buffered.

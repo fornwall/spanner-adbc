@@ -69,80 +69,43 @@ fn partitioned_dml_rejects_what_it_cannot_express() {
 }
 
 #[test]
-fn execute_schema_guard_rejects_ddl_and_dml() {
-    let check_schema =
-        |sql: &str| check_query_only(sql, "execute_schema", "planned in a read-only schema probe");
-    for sql in [
-        "SELECT 1",
-        "WITH cte AS (SELECT 1 AS a) SELECT a FROM cte",
-        "(SELECT 1)",
-        "@{USE_ADDITIONAL_PARALLELISM=true} SELECT 1",
-        "GRAPH g MATCH (n) RETURN n.id",
-    ] {
-        check_schema(sql).unwrap_or_else(|e| panic!("query should pass: {sql}: {e}"));
-    }
-    let error = check_schema("CREATE TABLE t (id INT64) PRIMARY KEY (id)").unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-    for sql in [
-        "INSERT INTO t (id) VALUES (1)",
-        "update t set c = 1 where true",
-        "Delete From t Where true",
-        "/* comment */ INSERT INTO t (id) VALUES (1)",
-        "@{PDML_MAX_PARALLELISM=1} DELETE FROM t WHERE true",
-        "INSERT INTO t (id) VALUES (1) THEN RETURN id",
-    ] {
-        let error = check_schema(sql).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments, "{sql}");
-        assert!(
-            error.message.contains("only supports queries"),
-            "unexpected message for {sql}: {}",
-            error.message
-        );
-    }
-}
-
-#[test]
-fn execute_partitions_guard_rejects_ddl_and_dml() {
-    let check_partitions = |sql: &str| {
-        check_query_only(
-            sql,
+fn query_only_guard_rejects_ddl_and_dml() {
+    for (entry_point, rationale) in [
+        ("execute_schema", "planned in a read-only schema probe"),
+        (
             "execute_partitions",
             "partitioned in a batch read-only transaction",
-        )
-    };
-    for sql in [
-        "SELECT 1",
-        "WITH cte AS (SELECT 1 AS a) SELECT a FROM cte",
-        "(SELECT 1)",
-        "@{USE_ADDITIONAL_PARALLELISM=true} SELECT 1",
-        "GRAPH g MATCH (n) RETURN n.id",
+        ),
     ] {
-        check_partitions(sql).unwrap_or_else(|e| panic!("query should pass: {sql}: {e}"));
-    }
-    let error = check_partitions("CREATE TABLE t (id INT64) PRIMARY KEY (id)").unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
-    assert!(
-        error.message.contains("execute_partitions"),
-        "unexpected message: {}",
-        error.message
-    );
-    for sql in [
-        "INSERT INTO t (id) VALUES (1)",
-        "update t set c = 1 where true",
-        "Delete From t Where true",
-        "/* comment */ INSERT INTO t (id) VALUES (1)",
-        "@{PDML_MAX_PARALLELISM=1} DELETE FROM t WHERE true",
-        "INSERT INTO t (id) VALUES (1) THEN RETURN id",
-    ] {
-        let error = check_partitions(sql).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments, "{sql}");
-        assert!(
-            error
-                .message
-                .contains("execute_partitions only supports queries"),
-            "unexpected message for {sql}: {}",
-            error.message
-        );
+        let check = |sql: &str| check_query_only(sql, entry_point, rationale);
+        for sql in [
+            "SELECT 1",
+            "WITH cte AS (SELECT 1 AS a) SELECT a FROM cte",
+            "(SELECT 1)",
+            "@{USE_ADDITIONAL_PARALLELISM=true} SELECT 1",
+            "GRAPH g MATCH (n) RETURN n.id",
+        ] {
+            check(sql).unwrap_or_else(|e| panic!("query should pass: {sql}: {e}"));
+        }
+        for sql in [
+            "CREATE TABLE t (id INT64) PRIMARY KEY (id)",
+            "INSERT INTO t (id) VALUES (1)",
+            "update t set c = 1 where true",
+            "Delete From t Where true",
+            "/* comment */ INSERT INTO t (id) VALUES (1)",
+            "@{PDML_MAX_PARALLELISM=1} DELETE FROM t WHERE true",
+            "INSERT INTO t (id) VALUES (1) THEN RETURN id",
+        ] {
+            let error = check(sql).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments, "{sql}");
+            assert!(
+                error
+                    .message
+                    .contains(&format!("{entry_point} only supports queries")),
+                "unexpected message for {sql}: {}",
+                error.message
+            );
+        }
     }
 }
 
