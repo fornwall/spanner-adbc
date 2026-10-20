@@ -13,6 +13,7 @@ use adbc_core::options::OptionValue;
 use google_cloud_gax::backoff_policy::BackoffPolicyArg;
 use google_cloud_gax::exponential_backoff::ExponentialBackoffBuilder;
 use google_cloud_gax::retry_policy::{RetryPolicyArg, RetryPolicyExt as _};
+use google_cloud_spanner::batch::Partition;
 use google_cloud_spanner::builder::{
     BatchDmlBuilder, BatchWriteTransactionBuilder, TransactionRunnerBuilder,
     WriteOnlyTransactionBuilder,
@@ -152,6 +153,12 @@ impl RetryConfig {
     apply_to_request_builder! {
         /// Bound retries of unacknowledged BatchWrite mutation groups.
         apply_to_batch_write(BatchWriteTransactionBuilder)
+    }
+
+    apply_to_request_builder! {
+        /// Apply the policies to a partition read. Descriptors do not carry them, so the reading
+        /// connection's settings apply.
+        apply_to_partition(Partition)
     }
 
     apply_to_commit_builder! {

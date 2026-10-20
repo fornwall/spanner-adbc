@@ -645,3 +645,82 @@ mod statistics_deadline {
         assert_eq!(error.status, Status::Timeout, "{}", error.message);
     }
 }
+
+/// `read_partition` against a mock server whose partition stream always breaks mid-stream.
+mod partition_retry {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use adbc_core::options::{OptionConnection, OptionValue};
+    use adbc_core::{Connection, Optionable};
+    use spanner_grpc_mock::MockSpanner;
+    use spanner_grpc_mock::google::spanner::v1;
+
+    use super::table_schema_probe::{Requests, connect, serve};
+
+    /// Attempts served before failing permanently, so an ignored limit cannot hang the test.
+    const CAP: usize = 4;
+
+    fn rows(with_metadata: bool) -> v1::PartialResultSet {
+        v1::PartialResultSet {
+            metadata: with_metadata.then(|| v1::ResultSetMetadata {
+                row_type: Some(v1::StructType {
+                    fields: vec![v1::struct_type::Field {
+                        name: "c".into(),
+                        r#type: Some(v1::Type {
+                            code: v1::TypeCode::String as i32,
+                            ..Default::default()
+                        }),
+                    }],
+                }),
+                ..Default::default()
+            }),
+            values: vec![prost_types::Value {
+                kind: Some(prost_types::value::Kind::StringValue("v".into())),
+            }],
+            resume_token: b"rt".to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// A descriptor carries no retry policy, so the reading connection's limit must apply.
+    #[test]
+    fn read_partition_honors_the_reading_connections_retry_limit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let mut mock = MockSpanner::new();
+        mock.expect_execute_streaming_sql().returning(move |_| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            if n >= CAP {
+                return Err(tonic::Status::internal("mock: attempt cap reached"));
+            }
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            // A resumed stream does not repeat the metadata.
+            tx.try_send(Ok(rows(n == 0))).unwrap();
+            tx.try_send(Err(tonic::Status::unavailable("mock: connection lost")))
+                .unwrap();
+            Ok(tonic::Response::new(rx))
+        });
+        let server = serve(mock, Requests::default());
+        let mut connection = connect(&server);
+        for (key, value) in [
+            (crate::OPTION_RETRY_MAX_ATTEMPTS, OptionValue::Int(2)),
+            (
+                crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS,
+                OptionValue::Double(0.01),
+            ),
+        ] {
+            connection
+                .set_option(OptionConnection::Other(key.into()), value)
+                .unwrap();
+        }
+
+        let descriptor = include_bytes!("../../fuzz/seeds/partition/enveloped-query-descriptor");
+        let failed = match connection.read_partition(descriptor) {
+            Ok(reader) => reader.collect::<Result<Vec<_>, _>>().is_err(),
+            Err(_) => true,
+        };
+        assert!(failed, "every attempt breaks, so the read must fail");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+}

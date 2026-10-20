@@ -469,11 +469,12 @@ impl Connection for SpannerConnection {
         let client = self.client.clone();
         let runtime = self.runtime.clone();
         let cancel = self.cancel.current();
-        // Timestamp precision comes from the reading connection; it must match the producing
-        // statement for the descriptor's schema to agree. The query timeout bounds the execute and
-        // first chunk, the fetch timeout each later chunk.
+        // Timestamp precision and retry settings come from the reading connection. The precision
+        // must match the producing statement's for the schemas to agree. The query timeout bounds
+        // the execute and first chunk, the fetch timeout each later chunk.
         let precision = self.config.timestamp_precision;
         let fallback_schema = descriptor.schema(precision)?;
+        let partition = self.config.retry.apply_to_partition(descriptor.partition);
         let fetch_timeout = self.config.timeouts.fetch_timeout();
         let reader = block_on_cancellable(
             &self.runtime,
@@ -482,11 +483,7 @@ impl Connection for SpannerConnection {
                 self.config.timeouts.query_timeout(),
                 crate::OPTION_RPC_TIMEOUT_QUERY,
                 async move {
-                    let result_set = descriptor
-                        .partition
-                        .execute(&client)
-                        .await
-                        .map_err(from_spanner)?;
+                    let result_set = partition.execute(&client).await.map_err(from_spanner)?;
                     stream_query(
                         runtime,
                         cancel,
