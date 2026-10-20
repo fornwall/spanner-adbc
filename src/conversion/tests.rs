@@ -408,7 +408,11 @@ fn malformed_values_are_errors_naming_the_type_and_value() {
         assert_eq!(error.status, Status::InvalidData, "{error}");
         let shown = value_to_json(&value).unwrap().to_string();
         assert!(
-            error.message.contains(spanner_type) && error.message.contains(&shown),
+            error.message.contains(spanner_type)
+                && error.message.contains(&shown)
+                && !error
+                    .message
+                    .contains(crate::OPTION_MAX_TIMESTAMP_PRECISION),
             "{data_type}: {error}"
         );
     }
@@ -516,7 +520,7 @@ fn nanosecond_overflow_names_the_column_and_the_option() {
     let values = ["1500-06-15T12:34:56.789012Z", "3000-01-01T00:00:00Z"].map(Value::from);
     for value in &values {
         let error = build_column(&column(TimeUnit::Nanosecond), &[Some(value)]).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(error.status, Status::InvalidData);
         for needle in [
             "column \"CreatedAt\"",
             value.as_str().unwrap(),

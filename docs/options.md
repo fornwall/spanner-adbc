@@ -247,7 +247,7 @@ Spanner timestamps cover the years 0001 to 9999. Arrow nanosecond timestamps are
 only covers about 1677 to 2262. `spanner.max_timestamp_precision` chooses between:
 
 - `nanoseconds_error_on_overflow`: `Timestamp(Nanosecond, "UTC")`. Out-of-range values return
-  `InvalidArguments` naming the column and value.
+  `InvalidData` (Python `DataError`) naming the column and value.
 - `microseconds`: `Timestamp(Microsecond, "UTC")`, covering Spanner's full range. Sub-microsecond
   digits are rounded toward negative infinity, so one nanosecond before the epoch becomes
   microsecond `-1`.

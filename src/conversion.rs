@@ -735,16 +735,19 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
                 |builder, v| {
                     let s = v.as_str().ok_or_else(|| decode_error("TIMESTAMP", v))?;
                     builder.append_value(parse_timestamp_nanos(s).ok_or_else(|| {
-                        if parse_timestamp(s).is_some() {
-                            invalid_argument(format!(
-                                "TIMESTAMP {s:?} is outside the Arrow Timestamp(Nanosecond) range \
-                                 (1677-09-21 to 2262-04-11); set {}={} to read it",
+                        if parse_timestamp(s).is_none() {
+                            return decode_error("TIMESTAMP", v);
+                        }
+                        // A value out of range for its type is a data error, as in PEP 249.
+                        err(
+                            format!(
+                                "TIMESTAMP {s:?} is outside the Arrow Timestamp(Nanosecond) \
+                                 range (1677-09-21 to 2262-04-11); set {}={} to read it",
                                 crate::OPTION_MAX_TIMESTAMP_PRECISION,
                                 TimestampPrecision::MICROSECONDS,
-                            ))
-                        } else {
-                            decode_error("TIMESTAMP", v)
-                        }
+                            ),
+                            Status::InvalidData,
+                        )
                     })?);
                     Ok(())
                 },
