@@ -214,7 +214,8 @@ Queries default to strong reads. `spanner.read.staleness` accepts:
 
 Durations are non-negative numbers, in seconds unless followed by a unit: `s`, `ms`, `us` or
 `µs`, `ns`, `m` or `h`. Examples: `exact:2.5s`, `max:1m`, `read:2026-07-07T00:00:00Z`. Prefixes
-are lowercase, and surrounding whitespace is trimmed.
+are lowercase, and surrounding whitespace is trimmed. Durations above 10,000 years and timestamps
+before year 1 are rejected when the option is set.
 
 Spanner only accepts `max:` and `min:` for single-use reads. Manual query transactions and
 queries bound to several rows convert them to the stalest equivalent exact bound: `max:<d>`

@@ -202,7 +202,7 @@ pub(crate) fn collect_objects(
     });
 
     let client = client.clone();
-    let bound = config.read_staleness.multi_use_timestamp_bound()?;
+    let bound = config.read_staleness.multi_use_timestamp_bound();
     let batches = block_on_cancellable(
         runtime,
         cancel,

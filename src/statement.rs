@@ -192,7 +192,7 @@ impl SpannerStatement {
     fn plan_query_schema(&self, sql: &str) -> Result<SchemaRef> {
         let client = self.client.clone();
         // The schema is versioned too, so probe at the same staleness as the data read.
-        let read_bound = self.config.read_staleness.timestamp_bound()?;
+        let read_bound = self.config.read_staleness.timestamp_bound();
         let precision = self.config.timestamp_precision;
         let statement = self.build_query_statement(sql, true)?;
         block_on_cancellable(
@@ -241,7 +241,7 @@ impl SpannerStatement {
             group: 0,
             row: 0,
         });
-        let bound = self.config.read_staleness.multi_use_timestamp_bound()?;
+        let bound = self.config.read_staleness.multi_use_timestamp_bound();
         let manual_txn = self.manual_read_transaction()?;
         let client = self.client.clone();
         let runtime = self.runtime.clone();
@@ -301,7 +301,7 @@ impl SpannerStatement {
         // Bind before taking the manual read transaction: a bind error after it would leave the
         // transaction installed but unbegun, fixing the manual transaction's kind to queries.
         let statement = self.build_query_statement(&sql, false)?;
-        let bound = self.config.read_staleness.timestamp_bound()?;
+        let bound = self.config.read_staleness.timestamp_bound();
         let manual_txn = self.manual_read_transaction()?;
         let client = self.client.clone();
         let runtime = self.runtime.clone();
@@ -513,7 +513,7 @@ impl SpannerStatement {
         // so the two connections should use the same setting.
         let precision = self.config.timestamp_precision;
         // Baked into the batch transaction, so every partition reads at this bound.
-        let bound = self.config.read_staleness.timestamp_bound()?;
+        let bound = self.config.read_staleness.timestamp_bound();
 
         let partition_op = async move {
             let plan_rs = crate::staleness::single_use(&client, bound.clone())
@@ -601,7 +601,7 @@ impl SpannerStatement {
         let plan_builder = self.read_sql_builder(&sql).set_query_mode(QueryMode::Plan);
         let client = self.client.clone();
         // Plan against the schema version the query will read, as `plan_query_schema` does.
-        let read_bound = self.config.read_staleness.timestamp_bound()?;
+        let read_bound = self.config.read_staleness.timestamp_bound();
         block_on_cancellable(
             &self.runtime,
             &self.cancel.current(),
@@ -697,7 +697,7 @@ impl SpannerStatement {
                 return Ok(Some(txn));
             }
         }
-        let bound = self.config.read_staleness.multi_use_timestamp_bound()?;
+        let bound = self.config.read_staleness.multi_use_timestamp_bound();
         let client = self.client.clone();
         let built = block_on_cancellable(&self.runtime, &self.cancel.current(), async move {
             crate::staleness::multi_use(&client, bound).await

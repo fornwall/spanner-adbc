@@ -307,7 +307,7 @@ impl Connection for SpannerConnection {
         let table = qualified_table(db_schema, table_name)?;
         let sql = format!("SELECT * FROM {table} LIMIT 0");
         let client = self.client.clone();
-        let bound = self.config.read_staleness.timestamp_bound()?;
+        let bound = self.config.read_staleness.timestamp_bound();
         // Use the connection's precision so the schema matches what its queries stream.
         let precision = self.config.timestamp_precision;
         let statement = metadata_sql_builder(&self.config, sql).build();

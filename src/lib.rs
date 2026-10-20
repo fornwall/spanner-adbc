@@ -225,7 +225,7 @@ pub mod fuzzing {
         crate::driver::ensure_scheme(host)
     }
 
-    /// Parse a `spanner.read.staleness` value and map it to client `TimestampBound`s.
+    /// Parse a `spanner.read.staleness` value into client `TimestampBound`s.
     pub fn parse_read_staleness(value: &str) {
         use adbc_core::options::OptionValue;
         let mut staleness = crate::staleness::ReadStaleness::default();
@@ -233,15 +233,17 @@ pub mod fuzzing {
             .set_staleness(OptionValue::String(value.to_string()))
             .is_ok()
         {
-            let _ = staleness.timestamp_bound();
-            let _ = staleness.multi_use_timestamp_bound();
+            assert_eq!(
+                staleness.timestamp_bound().is_some(),
+                staleness.multi_use_timestamp_bound().is_some()
+            );
         }
     }
 
     /// Parse a duration in the grammar shared by `spanner.read.staleness` and
     /// `spanner.commit.max_delay`.
     pub fn parse_duration(value: &str) {
-        let _ = crate::staleness::parse_duration(value);
+        let _ = crate::staleness::parse_duration(value, crate::OPTION_READ_STALENESS);
     }
 
     /// Parse a `spanner.directed_read` value.

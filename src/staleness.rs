@@ -1,15 +1,15 @@
 //! The [`OPTION_READ_STALENESS`](crate::OPTION_READ_STALENESS) read bound for read-only queries,
 //! mapped to the client's [`TimestampBound`]. Unset means a strong read.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use adbc_core::error::Result;
 use adbc_core::options::OptionValue;
-use chrono::{DateTime, Utc};
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::transaction::{
     MultiUseReadOnlyTransaction, SingleUseReadOnlyTransaction, TimestampBound,
 };
+use google_cloud_wkt::Timestamp;
 
 use crate::error::{from_spanner, invalid_argument};
 use crate::options::RawParsed;
@@ -43,52 +43,20 @@ pub(crate) async fn multi_use(
     .map_err(from_spanner)
 }
 
-/// A parsed read bound. Unlike [`TimestampBound`], it can be inspected for pinning and tests.
+/// A parsed read bound, for single-use reads and for transactions that begin explicitly or
+/// serve several reads.
 #[derive(Debug, Clone, PartialEq)]
-enum ReadBound {
-    /// `exact:<duration>`
-    ExactStaleness(Duration),
-    /// `max:<duration>`
-    MaxStaleness(Duration),
-    /// `read:<rfc3339>` or a bare timestamp
-    ReadTimestamp(DateTime<Utc>),
-    /// `min:<rfc3339>`
-    MinReadTimestamp(DateTime<Utc>),
-}
-
-impl ReadBound {
-    /// The bound to use for a multi-use read-only transaction.
-    ///
-    /// `BeginTransaction` rejects the bounded-staleness kinds, so they are pinned to the most stale
-    /// timestamp they allow, which satisfies the original bound.
-    fn pinned_for_multi_use(&self) -> ReadBound {
-        match self {
-            ReadBound::MaxStaleness(d) => ReadBound::ExactStaleness(*d),
-            ReadBound::MinReadTimestamp(t) => ReadBound::ReadTimestamp(*t),
-            other => other.clone(),
-        }
-    }
-
-    fn to_timestamp_bound(&self) -> Result<TimestampBound> {
-        match self {
-            ReadBound::ExactStaleness(d) => TimestampBound::try_exact_staleness(*d)
-                .map_err(|e| invalid_argument(format!("read staleness out of range: {e}"))),
-            ReadBound::MaxStaleness(d) => TimestampBound::try_max_staleness(*d)
-                .map_err(|e| invalid_argument(format!("read staleness out of range: {e}"))),
-            ReadBound::ReadTimestamp(t) => TimestampBound::try_read_timestamp(to_system_time(*t))
-                .map_err(|e| invalid_argument(format!("read timestamp out of range: {e}"))),
-            ReadBound::MinReadTimestamp(t) => {
-                TimestampBound::try_min_read_timestamp(to_system_time(*t))
-                    .map_err(|e| invalid_argument(format!("read timestamp out of range: {e}")))
-            }
-        }
-    }
+struct Bounds {
+    single_use: TimestampBound,
+    /// `BeginTransaction` rejects the bounded-staleness kinds, so they are pinned to the most
+    /// stale timestamp they allow, which satisfies the original bound.
+    multi_use: TimestampBound,
 }
 
 /// The `spanner.read.staleness` setting of a connection or statement.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReadStaleness {
-    bound: RawParsed<ReadBound>,
+    bound: RawParsed<Bounds>,
 }
 
 impl ReadStaleness {
@@ -102,20 +70,13 @@ impl ReadStaleness {
     }
 
     /// The bound for a single-use read, or `None` for a strong read.
-    pub(crate) fn timestamp_bound(&self) -> Result<Option<TimestampBound>> {
-        self.bound
-            .parsed()
-            .map(ReadBound::to_timestamp_bound)
-            .transpose()
+    pub(crate) fn timestamp_bound(&self) -> Option<TimestampBound> {
+        self.bound.parsed().map(|b| b.single_use.clone())
     }
 
-    /// The bound for a multi-use read-only transaction (see
-    /// [`ReadBound::pinned_for_multi_use`]), or `None` for a strong read.
-    pub(crate) fn multi_use_timestamp_bound(&self) -> Result<Option<TimestampBound>> {
-        self.bound
-            .parsed()
-            .map(|b| b.pinned_for_multi_use().to_timestamp_bound())
-            .transpose()
+    /// The bound for a multi-use or batch read-only transaction, or `None` for a strong read.
+    pub(crate) fn multi_use_timestamp_bound(&self) -> Option<TimestampBound> {
+        self.bound.parsed().map(|b| b.multi_use.clone())
     }
 }
 
@@ -123,62 +84,92 @@ const GRAMMAR_FORMS: &str = "\"exact:<duration>\" (e.g. \"exact:10s\"), \"max:<d
      (e.g. \"max:500ms\"), \"read:<rfc3339>\" (e.g. \"read:2026-07-07T00:00:00Z\") or \
      \"min:<rfc3339>\" (e.g. \"min:2026-07-07T00:00:00+02:00\")";
 
-fn grammar_err(value: &str) -> adbc_core::error::Error {
-    invalid_argument(format!(
-        "option {}: {value:?} is not a valid read bound; expected {GRAMMAR_FORMS}",
-        crate::OPTION_READ_STALENESS
-    ))
-}
-
 /// Parse a `spanner.read.staleness` value. Prefixes are case-sensitive, like other ADBC option
 /// values.
-fn parse_read_bound(value: &str) -> Result<ReadBound> {
+fn parse_read_bound(value: &str) -> Result<Bounds> {
     // A timestamp's colons all follow its date, so the first colon ends any prefix. For a bare
     // timestamp the "prefix" is `2026-07-07T00`, which matches no kind.
     if let Some((kind, arg)) = value.split_once(':') {
+        let arg = arg.trim();
+        let staleness = || {
+            let duration = duration(arg).ok_or_else(|| {
+                invalid_argument(format!(
+                    "option {}: {value:?} does not carry a valid duration; expected \
+                     {DURATION_FORM}",
+                    crate::OPTION_READ_STALENESS
+                ))
+            })?;
+            // The client would clamp a duration beyond the wire format's 10,000 years.
+            match google_cloud_wkt::Duration::try_from(duration) {
+                Ok(_) => Ok(duration),
+                Err(_) => Err(invalid_argument(format!(
+                    "option {}: {value:?} exceeds 10,000 years",
+                    crate::OPTION_READ_STALENESS
+                ))),
+            }
+        };
+        let timestamp = || {
+            Timestamp::try_from(arg).map_err(|e| {
+                invalid_argument(format!(
+                    "option {}: {value:?} does not carry a valid RFC 3339 timestamp ({e}); \
+                     expected {GRAMMAR_FORMS}",
+                    crate::OPTION_READ_STALENESS
+                ))
+            })
+        };
         match kind.trim() {
-            "exact" => return Ok(ReadBound::ExactStaleness(parse_duration(arg.trim())?)),
-            "max" => return Ok(ReadBound::MaxStaleness(parse_duration(arg.trim())?)),
-            // With an explicit prefix, chrono's diagnosis of the timestamp is useful.
-            "read" => return parse_rfc3339(value, arg.trim()).map(ReadBound::ReadTimestamp),
-            "min" => return parse_rfc3339(value, arg.trim()).map(ReadBound::MinReadTimestamp),
+            "exact" => return Ok(both(TimestampBound::exact_staleness(staleness()?))),
+            "max" => {
+                let d = staleness()?;
+                return Ok(Bounds {
+                    single_use: TimestampBound::max_staleness(d),
+                    multi_use: TimestampBound::exact_staleness(d),
+                });
+            }
+            "read" => return Ok(both(TimestampBound::read_timestamp(timestamp()?))),
+            "min" => {
+                let t = timestamp()?;
+                return Ok(Bounds {
+                    single_use: TimestampBound::min_read_timestamp(t),
+                    multi_use: TimestampBound::read_timestamp(t),
+                });
+            }
             _ => {}
         }
     }
     // Without a known prefix, the prefix is the likely mistake, so report the grammar instead of
-    // chrono's error.
-    DateTime::parse_from_rfc3339(value)
-        .map(|t| ReadBound::ReadTimestamp(t.with_timezone(&Utc)))
-        .map_err(|_| grammar_err(value))
-}
-
-/// Parse the timestamp of a `read:` or `min:` value, quoting the whole value in errors.
-fn parse_rfc3339(value: &str, timestamp: &str) -> Result<DateTime<Utc>> {
-    Ok(DateTime::parse_from_rfc3339(timestamp)
-        .map_err(|e| {
+    // the timestamp parser's error.
+    Timestamp::try_from(value)
+        .map(|t| both(TimestampBound::read_timestamp(t)))
+        .map_err(|_| {
             invalid_argument(format!(
-                "option {}: {value:?} does not carry a valid RFC 3339 timestamp ({e}); expected \
-                 {GRAMMAR_FORMS}",
+                "option {}: {value:?} is not a valid read bound; expected {GRAMMAR_FORMS}",
                 crate::OPTION_READ_STALENESS
             ))
-        })?
-        .with_timezone(&Utc))
+        })
 }
 
-/// [`parse_duration_for`] with `spanner.read.staleness` named in errors.
-pub(crate) fn parse_duration(value: &str) -> Result<Duration> {
-    parse_duration_for(value, crate::OPTION_READ_STALENESS)
+fn both(bound: TimestampBound) -> Bounds {
+    Bounds {
+        single_use: bound.clone(),
+        multi_use: bound,
+    }
 }
 
-/// Parse a non-negative duration with an optional unit suffix (`s` by default, `ms`, `us`/`µs`,
-/// `ns`, `m`, `h`), naming option `key` in errors.
-pub(crate) fn parse_duration_for(value: &str, key: &str) -> Result<Duration> {
-    let bad = || {
+const DURATION_FORM: &str = "a number with an optional unit suffix (s [default], ms, us/µs, \
+     ns, m, h), e.g. \"500ms\"";
+
+/// Parse a duration such as `500ms`, naming option `key` in errors.
+pub(crate) fn parse_duration(value: &str, key: &str) -> Result<Duration> {
+    duration(value).ok_or_else(|| {
         invalid_argument(format!(
-            "option {key}: {value:?} is not a valid duration; expected a number with an optional \
-             unit suffix (s [default], ms, us/µs, ns, m, h), e.g. \"500ms\""
+            "option {key}: {value:?} is not a valid duration; expected {DURATION_FORM}"
         ))
-    };
+    })
+}
+
+/// A non-negative number of seconds, or of the unit its suffix names.
+fn duration(value: &str) -> Option<Duration> {
     // Check two-letter suffixes before `s`.
     let (number, unit_secs): (&str, f64) = if let Some(n) = value.strip_suffix("ms") {
         (n, 1e-3)
@@ -198,25 +189,10 @@ pub(crate) fn parse_duration_for(value: &str, key: &str) -> Result<Duration> {
     } else {
         (value, 1.0)
     };
-    let magnitude: f64 = number.trim().parse().map_err(|_| bad())?;
-    let seconds = magnitude * unit_secs;
-    if !seconds.is_finite() || seconds < 0.0 {
-        return Err(bad());
-    }
-    // Unlike `from_secs_f64`, this does not panic on overflow such as "exact:1e20".
-    Duration::try_from_secs_f64(seconds).map_err(|_| bad())
-}
-
-/// Convert to [`SystemTime`], including timestamps before the Unix epoch.
-fn to_system_time(dt: DateTime<Utc>) -> SystemTime {
-    let secs = dt.timestamp();
-    // Non-negative even before the epoch: an offset from the floor second.
-    let nanos = dt.timestamp_subsec_nanos();
-    if secs >= 0 {
-        UNIX_EPOCH + Duration::new(secs as u64, nanos)
-    } else {
-        UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs()) + Duration::from_nanos(nanos as u64)
-    }
+    let seconds = number.trim().parse::<f64>().ok()? * unit_secs;
+    // Unlike `from_secs_f64`, this rejects negative and non-finite values and overflow such as
+    // "1e20" instead of panicking.
+    Duration::try_from_secs_f64(seconds).ok()
 }
 
 #[cfg(test)]

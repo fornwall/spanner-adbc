@@ -63,7 +63,7 @@ pub(crate) fn collect_statistics(
     db_schema: Option<&str>,
     table_name: Option<&str>,
 ) -> Result<Vec<SchemaStatistics>> {
-    let bound = config.read_staleness.multi_use_timestamp_bound()?;
+    let bound = config.read_staleness.multi_use_timestamp_bound();
     let client = client.clone();
     // As in `get_objects`, the pushed-down filters only cut transferred rows.
     let discovery = filtered_query(

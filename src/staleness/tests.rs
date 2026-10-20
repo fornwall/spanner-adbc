@@ -1,182 +1,136 @@
 use super::*;
 use adbc_core::error::Status;
 
-fn dt(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+fn ts(s: &str) -> Timestamp {
+    Timestamp::try_from(s).unwrap()
+}
+
+fn exact(d: Duration) -> TimestampBound {
+    TimestampBound::exact_staleness(d)
+}
+
+fn read_at(s: &str) -> TimestampBound {
+    TimestampBound::read_timestamp(ts(s))
 }
 
 #[test]
 fn parses_exact_and_max_staleness_with_units() {
-    assert_eq!(
-        parse_read_bound("exact:10").unwrap(),
-        ReadBound::ExactStaleness(Duration::from_secs(10))
-    );
-    assert_eq!(
-        parse_read_bound("exact:2.5s").unwrap(),
-        ReadBound::ExactStaleness(Duration::from_secs_f64(2.5))
-    );
-    assert_eq!(
-        parse_read_bound("max:500ms").unwrap(),
-        ReadBound::MaxStaleness(Duration::from_millis(500))
-    );
-    assert_eq!(
-        parse_read_bound("max:1m").unwrap(),
-        ReadBound::MaxStaleness(Duration::from_secs(60))
-    );
-    assert_eq!(
-        parse_read_bound(" exact : 1h ").unwrap(),
-        ReadBound::ExactStaleness(Duration::from_secs(3600))
-    );
-}
-
-#[test]
-fn parses_read_and_min_timestamp() {
-    assert_eq!(
-        parse_read_bound("2026-07-07T00:00:00Z").unwrap(),
-        ReadBound::ReadTimestamp(dt("2026-07-07T00:00:00Z"))
-    );
-    assert_eq!(
-        parse_read_bound("read:2026-07-07T00:00:00Z").unwrap(),
-        ReadBound::ReadTimestamp(dt("2026-07-07T00:00:00Z"))
-    );
-    assert_eq!(
-        parse_read_bound("min:2026-07-07T00:00:00+02:00").unwrap(),
-        ReadBound::MinReadTimestamp(dt("2026-07-07T00:00:00+02:00"))
-    );
-    assert_eq!(
-        parse_read_bound("read : 2026-07-07T00:00:00Z").unwrap(),
-        ReadBound::ReadTimestamp(dt("2026-07-07T00:00:00Z"))
-    );
-}
-
-#[test]
-fn rejects_uppercase_and_mixed_case_prefixes() {
-    for bad in [
-        "EXACT:10s",
-        "Exact:10s",
-        "MAX:1m",
-        "READ:2026-07-07T00:00:00Z",
-        "Read:2026-07-07T00:00:00Z",
-        "MIN:2026-07-07T00:00:00+02:00",
-        "Min:2026-07-07T00:00:00+02:00",
+    for (value, duration) in [
+        ("exact:10", Duration::from_secs(10)),
+        ("exact:2.5s", Duration::from_millis(2500)),
+        (" exact : 1h ", Duration::from_secs(3600)),
+        ("exact:0", Duration::ZERO),
     ] {
-        let error = parse_read_bound(bad).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments, "{bad}");
+        assert_eq!(
+            parse_read_bound(value).unwrap(),
+            both(exact(duration)),
+            "{value}"
+        );
+    }
+    // The multi-use bound pins `max:` to the stalest exact bound it allows.
+    for (value, duration) in [
+        ("max:500ms", Duration::from_millis(500)),
+        ("max:1m", Duration::from_secs(60)),
+    ] {
+        assert_eq!(
+            parse_read_bound(value).unwrap(),
+            Bounds {
+                single_use: TimestampBound::max_staleness(duration),
+                multi_use: exact(duration),
+            },
+            "{value}"
+        );
     }
 }
 
 #[test]
-fn rejects_bad_read_bound() {
+fn parses_read_and_min_timestamps() {
+    for value in [
+        "2026-07-07T00:00:00Z",
+        "read:2026-07-07T00:00:00Z",
+        "read : 2026-07-07T00:00:00Z",
+        "read:2026-07-07T02:00:00+02:00",
+    ] {
+        assert_eq!(
+            parse_read_bound(value).unwrap(),
+            both(read_at("2026-07-07T00:00:00Z")),
+            "{value}"
+        );
+    }
+    assert_eq!(
+        parse_read_bound("min:1969-12-31T23:59:59.25Z").unwrap(),
+        Bounds {
+            single_use: TimestampBound::min_read_timestamp(ts("1969-12-31T23:59:59.25Z")),
+            multi_use: read_at("1969-12-31T23:59:59.25Z"),
+        }
+    );
+}
+
+#[test]
+fn rejects_malformed_and_out_of_range_bounds() {
     for bad in [
-        "10s",        // no kind, not a timestamp
-        "exact:",     // no duration
-        "exact:abc",  // non-numeric duration
-        "exact:-5",   // negative duration
-        "soon:10s",   // unknown duration kind
-        "exact:1x",   // unknown unit
+        "10s",       // no kind, not a timestamp
+        "exact:",    // no duration
+        "exact:abc", // non-numeric duration
+        "exact:-5",  // negative duration
+        "soon:10s",  // unknown duration kind
+        "exact:1x",  // unknown unit
+        "EXACT:10s", // prefixes are case-sensitive
+        "Read:2026-07-07T00:00:00Z",
         "not-a-time", // not a timestamp
         "read:",      // empty timestamp
         "2026-07-07", // date only, not a full RFC 3339 timestamp
         "min:12345",  // not a timestamp
+        // Too large for a `Duration`; the unit multiplies before the conversion.
+        "exact:1e20",
+        "exact:1e19h",
+        // Beyond the wire format's 10,000 years.
+        "max:1e12",
+        // Before the wire format's 0001-01-01.
+        "read:0000-12-31T00:00:00Z",
     ] {
-        assert!(parse_read_bound(bad).is_err(), "expected error for {bad:?}");
-    }
-}
-
-/// The unit multiplies before the conversion, so `1e19h` overflows although `1e19` would not.
-#[test]
-fn rejects_oversized_duration_instead_of_panicking() {
-    for bad in ["exact:1e20", "max:1e20", "exact:1e19h"] {
         let error = parse_read_bound(bad).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "{bad}");
+        assert!(
+            error
+                .message
+                .starts_with(&format!("option spanner.read.staleness: {:?} ", bad.trim())),
+            "{}",
+            error.message
+        );
     }
 }
 
 #[test]
-fn single_option_holds_one_bound_and_can_be_replaced() {
+fn set_staleness_round_trips_and_unsets() {
     let mut s = ReadStaleness::default();
-    assert!(s.timestamp_bound().unwrap().is_none());
+    assert_eq!(s.timestamp_bound(), None);
 
-    s.set_staleness(OptionValue::String("exact:10s".into()))
+    s.set_staleness(OptionValue::String(" max:10s ".into()))
         .unwrap();
-    assert_eq!(s.staleness_string(), Some("exact:10s"));
-    assert!(s.timestamp_bound().unwrap().is_some());
+    assert_eq!(s.staleness_string(), Some("max:10s"));
+    assert_eq!(
+        s.timestamp_bound(),
+        Some(TimestampBound::max_staleness(Duration::from_secs(10)))
+    );
+    assert_eq!(
+        s.multi_use_timestamp_bound(),
+        Some(exact(Duration::from_secs(10)))
+    );
 
-    s.set_staleness(OptionValue::String("read:2026-07-07T00:00:00Z".into()))
-        .unwrap();
-    assert_eq!(s.staleness_string(), Some("read:2026-07-07T00:00:00Z"));
-    assert!(s.timestamp_bound().unwrap().is_some());
+    // A rejected value keeps the previous one.
+    s.set_staleness(OptionValue::String("exact:1e12".into()))
+        .unwrap_err();
+    assert_eq!(s.staleness_string(), Some("max:10s"));
 
     s.set_staleness(OptionValue::String(String::new())).unwrap();
     assert_eq!(s.staleness_string(), None);
-    assert!(s.timestamp_bound().unwrap().is_none());
+    assert_eq!(s.multi_use_timestamp_bound(), None);
 }
 
 #[test]
-fn multi_use_pins_bounded_staleness_kinds() {
-    let d = Duration::from_secs(10);
-    let t = dt("2026-07-07T00:00:00Z");
-    assert_eq!(
-        ReadBound::ExactStaleness(d).pinned_for_multi_use(),
-        ReadBound::ExactStaleness(d)
-    );
-    assert_eq!(
-        ReadBound::ReadTimestamp(t).pinned_for_multi_use(),
-        ReadBound::ReadTimestamp(t)
-    );
-    assert_eq!(
-        ReadBound::MaxStaleness(d).pinned_for_multi_use(),
-        ReadBound::ExactStaleness(d)
-    );
-    assert_eq!(
-        ReadBound::MinReadTimestamp(t).pinned_for_multi_use(),
-        ReadBound::ReadTimestamp(t)
-    );
-
-    let mut s = ReadStaleness::default();
-    assert!(s.multi_use_timestamp_bound().unwrap().is_none());
-    s.set_staleness(OptionValue::String("max:500ms".into()))
-        .unwrap();
-    assert!(s.multi_use_timestamp_bound().unwrap().is_some());
-}
-
-/// A pre-epoch conversion error would shift the timestamp by up to a second, which no `is_ok()`
-/// would notice.
-#[test]
-fn to_system_time_round_trips_every_timestamp_it_is_given() {
-    for rfc3339 in [
-        "2026-07-07T12:34:56.789Z",
-        "1999-12-31T23:59:59Z",
-        "1970-01-01T00:00:00Z",
-        // Pre-epoch with a fractional part.
-        "1969-12-31T23:59:59.250Z",
-        "1901-12-13T20:45:52.123456789Z",
-    ] {
-        let original = dt(rfc3339);
-        let round_tripped: DateTime<Utc> = to_system_time(original).into();
-        assert_eq!(round_tripped, original, "{rfc3339}");
-    }
-
-    assert_eq!(to_system_time(dt("1970-01-01T00:00:00Z")), UNIX_EPOCH);
-    assert_eq!(
-        UNIX_EPOCH
-            .duration_since(to_system_time(dt("1969-12-31T23:59:59.750Z")))
-            .unwrap(),
-        Duration::from_millis(250)
-    );
-
-    ReadBound::ReadTimestamp(dt("2026-07-07T12:34:56.789Z"))
-        .to_timestamp_bound()
-        .unwrap();
-    ReadBound::MinReadTimestamp(dt("1999-12-31T23:59:59Z"))
-        .to_timestamp_bound()
-        .unwrap();
-}
-
-#[test]
-fn grammar_rejection_echoes_the_value_and_omits_the_timestamp_parser_detail() {
+fn grammar_rejection_omits_the_timestamp_parser_detail() {
     let error = parse_read_bound("stale:10s").unwrap_err();
-    assert_eq!(error.status, Status::InvalidArguments);
     assert_eq!(
         error.message,
         "option spanner.read.staleness: \"stale:10s\" is not a valid read bound; expected \
@@ -184,46 +138,25 @@ fn grammar_rejection_echoes_the_value_and_omits_the_timestamp_parser_detail() {
          \"read:<rfc3339>\" (e.g. \"read:2026-07-07T00:00:00Z\") or \"min:<rfc3339>\" \
          (e.g. \"min:2026-07-07T00:00:00+02:00\")"
     );
+    // With an explicit prefix, the parser's diagnosis is kept.
+    let error = parse_read_bound("read:nope").unwrap_err();
     assert!(
-        !error.message.contains("invalid characters"),
+        error.message.starts_with(
+            "option spanner.read.staleness: \"read:nope\" does not carry a valid RFC 3339 \
+             timestamp ("
+        ),
         "{}",
         error.message
     );
 }
 
 #[test]
-fn timestamp_rejection_keeps_the_parser_detail() {
-    for bad in ["read:nope", "min:12345"] {
-        let error = parse_read_bound(bad).unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments, "{bad}");
-        assert!(
-            error.message.starts_with(&format!(
-                "option spanner.read.staleness: {bad:?} does not carry a valid RFC 3339 timestamp ("
-            )),
-            "{}",
-            error.message
-        );
-        assert!(
-            error.message.contains("expected \"exact:<duration>\""),
-            "{}",
-            error.message
-        );
-    }
-}
-
-#[test]
 fn duration_rejection_names_its_option_and_the_units() {
-    let error = parse_duration_for("1x", crate::OPTION_MAX_COMMIT_DELAY).unwrap_err();
+    let error = parse_duration("1x", crate::OPTION_MAX_COMMIT_DELAY).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     assert_eq!(
         error.message,
         "option spanner.commit.max_delay: \"1x\" is not a valid duration; expected a number with \
          an optional unit suffix (s [default], ms, us/µs, ns, m, h), e.g. \"500ms\""
-    );
-    assert!(
-        parse_duration("1x")
-            .unwrap_err()
-            .message
-            .starts_with("option spanner.read.staleness: \"1x\" is not a valid duration;")
     );
 }
