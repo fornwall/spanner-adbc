@@ -22,9 +22,16 @@ pub(crate) fn unsupported(message: impl Into<String>) -> Error {
     err(message, Status::NotImplemented)
 }
 
-/// The error for setting an unknown option on a `"database"`, `"connection"` or `"statement"`.
+/// The error for setting an option that a `"database"`, `"connection"` or `"statement"` doesn't
+/// accept.
 pub(crate) fn unknown_option(object_kind: &str, key: &str) -> Error {
-    unsupported(format!("unsupported Spanner {object_kind} option: {key}"))
+    unsupported(if key == crate::OPTION_COMMIT_STATS_MUTATION_COUNT {
+        format!("option {key} is read-only")
+    } else if let Some(level) = crate::options::option_level(key) {
+        format!("option {key} is a {level} option and can't be set on a {object_kind}")
+    } else {
+        format!("unsupported Spanner {object_kind} option: {key}")
+    })
 }
 
 /// The error for getting an option that is unset or unknown. Getters cannot tell the two apart,

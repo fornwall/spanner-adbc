@@ -347,6 +347,47 @@ fn unsupported_keeps_the_message_verbatim() {
 }
 
 #[test]
+fn an_option_set_at_the_wrong_level_names_where_it_belongs() {
+    for (kind, key, message) in [
+        (
+            "connection",
+            crate::OPTION_ENDPOINT,
+            "option spanner.endpoint is a database option and can't be set on a connection",
+        ),
+        (
+            "connection",
+            crate::OPTION_ROWS_PER_BATCH,
+            "option spanner.rows_per_batch is a statement option and can't be set on a connection",
+        ),
+        (
+            "statement",
+            crate::OPTION_TRANSACTION_TAG,
+            "option spanner.transaction.tag is a connection option and can't be set on a statement",
+        ),
+        (
+            "database",
+            crate::OPTION_READ_STALENESS,
+            "option spanner.read.staleness is a connection or statement option and can't be set \
+             on a database",
+        ),
+        (
+            "statement",
+            crate::OPTION_COMMIT_STATS_MUTATION_COUNT,
+            "option spanner.commit_stats.mutation_count is read-only",
+        ),
+        (
+            "statement",
+            "spanner.read.stalenesss",
+            "unsupported Spanner statement option: spanner.read.stalenesss",
+        ),
+    ] {
+        let error = unknown_option(kind, key);
+        assert_eq!(error.status, Status::NotImplemented);
+        assert_eq!(error.message, message);
+    }
+}
+
+#[test]
 fn annotate_rewrites_only_the_message() {
     let mut original = err("boom", Status::Internal);
     original.vendor_code = 42;

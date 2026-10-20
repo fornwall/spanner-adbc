@@ -348,5 +348,53 @@ impl SharedConfig {
     }
 }
 
+/// The objects that accept `key`, so that setting it on the wrong one can say where it belongs.
+pub(crate) fn option_level(key: &str) -> Option<&'static str> {
+    use crate::*;
+    use adbc_core::constants::*;
+    let level = match key {
+        ADBC_OPTION_URI
+        | OPTION_ENDPOINT
+        | OPTION_EMULATOR
+        | OPTION_INSTANCE_TYPE
+        | OPTION_KEYFILE
+        | OPTION_KEYFILE_JSON
+        | OPTION_IMPERSONATE_TARGET_PRINCIPAL
+        | OPTION_IMPERSONATE_DELEGATES
+        | OPTION_IMPERSONATE_SCOPES
+        | OPTION_IMPERSONATE_LIFETIME
+        | OPTION_ACCESS_TOKEN
+        | OPTION_QUOTA_PROJECT
+        | OPTION_RPC_TIMEOUT_CONNECT => "database",
+        ADBC_CONNECTION_OPTION_AUTOCOMMIT
+        | ADBC_CONNECTION_OPTION_READ_ONLY
+        | ADBC_CONNECTION_OPTION_ISOLATION_LEVEL
+        | ADBC_CONNECTION_OPTION_CURRENT_CATALOG
+        | ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA
+        | OPTION_TRANSACTION_TAG => "connection",
+        ADBC_STATEMENT_OPTION_INCREMENTAL
+        | ADBC_INGEST_OPTION_TARGET_TABLE
+        | ADBC_INGEST_OPTION_TARGET_DB_SCHEMA
+        | ADBC_INGEST_OPTION_TARGET_CATALOG
+        | ADBC_INGEST_OPTION_TEMPORARY
+        | ADBC_INGEST_OPTION_MODE
+        | OPTION_ROWS_PER_BATCH
+        | OPTION_DATA_BOOST
+        | OPTION_BIND_BY_NAME
+        | OPTION_INGEST_BATCH_WRITE
+        | OPTION_DML_PARTITIONED => "statement",
+        // Every shared option accepts "" to reset it.
+        _ if matches!(
+            SharedConfig::default().set_option(key, OptionValue::String(String::new())),
+            Ok(true)
+        ) =>
+        {
+            "connection or statement"
+        }
+        _ => return None,
+    };
+    Some(level)
+}
+
 #[cfg(test)]
 mod tests;

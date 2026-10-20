@@ -2,7 +2,8 @@
 
 Set options with `set_option` or constructor options in Rust, the `Adbc*SetOption` functions in
 C, or `db_kwargs`, `conn_kwargs` and `adbc_stmt_kwargs` in Python. Setting an unknown key
-returns `NotImplemented`, and getting one returns `NotFound`.
+returns `NotImplemented`, and getting one returns `NotFound`. Setting a key on the wrong level
+also returns `NotImplemented`, with a message naming the level that accepts it.
 
 Options live at three levels:
 
