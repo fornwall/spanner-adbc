@@ -44,7 +44,8 @@ in a read/write transaction that commits before the call returns.
 
 Setting `adbc.connection.autocommit=false` starts manual mode. The pinned client only exposes
 read/write transactions as a closure it may replay, so the driver buffers writes and runs them
-at commit. The first query or write decides what the transaction is:
+at commit; see [known limitations](limitations.md#manual-transactions-buffer-writes). The first
+query or write decides what the transaction is:
 
 ```mermaid
 stateDiagram-v2
@@ -60,8 +61,8 @@ stateDiagram-v2
 
 Mixing queries and writes fails with `InvalidState`, so there is no read-your-writes. Buffered
 DML and ingest return `None` from `execute_update` and -1 as the C ABI's `rows_affected` (the
-DBAPI `rowcount`), and commit doesn't report a row count.
-`THEN RETURN` and partitioned DML need autocommit.
+DBAPI `rowcount`), and commit doesn't report a row count. `THEN RETURN` and partitioned DML need
+autocommit.
 
 A manual read transaction takes its snapshot from the first query's staleness bound, converting
 `max:` and `min:` bounds to exact ones, and ignores the bounds of later queries. If the first
