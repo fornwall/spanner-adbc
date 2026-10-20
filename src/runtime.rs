@@ -196,7 +196,8 @@ pub(crate) fn block_on_cancellable<T>(
 ///
 /// Tokio panics when this happens inside another runtime's context, as it does for a Rust caller
 /// in an async task. A multi-thread caller runtime can hand off the blocked thread's work, but a
-/// current-thread one cannot.
+/// current-thread one cannot. Tokio offers no way to tell its `spawn_blocking` threads, where
+/// blocking would be fine, from the thread that runs its tasks, so both are refused.
 pub(crate) fn block_on<T>(
     runtime: &DriverRuntime,
     future: impl Future<Output = Result<T>>,
@@ -212,9 +213,9 @@ pub(crate) fn block_on<T>(
     };
     if caller.runtime_flavor() == RuntimeFlavor::CurrentThread {
         return Err(invalid_state(
-            "the synchronous ADBC API blocks, so it cannot run on a current-thread Tokio runtime \
-             such as the `#[tokio::test]` default; call it through `tokio::task::spawn_blocking` \
-             or from a multi-thread runtime",
+            "the synchronous ADBC API blocks, so it can't run inside a current-thread Tokio \
+             runtime such as the `#[tokio::test]` default, not even in its `spawn_blocking` \
+             threads; use a multi-thread runtime or a thread outside the runtime",
         ));
     }
     tokio::task::block_in_place(|| runtime.block_on(future))

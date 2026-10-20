@@ -22,24 +22,34 @@ fn works_and_drops_inside_a_multi_thread_runtime() {
     });
 }
 
+/// The error used to advise `spawn_blocking`, which fails the same way on a current-thread
+/// runtime.
 #[test]
 fn a_current_thread_caller_runtime_gets_an_error_instead_of_a_panic() {
     let runtime = new_runtime().unwrap();
     let outer = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    outer.block_on(async move {
-        let result: Result<i32> =
-            block_on_cancellable(&runtime, &CancelSignal::new(), async { Ok(1) });
+    let in_blocking_thread = runtime.clone();
+    let from_blocking_thread = outer
+        .block_on(outer.spawn_blocking(move || {
+            block_on_cancellable(&in_blocking_thread, &CancelSignal::new(), async { Ok(1) })
+        }))
+        .unwrap();
+    let from_task = outer.block_on(async move {
+        let result = block_on_cancellable(&runtime, &CancelSignal::new(), async { Ok(1) });
+        drop(runtime);
+        result
+    });
+    for result in [from_blocking_thread, from_task] {
         let error = result.unwrap_err();
         assert_eq!(error.status, Status::InvalidState);
         assert!(
-            error.message.contains("spawn_blocking"),
+            error.message.contains("multi-thread runtime"),
             "{}",
             error.message
         );
-        drop(runtime);
-    });
+    }
 }
 
 /// A runtime as a forked child sees it. No process has pid 0.
