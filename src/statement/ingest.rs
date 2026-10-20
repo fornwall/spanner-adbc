@@ -148,12 +148,13 @@ impl SpannerStatement {
         }
         self.check_ingest_names(table)?;
         let ingest_ddl = self.build_ingest_table_ddl(table, self.ingest_mode)?;
+        // A bad value must fail before anything is written: DDL can't be rolled back, `replace`
+        // drops the old table, and a chunked autocommit ingest would leave earlier chunks
+        // committed.
+        for batch in &self.bound {
+            bind::check_ingest_values(batch)?;
+        }
         if let Some(ddl) = ingest_ddl {
-            // DDL can't be rolled back, and `replace` has already dropped the old table when the
-            // mutations are built, so a bad value must fail first.
-            for batch in &self.bound {
-                bind::check_ingest_values(batch)?;
-            }
             self.run_ddl(ddl)
                 .map_err(|error| self.remap_ingest_create_error(table, error))?;
         }
@@ -327,9 +328,7 @@ impl SpannerStatement {
         if self.ingest_batch_write {
             // BatchWrite applies each row's group independently, so the per-commit mutation
             // limit, and the split that works around it, don't apply.
-            let mutations = self
-                .build_range_mutations(target, start, end)
-                .map_err(|e| note_rows_already_committed(e, prior_total))?;
+            let mutations = self.build_range_mutations(target, start, end)?;
             self.batch_write_chunk(mutations, prior_total)
         } else {
             self.write_mutation_range(target, start, end, prior_total)
@@ -350,9 +349,7 @@ impl SpannerStatement {
         end: usize,
         prior_total: i64,
     ) -> Result<i64> {
-        let mutations = self
-            .build_range_mutations(target, start, end)
-            .map_err(|e| note_rows_already_committed(e, prior_total))?;
+        let mutations = self.build_range_mutations(target, start, end)?;
         // A commit reports no row count, but each insert mutation is one row.
         let count = mutations.len() as i64;
         // Write-only transactions have replay protection, so internal retries on `ABORTED` still

@@ -121,7 +121,7 @@ For ingest, `adbc.ingest.target_table` selects the table and `adbc.ingest.mode` 
 to create or replace it. Each row becomes an insert mutation. Autocommit ingest commits in
 chunks, so a large ingest is not atomic; in a manual transaction all mutations wait for one
 commit. Creating or replacing the table is DDL and happens immediately. The driver converts every
-bound value first, so a bad value fails before the DDL runs.
+bound value first, so a bad value fails before the DDL runs or any chunk commits.
 
 The driver checks table, schema and column names before sending anything. It rejects names
 containing a backtick, a backslash or a control character, because Spanner's DDL parser doesn't

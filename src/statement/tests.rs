@@ -607,24 +607,28 @@ mod mock {
         statement
     }
 
-    /// DDL can't be rolled back, and `replace` drops the existing table, so a value that fails
-    /// to convert must fail the ingest before any DDL runs.
+    /// A value that fails to convert must fail the ingest before anything is written: DDL can't
+    /// be rolled back, `replace` drops the existing table, and these rows span two autocommit
+    /// chunks, so an append would otherwise commit the first.
     #[test]
-    fn ingest_value_errors_fail_before_the_table_ddl() {
+    fn ingest_value_errors_fail_before_anything_is_written() {
         let server = start();
         let mut connection = connect(&server);
+        let rows = 10_001;
+        let mut days = vec![0; rows];
+        days[rows - 1] = i32::MAX;
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
                 Field::new("d", DataType::Date32, false),
             ])),
             vec![
-                Arc::new(Int64Array::from(vec![1_i64, 2])),
-                Arc::new(Date32Array::from(vec![0, i32::MAX])),
+                Arc::new(Int64Array::from_iter_values(0..rows as i64)),
+                Arc::new(Date32Array::from(days)),
             ],
         )
         .unwrap();
-        for mode in ["replace", "create", "create_append"] {
+        for mode in ["replace", "create", "create_append", "append"] {
             let mut statement = ingest_statement(&mut connection, None, "t", mode);
             statement.bind(batch.clone()).unwrap();
             let error = statement.execute_update().unwrap_err();

@@ -2044,55 +2044,6 @@ fn ingest_does_not_bisect_a_non_mutation_limit_error() {
     );
 }
 
-/// A conversion error while building a later chunk reports the rows earlier chunks committed.
-#[test]
-fn mutation_build_failure_on_a_later_chunk_notes_committed_rows() {
-    let _watchdog = watchdog!();
-    let commits = Arc::new(AtomicUsize::new(0));
-    let commits_in_mock = commits.clone();
-    let server = MockServer::start(move |mock| {
-        serve_begin_transaction(mock);
-        mock.expect_commit().returning(move |_| {
-            commits_in_mock.fetch_add(1, Ordering::SeqCst);
-            commit_ok()
-        });
-    });
-
-    // With the 4 MiB chunk budget, each ~3 MiB row gets its own commit. Row 1's DATE, i32::MAX
-    // days, is out of range.
-    let big = "x".repeat(3 * 1024 * 1024);
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("pad", DataType::Utf8, false),
-        Field::new("d", DataType::Date32, false),
-    ]));
-    let pad = StringArray::from(vec![big.clone(), big]);
-    let dates = Date32Array::from(vec![0, i32::MAX]);
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(pad), Arc::new(dates)])
-        .expect("build ingest batch");
-
-    let mut connection = server.connect();
-    let mut statement = append_ingest_statement(&mut connection);
-    statement.bind(batch).expect("bind ingest data");
-
-    let error = statement
-        .execute_update()
-        .expect_err("the out-of-range DATE in the second chunk must fail the ingest");
-
-    assert_eq!(error.status, AdbcStatus::InvalidArguments, "got: {error}");
-    assert!(
-        error
-            .message
-            .contains("1 row(s) from this bulk ingest were already committed"),
-        "the build failure must report the earlier chunk's committed row; got: {}",
-        error.message
-    );
-    assert_eq!(
-        commits.load(Ordering::SeqCst),
-        1,
-        "exactly the first chunk (row 0) must have committed before the build failure"
-    );
-}
-
 /// A cancelled commit may still apply on the server, so the error must say the outcome is unknown
 /// and that retrying risks duplicates. The unscripted exists-probe fails, which leaves the
 /// annotated error unchanged.
