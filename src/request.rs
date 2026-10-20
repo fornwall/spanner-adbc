@@ -117,12 +117,8 @@ impl RequestConfig {
         Ok(())
     }
 
-    pub(crate) fn commit_stats_string(&self) -> &'static str {
-        if self.return_commit_stats {
-            "true"
-        } else {
-            "false"
-        }
+    pub(crate) fn return_commit_stats(&self) -> bool {
+        self.return_commit_stats
     }
 
     pub(crate) fn set_exclude_txn_from_change_streams(&mut self, value: OptionValue) -> Result<()> {
@@ -131,12 +127,8 @@ impl RequestConfig {
         Ok(())
     }
 
-    pub(crate) fn exclude_txn_from_change_streams_string(&self) -> &'static str {
-        if self.exclude_txn_from_change_streams {
-            "true"
-        } else {
-            "false"
-        }
+    pub(crate) fn exclude_txn_from_change_streams(&self) -> bool {
+        self.exclude_txn_from_change_streams
     }
 
     pub(crate) fn priority_string(&self) -> Option<&str> {

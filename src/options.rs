@@ -301,12 +301,10 @@ impl SharedConfig {
             crate::OPTION_MAX_COMMIT_DELAY => {
                 self.request.max_commit_delay_string().map(str::to_string)
             }
-            crate::OPTION_COMMIT_STATS => Some(self.request.commit_stats_string().to_string()),
-            crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS => Some(
-                self.request
-                    .exclude_txn_from_change_streams_string()
-                    .to_string(),
-            ),
+            crate::OPTION_COMMIT_STATS => Some(self.request.return_commit_stats().to_string()),
+            crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS => {
+                Some(self.request.exclude_txn_from_change_streams().to_string())
+            }
             crate::OPTION_COMMIT_STATS_MUTATION_COUNT => {
                 self.commit_stats.mutation_count().map(|n| n.to_string())
             }

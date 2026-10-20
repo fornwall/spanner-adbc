@@ -147,22 +147,22 @@ fn max_commit_delay_round_trips_and_unsets() {
 #[test]
 fn commit_flags_take_exact_booleans_and_unset_to_false() {
     type Set = fn(&mut RequestConfig, OptionValue) -> Result<()>;
-    type Get = fn(&RequestConfig) -> &'static str;
+    type Get = fn(&RequestConfig) -> bool;
     let flags: [(Set, Get); 2] = [
         (
             RequestConfig::set_commit_stats,
-            RequestConfig::commit_stats_string,
+            RequestConfig::return_commit_stats,
         ),
         (
             RequestConfig::set_exclude_txn_from_change_streams,
-            RequestConfig::exclude_txn_from_change_streams_string,
+            RequestConfig::exclude_txn_from_change_streams,
         ),
     ];
     for (set, get) in flags {
         let mut config = RequestConfig::default();
-        assert_eq!(get(&config), "false");
+        assert!(!get(&config));
         set(&mut config, s("true")).unwrap();
-        assert_eq!(get(&config), "true");
+        assert!(get(&config));
         for bad in [
             OptionValue::Int(1),
             s("1"),
@@ -173,13 +173,13 @@ fn commit_flags_take_exact_booleans_and_unset_to_false() {
         ] {
             let error = set(&mut config, bad.clone()).unwrap_err();
             assert_eq!(error.status, Status::InvalidArguments, "{bad:?}");
-            assert_eq!(get(&config), "true", "a rejected value keeps the old one");
+            assert!(get(&config), "a rejected value keeps the old one");
         }
         set(&mut config, s("false")).unwrap();
-        assert_eq!(get(&config), "false");
+        assert!(!get(&config));
         set(&mut config, s("true")).unwrap();
         set(&mut config, s("")).unwrap();
-        assert_eq!(get(&config), "false");
+        assert!(!get(&config));
     }
 }
 

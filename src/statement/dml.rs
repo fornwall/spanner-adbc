@@ -230,8 +230,7 @@ impl SpannerStatement {
         let Some(statement) = statements.pop() else {
             return Ok(0);
         };
-        let exclude_from_change_streams =
-            self.config.request.exclude_txn_from_change_streams_string() == "true";
+        let exclude_from_change_streams = self.config.request.exclude_txn_from_change_streams();
         let client = self.client.clone();
         block_on_cancellable(
             &self.runtime,
