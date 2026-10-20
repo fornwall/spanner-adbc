@@ -169,8 +169,8 @@ this repository's [Cargo.toml](Cargo.toml). With the default `ffi` feature, also
 ignores patches declared by dependencies. [Dependency pins](CONTRIBUTING.md#dependency-pins)
 explains why they exist.
 
-The ADBC Rust traits are synchronous. From async code on a multi-thread Tokio runtime, call the
-driver inside `tokio::task::spawn_blocking`; see [synchronous calls from Tokio](docs/limitations.md#synchronous-calls-from-tokio).
+The ADBC Rust traits are synchronous. From async code, call the driver inside
+`tokio::task::spawn_blocking`; see [synchronous calls from Tokio](docs/limitations.md#synchronous-calls-from-tokio).
 
 ## Contributing
 

@@ -194,10 +194,9 @@ pub(crate) fn block_on_cancellable<T>(
 
 /// Run `future` on `runtime` from synchronous code.
 ///
-/// Tokio panics when this happens inside another runtime's context, as it does for a Rust caller
-/// in an async task. A multi-thread caller runtime can hand off the blocked thread's work, but a
-/// current-thread one cannot. Tokio offers no way to tell its `spawn_blocking` threads, where
-/// blocking would be fine, from the thread that runs its tasks, so both are refused.
+/// A task on a multi-thread caller runtime hands its worker's other tasks off first. On a
+/// current-thread runtime's own thread this panics, as other blocking clients such as
+/// `reqwest::blocking` do, while its `spawn_blocking` threads can block.
 pub(crate) fn block_on<T>(
     runtime: &DriverRuntime,
     future: impl Future<Output = Result<T>>,
@@ -208,17 +207,12 @@ pub(crate) fn block_on<T>(
              exist in the parent; create new databases and connections in the child",
         ));
     }
-    let Ok(caller) = Handle::try_current() else {
-        return runtime.block_on(future);
-    };
-    if caller.runtime_flavor() == RuntimeFlavor::CurrentThread {
-        return Err(invalid_state(
-            "the synchronous ADBC API blocks, so it can't run inside a current-thread Tokio \
-             runtime such as the `#[tokio::test]` default, not even in its `spawn_blocking` \
-             threads; use a multi-thread runtime or a thread outside the runtime",
-        ));
+    match Handle::try_current() {
+        Ok(caller) if caller.runtime_flavor() != RuntimeFlavor::CurrentThread => {
+            tokio::task::block_in_place(|| runtime.block_on(future))
+        }
+        _ => runtime.block_on(future),
     }
-    tokio::task::block_in_place(|| runtime.block_on(future))
 }
 
 /// A source of row chunks for [`spawn_prefetch`]. An empty chunk ends the stream.

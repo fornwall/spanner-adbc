@@ -43,13 +43,12 @@ the transaction back. Its locks stay held until Spanner aborts it as idle, norma
 The ADBC Rust traits are synchronous, and the driver runs them on its own Tokio runtime. Called
 from a task on a multi-thread Tokio runtime, each call blocks its worker thread, after handing
 that worker's other tasks to another thread with `tokio::task::block_in_place`. A current-thread
-runtime, such as the `#[tokio::test]` default, can't do that, so calls there fail with
-`InvalidState`. So do calls from its `spawn_blocking` threads, which the driver can't tell apart
-from the runtime's own thread.
+runtime, such as the `#[tokio::test]` default, can't do that, so a call from its own thread
+panics, as with other blocking clients such as `reqwest::blocking`.
 
-In async applications on a multi-thread runtime, prefer to use the driver and its handles inside
-`tokio::task::spawn_blocking` or on a dedicated thread. That includes reading results. An async
-ADBC interface would remove this restriction.
+In async applications, prefer to use the driver and its handles inside
+`tokio::task::spawn_blocking` or on a dedicated thread, which works on either kind of runtime.
+That includes reading results. An async ADBC interface would remove this restriction.
 
 ## Forked processes
 

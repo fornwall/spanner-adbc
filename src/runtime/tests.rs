@@ -22,34 +22,36 @@ fn works_and_drops_inside_a_multi_thread_runtime() {
     });
 }
 
-/// A current-thread runtime's `spawn_blocking` threads carry its handle, so they get the same
-/// error as its tasks.
+/// `spawn_blocking` on a current-thread runtime, such as the `#[tokio::test]` default, is the
+/// usual way to call a synchronous client from async code. Its threads carry the runtime's handle
+/// but don't run its tasks, so they can block. Connecting sends `CreateSession`.
 #[test]
-fn a_current_thread_caller_runtime_gets_an_error_instead_of_a_panic() {
+fn a_current_thread_runtimes_blocking_threads_can_connect() {
+    let server = crate::mock_server::MockServer::serve(spanner_grpc_mock::MockSpanner::new());
+    let outer = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let connected = outer.block_on(outer.spawn_blocking(move || {
+        let connection = server.connect();
+        let catalog = connection.catalog().to_string();
+        drop(connection);
+        catalog
+    }));
+    assert_eq!(connected.unwrap(), "d");
+}
+
+/// Blocking the thread that drives a current-thread runtime would stall its tasks, so Tokio
+/// panics there.
+#[test]
+#[should_panic(expected = "Cannot start a runtime from within a runtime")]
+fn the_thread_of_a_current_thread_runtime_panics() {
     let runtime = new_runtime().unwrap();
     let outer = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    let in_blocking_thread = runtime.clone();
-    let from_blocking_thread = outer
-        .block_on(outer.spawn_blocking(move || {
-            block_on_cancellable(&in_blocking_thread, &CancelSignal::new(), async { Ok(1) })
-        }))
-        .unwrap();
-    let from_task = outer.block_on(async move {
-        let result = block_on_cancellable(&runtime, &CancelSignal::new(), async { Ok(1) });
-        drop(runtime);
-        result
+    outer.block_on(async move {
+        let _: Result<i32> = block_on_cancellable(&runtime, &CancelSignal::new(), async { Ok(1) });
     });
-    for result in [from_blocking_thread, from_task] {
-        let error = result.unwrap_err();
-        assert_eq!(error.status, Status::InvalidState);
-        assert!(
-            error.message.contains("multi-thread runtime"),
-            "{}",
-            error.message
-        );
-    }
 }
 
 /// A runtime as a forked child sees it. No process has pid 0.
