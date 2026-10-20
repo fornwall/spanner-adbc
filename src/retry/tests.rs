@@ -270,3 +270,32 @@ fn huge_elapsed_limit_does_not_overflow_instant_arithmetic() {
     let remaining = policy.remaining_time(&RetryState::new(true));
     assert!(remaining.is_some_and(|r| r > Duration::from_secs(365 * 24 * 60 * 60)));
 }
+
+/// Setting both limits keeps both: the attempt limit ends retries before the time limit does.
+#[test]
+fn attempt_and_elapsed_limits_combine() {
+    use google_cloud_gax::error::Error as GaxError;
+    use google_cloud_gax::error::rpc::{Code, Status as RpcStatus};
+    use google_cloud_gax::retry_policy::RetryPolicy;
+    use google_cloud_gax::retry_result::RetryResult;
+    use google_cloud_gax::retry_state::RetryState;
+
+    let mut config = SharedConfig::default();
+    config.set_option(MAX_ATTEMPTS, s("2")).unwrap();
+    config.set_option(MAX_ELAPSED_SECONDS, s("60")).unwrap();
+    let policy: std::sync::Arc<dyn RetryPolicy> = config.retry.retry_policy_arg().unwrap().into();
+    let remaining = policy.remaining_time(&RetryState::new(true));
+    assert!(
+        remaining.is_some_and(|r| r <= Duration::from_secs(60)),
+        "{remaining:?}"
+    );
+    let unavailable = || GaxError::service(RpcStatus::default().set_code(Code::Unavailable));
+    let after = |attempts: u32| {
+        policy.on_error(
+            &RetryState::new(true).set_attempt_count(attempts),
+            unavailable(),
+        )
+    };
+    assert!(matches!(after(1), RetryResult::Continue(_)));
+    assert!(matches!(after(2), RetryResult::Exhausted(_)));
+}
