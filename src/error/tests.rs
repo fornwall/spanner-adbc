@@ -229,6 +229,18 @@ fn an_http_payload_is_not_treated_as_an_rpc_status() {
     }
 }
 
+#[test]
+fn builder_errors_report_their_cause() {
+    use google_cloud_gax::client_builder::Error as BuilderError;
+
+    let adbc = from_builder(BuilderError::transport("invalid uri character"));
+    assert_eq!(adbc.status, Status::Internal);
+    assert_eq!(
+        adbc.message,
+        "Spanner error: could not initialize transport client: invalid uri character"
+    );
+}
+
 /// A retry loop that runs out of time returns `Error::exhausted(last_error)`.
 #[test]
 fn an_exhausted_retry_keeps_the_wrapped_grpc_status() {

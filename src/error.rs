@@ -165,9 +165,18 @@ fn map_detail(detail: &StatusDetails) -> Option<(String, Vec<u8>)> {
     Some((key, serde_json::to_vec(&value).ok()?))
 }
 
-/// Translate a client builder error, which has no gRPC status, into an `Internal` error.
-pub(crate) fn from_builder<E: std::fmt::Display>(error: E) -> Error {
-    err(format!("Spanner error: {error}"), Status::Internal)
+/// Translate a client builder error, which has no gRPC status, into an `Internal` error. Its
+/// message, such as "could not initialize transport client", leaves out the cause, so the
+/// sources are appended.
+pub(crate) fn from_builder(error: impl std::error::Error + 'static) -> Error {
+    let mut message = format!("Spanner error: {error}");
+    for source in chain(&error).skip(1) {
+        let source = source.to_string();
+        if !message.ends_with(&source) {
+            message = format!("{message}: {source}");
+        }
+    }
+    err(message, Status::Internal)
 }
 
 /// Map a gRPC status to an ADBC [`Status`]: [`Status::Integrity`] for a violated data constraint,
