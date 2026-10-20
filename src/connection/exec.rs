@@ -39,11 +39,7 @@ pub(crate) fn runner_builder(
 /// exhibit write skew, even in a single autocommit statement.
 pub(super) fn parse_isolation_level(value: OptionValue) -> Result<IsolationLevel> {
     use adbc_core::constants::*;
-    let value = string_option(
-        value,
-        &format!("option {ADBC_CONNECTION_OPTION_ISOLATION_LEVEL}"),
-    )?;
-    match value.as_str() {
+    match string_option(value, ADBC_CONNECTION_OPTION_ISOLATION_LEVEL)?.as_str() {
         ADBC_OPTION_ISOLATION_LEVEL_DEFAULT => Ok(IsolationLevel::Unspecified),
         ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE | ADBC_OPTION_ISOLATION_LEVEL_LINEARIZABLE => {
             Ok(IsolationLevel::Serializable)
