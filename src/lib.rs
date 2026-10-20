@@ -400,343 +400,220 @@ pub mod bench_support {
     }
 }
 
-/// Database option: an explicit gRPC endpoint, such as an emulator's `http://localhost:9010`.
-/// A bare `host:port` gets `http://`, and every scheme but `https://` connects over plaintext.
-/// When unset or `""`, the driver uses `SPANNER_EMULATOR_HOST` if set, else the production
-/// service.
+/// Database option: the gRPC endpoint, such as an emulator's `localhost:9010`. A bare `host:port`
+/// gets `http://`, and every scheme but `https://` connects over plaintext. Unset or `""` uses
+/// `SPANNER_EMULATOR_HOST` if set, else the production service.
 pub const OPTION_ENDPOINT: &str = "spanner.endpoint";
 
-/// Database option: when `true`, connect with anonymous credentials, as the Spanner emulator
-/// expects. Enabled automatically when `SPANNER_EMULATOR_HOST` is set. Combining it with an
-/// explicit credential option or [`OPTION_QUOTA_PROJECT`], or using it without an endpoint,
-/// fails at connect time.
+/// Database option: `true` connects with anonymous credentials, as the emulator expects. A
+/// non-empty `SPANNER_EMULATOR_HOST` also turns it on. Connecting fails without an endpoint, or
+/// with a credential option or [`OPTION_QUOTA_PROJECT`] set.
 pub const OPTION_EMULATOR: &str = "spanner.emulator";
 
-/// Database option: `cloud` (default) or `omni`. Omni requires an explicit [`OPTION_ENDPOINT`],
-/// cannot be combined with [`OPTION_EMULATOR`], and uses anonymous credentials unless
-/// authentication options are supplied.
+/// Database option: `cloud` (the default) or `omni`. Omni needs an explicit [`OPTION_ENDPOINT`],
+/// can't be combined with [`OPTION_EMULATOR`], and connects anonymously unless a credential
+/// option is set.
 pub const OPTION_INSTANCE_TYPE: &str = "spanner.instance_type";
 
-/// Database option: path to a JSON credential file such as a service-account key (dbt's
-/// `keyfile`). [`OPTION_KEYFILE_JSON`] takes precedence when both are set. A path is not a
-/// secret, so it can be read back with `get_option` and used in a connection URI.
+/// Database option: the path of a JSON credential file, such as a service-account key (dbt's
+/// `keyfile`). [`OPTION_KEYFILE_JSON`] takes precedence. Unlike it, a path can be read back and
+/// set in a URI.
 pub const OPTION_KEYFILE: &str = "spanner.auth.keyfile";
 
-/// Database option: an inline JSON credential such as a service-account key (dbt's
-/// `keyfile_json`). Without a credential option, the driver uses Application Default Credentials,
-/// except in emulator mode and on Omni or plaintext endpoints, which connect anonymously.
-///
-/// Write-only: the value is a private key, so `get_option` always fails with
-/// [`Status::NotFound`](adbc_core::error::Status::NotFound), and a `spanner://` URI carrying it is
-/// rejected with `InvalidArguments`.
+/// Database option: an inline JSON credential, such as a service-account key (dbt's
+/// `keyfile_json`). Write-only: getting it returns
+/// [`Status::NotFound`](adbc_core::error::Status::NotFound), and a URI can't set it.
 pub const OPTION_KEYFILE_JSON: &str = "spanner.auth.keyfile_json";
 
-/// Database option: a service-account email to impersonate, like gcloud's
-/// `--impersonate-service-account`. The base credentials (ADC or a keyfile) mint short-lived
-/// access tokens for this principal through IAM Credentials `generateAccessToken`.
+/// Database option: a service account to impersonate, like gcloud's
+/// `--impersonate-service-account`. The keyfile or Application Default Credentials mint
+/// short-lived tokens for it.
 pub const OPTION_IMPERSONATE_TARGET_PRINCIPAL: &str = "spanner.auth.impersonate.target_principal";
 
-/// Database option: a comma-separated delegation chain of service-account emails for
-/// impersonation. Each needs the Token Creator role on the next, and the last on
-/// [`OPTION_IMPERSONATE_TARGET_PRINCIPAL`]. Ignored without a target principal.
+/// Database option: a comma-separated delegation chain of service accounts for
+/// [`OPTION_IMPERSONATE_TARGET_PRINCIPAL`]. Each needs the Token Creator role on the next, and
+/// the last on the target.
 pub const OPTION_IMPERSONATE_DELEGATES: &str = "spanner.auth.impersonate.delegates";
 
-/// Database option: comma-separated OAuth 2.0 scopes for the impersonated token. Defaults to the
-/// `cloud-platform` scope. Ignored without a target principal.
+/// Database option: comma-separated OAuth 2.0 scopes for the impersonated token. Defaults to
+/// `cloud-platform`.
 pub const OPTION_IMPERSONATE_SCOPES: &str = "spanner.auth.impersonate.scopes";
 
-/// Database option: the lifetime of the impersonated access token in seconds. Defaults to 3600.
-/// Ignored without a target principal.
+/// Database option: the impersonated token's lifetime in whole seconds. Defaults to 3600.
 pub const OPTION_IMPERSONATE_LIFETIME: &str = "spanner.auth.impersonate.lifetime";
 
-/// Database option: an OAuth 2.0 access token, sent as `Authorization: Bearer <token>`. The
-/// driver never refreshes it.
-///
-/// It cannot be combined with [`OPTION_KEYFILE`], [`OPTION_KEYFILE_JSON`] or
-/// [`OPTION_IMPERSONATE_TARGET_PRINCIPAL`] (connecting fails with
-/// [`Status::InvalidState`](adbc_core::error::Status::InvalidState)), nor with emulator mode.
-/// Write-only and rejected in URIs, like [`OPTION_KEYFILE_JSON`].
+/// Database option: an OAuth 2.0 access token, sent as a bearer token and never refreshed. It
+/// can't be combined with a keyfile, inline JSON, impersonation or emulator mode, and is
+/// write-only like [`OPTION_KEYFILE_JSON`].
 pub const OPTION_ACCESS_TOKEN: &str = "spanner.auth.access_token";
 
-/// Database option: the quota (billing) project charged for Spanner API usage, sent as the
-/// `x-goog-user-project` header, like gcloud's `--billing-project`. The caller needs
-/// `serviceusage.services.use` on it. Works with every credential source, but is rejected in
-/// emulator mode and on Omni or plaintext endpoints without explicit credentials, which connect
-/// anonymously. `""` unsets it. `GOOGLE_CLOUD_QUOTA_PROJECT` takes precedence over it in the auth
-/// library.
+/// Database option: the project billed for API quota, sent as `x-goog-user-project` like gcloud's
+/// `--billing-project`; `""` unsets it. With Application Default Credentials,
+/// `GOOGLE_CLOUD_QUOTA_PROJECT` takes precedence. Anonymous connections reject it.
 pub const OPTION_QUOTA_PROJECT: &str = "spanner.auth.quota_project";
 
-/// Database option: the connect timeout in seconds, a deadline for building the client stack
-/// when a database creates its first connection. It covers the gRPC client, credentials and the
-/// multiplexed session, including the client's retries, which otherwise continue without limit
-/// while the endpoint is unreachable. On expiry, creating the connection fails with
-/// [`Status::Timeout`](adbc_core::error::Status::Timeout), naming the endpoint, and the next
-/// connection tries again.
-///
-/// A finite, non-negative number of seconds (fractions allowed), set as a numeric string, an
-/// integer or a double. Defaults to 30; `0` disables the deadline and `""` restores the default.
-/// `get_option` and `get_option_double` return only an explicitly set value.
+/// Database option: the deadline in seconds for building the client stack on the first
+/// connection, including session creation, which otherwise retries without limit while the
+/// endpoint is unreachable. Defaults to 30; `0` disables it and `""` restores the default.
 pub const OPTION_RPC_TIMEOUT_CONNECT: &str = "spanner.rpc.timeout_seconds.connect";
 
 /// Statement option: the maximum number of rows in each Arrow
-/// [`RecordBatch`](arrow_array::RecordBatch) returned by
-/// [`Statement::execute`](adbc_core::Statement::execute), including `THEN RETURN` rows. Streamed
-/// query batches are also capped by size. Larger batches use more memory; smaller ones return the
-/// first batch sooner. A positive integer; defaults to 8192.
+/// [`RecordBatch`](arrow_array::RecordBatch) that `execute` returns, a positive integer that
+/// defaults to 8192. Streamed batches are also capped by size.
 pub const OPTION_ROWS_PER_BATCH: &str = "spanner.rows_per_batch";
 
-/// Statement option: run the partitions of
-/// [`Statement::execute_partitions`](adbc_core::Statement::execute_partitions) on Data Boost,
-/// Spanner's serverless, workload-isolated compute. The setting is stored in each partition
-/// descriptor, so whichever connection reads a partition honors it. Boolean, default `false`.
-/// Omni rejects Data Boost requests.
+/// Statement option: `true` runs the partitions of
+/// [`Statement::execute_partitions`](adbc_core::Statement::execute_partitions) on
+/// [Data Boost](https://docs.cloud.google.com/spanner/docs/databoost/databoost-overview). Each
+/// partition descriptor carries the setting. Omni doesn't support it.
 pub const OPTION_DATA_BOOST: &str = "spanner.data_boost";
 
-/// Statement option: how bound Arrow columns pair with the query's `@name` parameters, following
-/// the SQLite driver's `bind_by_name`
-/// ([apache/arrow-adbc#3362](https://github.com/apache/arrow-adbc/issues/3362)). Boolean,
-/// default `false`:
-///
-/// - `false`: positional. The nth column binds to the nth distinct `@name` parameter in query
-///   order, and column names are ignored. This is the ordinal binding ADBC clients expect.
-/// - `true`: by name. Each column binds to the parameter with its name (case-insensitively, as
-///   Spanner resolves names), in any order; a column naming no parameter fails with
-///   `InvalidArguments`.
+/// Statement option: `true` binds each Arrow column to the `@name` parameter with its name,
+/// case-insensitively, like the SQLite driver's option
+/// ([apache/arrow-adbc#3362](https://github.com/apache/arrow-adbc/issues/3362)). The default,
+/// `false`, binds the nth column to the nth distinct parameter in query order.
 pub const OPTION_BIND_BY_NAME: &str = "adbc.statement.bind_by_name";
 
-/// Statement option: send autocommit bulk-ingest mutations through Spanner's BatchWrite RPC
-/// instead of a write-only transaction, for high-throughput loads that do not need atomicity.
-/// Boolean, default `false`; `""` unsets it.
-///
-/// BatchWrite applies each chunk's mutation groups independently and non-atomically. Insert
-/// semantics, chunking, the row count, the read-only check and the append-mode
-/// `NotFound`/`AlreadyExists` mapping are unchanged. Manual-mode ingests ignore the option and
-/// commit atomically with their transaction. Priority and the transaction tag apply;
-/// `spanner.request.tag`, `spanner.commit.max_delay` and `spanner.commit_stats` do not, since
-/// BatchWrite ignores request tags and has no commit options.
+/// Statement option: `true` sends autocommit bulk ingest through Spanner's non-atomic BatchWrite
+/// RPC instead of a write-only transaction. Manual-mode ingest ignores it. Request tags, the
+/// commit delay and commit statistics don't apply to BatchWrite.
 pub const OPTION_INGEST_BATCH_WRITE: &str = "spanner.ingest.batch_write";
 
-/// Statement option: run the statement as
-/// [Partitioned DML](https://docs.cloud.google.com/spanner/docs/dml-partitioned), which applies
-/// each partition independently and so avoids the per-commit mutation limit. Boolean, default
-/// `false`; `""` unsets it.
-///
-/// Partitioned DML weakens two guarantees:
-///
-/// - It is not atomic. Each partition commits separately and may be applied more than once, so
-///   the statement must be idempotent (`SET active = true`, not `SET n = n + 1`).
-/// - The row count is a lower bound. `execute_update` returns Spanner's `row_count_lower_bound`,
-///   which undercounts when a partition was retried.
-///
-/// Spanner allows one statement per transaction and no `THEN RETURN` (both `InvalidArguments`),
-/// and partitioned DML cannot join a manual transaction (`InvalidState`). Non-DML statements and
-/// bulk ingests ignore the option. Commit options, `spanner.transaction.tag` and the isolation
-/// level have no effect, since there is no commit.
+/// Statement option: `true` runs DML as
+/// [Partitioned DML](https://docs.cloud.google.com/spanner/docs/dml-partitioned), which avoids the
+/// per-commit mutation limit. Partitions commit separately and may be applied more than once, so
+/// the statement must be idempotent, and the row count is a lower bound. It needs autocommit and
+/// one statement without `THEN RETURN`.
 pub const OPTION_DML_PARTITIONED: &str = "spanner.dml.partitioned";
 
 /// Connection and statement option: the
 /// [read bound](https://docs.cloud.google.com/spanner/docs/timestamp-bounds) for read-only
-/// queries. Unset (the default) or `""` means a strong read.
+/// queries. Unset or `""` means a strong read. The forms are:
 ///
-/// The value takes one of four forms:
+/// - `exact:<duration>`: read exactly `<duration>` in the past.
+/// - `max:<duration>`: Spanner picks a timestamp at most `<duration>` old.
+/// - `read:<rfc3339>`, or a bare `<rfc3339>`: read at that timestamp.
+/// - `min:<rfc3339>`: Spanner picks that timestamp or a later one.
 ///
-/// - `exact:<duration>`: read at exactly `<duration>` in the past.
-/// - `max:<duration>`: read at a timestamp within `<duration>` of now chosen by Spanner.
-/// - `read:<rfc3339>`, or a bare `<rfc3339>`: read at exactly that timestamp.
-/// - `min:<rfc3339>`: read at that timestamp or later.
-///
-/// Spanner allows `max:` and `min:` only on single-use reads, so reads that share a transaction
-/// use `exact:<duration>` and `read:<rfc3339>` instead.
-///
-/// `<duration>` is a non-negative number with an optional unit suffix: `s` (seconds, the default),
-/// `ms`, `us`/`µs`, `ns`, `m` (minutes) or `h` (hours). Examples: `exact:10`, `exact:2.5s`,
-/// `max:500ms`, `read:2026-07-07T00:00:00Z`, `min:2026-07-07T00:00:00+02:00`.
+/// A duration is a non-negative number with an optional unit, `s` (the default), `ms`,
+/// `us`/`µs`, `ns`, `m` or `h`, as in `exact:2.5s` or `max:500ms`. Spanner allows `max:` and
+/// `min:` only on single-use reads, so reads that share a transaction use the equivalent `exact:`
+/// or `read:` bound.
 pub const OPTION_READ_STALENESS: &str = "spanner.read.staleness";
 
 /// Connection and statement option: the
-/// [request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions),
-/// `low`, `medium` or `high`. Applies to queries, DML, BatchWrite, read/write transaction commits
-/// and driver-internal metadata reads. Unset (the default) or `""` leaves the service default
-/// (high).
+/// [request priority](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/RequestOptions)
+/// of queries, DML, commits, BatchWrite and internal metadata reads: `low`, `medium` or `high`.
+/// Unset or `""` leaves the service default, `high`.
 pub const OPTION_REQUEST_PRIORITY: &str = "spanner.request.priority";
 
-/// Connection and statement option: a
+/// Connection and statement option: the
 /// [directed read](https://docs.cloud.google.com/spanner/docs/directed-reads) replica selection
-/// for read-only queries. Spanner rejects directed reads in read/write transactions, so DML and
-/// DDL ignore it. Unset by default (Spanner's own routing); `""` unsets; malformed values fail
-/// with `InvalidArguments`.
-///
-/// The value has the form:
+/// for read-only queries. Unset or `""` leaves the routing to Spanner. The form is
 ///
 /// ```text
 /// <mode> [ ":" <selection> ("," <selection>)* ] [ ";auto_failover_disabled" ]
 /// ```
 ///
-/// - `<mode>` is `include` (an ordered preference list) or `exclude` (replicas to avoid).
-/// - `<selection>` is `<location>`, `<location>:<type>` or `:<type>`, where `<location>` is a
-///   region such as `us-east1` and `<type>` is `read_write`, `read_only` or `any` (the default,
-///   matching every replica type).
-/// - `;auto_failover_disabled`, valid only with `include`, stops Spanner from falling back to a
-///   replica outside the list when the listed ones are unavailable.
-///
-/// Keywords are lowercase. Examples: `include:us-east1`,
-/// `include:us-east1:read_only,us-east4:read_write`, `exclude:us-central1`,
-/// `include:us-east1;auto_failover_disabled`.
+/// where `<mode>` is `include` (in order of preference) or `exclude`, and a `<selection>` is
+/// `<location>`, `<location>:<type>` or `:<type>`, with `<type>` one of `read_write`, `read_only`
+/// or `any` (the default). `;auto_failover_disabled`, valid only with `include`, stops Spanner
+/// from falling back to replicas outside the list. Examples: `include:us-east1`,
+/// `include:us-east1:read_only,us-east4:read_write`, `exclude:us-central1`.
 pub const OPTION_DIRECTED_READ: &str = "spanner.directed_read";
 
-/// Connection and statement option: a request tag attached to each query, DML statement and
-/// `ExecuteBatchDml` batch, and reported in Spanner's query and transaction statistics; see
-/// [troubleshooting with tags](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags).
-/// Unset by default; `""` unsets.
+/// Connection and statement option: the
+/// [request tag](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags)
+/// of each query, DML statement and batch DML request. `""` unsets it.
 pub const OPTION_REQUEST_TAG: &str = "spanner.request.tag";
 
-/// Connection and statement option: the query optimizer version, such as `"6"` or `"latest"`,
-/// sent unchanged in each query's
+/// Connection and statement option: the query optimizer version, such as `6` or `latest`, sent
+/// in each query's
 /// [`QueryOptions`](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/ExecuteSqlRequest#queryoptions).
-/// Unset (the default) or `""` leaves the database or service default.
+/// Unset or `""` leaves the database default.
 pub const OPTION_QUERY_OPTIMIZER_VERSION: &str = "spanner.query.optimizer_version";
 
-/// Connection and statement option: the query optimizer statistics package, sent unchanged in
-/// each query's `QueryOptions`. Unset (the default) or `""` leaves the database default.
+/// Connection and statement option: the query optimizer statistics package sent in each query's
+/// `QueryOptions`. Unset or `""` leaves the database default.
 pub const OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE: &str =
     "spanner.query.optimizer_statistics_package";
 
-/// Connection and statement option: the query timeout in seconds. It bounds the initial execution
-/// of a query: the `ExecuteStreamingSql` call and first chunk, the `execute_schema` and
-/// `execute_partitions` probes, the first fetch of `read_partition`, and driver-internal metadata
-/// reads. Later chunks are bounded by [`OPTION_RPC_TIMEOUT_FETCH`]. On expiry the call fails with
-/// [`Status::Timeout`](adbc_core::error::Status::Timeout).
-///
-/// A finite, non-negative number of seconds (fractions allowed), set as a numeric string, an
-/// integer or a double, and readable with `get_option` or `get_option_double`. `0` disables the
-/// timeout and `""` unsets it; unset (the default) means no deadline.
+/// Connection and statement option: the deadline in seconds for a query's first chunk, the
+/// `execute_schema` and `execute_partitions` probes, a partition's first chunk and internal
+/// metadata reads, including retries. Fractions are allowed, and `0` or `""` (the default) means
+/// no deadline. Expiry fails with [`Status::Timeout`](adbc_core::error::Status::Timeout).
 pub const OPTION_RPC_TIMEOUT_QUERY: &str = "spanner.rpc.timeout_seconds.query";
 
-/// Connection and statement option: the update timeout in seconds, an overall deadline for each
-/// write. Writes are autocommit DML and batch-DML transactions, manual-mode commits (including
-/// the one made by re-enabling autocommit), each bulk-ingest commit chunk, and DDL changes,
-/// including the long-running-operation polling that is otherwise unbounded. Client retries
-/// count against the deadline. On expiry the call fails with
-/// [`Status::Timeout`](adbc_core::error::Status::Timeout), although Spanner may still have
-/// committed, as with any timed-out commit. Values are handled as for
+/// Connection and statement option: the deadline in seconds for each write, including retries: a
+/// DML transaction, a manual commit, an ingest chunk, BatchWrite, partitioned DML or a DDL
+/// operation. A write that timed out may still have been applied. Values are as for
 /// [`OPTION_RPC_TIMEOUT_QUERY`].
 pub const OPTION_RPC_TIMEOUT_UPDATE: &str = "spanner.rpc.timeout_seconds.update";
 
-/// Connection and statement option: the fetch timeout in seconds, a deadline for each result
-/// chunk after the first (which [`OPTION_RPC_TIMEOUT_QUERY`] covers). It is enforced in the
-/// background prefetch task, so a stalled stream fails the next batch with
-/// [`Status::Timeout`](adbc_core::error::Status::Timeout) instead of hanging. For a query with
-/// bound parameters it also bounds each per-row execution as the stream advances. Values are
-/// handled as for [`OPTION_RPC_TIMEOUT_QUERY`].
+/// Connection and statement option: the deadline in seconds for each result chunk after the
+/// first, so that a stalled stream fails instead of hanging. Values are as for
+/// [`OPTION_RPC_TIMEOUT_QUERY`].
 pub const OPTION_RPC_TIMEOUT_FETCH: &str = "spanner.rpc.timeout_seconds.fetch";
 
-/// Connection and statement option: the maximum number of attempts, including the first, that
-/// the Spanner client makes for a retryable RPC. A positive integer; `1` disables retries. Unset
-/// (the default) keeps the client's policy: unlimited on unary RPCs and 10 attempts on streaming
-/// queries and BatchWrite. A set value applies to all three.
-///
-/// Set as an integer, a whole-valued double or a numeric string; readable with `get_option` or
-/// `get_option_int`; `""` unsets it. Setting this or [`OPTION_RETRY_MAX_ELAPSED_SECONDS`] bounds
-/// the client's default policy without changing which errors it retries, stopping at whichever
-/// limit is reached first. These options bound the retry loop; the [`OPTION_RPC_TIMEOUT_QUERY`]
-/// family bounds the overall time of each operation.
+/// Connection and statement option: the maximum number of attempts, including the first, for
+/// each query, DML, BatchWrite, begin or commit RPC. `1` disables retries. Unset keeps the
+/// client's policy: no limit on unary RPCs and 10 attempts on streaming queries and BatchWrite.
 pub const OPTION_RETRY_MAX_ATTEMPTS: &str = "spanner.retry.max_attempts";
 
-/// Connection and statement option: the maximum total time in seconds the Spanner client spends
-/// retrying before returning the last error. A finite, strictly positive number; unset (the
-/// default) keeps the client's policy, which has no time limit. Values, interaction with
-/// [`OPTION_RETRY_MAX_ATTEMPTS`] and inheritance work as for that option; readable with
-/// `get_option` or `get_option_double`.
-///
-/// Applies only to unary RPCs (DML, `ExecuteBatchDml`, begin and commit); streaming queries and
-/// BatchWrite ignore it. Use [`OPTION_RPC_TIMEOUT_QUERY`] and [`OPTION_RPC_TIMEOUT_FETCH`] to bound
-/// queries, and [`OPTION_RPC_TIMEOUT_UPDATE`] for BatchWrite.
+/// Connection and statement option: the maximum time in seconds the client spends retrying a
+/// DML, batch DML, begin or commit RPC. Unset means no limit. Streaming queries and BatchWrite
+/// ignore it, so bound them with the [`OPTION_RPC_TIMEOUT_QUERY`] family instead.
 pub const OPTION_RETRY_MAX_ELAPSED_SECONDS: &str = "spanner.retry.max_elapsed_seconds";
 
-/// Connection and statement option: the initial delay in seconds of the Spanner client's
-/// exponential retry backoff. A finite, strictly positive number, set as a numeric string, an
-/// integer or a double, and readable with `get_option` or `get_option_double`; `""` unsets it.
-/// Unset (the default) keeps the client's initial delay of 1 second.
-///
-/// Setting this, [`OPTION_RETRY_BACKOFF_MAX_SECONDS`] or [`OPTION_RETRY_BACKOFF_MULTIPLIER`]
-/// replaces the client's backoff. Unset knobs take the client defaults (1 s initial, 60 s maximum,
-/// multiplier 2.0), and all are clamped to the gax recommended ranges. Independent of
-/// [`OPTION_RETRY_MAX_ATTEMPTS`] and [`OPTION_RETRY_MAX_ELAPSED_SECONDS`].
+/// Connection and statement option: the initial retry backoff in seconds. Setting any backoff
+/// option replaces the client's backoff, with the others at the client defaults: 1 second
+/// initial, 60 seconds maximum and a multiplier of 2.
 pub const OPTION_RETRY_BACKOFF_INITIAL_SECONDS: &str = "spanner.retry.backoff.initial_seconds";
 
-/// Connection and statement option: the maximum delay in seconds of the Spanner client's retry
-/// backoff. A finite, strictly positive number; unset (the default) keeps the client's maximum of
-/// 60 seconds. The gax clamp raises a value below the effective initial delay to that delay.
-/// Otherwise handled as [`OPTION_RETRY_BACKOFF_INITIAL_SECONDS`].
+/// Connection and statement option: the maximum retry backoff in seconds; see
+/// [`OPTION_RETRY_BACKOFF_INITIAL_SECONDS`].
 pub const OPTION_RETRY_BACKOFF_MAX_SECONDS: &str = "spanner.retry.backoff.max_seconds";
 
-/// Connection and statement option: the factor by which the Spanner client's retry backoff
-/// multiplies the delay after each attempt. A finite, strictly positive number; unset (the
-/// default) keeps the client's `2.0`. The gax clamp raises values below `1.0` to `1.0`, a constant
-/// delay. Otherwise handled as [`OPTION_RETRY_BACKOFF_INITIAL_SECONDS`].
+/// Connection and statement option: the factor by which the retry backoff grows after each
+/// attempt; see [`OPTION_RETRY_BACKOFF_INITIAL_SECONDS`].
 pub const OPTION_RETRY_BACKOFF_MULTIPLIER: &str = "spanner.retry.backoff.multiplier";
 
-/// Connection option: a transaction tag, applied to each read/write and write-only transaction the
-/// driver starts and to BatchWrite requests, and attached by Spanner to every operation in them.
-/// Unset by default; `""` unsets. There is no statement-level override, since a transaction can
-/// span several statements.
+/// Connection option: the transaction tag of each read/write and write-only transaction and
+/// BatchWrite request. `""` unsets it. Statements can't override it, since a transaction can span
+/// several statements.
 pub const OPTION_TRANSACTION_TAG: &str = "spanner.transaction.tag";
 
 /// Connection and statement option: the
 /// [maximum commit delay](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions)
-/// Spanner may add to each read/write and write-only commit so it can batch commits, trading
-/// latency for throughput.
-///
-/// A duration in the [`OPTION_READ_STALENESS`] grammar (e.g. `100ms`, `0.2s`) between 0 and
-/// 500ms. Malformed and out-of-range values fail with
-/// [`Status::InvalidArguments`](adbc_core::error::Status::InvalidArguments). `0` means no delay
-/// and `""` unsets it.
+/// that Spanner may add to read/write and write-only commits to batch them, a duration from `0`
+/// to `500ms` written as for [`OPTION_READ_STALENESS`]. `""` unsets it.
 pub const OPTION_MAX_COMMIT_DELAY: &str = "spanner.commit.max_delay";
 
-/// Connection and statement option: request
-/// [commit statistics](https://docs.cloud.google.com/spanner/docs/commit-statistics) for the
-/// read/write and write-only commits the driver makes. Boolean (`true` or `false`), default
-/// `false`; `""` unsets it.
-///
-/// The mutation count of the latest such commit is readable through
-/// [`OPTION_COMMIT_STATS_MUTATION_COUNT`]: on the statement for autocommit DML and bulk ingest,
-/// and on the connection for a manual-mode commit.
+/// Connection and statement option: `true` requests
+/// [commit statistics](https://docs.cloud.google.com/spanner/docs/commit-statistics) for
+/// read/write and write-only commits, reported by [`OPTION_COMMIT_STATS_MUTATION_COUNT`].
 pub const OPTION_COMMIT_STATS: &str = "spanner.commit_stats";
 
 /// Read-only connection and statement option: the mutation count of the latest commit made with
-/// [`OPTION_COMMIT_STATS`] enabled, readable with `get_option` or `get_option_int`.
-///
-/// Reading fails with [`Status::NotFound`](adbc_core::error::Status::NotFound) until such a
-/// commit has run on the object: the statement for autocommit DML and bulk ingest, or the
-/// connection for a manual-mode commit. When several commits run, as in a chunked ingest, it
-/// reports the last one. Setting it fails with
-/// [`Status::NotImplemented`](adbc_core::error::Status::NotImplemented).
+/// [`OPTION_COMMIT_STATS`]. A statement reports its autocommit DML and ingest commits, and a
+/// connection its manual commits. Until then, getting it returns
+/// [`Status::NotFound`](adbc_core::error::Status::NotFound).
 pub const OPTION_COMMIT_STATS_MUTATION_COUNT: &str = "spanner.commit_stats.mutation_count";
 
-/// Connection and statement option: whether to
-/// [exclude a transaction's writes from change streams](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions).
-/// Boolean (`true` or `false`), default `false`; `""` unsets it.
-///
-/// Applies to every write the driver makes, including `spanner.ingest.batch_write`. Spanner only
-/// honors it for change streams created with the `allow_txn_exclusion = true` option; other
-/// change streams record the writes regardless.
+/// Connection and statement option: `true`
+/// [excludes the driver's writes](https://docs.cloud.google.com/spanner/docs/reference/rest/v1/TransactionOptions)
+/// from change streams created with `allow_txn_exclusion = true`.
 pub const OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS: &str =
     "spanner.transaction.exclude_from_change_streams";
 
-/// Connection and statement option: the maximum precision at which Spanner `TIMESTAMP` columns
-/// are read into Arrow. `""` restores the default.
+/// Connection and statement option: the Arrow type of Spanner `TIMESTAMP` columns.
 ///
-/// - `nanoseconds_error_on_overflow` (the default): `Timestamp(Nanosecond, "UTC")`, keeping full
-///   precision. Arrow's `i64` nanoseconds only cover about 1677-09-21 to 2262-04-11, narrower than
-///   Spanner's years 0001–9999, so a timestamp outside that window fails with `InvalidArguments`
-///   naming the column and value.
-/// - `microseconds`: `Timestamp(Microsecond, "UTC")`, covering Spanner's full range, like the
-///   Snowflake driver's `adbc.snowflake.sql.client_option.max_timestamp_precision`.
-///   Sub-microsecond digits are truncated toward negative infinity.
+/// - `nanoseconds_error_on_overflow` (the default): `Timestamp(Nanosecond, "UTC")`. A value
+///   outside about 1677 to 2262, the range of `i64` nanoseconds, fails with `InvalidArguments`.
+/// - `microseconds`: `Timestamp(Microsecond, "UTC")`, which covers Spanner's years 1 to 9999,
+///   like the Snowflake driver's `max_timestamp_precision`. Sub-microsecond digits are floored.
 ///
-/// There is no wrapping nanosecond mode, since a wrapped timestamp is indistinguishable from real
-/// data. The mode applies to every result and schema with timestamps; `read_partition` uses the
-/// reading connection's setting.
+/// `read_partition` uses the reading connection's setting.
 pub const OPTION_MAX_TIMESTAMP_PRECISION: &str = "spanner.max_timestamp_precision";
 
 /// The vendor name reported by [`Connection::get_info`](adbc_core::Connection::get_info).
@@ -756,63 +633,38 @@ mod options_doc_tests {
         use adbc_core::constants;
 
         let doc = include_str!("../docs/options.md");
-        let keys: &[&str] = &[
-            crate::OPTION_ENDPOINT,
-            crate::OPTION_EMULATOR,
-            crate::OPTION_INSTANCE_TYPE,
-            crate::OPTION_KEYFILE,
-            crate::OPTION_KEYFILE_JSON,
-            crate::OPTION_IMPERSONATE_TARGET_PRINCIPAL,
-            crate::OPTION_IMPERSONATE_DELEGATES,
-            crate::OPTION_IMPERSONATE_SCOPES,
-            crate::OPTION_IMPERSONATE_LIFETIME,
-            crate::OPTION_ACCESS_TOKEN,
-            crate::OPTION_QUOTA_PROJECT,
-            crate::OPTION_ROWS_PER_BATCH,
-            crate::OPTION_DATA_BOOST,
-            crate::OPTION_BIND_BY_NAME,
-            crate::OPTION_INGEST_BATCH_WRITE,
-            crate::OPTION_DML_PARTITIONED,
-            crate::OPTION_READ_STALENESS,
-            crate::OPTION_REQUEST_PRIORITY,
-            crate::OPTION_REQUEST_TAG,
-            crate::OPTION_DIRECTED_READ,
-            crate::OPTION_QUERY_OPTIMIZER_VERSION,
-            crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE,
-            crate::OPTION_TRANSACTION_TAG,
-            crate::OPTION_MAX_COMMIT_DELAY,
-            crate::OPTION_COMMIT_STATS,
-            crate::OPTION_COMMIT_STATS_MUTATION_COUNT,
-            crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS,
-            crate::OPTION_MAX_TIMESTAMP_PRECISION,
-            crate::OPTION_RPC_TIMEOUT_CONNECT,
-            crate::OPTION_RPC_TIMEOUT_QUERY,
-            crate::OPTION_RPC_TIMEOUT_UPDATE,
-            crate::OPTION_RPC_TIMEOUT_FETCH,
-            crate::OPTION_RETRY_MAX_ATTEMPTS,
-            crate::OPTION_RETRY_MAX_ELAPSED_SECONDS,
-            crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS,
-            crate::OPTION_RETRY_BACKOFF_MAX_SECONDS,
-            crate::OPTION_RETRY_BACKOFF_MULTIPLIER,
-            // Standard ADBC options.
+        // Split so that this needle does not match itself.
+        let driver_keys = include_str!("lib.rs")
+            .split(concat!("pub const ", "OPTION_"))
+            .skip(1)
+            .map(|rest| {
+                rest.split('"')
+                    .nth(1)
+                    .expect("an option constant is a string")
+            });
+        let standard_keys = [
             constants::ADBC_OPTION_URI,
             constants::ADBC_CONNECTION_OPTION_AUTOCOMMIT,
             constants::ADBC_CONNECTION_OPTION_READ_ONLY,
             constants::ADBC_CONNECTION_OPTION_ISOLATION_LEVEL,
             constants::ADBC_CONNECTION_OPTION_CURRENT_CATALOG,
             constants::ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
+            constants::ADBC_STATEMENT_OPTION_INCREMENTAL,
             constants::ADBC_INGEST_OPTION_TARGET_TABLE,
             constants::ADBC_INGEST_OPTION_TARGET_DB_SCHEMA,
             constants::ADBC_INGEST_OPTION_TARGET_CATALOG,
             constants::ADBC_INGEST_OPTION_TEMPORARY,
             constants::ADBC_INGEST_OPTION_MODE,
         ];
-        for key in keys {
+        let mut count = 0;
+        for key in driver_keys.chain(standard_keys) {
+            count += 1;
             // Backticks keep a short key like `uri` from matching inside another word.
             assert!(
                 doc.contains(&format!("`{key}`")),
                 "option key `{key}` is handled by the driver but missing from docs/options.md"
             );
         }
+        assert!(count > standard_keys.len(), "found no OPTION_ constants");
     }
 }
