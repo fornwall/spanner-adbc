@@ -159,7 +159,7 @@ bytes with your own descriptors.
 | `get_info` | Driver and vendor metadata. Codes without a value, such as the vendor version, are null; unknown codes are omitted. |
 | `get_objects` | Catalogs, schemas, tables, columns and constraints from `INFORMATION_SCHEMA`. |
 | `get_table_schema` | A table's columns as Arrow fields. A missing table returns `NotFound`. |
-| `get_table_types` | `BASE TABLE` and `VIEW`. |
+| `get_table_types` | `BASE TABLE`, `SYNONYM` and `VIEW`. |
 | `get_statistics` | Exact row, distinct and null counts from one aggregate scan per table, even when approximate statistics are requested. |
 | `get_statistic_names` | An empty, typed result: the driver defines no statistics of its own. |
 | `get_parameter_schema` | The bound schema, or parameter names and types from a best-effort PLAN probe. Unresolved types are Arrow `Null`. |

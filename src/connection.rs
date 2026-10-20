@@ -11,7 +11,7 @@ use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
 use adbc_core::{CancelHandle, Connection, Optionable};
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::Schema;
 use google_cloud_spanner::batch::Partition;
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::model::StructType;
@@ -362,18 +362,10 @@ impl Connection for SpannerConnection {
     /// Spanner's `INFORMATION_SCHEMA.TABLES.TABLE_TYPE` values. `get_objects` reports the same
     /// values, so each works as its `table_type` filter.
     fn get_table_types(&self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "table_type",
-            DataType::Utf8,
-            false,
-        )]));
-        let array = Arc::new(StringArray::from(vec!["BASE TABLE", "VIEW"])) as ArrayRef;
-        let batch = RecordBatch::try_new(schema.clone(), vec![array]).map_err(|e| {
-            err(
-                format!("failed to build table types batch: {e}"),
-                Status::Internal,
-            )
-        })?;
+        let schema = adbc_core::schemas::GET_TABLE_TYPES_SCHEMA.clone();
+        let types = Arc::new(StringArray::from(vec!["BASE TABLE", "SYNONYM", "VIEW"])) as ArrayRef;
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![types]).map_err(crate::nested::arrow_err)?;
         Ok(Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema)))
     }
 
