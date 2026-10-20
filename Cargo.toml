@@ -50,6 +50,9 @@ default = ["ffi"]
 ffi = []
 # Unstable parsing helpers and Arbitrary inputs for fuzz/.
 fuzzing = ["dep:arbitrary"]
+# Compile out the dependencies' tracing and log events, which nothing can observe in a loaded
+# library. The release workflow enables it; in a Rust application it would silence every crate.
+strip-logging = ["dep:tracing", "dep:log", "tracing/max_level_off", "log/max_level_off"]
 
 [[bench]]
 name = "conversion"
@@ -101,6 +104,8 @@ google-cloud-rpc = { git = "https://github.com/googleapis/google-cloud-rust", re
 # Wire messages for the two DDL RPCs; already used by the Spanner client.
 prost = "0.14"
 prost-types = "0.14"
+tracing = { version = "0.1", optional = true }
+log = { version = "0.4", optional = true }
 
 [lints.rust]
 # The C++ ASan validation harness enables this tripwire via rustflags.
