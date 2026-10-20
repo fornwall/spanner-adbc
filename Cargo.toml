@@ -128,6 +128,11 @@ strip = true
 lto = "thin"
 codegen-units = 1
 
+# At opt-level "s", aws-lc builds with OPENSSL_SMALL, dropping AVX-512 AES-GCM and the P-256
+# assembly. Bulk AES-GCM stays above 3 GB/s per core; only TLS handshakes pay for slower P-256.
+[profile.release.package.aws-lc-sys]
+opt-level = "s"
+
 # Release performance with symbols for perf and flamegraphs.
 [profile.profiling]
 inherits = "release"
