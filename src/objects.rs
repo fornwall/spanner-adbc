@@ -52,7 +52,7 @@ pub(crate) struct Constraint {
     name: String,
     /// `CHECK`, `FOREIGN KEY`, `PRIMARY KEY` or `UNIQUE`.
     constraint_type: String,
-    /// Key columns in key order; empty for check constraints.
+    /// Key columns in key order, or the columns a check constraint reads, by name.
     columns: Vec<String>,
     /// A foreign key's referenced columns, in the order of `columns`. `None` for other
     /// constraints, which the spec reports with a null usage list.
@@ -100,15 +100,19 @@ const COLUMNS_SQL: &str = "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, IS_NULL
 /// `BOOL`; the `CAST` accepts both.
 const COLUMNS_PREDICATE: &str = "NOT CAST(IS_HIDDEN AS BOOL)";
 
-/// One row per constraint column in key order, with the column a foreign key column references.
-/// `POSITION_IN_UNIQUE_CONSTRAINT` is that column's position in the referenced constraint. A
-/// constraint without key columns, such as a check, is one row with null columns.
+/// One row per constraint column, with the column a foreign key column references.
+/// `POSITION_IN_UNIQUE_CONSTRAINT` is that column's position in the referenced constraint. Check
+/// constraints have no key columns, so their columns come from `CONSTRAINT_COLUMN_USAGE`. A
+/// constraint without columns is one row with null columns.
 const CONSTRAINTS_SQL: &str = "SELECT tc.TABLE_SCHEMA, tc.TABLE_NAME, tc.CONSTRAINT_NAME, \
-     tc.CONSTRAINT_TYPE, k.COLUMN_NAME, rk.TABLE_SCHEMA AS REF_SCHEMA, \
-     rk.TABLE_NAME AS REF_TABLE, rk.COLUMN_NAME AS REF_COLUMN \
+     tc.CONSTRAINT_TYPE, COALESCE(k.COLUMN_NAME, ck.COLUMN_NAME) AS COLUMN_NAME, \
+     rk.TABLE_SCHEMA AS REF_SCHEMA, rk.TABLE_NAME AS REF_TABLE, rk.COLUMN_NAME AS REF_COLUMN \
      FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc \
      LEFT JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS k \
        ON k.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA AND k.CONSTRAINT_NAME = tc.CONSTRAINT_NAME \
+     LEFT JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS ck \
+       ON tc.CONSTRAINT_TYPE = 'CHECK' AND ck.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA \
+      AND ck.CONSTRAINT_NAME = tc.CONSTRAINT_NAME \
      LEFT JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS AS r \
        ON r.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA AND r.CONSTRAINT_NAME = tc.CONSTRAINT_NAME \
      LEFT JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS rk \
@@ -205,7 +209,8 @@ pub(crate) fn collect_objects(
                 ("tc.TABLE_SCHEMA", db_schema),
                 ("tc.TABLE_NAME", table_name),
             ],
-            "tc.TABLE_SCHEMA, tc.TABLE_NAME, tc.CONSTRAINT_NAME, k.ORDINAL_POSITION",
+            "tc.TABLE_SCHEMA, tc.TABLE_NAME, tc.CONSTRAINT_NAME, k.ORDINAL_POSITION, \
+             ck.COLUMN_NAME",
         )
     });
 

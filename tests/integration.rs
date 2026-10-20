@@ -1885,6 +1885,30 @@ fn get_objects_reports_catalog_schema_table_columns() {
     );
     let type_names: Vec<&str> = (0..type_name.len()).map(|i| type_name.value(i)).collect();
     assert_eq!(type_names, ["INT64", "STRING(MAX)", "BOOL", "FLOAT64"]);
+
+    // The primary key, and the check Spanner keeps for `SingerId NOT NULL`, both name their
+    // columns.
+    let constraints = col::<ListArray>(tables.column(3));
+    let constraints = constraints.value(0);
+    let constraints = col::<StructArray>(&constraints);
+    let constraint_type = col::<StringArray>(constraints.column(1));
+    let column_names = col::<ListArray>(constraints.column(2));
+    let mut seen: Vec<(String, Vec<String>)> = (0..constraints.len())
+        .map(|i| {
+            let names = column_names.value(i);
+            let names = col::<StringArray>(&names);
+            let names = (0..names.len()).map(|j| names.value(j).to_string());
+            (constraint_type.value(i).to_string(), names.collect())
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            ("CHECK".to_string(), vec!["SingerId".to_string()]),
+            ("PRIMARY KEY".to_string(), vec!["SingerId".to_string()]),
+        ]
+    );
 }
 
 /// `get_objects` depth and filter handling. Levels below the requested depth are NULL; a filter
