@@ -43,8 +43,9 @@ jobs:
 
       - name: Clippy
         if: matrix.backend == 'emulator'
-        # --all-features so the `fuzzing` helper module is linted too.
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # --workspace checks the fuzz harnesses, which otherwise only build in the nightly fuzz
+        # workflow; --all-features lints the `fuzzing` helper module.
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Docs (deny warnings / broken links)
         if: matrix.backend == 'emulator'

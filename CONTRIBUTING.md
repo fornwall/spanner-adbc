@@ -19,7 +19,7 @@ Run these before pushing code changes:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo build
 cargo test
 cargo test --lib --features fuzzing
