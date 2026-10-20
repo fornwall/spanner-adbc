@@ -294,7 +294,8 @@ cp target/release/libspanner_adbc.so python/spanner_adbc/
 pip install './python[dbapi]'
 ```
 
-The release wheels use the `strip-logging` feature, which only makes the library smaller.
+The release wheels use the `strip-logging` feature too; without it, the library is larger but
+behaves the same.
 
 See [CONTRIBUTING.md](https://github.com/fornwall/spanner-adbc/blob/main/CONTRIBUTING.md) for
 development and releases.

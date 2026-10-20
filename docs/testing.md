@@ -12,7 +12,7 @@ instead.
 | Omni integration | `scripts/with-omni.sh cargo test` | [below](#backends) |
 | Python package | see [below](#python-package) | [Python README](../python/README.md) |
 | Transport faults | `scripts/with-toxiproxy.sh cargo test --test resilience` | [RESILIENCE.md](../tests/RESILIENCE.md) |
-| Backend scripts | `python3 -m unittest discover -s scripts/tests -v` | No Docker needed |
+| Scripts, workflows and pins | `python3 -m unittest discover -s scripts/tests -v` | No Docker needed |
 | ADBC C++ conformance | `scripts/run-adbc-validation.sh` | [harness](../adbc-validation/README.md) |
 | Foundry type and feature suite | `scripts/run-foundry-validation.sh` | [harness](../foundry-validation/README.md) |
 | Fuzzing | `CARGO_PROFILE_RELEASE_LTO=false cargo +nightly fuzz run <target>` | [below](#fuzzing) |
@@ -26,7 +26,7 @@ CI runs on pushes to `main` and on pull requests. It runs the Rust, Python, C++ 
 Foundry suites against both the emulator and Omni, the C++ suite also under sanitizers, and
 fault injection against the emulator. Fault injection also runs nightly, and fuzzing runs only
 nightly. No CI job uses Cloud Spanner. CI lists the target-dependent test binaries explicitly,
-so add new ones to [ci.yml](../.github/workflows/ci.yml).
+so add new ones to [ci.yml](../.github/workflows/ci.yml); a script test fails until you do.
 
 ## Backends
 

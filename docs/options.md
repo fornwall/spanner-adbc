@@ -125,18 +125,10 @@ option's getter shows its current value.
 
 ### Isolation levels
 
-Values need the `adbc.connection.transaction.isolation.` prefix. Unknown values return
-`InvalidArguments`. The getter reports the effective level:
-
-| Suffix | Effective level |
-| --- | --- |
-| `default` | Spanner's default, `SERIALIZABLE`. The getter keeps `default`. |
-| `serializable`, `linearizable` | `serializable` |
-| `repeatable_read`, `snapshot`, `read_committed`, `read_uncommitted` | `repeatable_read` |
-
-The level applies to transactions that run DML. Queries use staleness instead, and mutation-only
-ingest commits and partitioned DML ignore it. Repeatable read permits write skew; see
-[isolation and locking](transactions.md#isolation-and-locking).
+Values need the `adbc.connection.transaction.isolation.` prefix, and unknown values return
+`InvalidArguments`. [Isolation and locking](transactions.md#isolation-and-locking) maps each
+level to Spanner's and says which transactions use it. The getter reports the level the driver
+sends, `serializable` or `repeatable_read`, except that `default` stays `default`.
 
 ## Shared options (connection and statement)
 
@@ -185,15 +177,10 @@ settings, but no request or transaction tags.
 | `spanner.ingest.batch_write` | boolean; `""` resets | `false` | always | Uses non-atomic BatchWrite for autocommit ingest. Ignored in manual mode. |
 | `spanner.dml.partitioned` | boolean; `""` resets | `false` | always | Runs DML as partitioned DML. Ignored for queries, DDL and ingest. |
 
-Ingest modes that create a table derive its columns from the Arrow schema and declare no primary
-key, so Spanner adds a [hidden row ID](https://docs.cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys).
-To choose the key, create the table yourself and use `append`. Creating the table is DDL and
-happens immediately, even in manual mode.
-
-BatchWrite sends one mutation group per row, so a chunk can partially succeed. Priority,
-transaction tag, change-stream exclusion, retry settings and the update timeout apply; request
-tags and commit delay and statistics don't. Ordinary autocommit ingest is atomic per chunk, and
-manual ingest buffers all mutations for one commit.
+[Parameters and ingest](adbc.md#parameters-and-ingest) describes the tables ingest creates.
+[BatchWrite](transactions.md#batchwrite-and-partitioned-dml) sends one mutation group per row, so
+a chunk can partially succeed. Priority, transaction tag, change-stream exclusion, retry settings
+and the update timeout apply to it; request tags and commit delay and statistics don't.
 
 [Partitioned DML](https://docs.cloud.google.com/spanner/docs/dml-partitioned) needs an idempotent
 `UPDATE` or `DELETE`, because partitions commit independently and can run more than once. The

@@ -47,8 +47,9 @@ Other ADBC clients load the driver as a shared library: `libspanner_adbc.so` on 
 Download it from a [release](https://github.com/fornwall/spanner-adbc/releases) or the
 [shared libraries workflow](https://github.com/fornwall/spanner-adbc/actions/workflows/libraries.yml),
 or build it with `cargo build --release --features strip-logging`, which writes it to
-`target/release/`. The release workflow enables `strip-logging` too; it compiles out dependency
-logging that a loaded library can't surface, and only makes the library smaller. To load it by
+`target/release/`. The `strip-logging` feature, which the release workflow also enables, compiles
+out dependency logging that a loaded library can't surface; without it, the library is larger but
+behaves the same. To load it by
 name (`driver="spanner"`), point the library paths in [spanner.toml](spanner.toml) at it and
 install the file as a [driver manifest](https://arrow.apache.org/adbc/current/format/driver_manifests.html).
 
@@ -170,7 +171,8 @@ Arrow crates. To use it, add it as a git dependency and use the same `adbc_core`
 this repository's [Cargo.toml](Cargo.toml). With the default `ffi` feature, also copy the four
 `arrow-*` entries under `[patch.crates-io]` into your workspace's root `Cargo.toml`, since Cargo
 ignores patches declared by dependencies. [Dependency pins](CONTRIBUTING.md#dependency-pins)
-explains why they exist.
+explains why they exist. Leave the `strip-logging` feature off, since Cargo would apply it to
+every crate in your build and silence their logging.
 
 The ADBC Rust traits are synchronous. From async code, call the driver inside
 `tokio::task::spawn_blocking`; see [synchronous calls from Tokio](docs/limitations.md#synchronous-calls-from-tokio).

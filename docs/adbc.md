@@ -59,8 +59,8 @@ db = adbc_driver_manager.AdbcDatabase(
 The [Python package](../python/README.md) bundles the library and adds a DBAPI interface.
 
 A database does no network I/O until its first connection, which builds the credentials,
-channels and multiplexed session. Later connections reuse them. Setting a database option
-discards the cache for future connections; existing connections keep theirs.
+channels and multiplexed session. Later connections reuse them until a
+[database option](options.md#database-options) changes.
 
 ## Execution
 
@@ -121,12 +121,16 @@ snapshot.
 For ingest, `adbc.ingest.target_table` selects the table and `adbc.ingest.mode` decides whether
 to create or replace it. Each row becomes an insert mutation. Autocommit ingest commits in
 chunks, so a large ingest is not atomic; in a manual transaction all mutations wait for one
-commit. Creating or replacing the table is DDL and happens immediately, and makes non-nullable
-fields `NOT NULL` columns. The driver converts every bound value first, so a bad value fails
-before the DDL runs or any chunk commits, as does a null in a non-nullable field of a table the
-ingest creates. In manual mode, an append checks the table and its columns before buffering, so
-a missing table returns `NotFound` and an unknown column `AlreadyExists` at execution rather
-than at commit.
+commit. The driver converts every bound value first and rejects nulls in non-nullable fields, so
+a bad value fails before any DDL runs or any chunk commits. In manual mode, an append checks the
+table and its columns before buffering, so a missing table returns `NotFound` and an unknown
+column `AlreadyExists` at execution rather than at commit.
+
+Creating or replacing the table is DDL and happens immediately, even in manual mode. Its columns
+come from the Arrow schema, with non-nullable fields as `NOT NULL` columns. The table declares no
+primary key, so Spanner adds a
+[hidden row ID](https://docs.cloud.google.com/spanner/docs/primary-key-default-value#tables-without-primary-keys).
+To choose the key, create the table yourself and ingest in `append` mode.
 
 The driver checks table, schema and column names before sending anything. It rejects names
 containing a backtick, a backslash or a control character, because Spanner's DDL parser doesn't
