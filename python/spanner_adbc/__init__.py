@@ -66,7 +66,6 @@ def _driver_path() -> str:
         if candidate.is_file():
             return str(candidate)
     raise RuntimeError(
-        "spanner_adbc: no bundled Spanner driver library found next to "
-        f"{here}. This usually means a source/sdist install without a matching "
-        "platform wheel; install a prebuilt wheel for your platform instead."
+        f"spanner_adbc: no Spanner driver library in {here}. Install a wheel for your "
+        "platform, or copy the library that `cargo build` writes to target/ into that directory."
     )

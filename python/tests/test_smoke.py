@@ -29,7 +29,7 @@ def test_missing_library_raises_clearly(tmp_path, monkeypatch):
     monkeypatch.setattr(spanner_adbc, "__file__", str(tmp_path / "__init__.py"))
     spanner_adbc._driver_path.cache_clear()
     try:
-        with pytest.raises(RuntimeError, match="no bundled Spanner driver library"):
+        with pytest.raises(RuntimeError, match="no Spanner driver library in"):
             spanner_adbc._driver_path()
     finally:
         spanner_adbc._driver_path.cache_clear()
