@@ -224,36 +224,39 @@ fn access_token_with_illegal_header_characters_is_rejected_without_leaking() {
     );
 }
 
+/// A templated profile can pass an empty value for an unused credential. It must not count as a
+/// credential, which would block emulator mode or read the keyfile path "".
 #[test]
-fn quota_project_option_round_trips_and_unsets() {
-    let mut db = new_database();
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Other(OPTION_QUOTA_PROJECT.into()))
-            .unwrap_err()
-            .status,
-        Status::NotFound
-    );
-    db.set_option(
-        OptionDatabase::Other(OPTION_QUOTA_PROJECT.into()),
-        OptionValue::String("my-billing-project".into()),
-    )
-    .unwrap();
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Other(OPTION_QUOTA_PROJECT.into()))
-            .unwrap(),
-        "my-billing-project"
-    );
-    db.set_option(
-        OptionDatabase::Other(OPTION_QUOTA_PROJECT.into()),
-        OptionValue::String(String::new()),
-    )
-    .unwrap();
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Other(OPTION_QUOTA_PROJECT.into()))
-            .unwrap_err()
-            .status,
-        Status::NotFound
-    );
+fn an_empty_credential_option_unsets_it() {
+    for (option, value) in [
+        (OPTION_KEYFILE, "/path/to/key.json"),
+        (OPTION_KEYFILE_JSON, "{}"),
+        (
+            OPTION_IMPERSONATE_TARGET_PRINCIPAL,
+            "t@p.iam.gserviceaccount.com",
+        ),
+        (OPTION_IMPERSONATE_LIFETIME, "600"),
+        (OPTION_ACCESS_TOKEN, "ya29.token"),
+        (OPTION_QUOTA_PROJECT, "billing"),
+    ] {
+        let key = || OptionDatabase::Other(option.into());
+        let mut db = new_database();
+        db.set_option(key(), s(value)).unwrap();
+        db.set_option(key(), s("")).unwrap();
+        assert_eq!(
+            db.get_option_string(key()).unwrap_err().status,
+            Status::NotFound,
+            "{option}"
+        );
+        db.database = Some("projects/p/instances/i/databases/d".into());
+        db.emulator = true;
+        assert!(
+            db.resolve_target(Some("localhost:9010")).is_ok(),
+            "{option}"
+        );
+        assert_eq!(db.credentials_json().unwrap(), None, "{option}");
+        assert_eq!(db.impersonate_lifetime_secs, None, "{option}");
+    }
 }
 
 #[test]

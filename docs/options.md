@@ -58,13 +58,13 @@ connections keep theirs. Getters don't show values taken from the environment.
 | `spanner.endpoint` | gRPC endpoint URL; `""` unsets | production endpoint | set | Overrides the endpoint from `SPANNER_EMULATOR_HOST`. A bare `host:port` uses `http://`. Only `https://` uses TLS; other schemes are plaintext. |
 | `spanner.emulator` | boolean | `false` | always | Uses anonymous credentials. The emulator's address still comes from `spanner.endpoint` or `SPANNER_EMULATOR_HOST`; with neither, connecting fails with `InvalidState`. A non-empty `SPANNER_EMULATOR_HOST` also enables this mode. |
 | `spanner.instance_type` | `cloud`, `omni` | `cloud` | always | Selects Cloud Spanner or Spanner Omni. Omni needs an explicit endpoint, ignores `SPANNER_EMULATOR_HOST` and can't be combined with `spanner.emulator=true`. Without explicit credentials, Omni connects anonymously; see [anonymous connections](#anonymous-connections). |
-| `spanner.auth.keyfile` | credential JSON file path | ADC | set | Supports `service_account`, `authorized_user`, `impersonated_service_account` and `external_account` JSON. |
-| `spanner.auth.keyfile_json` | inline credential JSON | ADC | write-only | Same formats as `keyfile`, and takes precedence over it. Not allowed in URIs. |
-| `spanner.auth.impersonate.target_principal` | service account email | unset | set | Impersonates this account, using the keyfile or ADC as base credentials. |
+| `spanner.auth.keyfile` | credential JSON file path; `""` unsets | ADC | set | Supports `service_account`, `authorized_user`, `impersonated_service_account` and `external_account` JSON. |
+| `spanner.auth.keyfile_json` | inline credential JSON; `""` unsets | ADC | write-only | Same formats as `keyfile`, and takes precedence over it. Not allowed in URIs. |
+| `spanner.auth.impersonate.target_principal` | service account email; `""` unsets | unset | set | Impersonates this account, using the keyfile or ADC as base credentials. |
 | `spanner.auth.impersonate.delegates` | comma-separated service account emails | no delegates | set | Delegation chain. Entries are trimmed and empty entries dropped. Ignored without a target principal. |
 | `spanner.auth.impersonate.scopes` | comma-separated OAuth scopes | `cloud-platform` | set | Scopes for the impersonated token, normalized like delegates. Ignored without a target principal. |
-| `spanner.auth.impersonate.lifetime` | non-negative integer seconds | `3600` | set | Lifetime of the impersonated token. Accepts an integer or integer string. Ignored without a target principal. |
-| `spanner.auth.access_token` | OAuth bearer token | ADC | write-only | Sent as is and never refreshed. Not allowed in URIs. |
+| `spanner.auth.impersonate.lifetime` | non-negative integer seconds; `""` unsets | `3600` | set | Lifetime of the impersonated token. Accepts an integer or integer string. Ignored without a target principal. |
+| `spanner.auth.access_token` | OAuth bearer token; `""` unsets | ADC | write-only | Sent as is and never refreshed. Not allowed in URIs. |
 | `spanner.auth.quota_project` | project ID; `""` unsets | credential default | set | Sends `x-goog-user-project`; the caller needs `serviceusage.services.use`. With ADC, `GOOGLE_CLOUD_QUOTA_PROJECT` takes precedence. Rejected in emulator mode and [anonymous connections](#anonymous-connections). |
 | `spanner.rpc.timeout_seconds.connect` | non-negative fractional seconds | `30` | set | Deadline for building the client stack, including session creation and its retries; see [connect timeout](#connect-timeout). |
 

@@ -21,7 +21,9 @@ use crate::error::{
     err, from_builder, from_spanner, invalid_argument, invalid_state, option_not_set,
     unknown_option, unsupported,
 };
-use crate::options::{F64Range, f64_option, impl_typed_option_getters};
+use crate::options::{
+    F64Range, f64_option, impl_typed_option_getters, non_empty_string_option, shown,
+};
 use crate::runtime::{SharedRuntime, block_on, new_runtime};
 use crate::{
     OPTION_ACCESS_TOKEN, OPTION_EMULATOR, OPTION_ENDPOINT, OPTION_IMPERSONATE_DELEGATES,
@@ -502,13 +504,13 @@ impl Optionable for SpannerDatabase {
                 };
             }
             OptionDatabase::Other(name) if name == OPTION_KEYFILE => {
-                self.keyfile = Some(string_value(&key, value)?)
+                self.keyfile = non_empty_string_option(value, name)?
             }
             OptionDatabase::Other(name) if name == OPTION_KEYFILE_JSON => {
-                self.keyfile_json = Some(string_value(&key, value)?)
+                self.keyfile_json = non_empty_string_option(value, name)?
             }
             OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_TARGET_PRINCIPAL => {
-                self.impersonate_target_principal = Some(string_value(&key, value)?)
+                self.impersonate_target_principal = non_empty_string_option(value, name)?
             }
             OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_DELEGATES => {
                 self.impersonate_delegates = comma_separated(&string_value(&key, value)?)
@@ -517,14 +519,13 @@ impl Optionable for SpannerDatabase {
                 self.impersonate_scopes = comma_separated(&string_value(&key, value)?)
             }
             OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_LIFETIME => {
-                self.impersonate_lifetime_secs = Some(u64_seconds_value(&key, value)?)
+                self.impersonate_lifetime_secs = u64_seconds_value(name, value)?
             }
             OptionDatabase::Other(name) if name == OPTION_ACCESS_TOKEN => {
-                self.access_token = Some(string_value(&key, value)?)
+                self.access_token = non_empty_string_option(value, name)?
             }
             OptionDatabase::Other(name) if name == OPTION_QUOTA_PROJECT => {
-                let project = string_value(&key, value)?;
-                self.quota_project = (!project.is_empty()).then_some(project);
+                self.quota_project = non_empty_string_option(value, name)?
             }
             OptionDatabase::Other(name) if name == OPTION_RPC_TIMEOUT_CONNECT => {
                 self.connect_timeout_secs = f64_option(value, name, F64Range::NonNegativeSeconds)?
@@ -633,21 +634,21 @@ fn comma_separated(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Parse a non-negative whole number of seconds, given as an integer or a numeric string.
-fn u64_seconds_value(key: &OptionDatabase, value: OptionValue) -> Result<u64> {
-    match value {
-        OptionValue::Int(seconds) if seconds >= 0 => Ok(seconds as u64),
-        OptionValue::String(seconds) => seconds.trim().parse::<u64>().map_err(|_| {
-            invalid_argument(format!(
-                "option {} expects a non-negative integer number of seconds, got {seconds:?}",
-                key.as_ref()
-            ))
-        }),
-        _ => Err(invalid_argument(format!(
-            "option {} expects a non-negative integer number of seconds",
-            key.as_ref()
-        ))),
-    }
+/// Parse a non-negative whole number of seconds from an integer or a numeric string; a blank
+/// string unsets.
+fn u64_seconds_value(key: &str, value: OptionValue) -> Result<Option<u64>> {
+    let seconds = match &value {
+        OptionValue::Int(seconds) => u64::try_from(*seconds).ok(),
+        OptionValue::String(s) if s.trim().is_empty() => return Ok(None),
+        OptionValue::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    seconds.map(Some).ok_or_else(|| {
+        invalid_argument(format!(
+            "option {key} expects a non-negative integer number of seconds, got {}",
+            shown(&value)
+        ))
+    })
 }
 
 fn bool_value(key: &OptionDatabase, value: OptionValue) -> Result<bool> {
