@@ -17,13 +17,10 @@ Options: ``--rows N`` (default 100000), ``--repeat K`` (default 5),
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import statistics
 import sys
 import time
-import urllib.error
-import urllib.request
 
 # Reuse the integration tests' emulator instance and database.
 PROJECT = "test-project"
@@ -43,67 +40,23 @@ DDL = (
 )
 
 
-def _rest_base() -> str:
-    grpc = os.environ["SPANNER_EMULATOR_HOST"]
-    host = grpc.rsplit(":", 1)[0] or "localhost"
-    port = os.environ.get("SPANNER_EMULATOR_REST_PORT", "9020")
-    return f"http://{host}:{port}"
-
-
-def _post(url: str, body: dict):
-    data = json.dumps(body).encode()
-    req = urllib.request.Request(
-        url, data=data, method="POST", headers={"Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read() or b"{}")
-    except urllib.error.HTTPError as exc:
-        if exc.code == 409:  # already exists
-            return None
-        raise
-
-
-def _await_operation(op) -> None:
-    if not op or op.get("done"):
-        return
-    name = op.get("name")
-    if not name:
-        return
-    for _ in range(120):
-        with urllib.request.urlopen(f"{_rest_base()}/v1/{name}", timeout=30) as resp:
-            got = json.loads(resp.read() or b"{}")
-        if got.get("done"):
-            if "error" in got:
-                raise RuntimeError(f"operation {name} failed: {got['error']}")
-            return
-        time.sleep(0.5)
-    raise RuntimeError(f"operation {name} did not complete in time")
-
-
 def ensure_database() -> str:
     """Create the instance and database if absent; return the database path."""
-    base = _rest_base()
-    _await_operation(
-        _post(
-            f"{base}/v1/projects/{PROJECT}/instances",
-            {
-                "instanceId": INSTANCE,
-                "instance": {
-                    "config": f"projects/{PROJECT}/instanceConfigs/emulator-config",
-                    "displayName": "ADBC benchmark instance",
-                    "nodeCount": 1,
-                },
-            },
-        )
+    from google.api_core.exceptions import AlreadyExists
+    from google.cloud import spanner
+
+    instance = spanner.Client(project=PROJECT).instance(
+        INSTANCE,
+        configuration_name=f"projects/{PROJECT}/instanceConfigs/emulator-config",
+        node_count=1,
     )
-    _await_operation(
-        _post(
-            f"{base}/v1/projects/{PROJECT}/instances/{INSTANCE}/databases",
-            {"createStatement": f"CREATE DATABASE `{DATABASE}`"},
-        )
-    )
-    return f"projects/{PROJECT}/instances/{INSTANCE}/databases/{DATABASE}"
+    database = instance.database(DATABASE)
+    for resource in (instance, database):
+        try:
+            resource.create().result(timeout=60)
+        except AlreadyExists:
+            pass
+    return database.name
 
 
 def build_data(n: int):
