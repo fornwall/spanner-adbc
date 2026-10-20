@@ -244,8 +244,9 @@ impl Connection for SpannerConnection {
 
     /// Driver and vendor metadata from static constants; makes no RPC.
     ///
-    /// `codes = None` returns every code the driver can answer. Otherwise there is one row per
-    /// requested code, with a null value for codes it cannot answer.
+    /// `codes = None` returns every code the driver recognizes. Otherwise there is one row per
+    /// requested code it recognizes, with a null value where Spanner has none, such as the vendor
+    /// version; unrecognized codes are omitted.
     fn get_info(
         &self,
         codes: Option<HashSet<InfoCode>>,
