@@ -230,7 +230,8 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   // Ingested Arrow types read back as the canonical type of their Spanner
   // column: INT64, FLOAT32 (for half floats), STRING(MAX) or BYTES(MAX). See
   // `bind::spanner_column_type` for ingest and `src/conversion.rs` for reads.
-  // The base class's SchemaField overload applies this to nested types.
+  // The base class's SchemaField overload applies this to nested types. UInt64
+  // is absent because ingest rejects it.
   ArrowType IngestSelectRoundTripType(ArrowType ingest_type) const override {
     switch (ingest_type) {
       case NANOARROW_TYPE_INT8:
@@ -239,7 +240,6 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
       case NANOARROW_TYPE_UINT8:
       case NANOARROW_TYPE_UINT16:
       case NANOARROW_TYPE_UINT32:
-      case NANOARROW_TYPE_UINT64:
         return NANOARROW_TYPE_INT64;
       case NANOARROW_TYPE_HALF_FLOAT:
         return NANOARROW_TYPE_FLOAT;
