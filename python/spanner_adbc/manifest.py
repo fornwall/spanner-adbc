@@ -51,7 +51,6 @@ publisher = "fornwall"
 license = "Apache-2.0"
 version = {_toml_string(__version__)}
 url = "https://github.com/fornwall/spanner-adbc"
-source = "spanner-adbc (Python wheel)"
 
 [ADBC]
 version = "1.1.0"

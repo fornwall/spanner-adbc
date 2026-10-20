@@ -19,7 +19,6 @@ name = 'Google Cloud Spanner'
 publisher = 'fornwall'
 license = 'Apache-2.0'
 url = 'https://github.com/fornwall/spanner-adbc'
-source = 'https://github.com/fornwall/spanner-adbc'
 
 [ADBC]
 # Supports ADBC 1.0.0 and 1.1.0 callers.
