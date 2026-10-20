@@ -1,12 +1,45 @@
 use super::*;
 use std::time::Duration;
 
+/// A Rust caller may use the synchronous API, and drop the last handle, from an async task.
 #[test]
-fn uncancelled_operation_completes() {
+fn works_and_drops_inside_a_multi_thread_runtime() {
     let runtime = new_runtime().unwrap();
+    let outer = tokio::runtime::Builder::new_multi_thread().build().unwrap();
     let cancel = CancelSignal::new();
-    let result: Result<i32> = block_on_cancellable(&runtime, &cancel, async { Ok(42) });
-    assert_eq!(result.unwrap(), 42);
+    let in_task = runtime.clone();
+    outer
+        .block_on(outer.spawn(async move {
+            let result: Result<i32> =
+                block_on_cancellable(&in_task, &CancelSignal::new(), async { Ok(1) });
+            assert_eq!(result.unwrap(), 1);
+        }))
+        .unwrap();
+    outer.block_on(async move {
+        let result: Result<i32> = block_on_cancellable(&runtime, &cancel, async { Ok(2) });
+        assert_eq!(result.unwrap(), 2);
+        drop(runtime);
+    });
+}
+
+#[test]
+fn a_current_thread_caller_runtime_gets_an_error_instead_of_a_panic() {
+    let runtime = new_runtime().unwrap();
+    let outer = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    outer.block_on(async move {
+        let result: Result<i32> =
+            block_on_cancellable(&runtime, &CancelSignal::new(), async { Ok(1) });
+        let error = result.unwrap_err();
+        assert_eq!(error.status, Status::InvalidState);
+        assert!(
+            error.message.contains("spawn_blocking"),
+            "{}",
+            error.message
+        );
+        drop(runtime);
+    });
 }
 
 #[test]

@@ -21,7 +21,7 @@ use crate::error::{
     err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option,
 };
 use crate::options::{F64Range, f64_option, impl_typed_option_getters};
-use crate::runtime::{SharedRuntime, new_runtime};
+use crate::runtime::{SharedRuntime, block_on, new_runtime};
 use crate::{
     OPTION_ACCESS_TOKEN, OPTION_EMULATOR, OPTION_ENDPOINT, OPTION_IMPERSONATE_DELEGATES,
     OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES, OPTION_IMPERSONATE_TARGET_PRINCIPAL,
@@ -233,22 +233,24 @@ impl SpannerDatabase {
         // The client retries session creation without limit while the endpoint is unreachable,
         // so only this deadline ends such a connect. Expiry drops, and so cancels, the build.
         let Some(limit) = self.connect_timeout() else {
-            return self.runtime.block_on(build);
+            return block_on(&self.runtime, build);
         };
         // The timer must be created inside the runtime.
-        self.runtime
-            .block_on(async { tokio::time::timeout(limit, build).await })
-            .unwrap_or_else(|_| {
-                Err(err(
-                    format!(
-                        "connecting to {target} timed out after {}s \
+        block_on(&self.runtime, async {
+            tokio::time::timeout(limit, build)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(err(
+                        format!(
+                            "connecting to {target} timed out after {}s \
                          ({OPTION_RPC_TIMEOUT_CONNECT}); check that the endpoint is reachable \
                          and serves Spanner, or raise the timeout",
-                        limit.as_secs_f64()
-                    ),
-                    Status::Timeout,
-                ))
-            })
+                            limit.as_secs_f64()
+                        ),
+                        Status::Timeout,
+                    ))
+                })
+        })
     }
 
     /// The [`OPTION_RPC_TIMEOUT_CONNECT`] deadline; `None` when disabled with `0`.

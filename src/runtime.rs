@@ -2,18 +2,46 @@
 //! runtime through an [`Arc`], keeping client background tasks alive until the last handle drops.
 
 use std::future::Future;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use adbc_core::CancelHandle;
 use adbc_core::error::{Error, Result, Status};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::error::err;
+use crate::error::{err, invalid_state};
 
-pub(crate) type SharedRuntime = Arc<Runtime>;
+pub(crate) type SharedRuntime = Arc<DriverRuntime>;
+
+/// The driver's Tokio runtime.
+///
+/// Tokio panics when a runtime is dropped inside another runtime's context, such as the last
+/// handle dropped by a Rust caller's async task, so it then shuts down in the background.
+#[derive(Debug)]
+pub(crate) struct DriverRuntime(Option<Runtime>);
+
+impl Deref for DriverRuntime {
+    type Target = Runtime;
+
+    fn deref(&self) -> &Runtime {
+        self.0
+            .as_ref()
+            .expect("the runtime is only taken when dropped")
+    }
+}
+
+impl Drop for DriverRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take()
+            && Handle::try_current().is_ok()
+        {
+            runtime.shutdown_background();
+        }
+    }
+}
 
 /// A latched cancellation signal shared by an operation and its streamed readers.
 ///
@@ -136,7 +164,7 @@ pub(crate) fn block_on_cancellable<T>(
     // Client/retry/conversion futures can exceed a host thread's 2 MiB stack in debug builds.
     // Boxing keeps the synchronous bridge's frame small.
     let future = Box::pin(future);
-    runtime.block_on(async move {
+    block_on(runtime, async move {
         tokio::select! {
             // Check/register the cancellation waiter before polling the operation.
             biased;
@@ -144,6 +172,25 @@ pub(crate) fn block_on_cancellable<T>(
             result = future => result,
         }
     })
+}
+
+/// Run `future` on `runtime` from synchronous code.
+///
+/// Tokio panics when this happens inside another runtime's context, as it does for a Rust caller
+/// in an async task. A multi-thread caller runtime can hand off the blocked thread's work, but a
+/// current-thread one cannot.
+pub(crate) fn block_on<T>(runtime: &Runtime, future: impl Future<Output = Result<T>>) -> Result<T> {
+    let Ok(caller) = Handle::try_current() else {
+        return runtime.block_on(future);
+    };
+    if caller.runtime_flavor() == RuntimeFlavor::CurrentThread {
+        return Err(invalid_state(
+            "the synchronous ADBC API blocks, so it cannot run on a current-thread Tokio runtime \
+             such as the `#[tokio::test]` default; call it through `tokio::task::spawn_blocking` \
+             or from a multi-thread runtime",
+        ));
+    }
+    tokio::task::block_in_place(|| runtime.block_on(future))
 }
 
 /// A source of row chunks for [`spawn_prefetch`]. An empty chunk ends the stream.
@@ -219,7 +266,7 @@ pub(crate) fn new_runtime() -> Result<SharedRuntime> {
                 Status::Internal,
             )
         })?;
-    Ok(Arc::new(runtime))
+    Ok(Arc::new(DriverRuntime(Some(runtime))))
 }
 
 #[cfg(test)]
