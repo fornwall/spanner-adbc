@@ -348,10 +348,7 @@ impl Connection for SpannerConnection {
                     table_name,
                 );
                 match exists {
-                    Ok(false) => Err(err(
-                        format!("table {table_name:?} not found"),
-                        Status::NotFound,
-                    )),
+                    Ok(false) => Err(err(format!("table {table} not found"), Status::NotFound)),
                     // The query failed for another reason, or the probe failed too.
                     Ok(true) | Err(_) => Err(error),
                 }

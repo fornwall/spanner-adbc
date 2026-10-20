@@ -372,6 +372,11 @@ mod table_schema_probe {
             .get_table_schema(None, Some("App"), "singers")
             .unwrap_err();
         assert_eq!(error.status, Status::NotFound, "{}", error.message);
+        assert!(
+            error.message.contains("table `App`.`singers` not found"),
+            "the message names the schema: {}",
+            error.message
+        );
 
         let requests = server.requests.lock().unwrap();
         let probe = &requests[1];
