@@ -16,7 +16,7 @@ use super::guard::sanitized_cstring;
 type ErrorDetails = Vec<(CString, Vec<u8>)>;
 
 /// Detail key for the gRPC code that the 1.1.0 sentinel displaces from `vendor_code`.
-const VENDOR_CODE_DETAIL_KEY: &str = "adbc.spanner.vendor_code";
+const VENDOR_CODE_DETAIL_KEY: &str = "spanner.vendor_code";
 
 /// # Safety
 /// `error` must be a pointer this driver previously wrote a 1.1.0 error into.

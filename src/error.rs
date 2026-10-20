@@ -71,7 +71,7 @@ pub(crate) fn chain<'a>(
 /// `vendor_code` 0 and become [`Status::Unauthenticated`] for credential failures,
 /// [`Status::Timeout`] for client deadlines, [`Status::IO`] for connection and transport failures
 /// and [`Status::Internal`] otherwise. The C ABI's 1.1.0 error layout reserves `vendor_code`, so
-/// `src/ffi/error.rs` passes a non-zero code there as the detail `adbc.spanner.vendor_code`
+/// `src/ffi/error.rs` passes a non-zero code there as the detail `spanner.vendor_code`
 /// instead.
 ///
 /// # Structured error details

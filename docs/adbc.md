@@ -227,7 +227,7 @@ the bound schema, as ADBC requires.
 
 Rust callers and callers with a 1.0.0 `AdbcError` get the numeric gRPC code in `vendor_code`. A
 1.1.0 `AdbcError` keeps `vendor_code` at `ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA`, so those callers
-get the code as the error detail `adbc.spanner.vendor_code`, a decimal string. Each
+get the code as the error detail `spanner.vendor_code`, a decimal string. Each
 `google.rpc.Status` detail, such as `ErrorInfo` or `RetryInfo`, becomes an error detail keyed by
 its lowercased type name (for example `google.rpc.retryinfo`) with its ProtoJSON encoding as the
 value.
