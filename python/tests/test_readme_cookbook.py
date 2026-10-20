@@ -1,7 +1,7 @@
 """Run README Python examples against the configured Spanner target.
 
-Blocks marked ``docs-test: skip`` or without ``spanner.connect`` are excluded.
-Connection options are redirected to the test database; snippets run unchanged.
+Blocks marked ``docs-test: skip`` are excluded. Connections are redirected to the
+test database; snippets run unchanged.
 """
 
 import pathlib
@@ -16,20 +16,11 @@ pytest.importorskip("pyarrow")  # every snippet returns Arrow
 README = pathlib.Path(__file__).resolve().parents[1] / "README.md"
 
 
-def _runnable_blocks():
-    text = README.read_text()
-    blocks = re.findall(r"```python([^\n]*)\n(.*?)```", text, re.DOTALL)
-    runnable = []
-    for info, block in blocks:
-        if "docs-test: skip" in info or block.lstrip().startswith("# docs-test: skip"):
-            continue
-        if "spanner.connect" not in block:
-            continue
-        runnable.append(block)
-    return runnable
-
-
-RUNNABLE = _runnable_blocks()
+RUNNABLE = [
+    block
+    for info, block in re.findall(r"```python([^\n]*)\n(.*?)```", README.read_text(), re.DOTALL)
+    if "docs-test: skip" not in info
+]
 
 
 def test_readme_has_runnable_snippets():
