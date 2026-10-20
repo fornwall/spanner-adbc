@@ -191,14 +191,15 @@ pub(crate) fn insert_mutation(table: &str, batch: &RecordBatch, row: usize) -> R
 /// a bad value before its DDL runs. A column whose values always convert once its type is accepted
 /// is checked on its first row only.
 ///
-/// A non-nullable field becomes a `NOT NULL` column, so its nulls are bad values too. Arrow only
-/// checks physical nulls, which miss a valid dictionary key that selects a null value.
+/// A non-nullable field's nulls are bad values too, since the create modes make it a `NOT NULL`
+/// column. Arrow only checks physical nulls, which miss a valid dictionary key that selects a null
+/// value.
 pub(crate) fn check_ingest_values(batch: &RecordBatch) -> Result<()> {
     for (field, column) in batch.schema_ref().fields().iter().zip(batch.columns()) {
         if !field.is_nullable() && column.logical_null_count() > 0 {
             return Err(invalid_argument(format!(
-                "ingest column {:?} is non-nullable, so it is created NOT NULL, but it contains \
-                 nulls; mark the field nullable or remove the nulls",
+                "ingest column {:?} is non-nullable but contains nulls; mark the field nullable \
+                 or remove the nulls",
                 field.name()
             )));
         }
@@ -329,7 +330,7 @@ fn unsupported(target: Target<'_>, data_type: &DataType) -> adbc_core::error::Er
     ))
 }
 
-/// Allocation-free scalar encoder for one array type, reused across all elements of a list.
+/// Scalar encoder for one array type, reused across all elements of a list.
 ///
 /// Encoders map a valid cell through `Option::into`, which consumes owned strings where
 /// `ToValue` would copy them.
@@ -400,8 +401,8 @@ fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
         DataType::Timestamp(TimeUnit::Nanosecond, _) => {
             timestamp_binder::<TimestampNanosecondType>()
         }
-        // Arrow caps the scale at 38, which keeps `numeric_string`'s divisor in a u128. Spanner
-        // checks whether the formatted value fits NUMERIC's precision and scale.
+        // A larger scale, possible in an imported schema, would overflow `numeric_string`'s u128
+        // divisor. Spanner checks whether the formatted value fits NUMERIC's precision and scale.
         DataType::Decimal128(_, scale) if *scale <= 38 => |_, a, i| {
             let a = a.as_primitive::<Decimal128Type>();
             Ok(a.is_valid(i)

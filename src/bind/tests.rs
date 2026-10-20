@@ -860,8 +860,8 @@ fn ingest_value_check_fails_where_mutation_building_would() {
     }
     let unsupported = column_batch(Arc::new(UInt64Array::from(vec![1])));
     assert!(check_ingest_values(&unsupported).is_err());
-    // A non-nullable column would be created NOT NULL. Arrow accepts this one because the
-    // dictionary's keys are all valid.
+    // Arrow accepts nulls in this non-nullable column because the dictionary's keys are all
+    // valid.
     let null_value = DictionaryArray::new(
         Int8Array::from(vec![0, 1]),
         Arc::new(StringArray::from(vec![Some("a"), None])),
