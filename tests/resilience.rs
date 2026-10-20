@@ -10,7 +10,7 @@
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use adbc_core::error::{Error as AdbcError, Result as AdbcResult, Status as AdbcStatus};
@@ -293,8 +293,14 @@ fn run(connection: &mut SpannerConnection, sql: &str) {
         .unwrap_or_else(|e| panic!("run {sql:?}: {e:?}"));
 }
 
-/// Refills the streaming table, in batches that stay under the commit size limit.
+/// Refills the streaming table once per run, in batches that stay under the commit size limit.
+/// The tests only read it.
 fn seed_stream_table(connection: &mut SpannerConnection) {
+    static SEEDED: Mutex<bool> = Mutex::new(false);
+    let mut seeded = SEEDED.lock().unwrap_or_else(PoisonError::into_inner);
+    if *seeded {
+        return;
+    }
     run(
         connection,
         &format!("DELETE FROM {STREAM_TABLE} WHERE true"),
@@ -313,6 +319,7 @@ fn seed_stream_table(connection: &mut SpannerConnection) {
         );
         start = end + 1;
     }
+    *seeded = true;
 }
 
 /// A full scan of the streaming table in 300-row batches, so many fetches follow `execute()`.
