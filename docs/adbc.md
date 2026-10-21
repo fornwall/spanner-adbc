@@ -148,6 +148,9 @@ Parameters and ingested columns keep their Arrow type:
   bind as their values. `LargeList` and `FixedSizeList`, such as embedding vectors, bind as
   `ARRAY` like `List`.
 - `UInt64`, structs and nested lists are not supported.
+- `Null` and `List(Null)` parameters bind untyped and take their type from the SQL, such as an
+  insert into an `ARRAY` column, `IN UNNEST(@p)` or `CAST(@p AS ARRAY<STRING>)`. Where the SQL
+  gives none, Spanner assumes `INT64`, so cast the parameter or pass a typed Arrow array.
 - `Date64` values must be whole days (multiples of 86,400,000 ms). Use an Arrow timestamp to keep
   a time of day.
 - `Decimal128` values of any scale keep their value (`99` at scale `-2` is `9900`), and read back

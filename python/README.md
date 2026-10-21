@@ -180,7 +180,8 @@ autocommit for large writes. In manual mode, end a read with `conn.rollback()` b
 Results follow the [type mapping][types]. Polars 2.0 reads JSON columns as
 `Extension('arrow.json', String)`. Spanner allows duplicate `STRUCT` field names: pandas and
 DuckDB keep only the last field of each name, and Polars raises `DuplicateError` when unnesting
-such a struct.
+such a struct. pyarrow and Polars infer `List(Null)` for `[]` and `[None]`, which bind
+[untyped][bound].
 
 DuckDB can query fetched Arrow data in-process:
 
@@ -197,6 +198,7 @@ print(duckdb.sql("SELECT COUNT(*) FROM singers").fetchone())
 ```
 
 [types]: https://github.com/fornwall/spanner-adbc/blob/main/README.md#type-mapping
+[bound]: https://github.com/fornwall/spanner-adbc/blob/main/docs/adbc.md#bound-types
 
 ## Bulk ingest
 
