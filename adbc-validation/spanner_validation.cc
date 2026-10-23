@@ -49,8 +49,7 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   // an ordinary ExecuteQuery of a DROP/CREATE works here.
   AdbcStatusCode DropTable(struct AdbcConnection* connection, const std::string& name,
                            struct AdbcError* error) const override {
-    return RunIgnoringResult(connection, "DROP TABLE IF EXISTS " + Qualified(name, ""),
-                             error);
+    return DropTable(connection, name, "", error);
   }
 
   AdbcStatusCode DropTable(struct AdbcConnection* connection, const std::string& name,
@@ -258,10 +257,10 @@ class SpannerQuirks : public adbc_validation::DriverQuirks {
   // Created tables have no `PRIMARY KEY` clause, so their columns are just the
   // ingested ones.
   bool supports_bulk_ingest(const char* mode) const override {
-    return std::strcmp(mode, "adbc.ingest.mode.append") == 0 ||
-           std::strcmp(mode, "adbc.ingest.mode.create") == 0 ||
-           std::strcmp(mode, "adbc.ingest.mode.create_append") == 0 ||
-           std::strcmp(mode, "adbc.ingest.mode.replace") == 0;
+    return std::strcmp(mode, ADBC_INGEST_OPTION_MODE_APPEND) == 0 ||
+           std::strcmp(mode, ADBC_INGEST_OPTION_MODE_CREATE) == 0 ||
+           std::strcmp(mode, ADBC_INGEST_OPTION_MODE_CREATE_APPEND) == 0 ||
+           std::strcmp(mode, ADBC_INGEST_OPTION_MODE_REPLACE) == 0;
   }
 
   bool supports_execute_schema() const override { return true; }
@@ -336,9 +335,110 @@ class SpannerConnectionTest : public ::testing::Test,
   void TearDown() override { ASSERT_NO_FATAL_FAILURE(TearDownTest()); }
 
  protected:
+  void ExecuteSql(const std::string& sql) {
+    adbc_validation::Handle<struct AdbcStatement> stmt;
+    ASSERT_THAT(AdbcStatementNew(&connection, &stmt.value, &error),
+                adbc_validation::IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&stmt.value, sql.c_str(), &error),
+                adbc_validation::IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&stmt.value, nullptr, nullptr, &error),
+                adbc_validation::IsOkStatus(&error));
+  }
+
+  void ExpectIds(struct AdbcConnection* observer, const std::string& table,
+                 const std::vector<int64_t>& expected) {
+    adbc_validation::Handle<struct AdbcStatement> stmt;
+    adbc_validation::StreamReader reader;
+    const std::string sql = "SELECT id FROM `" + table + "` ORDER BY id";
+    ASSERT_THAT(AdbcStatementNew(observer, &stmt.value, &error),
+                adbc_validation::IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&stmt.value, sql.c_str(), &error),
+                adbc_validation::IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&stmt.value, &reader.stream.value,
+                                          &reader.rows_affected, &error),
+                adbc_validation::IsOkStatus(&error));
+    ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+    ASSERT_NO_FATAL_FAILURE(adbc_validation::CompareSchema(
+        &reader.schema.value, {{"id", NANOARROW_TYPE_INT64}}));
+    std::vector<int64_t> actual;
+    while (true) {
+      ASSERT_NO_FATAL_FAILURE(reader.Next());
+      if (!reader.array->release) break;
+      auto* values = reader.array_view->children[0];
+      for (int64_t row = 0; row < values->length; ++row) {
+        ASSERT_FALSE(ArrowArrayViewIsNull(values, row));
+        actual.push_back(ArrowArrayViewGetIntUnsafe(values, row));
+      }
+    }
+    EXPECT_EQ(actual, expected);
+  }
+
   SpannerQuirks quirks_;
 };
 ADBCV_TEST_CONNECTION(SpannerConnectionTest)
+
+TEST_F(SpannerConnectionTest, BufferedWritesCommitAndEnableAutocommit) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error),
+              adbc_validation::IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error),
+              adbc_validation::IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropTable(&connection, "buffered_commit", &error),
+              adbc_validation::IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(ExecuteSql("CREATE TABLE buffered_commit (id INT64)"));
+
+  adbc_validation::Handle<struct AdbcConnection> observer;
+  ASSERT_THAT(AdbcConnectionNew(&observer.value, &error),
+              adbc_validation::IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&observer.value, &database, &error),
+              adbc_validation::IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionSetOption(&connection, ADBC_CONNECTION_OPTION_AUTOCOMMIT,
+                                      ADBC_OPTION_VALUE_DISABLED, &error),
+              adbc_validation::IsOkStatus(&error));
+
+  ASSERT_NO_FATAL_FAILURE(ExecuteSql("INSERT INTO buffered_commit (id) VALUES (1)"));
+  ASSERT_NO_FATAL_FAILURE(ExecuteSql("INSERT INTO buffered_commit (id) VALUES (2)"));
+  ASSERT_NO_FATAL_FAILURE(ExpectIds(&observer.value, "buffered_commit", {}));
+  ASSERT_THAT(AdbcConnectionCommit(&connection, &error),
+              adbc_validation::IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(ExpectIds(&observer.value, "buffered_commit", {1, 2}));
+
+  ASSERT_NO_FATAL_FAILURE(ExecuteSql("INSERT INTO buffered_commit (id) VALUES (3)"));
+  ASSERT_NO_FATAL_FAILURE(ExpectIds(&observer.value, "buffered_commit", {1, 2}));
+  ASSERT_THAT(AdbcConnectionSetOption(&connection, ADBC_CONNECTION_OPTION_AUTOCOMMIT,
+                                      ADBC_OPTION_VALUE_ENABLED, &error),
+              adbc_validation::IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(ExpectIds(&observer.value, "buffered_commit", {1, 2, 3}));
+  ASSERT_THAT(quirks()->DropTable(&connection, "buffered_commit", &error),
+              adbc_validation::IsOkStatus(&error));
+}
+
+TEST_F(SpannerConnectionTest, RollbackDiscardsWritesButKeepsDdl) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error),
+              adbc_validation::IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error),
+              adbc_validation::IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropTable(&connection, "buffered_rollback", &error),
+              adbc_validation::IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionSetOption(&connection, ADBC_CONNECTION_OPTION_AUTOCOMMIT,
+                                      ADBC_OPTION_VALUE_DISABLED, &error),
+              adbc_validation::IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(ExecuteSql("CREATE TABLE buffered_rollback (id INT64)"));
+  ASSERT_NO_FATAL_FAILURE(ExecuteSql("INSERT INTO buffered_rollback (id) VALUES (1)"));
+  ASSERT_NO_FATAL_FAILURE(
+      ExecuteSql("ALTER TABLE buffered_rollback ADD COLUMN label STRING(MAX)"));
+
+  adbc_validation::Handle<struct AdbcConnection> observer;
+  ASSERT_THAT(AdbcConnectionNew(&observer.value, &error),
+              adbc_validation::IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&observer.value, &database, &error),
+              adbc_validation::IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(ExpectIds(&observer.value, "buffered_rollback", {}));
+  ASSERT_THAT(AdbcConnectionRollback(&connection, &error),
+              adbc_validation::IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(ExpectIds(&observer.value, "buffered_rollback", {}));
+  ASSERT_THAT(quirks()->DropTable(&connection, "buffered_rollback", &error),
+              adbc_validation::IsOkStatus(&error));
+}
 
 class SpannerStatementTest : public ::testing::Test,
                              public adbc_validation::StatementTest {

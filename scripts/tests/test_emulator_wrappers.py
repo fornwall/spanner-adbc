@@ -246,6 +246,57 @@ sys.exit(int(os.environ.get("CARGO_EXIT", "0")))
         self.assertIn(["cargo", "build"], self.calls)
         self.assertEqual(self.removed_ids(), ["owned-existing-emulator"])
 
+    def adbc_harness(self):
+        self.tool("cmake", "")
+        self.tool("spanner_validation", '''
+import os, pathlib, sys
+cases = ("SqlIngestDuration", "SqlIngestInterval", "SqlIngestUInt64")
+if "--gtest_list_tests" in sys.argv:
+    print("SpannerStatementTest.")
+    for case in cases:
+        print("  " + case)
+    sys.exit(int(os.environ.get("DISCOVERY_EXIT", "0")))
+for arg in sys.argv:
+    if arg.startswith("--gtest_output=xml:"):
+        results = ''.join(
+            f'<testcase classname="SpannerStatementTest" name="{case}" '
+            'status="run" result="completed"><failure/></testcase>' for case in cases
+        )
+        pathlib.Path(arg.removeprefix("--gtest_output=xml:")).write_text(
+            f"<testsuites><testsuite>{results}</testsuite></testsuites>"
+        )
+        print("excluded harness diagnostics")
+        sys.exit(int(os.environ.get("EXCLUDED_EXIT", "1")))
+''')
+
+    def test_adbc_runner_rejects_failed_discovery_with_partial_output(self):
+        self.adbc_harness()
+        result = self.run_runner(
+            "run-adbc-validation.sh", "--check-drift",
+            ADBC_VALIDATION_BUILD_DIR=str(self.root), DISCOVERY_EXIT="3",
+        )
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertNotIn("stale guard OK", result.stdout)
+
+    def test_adbc_runner_checks_excluded_exit_status_and_keeps_diagnostics(self):
+        self.adbc_harness()
+        for exit_code in (1, 139):
+            with self.subTest(exit_code=exit_code):
+                result = self.run_runner(
+                    "run-adbc-validation.sh", SPANNER_GCP_DATABASE="project.instance.db",
+                    ADBC_VALIDATION_BUILD_DIR=str(self.root), EXCLUDED_EXIT=str(exit_code),
+                )
+                if exit_code == 1:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("harness exited with status 139", result.stderr)
+                    self.assertIn("excluded harness diagnostics", result.stderr)
+                self.assertIn(
+                    "excluded harness diagnostics",
+                    (self.root / "excluded-results.log").read_text(),
+                )
+
     def test_foundry_runner_reenters_with_a_relative_python(self):
         self.tool("fake-python", '''
 import json, os, sys

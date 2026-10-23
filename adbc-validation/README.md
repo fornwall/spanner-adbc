@@ -53,10 +53,19 @@ The default run then checks that:
 2. every excluded case still fails or skips, so an unexpected pass means the exclusion should go;
 3. every excluded case still exists, so renamed or removed cases are caught.
 
+The expected-failure check requires a complete XML report with one result per excluded case.
+Crashes, missing results and malformed reports fail the run. The report and harness output
+remain in the build directory as `excluded-results.xml` and `excluded-results.log`.
+
 Some cases skip through quirks instead: `Transactions` expects behavior that conflicts with
 immediate DDL and buffered manual writes, `SqlIngestPrimaryKey` expects ordered generated keys,
 and the `SqlIngestTemporary*` cases need temporary tables. Check 2 doesn't cover these, so review
 them when the driver's capabilities change.
+
+Two local connection tests cover the transaction behavior that the upstream `Transactions`
+case cannot express. They check that buffered writes stay invisible to another connection until
+commit or enabling autocommit, and that rollback discards writes while preserving DDL. They use
+the same driver manager and sanitizer configurations as the upstream tests.
 
 ## Sanitizers
 

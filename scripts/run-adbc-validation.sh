@@ -132,7 +132,7 @@ build_harness() {
 # Parse `Suite.\n  Case\n ...` from `--gtest_list_tests` into fully-qualified
 # Suite.Case names (one per line). Lists only; connects to no database.
 list_available_cases() {
-  "$BUILD_DIR/spanner_validation" --gtest_list_tests 2>/dev/null | awk '
+  "$BUILD_DIR/spanner_validation" --gtest_list_tests | awk '
     /^[A-Za-z]/          { suite = $1; next }
     /^[[:space:]]/ && NF { print suite $1 }
   '
@@ -148,11 +148,13 @@ run_stale_guard() {
   fi
 
   local -a available=()
-  mapfile -t available < <(list_available_cases)
-  if [ "${#available[@]}" -eq 0 ]; then
+  local inventory
+  inventory="$(list_available_cases)" || return $?
+  if [ -z "$inventory" ]; then
     echo "!! could not enumerate any test cases from $bin --gtest_list_tests" >&2
     return 1
   fi
+  mapfile -t available <<<"$inventory"
 
   local -A avail=()
   local t
@@ -182,40 +184,17 @@ run_gate() {
 }
 
 # Unexpected passes must be removed from EXCLUDED so the normal run enforces them.
-# gtest writes each <testcase> opening tag on one line. A pass has result="completed"
-# and no <failure> child; skipped cases use result="skipped".
 run_xfail_guard() {
   echo ">> expected-failure guard: no EXCLUDED case may actually pass"
   local bin="$BUILD_DIR/spanner_validation"
   local xml="$BUILD_DIR/excluded-results.xml"
+  local log="$BUILD_DIR/excluded-results.log"
   rm -f "$xml"
 
   local rc=0
-  "$bin" --gtest_filter="$EXCLUDED_FILTER" --gtest_output="xml:$xml" >/dev/null 2>&1 || rc=$?
-  if [ ! -f "$xml" ]; then
-    echo "!! expected-failure guard: harness produced no XML at $xml (exit $rc)" >&2
-    return 1
-  fi
-
-  local -a xpass=()
-  mapfile -t xpass < <(awk '
-    /<testcase /{
-      cls = ""; nm = ""; res = ""; failed = 0; open = 1
-      if (match($0, /classname="[^"]*"/)) cls = substr($0, RSTART + 11, RLENGTH - 12)
-      if (match($0, /name="[^"]*"/))      nm  = substr($0, RSTART + 6,  RLENGTH - 7)
-      if (match($0, /result="[^"]*"/))    res = substr($0, RSTART + 8,  RLENGTH - 9)
-      # A self-closing <testcase .../> has no children => it ran and passed.
-      if ($0 ~ /\/>[[:space:]]*$/) { if (res == "completed") print cls "." nm; open = 0 }
-      next
-    }
-    open && /<failure/       { failed = 1 }
-    open && /<\/testcase>/   { if (res == "completed" && failed == 0) print cls "." nm; open = 0 }
-  ' "$xml")
-
-  if [ "${#xpass[@]}" -ne 0 ]; then
-    echo "!! ${#xpass[@]} EXCLUDED test(s) now pass; remove them from EXCLUDED so the" >&2
-    echo "   gate enforces them:" >&2
-    printf '     %s\n' "${xpass[@]}" >&2
+  "$bin" --gtest_filter="$EXCLUDED_FILTER" --gtest_output="xml:$xml" >"$log" 2>&1 || rc=$?
+  if ! python3 "$REPO_ROOT/scripts/check-adbc-exclusions.py" "$xml" "$rc" "${EXCLUDED[@]}"; then
+    cat "$log" >&2
     return 1
   fi
 
