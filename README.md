@@ -4,6 +4,7 @@
 # spanner-adbc
 
 [![CI](https://github.com/fornwall/spanner-adbc/actions/workflows/ci.yml/badge.svg)](https://github.com/fornwall/spanner-adbc/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/spanner-adbc.svg)](https://pypi.org/project/spanner-adbc/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver for
