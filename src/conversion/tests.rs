@@ -68,8 +68,8 @@ fn spanner_types_map_to_arrow_types() {
         (types::bytes(), DataType::Binary),
         (types::date(), DataType::Date32),
         (types::timestamp(), timestamp_type(TimeUnit::Nanosecond)),
-        (types::enum_type("pkg.Color"), DataType::Int64),
-        (types::proto_type("pkg.Message"), DataType::Binary),
+        (types::proto_enum("pkg.Color"), DataType::Int64),
+        (types::proto("pkg.Message"), DataType::Binary),
         (types::array(types::int64()), list_of(DataType::Int64)),
         (
             types::array(row.clone()),

@@ -194,7 +194,7 @@ with spanner.connect("spanner:///projects/p/instances/i/databases/d") as conn:
         cur.execute("SELECT SingerId, FirstName FROM Singers")
         singers = cur.fetch_arrow_table()
 
-print(duckdb.sql("SELECT COUNT(*) FROM singers").fetchone())
+print(duckdb.sql("SELECT COUNT(*) FROM singers").fetchall())
 ```
 
 [types]: https://github.com/fornwall/spanner-adbc/blob/main/README.md#type-mapping

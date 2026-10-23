@@ -14,7 +14,7 @@ scripts/run-foundry-validation.sh --prepare  # build and install only
 ```
 
 You need Python 3.13+ with pip (required by the
-[pinned suite](https://github.com/adbc-drivers/validation/blob/68242ee13524e8f2b36038764e2f439d4cb49f33/pyproject.toml)),
+[pinned suite](https://github.com/adbc-drivers/validation/blob/9f9f4417a08d6c082193842bc5caaa36e65908a0/pyproject.toml)),
 Rust, git and curl, plus Docker for the emulator. `PYTHON` selects the interpreter. The
 [script](../scripts/run-foundry-validation.sh) builds the driver, installs the pinned suite if
 needed, sets up the target database and runs pytest. `ADBC_VALIDATION_REF` and

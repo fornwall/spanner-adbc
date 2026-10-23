@@ -251,7 +251,7 @@ sys.exit(int(os.environ.get("CARGO_EXIT", "0")))
 import json, os, sys
 if sys.argv[1:4] == ["-m", "pip", "freeze"]:
     print("adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@"
-          "68242ee13524e8f2b36038764e2f439d4cb49f33")
+          "9f9f4417a08d6c082193842bc5caaa36e65908a0")
     sys.exit(0)
 with open(os.environ["WRAPPER_LOG"], "a") as log:
     log.write(json.dumps(["python", os.getcwd(), *sys.argv[1:]]) + "\\n")

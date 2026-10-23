@@ -23,7 +23,7 @@ endif()
 # Keep this revision in sync with adbc_core, adbc_ffi and adbc_driver_manager
 # in Cargo.toml. The suite uses the upstream SQL-rewriting and identifier-quoting hooks.
 # FORCE replaces revisions cached in restored or incremental build trees.
-set(ARROW_ADBC_TAG "0a40cf30d0458867cea48d0fbc5283340b59b40f"
+set(ARROW_ADBC_TAG "032775861123dd07e198b0d333c5f6aab97b2932"
     CACHE STRING "arrow-adbc revision (apache/arrow-adbc main, see above)" FORCE)
 
 include(FetchContent)

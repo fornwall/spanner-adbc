@@ -22,7 +22,7 @@ esac
 cd "$REPO_ROOT"
 
 # Pin the upstream query corpus and test behavior for reproducible runs.
-VALIDATION_REF="${ADBC_VALIDATION_REF:-68242ee13524e8f2b36038764e2f439d4cb49f33}"
+VALIDATION_REF="${ADBC_VALIDATION_REF:-9f9f4417a08d6c082193842bc5caaa36e65908a0}"
 VALIDATION_REPO="${ADBC_VALIDATION_REPO:-adbc-drivers/validation}"
 
 echo ">> building the spanner-adbc cdylib"

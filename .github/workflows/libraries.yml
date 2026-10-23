@@ -63,7 +63,7 @@ jobs:
         with:
           version: "3.02"
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
 
@@ -161,7 +161,7 @@ jobs:
             -v "$PWD":/work -w /work \
             -e CARGO_TARGET_DIR=/work/target \
             -e RUSTFLAGS="-C target-feature=-crt-static" \
-            rust@sha256:557a94c82b485a14b569120e00867267108c734efe33f10cc31ca0cd5dd1eca9 \
+            rust@sha256:b1d5dd5a22a09404d3e798c0cf051b689077360374eb505fa5bb93c479693d87 \
             sh -euc '
               apk add --no-cache build-base cmake perl git
               cargo build --release --features strip-logging
@@ -501,7 +501,7 @@ jobs:
 
       - name: Publish to PyPI
         # SHA-pinned because this action holds the PyPI publishing identity token.
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           packages-dir: dist
           skip-existing: true
