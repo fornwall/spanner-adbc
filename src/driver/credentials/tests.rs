@@ -9,6 +9,8 @@ use google_cloud_gax::error::CredentialsError;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod flows;
+
 fn s(value: &str) -> OptionValue {
     OptionValue::String(value.into())
 }
@@ -135,14 +137,19 @@ fn first_token_retries_transient_failures_and_keeps_only_the_io_cause() {
         assert!(calls.load(Ordering::SeqCst) >= 2);
         assert_eq!(failure.as_deref(), Some("no metadata server"));
 
-        // The client reports a permanent failure itself.
+        calls.store(0, Ordering::SeqCst);
         let credentials = Credentials::from(FailingTokens {
             transient: false,
-            calls,
+            calls: calls.clone(),
         });
-        first_token(&credentials, &mut failure).await;
+        let error = first_token(&credentials, &mut failure).await.unwrap_err();
+        assert_eq!(error.status, Status::Unauthenticated);
+        assert!(!error.message.contains("SECRET"), "{}", error.message);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(failure, None);
-        first_token(&AnonymousCredentials::new().build(), &mut failure).await;
+        first_token(&AnonymousCredentials::new().build(), &mut failure)
+            .await
+            .unwrap();
         assert_eq!(failure, None);
     });
 }
@@ -695,6 +702,20 @@ fn impersonation_lifetime_takes_whole_seconds() {
         assert!(error.message.contains("non-negative integer"));
     }
     assert_eq!(db.impersonate_lifetime_secs, Some(900));
+    for seconds in [0, 43201, i64::MAX] {
+        for value in [OptionValue::Int(seconds), s(&seconds.to_string())] {
+            let error = db.set_option(key(), value).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert!(error.message.contains("between 1 and 43200 seconds"));
+            assert_eq!(db.impersonate_lifetime_secs, Some(900));
+        }
+    }
+    for seconds in [1, 3600, 43200] {
+        db.set_option(key(), OptionValue::Int(seconds)).unwrap();
+        assert_eq!(db.impersonate_lifetime_secs, Some(seconds as u64));
+    }
+    db.set_option(key(), s("")).unwrap();
+    assert_eq!(db.impersonate_lifetime_secs, None);
 }
 
 // The IAM `generateAccessToken` call only happens on first token use.
@@ -731,6 +752,23 @@ fn impersonated_credentials_build_without_network() {
             "{built}"
         );
     });
+}
+
+#[test]
+fn impersonation_delegates_use_iam_resource_names() {
+    for (input, expected) in [
+        (
+            "delegate@project.iam.gserviceaccount.com",
+            "projects/-/serviceAccounts/delegate@project.iam.gserviceaccount.com",
+        ),
+        ("1234567890", "projects/-/serviceAccounts/1234567890"),
+        (
+            "projects/-/serviceAccounts/other@project.iam.gserviceaccount.com",
+            "projects/-/serviceAccounts/other@project.iam.gserviceaccount.com",
+        ),
+    ] {
+        assert_eq!(delegate_resource_name(input), expected);
+    }
 }
 
 /// ADC naming a missing file fails with the path, which is safe to show and the likely fix. The

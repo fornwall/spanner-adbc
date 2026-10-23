@@ -22,6 +22,10 @@ Unit tests cover SQL parsing, options, value conversion and transaction state. T
 mock server checks what goes over the wire: gRPC errors and details, cancellation, timeouts,
 retry limits, ingest failures and request options. Neither needs a backend or credentials.
 
+Run the focused authentication tests with `cargo test --lib driver::credentials::tests`.
+They cover credential selection, construction, validation and error handling without a Cloud
+Spanner database. The opt-in Cloud tests below verify real credentials and IAM permissions.
+
 CI runs on pushes to `main` and on pull requests. It runs the Rust, Python, C++ validation and
 Foundry suites against both the emulator and Omni, the C++ suite also under sanitizers, and
 fault injection against the emulator. Fault injection also runs nightly, and fuzzing runs only
@@ -85,6 +89,15 @@ tables and leave some schema behind, so use a dedicated test database.
 The `auth_end_to_end` tests also need `SPANNER_TEST_KEYFILE`,
 `SPANNER_TEST_IMPERSONATE_TARGET_PRINCIPAL` or both, together with `SPANNER_GCP_DATABASE`. They
 always run against that database, even when an emulator or Omni endpoint is set.
+Setup uses ADC to create fixtures, independently of the keyfile under test. The keyfile can
+contain any supported credential JSON type. For impersonation, the ADC identity needs
+`roles/iam.serviceAccountTokenCreator` on the target, and the target needs Spanner access.
+
+```sh
+SPANNER_GCP_DATABASE=my-project.my-instance.my-test-db \
+  SPANNER_TEST_KEYFILE=/path/to/credentials.json \
+  cargo test --test integration auth_end_to_end -- --nocapture
+```
 
 ## Python package
 

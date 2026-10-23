@@ -162,16 +162,22 @@ impl SpannerDatabase {
 /// Wait until `credentials` supply a token, which their cache then keeps for the client.
 ///
 /// The client retries a transient token failure until the connect deadline and then reports only
-/// a timeout, so retry here instead and keep the latest failure's cause in `failure`. A permanent
-/// failure is left to the client, which reports it in full.
-pub(super) async fn first_token(credentials: &Credentials, failure: &mut Option<String>) {
+/// a timeout, so retry here instead and keep the latest failure's cause in `failure`.
+pub(super) async fn first_token(
+    credentials: &Credentials,
+    failure: &mut Option<String>,
+) -> Result<()> {
     let mut delay = Duration::from_millis(250);
     loop {
         match credentials.headers(Extensions::new()).await {
             Err(error) if error.is_transient() => *failure = Some(io_cause(&error)),
-            _ => {
+            Err(error) => {
                 *failure = None;
-                return;
+                return Err(crate::error::from_credentials(&error));
+            }
+            Ok(_) => {
+                *failure = None;
+                return Ok(());
             }
         }
         tokio::time::sleep(delay).await;
@@ -248,7 +254,20 @@ fn build_credentials_from_json(json: &str, quota_project: Option<&str>) -> Resul
         "impersonated_service_account" => {
             with_quota_project!(ImpersonatedCredentials::new(value)).build()
         }
-        "external_account" => with_quota_project!(ExternalAccountCredentials::new(value)).build(),
+        "external_account" => {
+            // The pinned external-account builder does not read quota_project_id from JSON.
+            let project = quota_project.map(str::to_owned).or_else(|| {
+                value
+                    .get("quota_project_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+            let mut builder = ExternalAccountCredentials::new(value);
+            if let Some(project) = project {
+                builder = builder.with_quota_project_id(project);
+            }
+            builder.build()
+        }
         other => {
             return Err(invalid_argument(format!(
                 "unsupported credential `type` {other:?}; expected one of \
@@ -301,7 +320,7 @@ fn build_impersonated_credentials(
         .with_target_principal(target_principal)
         .with_lifetime(lifetime);
     if !delegates.is_empty() {
-        builder = builder.with_delegates(delegates.iter().cloned());
+        builder = builder.with_delegates(delegates.iter().map(|d| delegate_resource_name(d)));
     }
     if !scopes.is_empty() {
         builder = builder.with_scopes(scopes.iter().cloned());
@@ -319,6 +338,14 @@ fn build_impersonated_credentials(
             Status::InvalidArguments,
         )
     })
+}
+
+fn delegate_resource_name(delegate: &str) -> String {
+    if delegate.starts_with("projects/") {
+        delegate.to_owned()
+    } else {
+        format!("projects/-/serviceAccounts/{delegate}")
+    }
 }
 
 /// Credentials for a fixed bearer token, which the pinned auth crate has no builder for.

@@ -430,14 +430,15 @@ pub const OPTION_IMPERSONATE_TARGET_PRINCIPAL: &str = "spanner.auth.impersonate.
 
 /// Database option: a comma-separated delegation chain of service accounts for
 /// [`OPTION_IMPERSONATE_TARGET_PRINCIPAL`]. Each needs the Token Creator role on the next, and
-/// the last on the target.
+/// the last on the target. Accepts emails, unique IDs or `projects/-/serviceAccounts/...` names.
 pub const OPTION_IMPERSONATE_DELEGATES: &str = "spanner.auth.impersonate.delegates";
 
 /// Database option: comma-separated OAuth 2.0 scopes for the impersonated token. Defaults to
 /// `cloud-platform`.
 pub const OPTION_IMPERSONATE_SCOPES: &str = "spanner.auth.impersonate.scopes";
 
-/// Database option: the impersonated token's lifetime in whole seconds. Defaults to 3600.
+/// Database option: the impersonated token's lifetime in whole seconds, from 1 to 43200.
+/// Defaults to 3600; longer lifetimes require an IAM organization policy allowing the extension.
 pub const OPTION_IMPERSONATE_LIFETIME: &str = "spanner.auth.impersonate.lifetime";
 
 /// Database option: an OAuth 2.0 access token, sent as a bearer token and never refreshed. It

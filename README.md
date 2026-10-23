@@ -75,7 +75,16 @@ every option with its type and default.
 ### Authentication
 
 Cloud Spanner connections use [Application Default Credentials](https://docs.cloud.google.com/docs/authentication/application-default-credentials)
-unless one of these database options is set:
+(ADC). For local development, create ADC with:
+
+```sh
+gcloud auth application-default login
+```
+
+`gcloud auth login` sets up the CLI's credentials separately. On Google Cloud, ADC can use the
+service account attached to the compute resource. Outside Google Cloud, point
+`GOOGLE_APPLICATION_CREDENTIALS` at a Workload Identity Federation configuration or another
+supported credential JSON file. These database options select credentials explicitly:
 
 | Option | Credentials |
 | --- | --- |
@@ -83,6 +92,13 @@ unless one of these database options is set:
 | `spanner.auth.keyfile_json` | The same JSON, as a string |
 | `spanner.auth.access_token` | A bearer token, sent as is and never refreshed |
 | `spanner.auth.impersonate.target_principal` | A service account to impersonate, with the keyfile or ADC as base credentials |
+
+ADC, keyfile and impersonated credentials refresh their tokens automatically. A static access
+token must be replaced by the caller when it expires. Impersonation requires the source identity
+to have `iam.serviceAccounts.getAccessToken` on the target, for example through
+`roles/iam.serviceAccountTokenCreator`, and the target needs access to the
+Spanner database. See [authentication details](docs/options.md#authentication) for federation,
+delegation and token lifetimes.
 
 `spanner.auth.quota_project` sets the project billed for quota. URIs are often logged, so the
 driver rejects `keyfile_json` and `access_token` as URI query parameters.

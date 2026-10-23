@@ -20,21 +20,24 @@ class DatabaseOptions(enum.StrEnum):
     INSTANCE_TYPE = "spanner.instance_type"
     #: ``"true"`` to connect with anonymous credentials (emulator mode).
     EMULATOR = "spanner.emulator"
-    #: Path to a credential JSON file.
+    #: Path to service account, authorized user, impersonated service account or
+    #: external account credential JSON. Tokens refresh automatically.
     KEYFILE = "spanner.auth.keyfile"
     #: Credential JSON passed inline. Write-only, and rejected as a URI query
     #: parameter because URIs get logged.
     KEYFILE_JSON = "spanner.auth.keyfile_json"
-    #: OAuth 2.0 bearer token, sent as is and never refreshed. Write-only, and
-    #: rejected as a URI query parameter because URIs get logged.
+    #: Raw OAuth 2.0 access token, without a ``Bearer `` prefix, never refreshed.
+    #: Write-only, and rejected as a URI query parameter because URIs get logged.
     ACCESS_TOKEN = "spanner.auth.access_token"
     #: Service account to impersonate; setting it enables impersonation.
     IMPERSONATE_TARGET_PRINCIPAL = "spanner.auth.impersonate.target_principal"
-    #: Optional impersonation delegation chain (comma-separated emails).
+    #: Optional impersonation chain: comma-separated service account emails, unique
+    #: IDs or ``projects/-/serviceAccounts/...`` names.
     IMPERSONATE_DELEGATES = "spanner.auth.impersonate.delegates"
     #: Optional OAuth scopes for the impersonated token (comma-separated).
     IMPERSONATE_SCOPES = "spanner.auth.impersonate.scopes"
-    #: Optional impersonated-token lifetime, in seconds (default ``3600``).
+    #: Optional impersonated-token lifetime: ``1`` through ``43200`` seconds (default
+    #: ``3600``). Values above ``3600`` need an organization policy allowing them.
     IMPERSONATE_LIFETIME = "spanner.auth.impersonate.lifetime"
     #: Project billed for API quota (``x-goog-user-project``). ``""`` unsets.
     QUOTA_PROJECT = "spanner.auth.quota_project"

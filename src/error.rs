@@ -89,15 +89,16 @@ pub(crate) fn chain<'a>(
 /// `RetryInfo` on `ABORTED` is rare because the client's transaction runner consumes it. Without
 /// details, `details` is `None`, never `Some(vec![])`.
 pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
+    if let Some(error) = authentication_error(&error) {
+        return error;
+    }
     // An exhausted retry policy wraps the last error instead of carrying its kind and status.
     let client_errors =
         || chain(&error).filter_map(|e| e.downcast_ref::<google_cloud_spanner::Error>());
     if let Some(status) = client_errors().find_map(|e| e.status()) {
         return service_error(status.code as i32, &status.message, &status.details);
     }
-    let status = if client_errors().any(google_cloud_spanner::Error::is_authentication) {
-        Status::Unauthenticated
-    } else if client_errors().any(google_cloud_spanner::Error::is_timeout) {
+    let status = if client_errors().any(google_cloud_spanner::Error::is_timeout) {
         Status::Timeout
     } else if client_errors().any(|e| e.is_connect() || e.is_transport()) {
         // adbc.h: IO covers "a remote service may be unavailable".
@@ -106,6 +107,34 @@ pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
         Status::Internal
     };
     err(format!("Spanner error: {error}"), status)
+}
+
+fn authentication_error(source: &(dyn std::error::Error + 'static)) -> Option<Error> {
+    chain(source)
+        .find_map(|error| error.downcast_ref::<google_cloud_gax::error::CredentialsError>())
+        .map(from_credentials)
+}
+
+pub(crate) fn from_credentials(credentials: &google_cloud_gax::error::CredentialsError) -> Error {
+    let client_errors = || {
+        chain(credentials)
+            .filter_map(|error| error.downcast_ref::<google_cloud_gax::error::Error>())
+    };
+    let mut message = "Spanner authentication failed".to_owned();
+    if let Some(code) = client_errors().find_map(|error| error.http_status_code()) {
+        message.push_str(&format!(" (HTTP {code})"));
+    } else if let Some(status) = client_errors().find_map(|error| error.status()) {
+        message.push_str(&format!(" ({})", status.code));
+    }
+    // Authentication errors can quote token responses and credential URLs, including secrets.
+    // Their structured codes are safe to report, but their messages and sources are not.
+    message.push_str(": could not obtain authentication headers; ");
+    message.push_str(if credentials.is_transient() {
+        "check connectivity to the authentication service and retry"
+    } else {
+        "check the credential configuration, token validity and any impersonation permissions"
+    });
+    err(message, Status::Unauthenticated)
 }
 
 /// Build an ADBC error from a `google.rpc.Status` embedded in a `BatchWriteResponse`, matching
@@ -156,10 +185,13 @@ fn map_detail(detail: &StatusDetails) -> Option<(String, Vec<u8>)> {
     Some((key, serde_json::to_vec(&value).ok()?))
 }
 
-/// Translate a client builder error, which has no gRPC status, into an `Internal` error. Its
-/// message, such as "could not initialize transport client", leaves out the cause, so the
-/// sources are appended.
+/// Translate a client builder error into `Unauthenticated` for credential failures, or `Internal`
+/// otherwise. Non-authentication errors include their sources, since the outer message often
+/// leaves out the cause.
 pub(crate) fn from_builder(error: impl std::error::Error + 'static) -> Error {
+    if let Some(error) = authentication_error(&error) {
+        return error;
+    }
     let mut message = format!("Spanner error: {error}");
     for source in chain(&error).skip(1) {
         let source = source.to_string();

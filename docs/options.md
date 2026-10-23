@@ -58,12 +58,12 @@ connections keep theirs. Getters don't show values taken from the environment.
 | `spanner.endpoint` | gRPC endpoint URL; `""` unsets | production endpoint | set | Overrides the endpoint from `SPANNER_EMULATOR_HOST`. A bare `host:port` uses `http://`. Only `https://` uses TLS; other schemes are plaintext. |
 | `spanner.emulator` | boolean | `false` | always | Uses anonymous credentials. The emulator's address still comes from `spanner.endpoint` or `SPANNER_EMULATOR_HOST`; with neither, connecting fails with `InvalidState`. A non-empty `SPANNER_EMULATOR_HOST` also enables this mode. |
 | `spanner.instance_type` | `cloud`, `omni` | `cloud` | always | Selects Cloud Spanner or Spanner Omni. Omni needs an explicit endpoint, ignores `SPANNER_EMULATOR_HOST` and can't be combined with `spanner.emulator=true`. Without explicit credentials, Omni connects anonymously; see [anonymous connections](#anonymous-connections). |
-| `spanner.auth.keyfile` | credential JSON file path; `""` unsets | ADC | set | Supports `service_account`, `authorized_user`, `impersonated_service_account` and `external_account` JSON. |
+| `spanner.auth.keyfile` | credential JSON file path; `""` unsets | ADC | set | Supports `service_account`, `authorized_user`, `impersonated_service_account` and `external_account` JSON; see [authentication](#authentication). |
 | `spanner.auth.keyfile_json` | inline credential JSON; `""` unsets | ADC | write-only | Same formats as `keyfile`, and takes precedence over it. Not allowed in URIs. |
 | `spanner.auth.impersonate.target_principal` | service account email; `""` unsets | unset | set | Impersonates this account, using the keyfile or ADC as base credentials. |
-| `spanner.auth.impersonate.delegates` | comma-separated service account emails | no delegates | set | Delegation chain. Entries are trimmed and empty entries dropped. Ignored without a target principal. |
-| `spanner.auth.impersonate.scopes` | comma-separated OAuth scopes | `cloud-platform` | set | Scopes for the impersonated token, normalized like delegates. Ignored without a target principal. |
-| `spanner.auth.impersonate.lifetime` | non-negative integer seconds; `""` unsets | `3600` | set | Lifetime of the impersonated token. Accepts an integer or integer string. Ignored without a target principal. |
+| `spanner.auth.impersonate.delegates` | comma-separated service account emails, unique IDs or `projects/-/serviceAccounts/...` names | no delegates | set | Delegation chain. Entries are trimmed and empty entries dropped. Bare emails and IDs are expanded to resource names for IAM. Ignored without a target principal. |
+| `spanner.auth.impersonate.scopes` | comma-separated OAuth scopes | `cloud-platform` | set | Scopes for the impersonated token. Entries are trimmed and empty entries dropped. Ignored without a target principal. |
+| `spanner.auth.impersonate.lifetime` | integer seconds, `1` through `43200`; `""` unsets | `3600` | set | Lifetime of the impersonated token. Accepts an integer or integer string. Values above `3600` require an organization policy; see [authentication](#authentication). Ignored without a target principal. |
 | `spanner.auth.access_token` | OAuth bearer token; `""` unsets | ADC | write-only | Sent as is and never refreshed. Not allowed in URIs. |
 | `spanner.auth.quota_project` | project ID; `""` unsets | credential default | set | Sends `x-goog-user-project`; the caller needs `serviceusage.services.use`. With ADC, `GOOGLE_CLOUD_QUOTA_PROJECT` takes precedence. Rejected in emulator mode and [anonymous connections](#anonymous-connections). |
 | `spanner.rpc.timeout_seconds.connect` | non-negative fractional seconds | `30` | set | Deadline for building the client stack, including session creation and its retries; see [connect timeout](#connect-timeout). |
@@ -76,6 +76,46 @@ with `InvalidState`.
 A keyfile, inline JSON or ADC that can't be read or parsed, for example because
 `GOOGLE_APPLICATION_CREDENTIALS` names a missing file, fails with `InvalidArguments` when the
 client stack is built. A token that can't be fetched or is rejected surfaces as `Unauthenticated`.
+Errors while fetching credentials omit token endpoint response bodies and credential JSON.
+
+### Authentication
+
+ADC searches `GOOGLE_APPLICATION_CREDENTIALS`, the local file created by
+`gcloud auth application-default login`, then the compute resource's attached identity through
+the metadata server. The CLI's `gcloud auth login` credentials are separate. See Google's
+[ADC setup guide](https://docs.cloud.google.com/docs/authentication/provide-credentials-adc).
+
+Explicit JSON credentials select the same four credential types supported by ADC:
+
+| JSON `type` | Use |
+| --- | --- |
+| `service_account` | A service account private key. |
+| `authorized_user` | A user's OAuth client and refresh token, such as local gcloud ADC. |
+| `impersonated_service_account` | A target service account and source credentials, such as ADC created with `gcloud auth application-default login --impersonate-service-account=ACCOUNT_EMAIL`. |
+| `external_account` | A Workload or Workforce Identity Federation configuration. File, URL, AWS and executable credential sources are supported. Executable sources require `GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES=1`. |
+
+Federation configurations can include `service_account_impersonation_url`. The pinned auth
+library uses a one-hour token lifetime for that embedded impersonation flow. To choose a
+lifetime explicitly, use a federation configuration without that field as the source and set
+`spanner.auth.impersonate.target_principal` and `spanner.auth.impersonate.lifetime`.
+
+For explicit external-account JSON or keyfiles, `quota_project_id` in the JSON supplies the
+quota project unless `spanner.auth.quota_project` overrides it. For external accounts loaded
+through ADC, the pinned auth library ignores the JSON quota project; set
+`spanner.auth.quota_project` or `GOOGLE_CLOUD_QUOTA_PROJECT` instead.
+
+For explicit impersonation, the source identity needs `iam.serviceAccounts.getAccessToken` on
+the target service account, for example through `roles/iam.serviceAccountTokenCreator`.
+With delegates, it needs that role on the first delegate, each delegate needs it on the next,
+and the last needs it on the target. The target also needs the appropriate Spanner permissions.
+Lifetimes above one hour require the target account to be allowed by
+`constraints/iam.allowServiceAccountCredentialLifetimeExtension`; IAM allows at most twelve
+hours. See [IAM's token API](https://docs.cloud.google.com/iam/docs/reference/credentials/rest/v1/projects.serviceAccounts/generateAccessToken).
+
+ADC, JSON credentials and impersonation cache and refresh tokens through the shared client
+stack. `spanner.auth.access_token` accepts the raw OAuth access token, without a `Bearer `
+prefix, and never refreshes it. To replace a static token, set the option and create a new
+connection; existing connections retain their original credentials.
 
 ### Anonymous connections
 

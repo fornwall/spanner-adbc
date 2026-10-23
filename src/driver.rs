@@ -222,7 +222,7 @@ impl SpannerDatabase {
         let build = async move {
             // One credential, and so one token cache, for every channel and the admin client.
             let credentials = self.build_credentials(choice, credentials_json)?;
-            first_token(&credentials, token_failure_slot).await;
+            first_token(&credentials, token_failure_slot).await?;
             let mut builder = Spanner::builder()
                 .with_instance_type(self.instance_type)
                 .with_credentials(credentials.clone());
@@ -523,7 +523,13 @@ impl Optionable for SpannerDatabase {
                 self.impersonate_scopes = comma_separated(&string_value(&key, value)?)
             }
             OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_LIFETIME => {
-                self.impersonate_lifetime_secs = u64_seconds_value(name, value)?
+                let seconds = u64_seconds_value(name, value)?;
+                if seconds.is_some_and(|seconds| !(1..=43200).contains(&seconds)) {
+                    return Err(invalid_argument(format!(
+                        "the `{name}` option must be between 1 and 43200 seconds"
+                    )));
+                }
+                self.impersonate_lifetime_secs = seconds;
             }
             OptionDatabase::Other(name) if name == OPTION_ACCESS_TOKEN => {
                 self.access_token = non_empty_string_option(value, name)?

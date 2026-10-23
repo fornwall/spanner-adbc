@@ -185,12 +185,7 @@ fn unrelated_errors_with_constraint_codes_keep_their_status() {
 
 #[test]
 fn errors_without_a_grpc_status_map_by_kind() {
-    use google_cloud_gax::error::CredentialsError;
-
-    let auth = || GaxError::authentication(CredentialsError::from_msg(false, "invalid_grant"));
     for (error, status) in [
-        (auth(), Status::Unauthenticated),
-        (GaxError::exhausted(auth()), Status::Unauthenticated),
         (GaxError::timeout("attempt deadline"), Status::Timeout),
         (GaxError::connect("connection refused"), Status::IO),
         (GaxError::io("connection reset"), Status::IO),
@@ -211,6 +206,74 @@ fn errors_without_a_grpc_status_map_by_kind() {
         assert_eq!(adbc.vendor_code, 0, "{}", adbc.message);
         assert_eq!(adbc.message, format!("Spanner error: {source}"));
         assert_eq!(adbc.details, None);
+    }
+}
+
+#[test]
+fn authentication_errors_do_not_expose_provider_messages_or_sources() {
+    use google_cloud_gax::client_builder::Error as BuilderError;
+    use google_cloud_gax::error::CredentialsError;
+
+    for transient in [false, true] {
+        let auth = || {
+            GaxError::authentication(CredentialsError::new(
+                transient,
+                "failed to fetch token, body=<SECRET-REFRESH-TOKEN>",
+                std::io::Error::other("https://token.example/?client_secret=SECRET-CLIENT-SECRET"),
+            ))
+        };
+        for adbc in [
+            from_spanner(auth()),
+            from_spanner(GaxError::exhausted(GaxError::exhausted(auth()))),
+            from_builder(BuilderError::transport(auth())),
+        ] {
+            assert_eq!(adbc.status, Status::Unauthenticated);
+            assert_eq!(adbc.vendor_code, 0);
+            assert_eq!(adbc.details, None);
+            assert!(adbc.message.starts_with("Spanner authentication failed:"));
+            assert!(!adbc.message.contains("SECRET"), "{}", adbc.message);
+            let guidance = if transient {
+                "check connectivity"
+            } else {
+                "check the credential configuration"
+            };
+            assert!(adbc.message.contains(guidance), "{}", adbc.message);
+        }
+    }
+}
+
+#[test]
+fn token_endpoint_statuses_are_authentication_failures_without_response_details() {
+    use google_cloud_gax::error::CredentialsError;
+
+    let detail = serde_json::json!({
+        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+        "reason": "SECRET",
+        "domain": "token.example",
+        "metadata": {"token": "SECRET"},
+    });
+    let status = RpcStatus::default()
+        .set_code(Code::PermissionDenied)
+        .set_message("SECRET")
+        .set_details([serde_json::from_value::<StatusDetails>(detail).unwrap()]);
+    for (source, expected_code) in [
+        (
+            GaxError::http(401, Default::default(), "SECRET".into()),
+            "HTTP 401",
+        ),
+        (GaxError::service(status.clone()), "PERMISSION_DENIED"),
+        (
+            GaxError::service_with_http_metadata(status, Some(403), Default::default()),
+            "HTTP 403",
+        ),
+    ] {
+        let auth = GaxError::authentication(CredentialsError::new(false, "SECRET", source));
+        let adbc = from_spanner(GaxError::exhausted(auth));
+        assert_eq!(adbc.status, Status::Unauthenticated);
+        assert_eq!(adbc.vendor_code, 0);
+        assert_eq!(adbc.details, None);
+        assert!(adbc.message.contains(expected_code), "{}", adbc.message);
+        assert!(!adbc.message.contains("SECRET"), "{}", adbc.message);
     }
 }
 
