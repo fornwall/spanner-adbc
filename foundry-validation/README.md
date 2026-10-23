@@ -11,11 +11,14 @@ see [testing](../docs/testing.md) for the other suites.
 scripts/run-foundry-validation.sh
 scripts/run-foundry-validation.sh -k ingest  # extra arguments go to pytest
 scripts/run-foundry-validation.sh --prepare  # build and install only
+scripts/run-foundry-validation.sh --no-prepare  # reuse that build and Python environment
 ```
 
 You need Python 3.13+ with pip (required by the
 [pinned suite](https://github.com/adbc-drivers/validation/blob/9f9f4417a08d6c082193842bc5caaa36e65908a0/pyproject.toml)),
-Rust, git and curl, plus Docker for the emulator. `PYTHON` selects the interpreter. The
+Rust, git and curl, plus Docker for the emulator. Python 3.13 is used in CI so native
+dependencies install from wheels; the Python package workflow covers the newest Python.
+`PYTHON` selects the interpreter. The
 [script](../scripts/run-foundry-validation.sh) builds the driver, installs the pinned suite if
 needed, sets up the target database and runs pytest. `ADBC_VALIDATION_REF` and
 `ADBC_VALIDATION_REPO` select a different upstream revision or repository. When running pytest
@@ -29,8 +32,20 @@ The target is chosen from `SPANNER_OMNI_ENDPOINT`, then `SPANNER_EMULATOR_HOST`,
 exist and is reached with ADC. The quirks expect the database to be called `adbc-test`, so
 adjust them for a different name.
 
-The [workflow](../.github/workflows/foundry-validation.yml) runs on pushes to `main` and pull
-requests. Every case must pass or skip with a reason; there are no expected failures.
+The [workflow](../.github/workflows/foundry-validation.yml) runs both backends on pushes to
+`main` and pull requests, and reports the slowest 20 test phases. Every case must pass or skip
+with a reason; there are no expected failures. Preparation runs before the backend starts;
+`--no-prepare` avoids repeating it. Rerun preparation after changing Rust code or the suite pin.
+Foundry removes interactive REPL and query-printing cases from normal runs, so pytest's initial
+collection count can exceed the executed total.
+
+Collection and query linting need neither a library nor a database once dependencies are installed:
+
+```sh
+python -m pytest foundry-validation/tests --collect-only -q
+python -m pytest foundry-validation/tests/test_query.py -k lint_query -q
+python -m pytest foundry-validation/harness_tests -q  # test the skip guards without a backend
+```
 
 ## Adaptations
 
@@ -46,7 +61,13 @@ requests. Every case must pass or skip with a reason; there are no expected fail
 - [`tests/test_ingest.py`](tests/test_ingest.py) enables the long-value tests for string, large
   string, string view, binary, large binary and binary view. Its fixture applies each case's
   connection options to both ingest and readback, and restores the previous values afterwards.
-  Other test modules reuse upstream classes and fixtures through [`tests/conftest.py`](tests/conftest.py).
+- Dictionary binding and ingestion cover string, large string, binary, integer, decimal and
+  microsecond timestamp inputs. Stream binding covers the same types with a single batch,
+  multiple batches, and empty batches before, between and after data. The other ingest modes
+  retain upstream's representative string case to bound DDL costs, particularly on Omni.
+- [`conftest.py`](conftest.py) registers the upstream pytest plugin, including its query grouping
+  that shares DDL setup between query, execute-schema and get-table-schema tests.
+  [`tests/conftest.py`](tests/conftest.py) supplies Spanner connections and the library path.
 
 Timestamp cases keep the upstream naive and timezone-aware inputs and expected instants, and
 read back in UTC. Nanosecond cases keep nanosecond precision; lower-precision cases use the
@@ -64,17 +85,20 @@ UNIQUE table constraints.
 
 ## Skip baseline
 
-CI sets two variables read by `tests/conftest.py`:
+CI sets two variables read by `conftest.py`:
 
-- `FOUNDRY_VALIDATION_REQUIRE_PASSES=1` fails a run in which no test passed.
+- `FOUNDRY_VALIDATION_REQUIRE_PASSES=1` requires a passing database test; query lint passes do
+  not count because they work without a backend.
 - `FOUNDRY_VALIDATION_CHECK_SKIP_BASELINE=1` compares the skipped test IDs with
   `skip_baseline.txt` and fails on skips missing from the file and on entries that no longer
   skip. Reason annotations are ignored. Omni runs use the same list, with their backend label
   read as `emulator`.
 
-The comparison is skipped for `-k` and `-m` runs, so check or update the baseline with a full
-run. A case skipped in its `.txtcase` file never runs, so the check can't notice when it would
-pass; review skip reasons when the driver gains features.
+Comparison requires a successful full run of `tests/`. Filtered runs (including file or node
+selection), collection, diagnostics and failed runs leave the baseline alone. Updates reject
+partial runs and require a passing database test even without `FOUNDRY_VALIDATION_REQUIRE_PASSES`.
+A case skipped in its `.txtcase` file never runs, so the check can't notice when it would pass;
+review skip reasons when the driver gains features.
 
 When a change to the skip set is expected, regenerate the file and review the diff:
 

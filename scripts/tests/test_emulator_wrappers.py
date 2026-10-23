@@ -220,7 +220,7 @@ print("200", end="")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("DOCKER_HOST=tcp://docker.example:2375", result.stdout.splitlines())
 
-    def run_runner(self, script, **env):
+    def run_runner(self, script, *args, **env):
         """Run a validation runner from outside the repository via a relative path."""
         self.tool("cargo", '''
 import json, os, sys
@@ -233,7 +233,7 @@ sys.exit(int(os.environ.get("CARGO_EXIT", "0")))
             self.env.pop(key, None)
         self.env.update(env)
         result = subprocess.run(
-            ["bash", os.path.relpath(SCRIPTS / script, self.root)],
+            ["bash", os.path.relpath(SCRIPTS / script, self.root), *args],
             cwd=self.root, env=self.env, capture_output=True, text=True, timeout=10,
         )
         self.calls = [json.loads(line) for line in self.log.read_text().splitlines()]
@@ -262,7 +262,42 @@ with open(os.environ["WRAPPER_LOG"], "a") as log:
         self.assertEqual(len(pytest), 1)
         self.assertEqual(pytest[0][1], str(SCRIPTS.parent / "foundry-validation"))
         self.assertEqual(pytest[0][2:4], ["-m", "pytest"])
+        self.assertEqual(self.calls.count(["cargo", "build"]), 1)
         self.assertEqual(self.removed_ids(), ["owned-existing-emulator"])
+
+    def test_foundry_runner_reinstalls_when_repository_changes(self):
+        self.tool("fake-python", '''
+import json, os, sys
+if sys.argv[1:4] == ["-m", "pip", "freeze"]:
+    print("adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@"
+          "9f9f4417a08d6c082193842bc5caaa36e65908a0")
+    sys.exit(0)
+with open(os.environ["WRAPPER_LOG"], "a") as log:
+    log.write(json.dumps(["python", *sys.argv[1:]]) + "\\n")
+''')
+        result = self.run_runner(
+            "run-foundry-validation.sh", "--prepare", PYTHON="./fake-python",
+            ADBC_VALIDATION_REPO="example/validation",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        install = next(call for call in self.calls if call[:4] == ["python", "-m", "pip", "install"])
+        self.assertIn("git+https://github.com/example/validation@", install[4])
+        self.assertFalse(any(call[0] == "docker" for call in self.calls))
+
+    def test_foundry_runner_can_reuse_prepared_environment(self):
+        self.tool("fake-python", '''
+import json, os, sys
+with open(os.environ["WRAPPER_LOG"], "a") as log:
+    log.write(json.dumps(["python", *sys.argv[1:]]) + "\\n")
+''')
+        result = self.run_runner(
+            "run-foundry-validation.sh", "--no-prepare", "-k", "connection",
+            PYTHON="./fake-python",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(call[0] == "cargo" for call in self.calls))
+        python = [call for call in self.calls if call[0] == "python"]
+        self.assertEqual(python, [["python", "-m", "pytest", "-p", "no:cacheprovider", "-k", "connection"]])
 
     def test_foundry_runner_reports_a_missing_pip(self):
         self.tool("fake-python", '''

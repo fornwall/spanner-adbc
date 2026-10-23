@@ -5,6 +5,11 @@ from pathlib import Path
 from adbc_drivers_validation import model, quirks
 
 
+# Cover variable-width, fixed-width, decimal and timestamp conversion in both
+# dictionary and stream paths without multiplying every test by every type.
+BIND_VARIANT_TYPES = {"string", "large_string", "binary", "int64", "decimal", "timestamp_us"}
+
+
 class SpannerQuirks(model.DriverQuirks):
     name = "spanner"
     driver = "spanner_adbc"

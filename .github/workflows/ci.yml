@@ -108,9 +108,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           check-latest: true
           cache: pip
-          cache-dependency-path: |
-            python/pyproject.toml
-            scripts/run-foundry-validation.sh
+          cache-dependency-path: python/pyproject.toml
 
       - name: Build the driver shared library
         run: cargo build

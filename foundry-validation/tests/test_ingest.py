@@ -17,7 +17,10 @@ LONG_VALUE_QUERIES = {
 def pytest_generate_tests(metafunc) -> None:
     quirks = [spanner.get_quirks(metafunc.config.getoption("vendor_version"))]
     return adbc_drivers_validation.tests.ingest.generate_tests(
-        quirks, metafunc, long_value_queries=LONG_VALUE_QUERIES
+        quirks,
+        metafunc,
+        ingest_dictionary_queries={f"ingest/{name}" for name in spanner.BIND_VARIANT_TYPES},
+        long_value_queries=LONG_VALUE_QUERIES,
     )
 
 
