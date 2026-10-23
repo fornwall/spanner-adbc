@@ -26,7 +26,8 @@ Plain `spanner-adbc` installs only the low-level ADBC API.
 
 ## Quickstart
 
-The examples assume a `Singers` table with `SingerId` and `FirstName` columns.
+Connect to an existing GoogleSQL database using [Application Default Credentials][adc]. This
+query needs no tables:
 
 ```python
 import spanner_adbc.dbapi as spanner
@@ -34,12 +35,25 @@ import spanner_adbc.dbapi as spanner
 uri = "spanner:///projects/my-project/instances/my-instance/databases/my-db"
 with spanner.connect(uri) as conn:
     with conn.cursor() as cur:
-        cur.execute("SELECT SingerId, FirstName FROM Singers WHERE SingerId >= @min", {"min": 1})
-        df = cur.fetch_df()  # pandas.DataFrame
+        cur.execute("SELECT @name AS name", {"name": "Alice"})
+        print(cur.fetch_arrow_table())
 ```
 
 Parameters use the GoogleSQL `@name` syntax, and `?` placeholders are rejected. A dict binds
 parameters by name. A tuple binds them in the order they first appear in the SQL.
+
+The later table examples use this sample table:
+
+```sql
+CREATE TABLE Singers (
+    SingerId INT64 NOT NULL,
+    FirstName STRING(MAX)
+) PRIMARY KEY (SingerId);
+INSERT INTO Singers (SingerId, FirstName) VALUES (1, 'Alice'), (2, 'Bob');
+```
+
+Run the `CREATE TABLE` and `INSERT` separately with `autocommit=True`; the driver doesn't accept
+DDL and DML in the same call.
 
 ## Connecting
 
@@ -104,8 +118,9 @@ databases:
   `ProgrammingError` until you commit or roll back. Queries share one snapshot, and there is no
   read-your-writes.
 - DML is buffered and runs at `commit()`, so errors such as a duplicate key come from
-  `commit()`, and `rowcount` is -1. A failed commit keeps the buffered writes until
-  `rollback()`.
+  `commit()`, and `rowcount` is -1. A failed commit keeps the buffered writes. If a commit times
+  out or loses its connection, it may already have applied; use `rollback()` to discard the
+  buffer before deciding whether to retry the work.
 - Closing the connection, including leaving its `with` block, discards uncommitted writes.
 - DDL runs immediately, and rollback can't undo it.
 - `THEN RETURN` and partitioned DML need `autocommit=True`.
@@ -115,15 +130,17 @@ import spanner_adbc.dbapi as spanner
 
 with spanner.connect("spanner:///projects/p/instances/i/databases/d") as conn:
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS Albums")
-        cur.execute("CREATE TABLE Albums (Id INT64 NOT NULL) PRIMARY KEY (Id)")
-        cur.execute("INSERT INTO Albums (Id) VALUES (1)")
+        cur.execute("CREATE TABLE AdbcExample (Id INT64 NOT NULL) PRIMARY KEY (Id)")
+        cur.execute("INSERT INTO AdbcExample (Id) VALUES (1)")
     conn.commit()
 
     with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM Albums")
+        cur.execute("SELECT COUNT(*) FROM AdbcExample")
         assert cur.fetchone() == (1,)
     conn.rollback()  # end the read snapshot
+
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE AdbcExample")
 ```
 
 See [transactions](https://github.com/fornwall/spanner-adbc/blob/main/docs/transactions.md) for

@@ -205,7 +205,7 @@ settings, but no request or transaction tags.
 
 | Option | Values | Default | Get | Effect |
 | --- | --- | --- | --- | --- |
-| `spanner.rows_per_batch` | positive integer; `""` resets | `8192` | always | Maximum rows per Arrow batch. Batches are also capped by size. |
+| `spanner.rows_per_batch` | positive integer; `""` resets | `8192` | always | Maximum rows per Arrow batch. An approximate byte budget can produce smaller batches; see [execution](adbc.md#execution). |
 | `spanner.data_boost` | boolean; `""` resets | `false` | always | Runs partitioned queries on [Data Boost](https://docs.cloud.google.com/spanner/docs/databoost/databoost-overview). Cloud Spanner only; Omni doesn't support it. Carried in partition descriptors. |
 | `adbc.statement.bind_by_name` | boolean | `false` | always | By default, columns bind to distinct parameters in SQL order. `true` matches column names to parameter names, case-insensitively as Spanner does; unknown names return `InvalidArguments`. |
 | `adbc.statement.exec.incremental` | boolean, only `false` supported | `false` | always | `true` returns `NotImplemented`; incremental partitioning is not supported. |
@@ -317,7 +317,8 @@ connection tries again. `0` disables the deadline and `""` restores the default.
 
 Connecting can't be interrupted: `AdbcConnectionCancel` only applies after `Init`, and Python
 handles Ctrl+C only once the call returns. Other connections on the same database wait while the
-first builds the client stack, so the deadline bounds them too.
+first builds the client stack. That wait is outside the timeout. If the build fails, the next
+waiting connection starts another attempt with its own deadline.
 
 ## Retry tuning
 
@@ -340,7 +341,9 @@ policy with no attempt limit. Use the `update` timeout to bound it.
 If the first request of a query stream fails, the stream's resume loop isn't involved. Setting
 only `max_elapsed_seconds` replaces the default streaming policy and its 10-attempt limit, so
 also set `max_attempts` if you want an attempt limit. Use the `query` and `fetch` timeouts to
-bound a query's total time and the `update` timeout for BatchWrite.
+bound the initial request and each subsequent chunk, and the `update` timeout for BatchWrite.
+The fetch deadline restarts for each chunk, so these settings don't bound the total time to read
+all results.
 
 ### Backoff
 

@@ -73,8 +73,10 @@ for batch in statement.execute()? {
 ```
 
 Queries return a streaming `RecordBatchReader`. Execution fetches the first chunk to learn the
-schema, and a background task prefetches later chunks as the reader advances. Batches hold up
-to `spanner.rows_per_batch` rows (default 8192) and are also capped by size.
+schema, and a background task prefetches later chunks as the reader advances. Each chunk stops
+at `spanner.rows_per_batch` rows (default 8192) or roughly 32 MiB of decoded Spanner data,
+whichever comes first. This is a memory estimate: a single large row can exceed it, and Arrow
+conversion allocates additional memory.
 
 Both execution methods accept queries, DML, DDL and bulk ingest:
 

@@ -140,9 +140,9 @@ the fuzzer blind. The fuzz workflow turns it off the same way.
 
 Each target needs a harness in `fuzz/fuzz_targets/` and a `[[bin]]` entry in `fuzz/Cargo.toml`;
 a unit test checks that they match. [`fuzz/`](../fuzz/) shares the root workspace and lockfile
-but is left out of the default build, test and Clippy commands. The
-[fuzz workflow](../.github/workflows/fuzz.yml) builds its matrix from `fuzz/Cargo.toml` and seeds
-runs from `fuzz/seeds/`.
+but is left out of the default build and test commands. The required `cargo clippy --workspace`
+check includes it. The [fuzz workflow](../.github/workflows/fuzz.yml) builds its matrix from
+`fuzz/Cargo.toml` and seeds runs from `fuzz/seeds/`.
 
 ## Benchmarks
 
