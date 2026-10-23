@@ -93,7 +93,7 @@ fn query_only_guard_rejects_ddl_and_dml() {
 
 #[test]
 fn batch_guard_rejects_mixed_batches_and_passes_single_statements() {
-    let split = |sql: &str| crate::sql::split_statements(sql);
+    use crate::sql::split_statements as split;
     // Single statements pass whatever their kind, as do all-DML and all-DDL batches.
     for sql in [
         "SELECT 1",

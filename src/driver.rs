@@ -412,9 +412,8 @@ impl SpannerDatabase {
 
     /// Return the shared client stack, building it on first use. A failed build is not cached.
     fn connect_shared(&self) -> Result<Connected> {
-        // Holding the lock across the build stops concurrent connections from building twice.
-        // It cannot deadlock: only caller threads take it, never tasks on the runtime that
-        // `connect` blocks on. The connect deadline bounds how long others wait.
+        // Holding the lock through the build avoids duplicate client stacks. Only caller threads
+        // take it, so the build cannot deadlock with tasks on the driver's runtime.
         let mut cached = self.connected.lock().unwrap();
         if let Some(connected) = cached.as_ref() {
             return Ok(connected.clone());

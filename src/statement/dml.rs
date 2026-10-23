@@ -34,15 +34,6 @@ impl SpannerStatement {
     /// Bind each row to the single DML statement in `sql`. Directed reads apply only to read-only
     /// queries, so this uses `sql_builder`.
     fn build_bound_statements(&self, sql: &str) -> Result<Vec<SpannerSql>> {
-        let parts = crate::sql::split_statements(sql);
-        if parts.len() > 1 {
-            return Err(invalid_argument(
-                "bound parameters require a single DML statement; execute each statement separately",
-            ));
-        }
-        let Some(sql) = parts.first() else {
-            return Ok(Vec::new());
-        };
         let builder = self.sql_builder(sql);
         let mut statements = Vec::new();
         for batch in &self.bound {
@@ -58,15 +49,17 @@ impl SpannerStatement {
         Ok(statements)
     }
 
-    /// Bind a single statement or split an unbound DML batch.
-    fn build_dml_statements(&self, sql: &str) -> Result<Vec<SpannerSql>> {
+    fn build_dml_statements(&self, parts: &[&str]) -> Result<Vec<SpannerSql>> {
         if !self.bound.is_empty() {
-            return self.build_bound_statements(sql);
+            return match parts {
+                [] => Ok(Vec::new()),
+                [sql] => self.build_bound_statements(sql),
+                _ => Err(invalid_argument(
+                    "bound parameters require a single DML statement; execute each statement separately",
+                )),
+            };
         }
-        Ok(crate::sql::split_statements(sql)
-            .into_iter()
-            .map(|s| self.sql_builder(&s).build())
-            .collect())
+        Ok(parts.iter().map(|s| self.sql_builder(s).build()).collect())
     }
 
     /// Buffer manual DML for commit, or execute an autocommit batch atomically and report its count.
@@ -169,17 +162,19 @@ impl SpannerStatement {
 
     /// Enforce writable mode and route plain, returning or partitioned DML.
     /// Manual transactions cannot return rows because they defer DML until commit.
-    pub(super) fn run_dml(&self, sql: &str) -> Result<DmlOutcome> {
+    pub(super) fn run_dml(&self, sql: &str, parts: &[&str]) -> Result<DmlOutcome> {
         if self.config.is_read_only() {
             return Err(invalid_state(
                 "cannot execute DML: the connection is read-only",
             ));
         }
         if self.dml_partitioned {
-            return Ok(DmlOutcome::Plain(Some(self.run_partitioned_dml(sql)?)));
+            return Ok(DmlOutcome::Plain(Some(
+                self.run_partitioned_dml(sql, parts)?,
+            )));
         }
         if !crate::sql::is_dml_returning(sql) {
-            let statements = self.build_dml_statements(sql)?;
+            let statements = self.build_dml_statements(parts)?;
             return Ok(DmlOutcome::Plain(self.run_or_buffer(statements)?));
         }
         if !lock_txn(&self.txn).autocommit() {
@@ -189,21 +184,13 @@ impl SpannerStatement {
                  autocommit to run it",
             ));
         }
-        let statements = if self.bound.is_empty() {
-            let parts = crate::sql::split_statements(sql);
-            if parts.len() > 1 {
-                return Err(unsupported(
-                    "THEN RETURN is not supported in a `;`-separated DML batch, whose statements' \
-                     rows can't share one result: execute each statement separately",
-                ));
-            }
-            parts
-                .into_iter()
-                .map(|s| self.sql_builder(&s).build())
-                .collect()
-        } else {
-            self.build_bound_statements(sql)?
-        };
+        if self.bound.is_empty() && parts.len() > 1 {
+            return Err(unsupported(
+                "THEN RETURN is not supported in a `;`-separated DML batch, whose statements' \
+                 rows can't share one result: execute each statement separately",
+            ));
+        }
+        let statements = self.build_dml_statements(parts)?;
         // Zero bound rows leave nothing to execute, as on the batch DML path; the runner would
         // still begin and commit an empty transaction.
         if statements.is_empty() {
@@ -222,10 +209,10 @@ impl SpannerStatement {
     }
 
     /// Execute one partitioned DML statement and return its lower-bound affected-row count.
-    fn run_partitioned_dml(&self, sql: &str) -> Result<i64> {
+    fn run_partitioned_dml(&self, sql: &str, parts: &[&str]) -> Result<i64> {
         let bound_rows = self.bound.iter().map(RecordBatch::num_rows).sum();
         check_partitioned_dml(sql, lock_txn(&self.txn).autocommit(), bound_rows)?;
-        let mut statements = self.build_dml_statements(sql)?;
+        let mut statements = self.build_dml_statements(parts)?;
         // Zero bound rows leave nothing to execute, as on the batch DML path.
         let Some(statement) = statements.pop() else {
             return Ok(0);

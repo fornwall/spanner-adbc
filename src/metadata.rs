@@ -124,8 +124,7 @@ pub(crate) fn metadata_sql_builder(
 /// An `INFORMATION_SCHEMA` query: `select`, filtered by the driver-written `predicate` and by
 /// `column LIKE @pN` for each present pattern, then sorted by `order_by`.
 ///
-/// Patterns are user data, so they are bound as parameters: formatting them into SQL caused a SQL
-/// injection in the Snowflake ADBC driver (apache/arrow-adbc#1338).
+/// Bind user patterns so filter text cannot change the generated SQL.
 pub(crate) fn filtered_query(
     config: &SharedConfig,
     select: &str,

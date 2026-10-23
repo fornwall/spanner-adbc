@@ -290,18 +290,18 @@ impl SpannerStatement {
         self.ensure_query_allowed()?;
         let bound_rows: usize = self.bound.iter().map(RecordBatch::num_rows).sum();
         if bound_rows > 1 {
-            return self.execute_multi_row_query(&sql);
+            return self.execute_multi_row_query(sql);
         }
         if bound_rows == 0 && !self.bound.is_empty() {
             // `executemany` with no parameter rows runs nothing, but the reader still has the
             // query's schema.
-            let schema = self.plan_query_schema(&sql)?;
+            let schema = self.plan_query_schema(sql)?;
             let empty: Vec<std::result::Result<RecordBatch, ArrowError>> = Vec::new();
             return Ok(Box::new(RecordBatchIterator::new(empty, schema)));
         }
         // Bind before taking the manual read transaction: a bind error after it would leave the
         // transaction installed but unbegun, fixing the manual transaction's kind to queries.
-        let statement = self.build_query_statement(&sql, false)?;
+        let statement = self.build_query_statement(sql, false)?;
         let bound = self.config.read_staleness.timestamp_bound();
         let manual_txn = self.manual_read_transaction()?;
         let client = self.client.clone();
@@ -401,9 +401,9 @@ impl SpannerStatement {
         )
     }
 
-    fn sql(&self) -> Result<String> {
+    fn sql(&self) -> Result<&str> {
         self.sql
-            .clone()
+            .as_deref()
             .ok_or_else(|| invalid_state("no SQL query set on statement; call set_sql_query first"))
     }
 
@@ -413,14 +413,14 @@ impl SpannerStatement {
         let statements = crate::sql::split_statements(sql);
         check_batch(&statements)?;
         if crate::sql::is_ddl(sql) {
-            self.run_ddl(statements)?;
+            self.run_ddl(statements.into_iter().map(str::to_owned).collect())?;
             return Ok((Self::empty_reader(), None));
         }
         // Clients such as the Python DBAPI and R send every statement through `ExecuteQuery`, so
         // DML must take the read/write path here; the read-only path would reject it.
         // `THEN RETURN` returns its rows; plain DML yields an empty result.
         if crate::sql::is_dml(sql) {
-            return match self.run_dml(sql)? {
+            return match self.run_dml(sql, &statements)? {
                 DmlOutcome::Returning {
                     batches,
                     schema,
@@ -458,7 +458,7 @@ impl SpannerStatement {
         let sql = self.sql()?;
         // Bound rows are consumed even if execution fails, so a reused handle can't apply them
         // to a later statement.
-        let result = self.run_sql(&sql);
+        let result = self.run_sql(sql);
         self.clear_bound();
         result
     }
@@ -498,7 +498,7 @@ impl SpannerStatement {
             "execute_partitions",
             "partitioned in a batch read-only transaction",
         )?;
-        let sql = &crate::sql::strip_trailing_terminators(sql);
+        let sql = crate::sql::strip_trailing_terminators(sql);
         // Partitioned reads never use a manual transaction's snapshot, but they would still miss
         // its buffered writes.
         self.ensure_query_allowed()?;
@@ -589,17 +589,17 @@ impl SpannerStatement {
     ) -> Result<BTreeMap<String, google_cloud_spanner::value::Type>> {
         // Spanner rejects a trailing `;` in a query.
         let sql = crate::sql::strip_trailing_terminators(sql);
-        if crate::sql::is_ddl(&sql) {
+        if crate::sql::is_ddl(sql) {
             return Ok(BTreeMap::new());
         }
         self.cancel.begin_operation();
-        if crate::sql::is_dml(&sql) {
+        if crate::sql::is_dml(sql) {
             if self.config.is_read_only() {
                 return Ok(BTreeMap::new());
             }
-            return self.plan_dml_parameter_types(&sql);
+            return self.plan_dml_parameter_types(sql);
         }
-        let plan_builder = self.read_sql_builder(&sql).set_query_mode(QueryMode::Plan);
+        let plan_builder = self.read_sql_builder(sql).set_query_mode(QueryMode::Plan);
         let client = self.client.clone();
         // Plan against the schema version the query will read, as `plan_query_schema` does.
         let read_bound = self.config.read_staleness.timestamp_bound();
@@ -873,14 +873,10 @@ impl Statement for SpannerStatement {
     fn execute_schema(&mut self) -> Result<Schema> {
         self.cancel.begin_operation();
         let sql = self.sql()?;
-        check_query_only(
-            &sql,
-            "execute_schema",
-            "planned in a read-only schema probe",
-        )?;
+        check_query_only(sql, "execute_schema", "planned in a read-only schema probe")?;
         // Spanner rejects a trailing `;` in a query.
-        let sql = crate::sql::strip_trailing_terminators(&sql);
-        Ok((*self.plan_query_schema(&sql)?).clone())
+        let sql = crate::sql::strip_trailing_terminators(sql);
+        Ok((*self.plan_query_schema(sql)?).clone())
     }
 
     /// Partition this query into opaque descriptors for `Connection::read_partition`.
@@ -899,7 +895,7 @@ impl Statement for SpannerStatement {
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
         self.cancel.begin_operation();
         let sql = self.sql()?;
-        let result = self.run_partition_query(&sql);
+        let result = self.run_partition_query(sql);
         self.clear_bound();
         result
     }
@@ -915,11 +911,11 @@ impl Statement for SpannerStatement {
             return Ok((*batch.schema()).clone());
         }
         let sql = self.sql()?;
-        let names = crate::sql::named_parameters(&sql);
+        let names = crate::sql::named_parameters(sql);
         let mut bound_fields = BTreeMap::new();
         // A binding error surfaces at execution; until then the bound columns give no types.
         if let Some(batch) = bound
-            && let Ok(resolved) = bind::resolve_parameter_names(&sql, batch, self.bind_by_name)
+            && let Ok(resolved) = bind::resolve_parameter_names(sql, batch, self.bind_by_name)
         {
             for (name, field) in resolved.into_iter().zip(batch.schema().fields()) {
                 bound_fields.insert(name.clone(), field.as_ref().clone().with_name(name));
@@ -930,7 +926,7 @@ impl Statement for SpannerStatement {
         let types = if names.iter().all(|name| bound_fields.contains_key(name)) {
             BTreeMap::new()
         } else {
-            self.plan_parameter_types(&sql).unwrap_or_default()
+            self.plan_parameter_types(sql).unwrap_or_default()
         };
         let fields: Vec<Field> = names
             .into_iter()
@@ -1022,7 +1018,7 @@ fn check_query_only(sql: &str, entry_point: &str, dml_rationale: &str) -> Result
 /// `UpdateDatabaseDdl` accepts only DDL and `ExecuteBatchDml` only DML, and one bad statement
 /// buffered in a manual transaction would block its commit until rollback. Queries can't be
 /// batched at all. Single statements pass.
-fn check_batch(statements: &[String]) -> Result<()> {
+fn check_batch(statements: &[&str]) -> Result<()> {
     let [first, _, ..] = statements else {
         return Ok(());
     };

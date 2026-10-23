@@ -105,17 +105,8 @@ impl Lexer<'_> {
         }
     }
 
-    /// Consume a literal or quoted identifier whose opening `quote` has been read, including
-    /// triple-quoted strings and backslash escapes.
-    ///
-    /// A backslash escapes the next character in raw literals too: the `r` prefix changes how the
-    /// contents are interpreted, not where the literal ends ("a raw string cannot end with an odd
-    /// number of backslashes"). So `r'x\'; DROP TABLE t'` is one string. Treating `\` as inert
-    /// would let a value ending in a backslash close early and inject a statement boundary.
-    ///
-    /// GoogleSQL ends a non-triple literal at an unescaped newline, but this scan continues to end
-    /// of input. Such SQL is invalid anyway, and the lenient scan can only yield fewer statement
-    /// boundaries, never more.
+    /// Raw literals still escape quotes with backslashes, so `r'x\'; DROP TABLE t'` is one string.
+    /// Scanning past invalid newlines can hide a statement boundary but cannot introduce one.
     fn consume_quoted(&mut self, quote: char) {
         // A second quote closes an empty literal unless a third opens a triple-quoted one.
         let triple = quote != '`' && self.bump_if(quote);
@@ -200,13 +191,9 @@ fn significant_lexemes(sql: &str) -> std::iter::Peekable<impl Iterator<Item = Le
         .peekable()
 }
 
-/// Split SQL into trimmed statements on top-level `;`, ignoring semicolons in literals, quoted
-/// identifiers and comments.
-///
-/// Segments with only whitespace or comments are dropped. Callers depend on the count: it drives
-/// the all-DML batch check, the single-statement guards for partitioned DML and `THEN RETURN`,
-/// and [`strip_trailing_terminators`].
-pub(crate) fn split_statements(sql: &str) -> Vec<String> {
+/// Borrow trimmed statements separated by `;` outside literals, identifiers and comments.
+/// Comment-only segments are omitted so they do not count toward single-statement limits.
+pub(crate) fn split_statements(sql: &str) -> Vec<&str> {
     let mut statements = Vec::new();
     let mut lexer = lex(sql);
     let mut start = 0;
@@ -215,7 +202,7 @@ pub(crate) fn split_statements(sql: &str) -> Vec<String> {
         match lexeme {
             Lexeme::Other(';') => {
                 if has_statement {
-                    statements.push(sql[start..lexer.pos - 1].trim().to_string());
+                    statements.push(sql[start..lexer.pos - 1].trim());
                 }
                 start = lexer.pos;
                 has_statement = false;
@@ -226,23 +213,17 @@ pub(crate) fn split_statements(sql: &str) -> Vec<String> {
         }
     }
     if has_statement {
-        statements.push(sql[start..].trim().to_string());
+        statements.push(sql[start..].trim());
     }
     statements
 }
 
-/// Strip top-level `;` terminators from a single statement: `SELECT 1;;` becomes `SELECT 1`.
-///
-/// Spanner's query API rejects a trailing `;`, which many clients and conformance suites send.
-/// The statement comes from [`split_statements`], so leading semicolons and trailing comment-only
-/// segments go too, while comments attached to the statement stay. Input that is not exactly one
-/// statement is returned unchanged for Spanner to reject.
-pub(crate) fn strip_trailing_terminators(sql: &str) -> String {
-    let mut statements = split_statements(sql);
-    if statements.len() == 1 {
-        statements.pop().unwrap()
-    } else {
-        sql.to_string()
+/// Spanner's query API rejects trailing `;`, so return the single statement without terminators.
+/// Leave empty input and multiple statements unchanged for Spanner to reject.
+pub(crate) fn strip_trailing_terminators(sql: &str) -> &str {
+    match split_statements(sql).as_slice() {
+        [statement] => statement,
+        _ => sql,
     }
 }
 
@@ -336,16 +317,9 @@ pub(crate) fn has_positional_placeholder(sql: &str) -> bool {
     lex(sql).any(|lexeme| lexeme == Lexeme::Other('?'))
 }
 
-/// Backtick-quote a Spanner identifier, rejecting names backticks cannot safely contain.
-///
-/// Caller-supplied table, schema and column names reach generated SQL through here. Spanner's
-/// query parser honours backslash escapes inside backticks, but its DDL parser ends the identifier
-/// at the first backtick and treats `\` literally. No escaping is safe under both: on the DDL path
-/// the rest of a name could add clauses such as `INTERLEAVE IN PARENT ... ON DELETE CASCADE` to a
-/// generated `CREATE TABLE`, and rollback cannot undo DDL.
-///
-/// Names containing a backtick, backslash or control character are therefore rejected, as is the
-/// empty name, which Spanner rejects too. Spaces, non-ASCII letters and reserved words still work.
+/// Backtick-quote a Spanner identifier, rejecting empty names and unsafe characters.
+/// DDL treats backslashes literally while queries interpret them as escapes, so escaping cannot
+/// safely represent backticks or backslashes on both paths.
 pub(crate) fn quote_ident(ident: &str) -> Result<String> {
     if ident.is_empty() {
         return Err(invalid_argument(

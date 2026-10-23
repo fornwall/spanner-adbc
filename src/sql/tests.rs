@@ -265,7 +265,7 @@ fn splits_statements_dropping_empty_ones() {
     );
     // `trim` cannot remove the whitespace between two comments.
     for sql in ["   ;  ; ", "/* a */ /* b */", "-- a\n /* b */ ; # c"] {
-        assert_eq!(split_statements(sql), Vec::<String>::new(), "{sql:?}");
+        assert!(split_statements(sql).is_empty(), "{sql:?}");
     }
     // Punctuation is kept for Spanner to reject.
     assert_eq!(split_statements("SELECT 1; ()"), vec!["SELECT 1", "()"]);
@@ -369,7 +369,7 @@ fn split_statements_returns_verbatim_in_order_slices() {
             assert_eq!(statement, statement.trim());
             assert!(!statement.is_empty());
             let found = sql[cursor..]
-                .find(statement.as_str())
+                .find(statement)
                 .unwrap_or_else(|| panic!("{statement:?} is not an in-order slice of {sql:?}"));
             cursor += found + statement.len();
         }
