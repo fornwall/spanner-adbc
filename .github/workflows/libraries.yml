@@ -61,7 +61,8 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc'
         uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
         with:
-          version: "3.02"
+          # Keep a version in setup-nasm's GitHub mirror so nasm.us outages cannot block builds.
+          version: "2.16.01"
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
