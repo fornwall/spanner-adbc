@@ -40,10 +40,11 @@ Repository = "https://github.com/fornwall/spanner-adbc"
 
 [tool.setuptools]
 packages = ["spanner_adbc"]
+include-package-data = false
 
 [tool.setuptools.dynamic]
 version = { attr = "spanner_adbc._version.__version__" }
 
 [tool.setuptools.package-data]
 # CI copies the platform library into the package before building the wheel.
-spanner_adbc = ["*.so", "*.dylib", "*.dll", "py.typed"]
+spanner_adbc = ["libspanner_adbc.so", "libspanner_adbc.dylib", "spanner_adbc.dll", "py.typed"]

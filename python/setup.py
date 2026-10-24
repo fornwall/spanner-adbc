@@ -15,12 +15,10 @@ class BuildPy(build_py):
     """Copy the staged library even when reusing a build directory."""
 
     def build_package_data(self):
-        package = Path(__file__).resolve().parent / "spanner_adbc"
-        for name in LIBRARIES:
-            if not self.dry_run and not (package / name).is_file():
-                (Path(self.build_lib) / "spanner_adbc" / name).unlink(missing_ok=True)
-        # Replacing a staged binary can preserve an older timestamp.
-        self.force = True
+        if not self.dry_run:
+            for library in (Path(self.build_lib) / "spanner_adbc").glob("*"):
+                if library.suffix in (".so", ".dylib", ".dll"):
+                    library.unlink()
         super().build_package_data()
 
 

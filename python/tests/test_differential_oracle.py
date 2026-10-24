@@ -173,11 +173,10 @@ def _official_query(database, sql):
 
 
 def test_scalar_and_array_types_match_oracle(spanner_database, official_database):
-    conn = spanner_adbc.connect(
+    with spanner_adbc.connect(
         db_kwargs=database_options(spanner_database),
         autocommit=True,
-    )
-    try:
+    ) as conn:
         with conn.cursor() as cur:
             _create_and_seed(cur)
 
@@ -187,8 +186,6 @@ def test_scalar_and_array_types_match_oracle(spanner_database, official_database
         with conn.cursor() as cur:
             cur.execute(sql)
             table = cur.fetch_arrow_table()
-    finally:
-        conn.close()
 
     official = _official_query(official_database, sql)
 
@@ -230,16 +227,13 @@ def test_array_of_struct_matches_oracle(spanner_database, official_database):
         ") AS arr"
     )
 
-    conn = spanner_adbc.connect(
+    with spanner_adbc.connect(
         db_kwargs=database_options(spanner_database),
         autocommit=True,
-    )
-    try:
+    ) as conn:
         with conn.cursor() as cur:
             cur.execute(sql)
             table = cur.fetch_arrow_table()
-    finally:
-        conn.close()
 
     adbc_arr = table.column("arr").to_pylist()[0]
     struct_type = table.schema.field("arr").type.value_type

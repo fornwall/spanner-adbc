@@ -1,12 +1,7 @@
-"""DBAPI cursors and Arrow/DataFrame helpers for the Spanner ADBC driver.
+"""DBAPI 2.0 and Arrow result helpers for Spanner.
 
-    import spanner_adbc.dbapi as spanner
-    with spanner.connect("spanner:///projects/p/instances/i/databases/d") as conn:
-        df = conn.cursor().execute("SELECT * FROM Singers").fetch_df()
-
-Autocommit is off by default: call ``conn.commit()`` to apply buffered writes.
-Closing a connection discards uncommitted writes. Use ``autocommit=True`` to
-commit each DML statement immediately.
+Connections buffer writes until ``commit()`` unless opened with
+``autocommit=True``. Closing discards uncommitted writes.
 """
 
 from collections.abc import Mapping
@@ -51,9 +46,7 @@ from . import (
     _driver_path,
 )
 
-# GoogleSQL marks parameters as `@name`; `?` is rejected. A mapping binds by name and a sequence
-# binds in order of first appearance. "named" is the closest PEP 249 style, but its `:name`
-# spelling is not accepted, so code that generates SQL must emit `@name` itself.
+# "named" is the closest PEP 249 style, but GoogleSQL requires `@name`, not `:name`.
 paramstyle = "named"
 
 #: PEP 249 constructor for BYTES values.
@@ -117,7 +110,11 @@ def connect(
     autocommit:
         ``False`` (the default) buffers writes until ``commit()``. Queries and
         writes cannot share a manual transaction. DDL always applies immediately.
+        Overrides ``ConnectionOptions.AUTOCOMMIT`` in *conn_kwargs*.
     """
+    conn_kwargs = dict(conn_kwargs or {})
+    # The driver manager assumes a new connection starts in autocommit mode.
+    conn_kwargs.pop(ConnectionOptions.AUTOCOMMIT, None)
     return adbc_driver_manager.dbapi.connect(
         driver=_driver_path(),
         entrypoint=ENTRYPOINT,

@@ -33,11 +33,10 @@ def cookbook_env(spanner_database):
     """Seed `Singers` and redirect the examples to the configured test database."""
     import spanner_adbc.dbapi as sp
 
-    conn = sp.connect(
+    with sp.connect(
         db_kwargs=database_options(spanner_database),
         autocommit=True,
-    )
-    try:
+    ) as conn:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS Singers")
             cur.execute(
@@ -47,8 +46,6 @@ def cookbook_env(spanner_database):
                 ") PRIMARY KEY (SingerId)"
             )
             cur.execute("INSERT INTO Singers (SingerId, FirstName) VALUES (1, 'Alice'), (2, 'Bob')")
-    finally:
-        conn.close()
 
     original = sp.connect
 

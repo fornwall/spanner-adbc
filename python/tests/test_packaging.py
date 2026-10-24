@@ -51,6 +51,8 @@ def test_repeated_wheel_builds_use_only_the_current_native_library(tmp_path):
     package.mkdir()
     shutil.copyfile(source / "spanner_adbc" / "_version.py", package / "_version.py")
     (package / "__init__.py").touch()
+    (package / "py.typed").touch()
+    (package / "libspanner_adbc_backup.so").write_bytes(b"unused library")
 
     previous = None
     for name, platform, contents in (
@@ -60,6 +62,8 @@ def test_repeated_wheel_builds_use_only_the_current_native_library(tmp_path):
     ):
         if previous is not None:
             previous.unlink()
+            build_package = next((tmp_path / "build").glob("lib*/spanner_adbc"))
+            (build_package / "stale_driver.so").write_bytes(b"stale build output")
         library = package / name
         library.write_bytes(contents)
         os.utime(library, (946684800, 946684800))
@@ -73,4 +77,5 @@ def test_repeated_wheel_builds_use_only_the_current_native_library(tmp_path):
             libraries = [n for n in archive.namelist() if n.endswith((".so", ".dylib", ".dll"))]
             assert libraries == [f"spanner_adbc/{name}"]
             assert archive.read(libraries[0]) == contents
+            assert "spanner_adbc/py.typed" in archive.namelist()
         previous = library

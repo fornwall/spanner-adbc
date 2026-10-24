@@ -25,11 +25,35 @@ def test_dbapi_module_follows_pep_249():
         assert getattr(dbapi, name) is getattr(adbc_driver_manager.dbapi, name)
 
 
-def test_missing_library_raises_clearly(tmp_path, monkeypatch):
+@pytest.fixture
+def driver_directory(tmp_path, monkeypatch):
     monkeypatch.setattr(spanner_adbc, "__file__", str(tmp_path / "__init__.py"))
     spanner_adbc._driver_path.cache_clear()
     try:
-        with pytest.raises(RuntimeError, match="no Spanner driver library in"):
-            spanner_adbc._driver_path()
+        yield tmp_path
     finally:
         spanner_adbc._driver_path.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "platform,library",
+    [
+        ("linux", "libspanner_adbc.so"),
+        ("darwin", "libspanner_adbc.dylib"),
+        ("win32", "spanner_adbc.dll"),
+    ],
+)
+def test_driver_path_selects_current_platform(driver_directory, monkeypatch, platform, library):
+    for name in ("libspanner_adbc.so", "libspanner_adbc.dylib", "spanner_adbc.dll"):
+        (driver_directory / name).touch()
+    monkeypatch.setattr(spanner_adbc.sys, "platform", platform)
+    assert spanner_adbc._driver_path() == str(driver_directory / library)
+
+
+@pytest.mark.parametrize("foreign_library", [None, "libspanner_adbc.dylib", "spanner_adbc.dll"])
+def test_missing_library_raises_clearly(driver_directory, monkeypatch, foreign_library):
+    monkeypatch.setattr(spanner_adbc.sys, "platform", "linux")
+    if foreign_library:
+        (driver_directory / foreign_library).touch()
+    with pytest.raises(RuntimeError, match="expected libspanner_adbc.so"):
+        spanner_adbc._driver_path()

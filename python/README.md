@@ -92,6 +92,8 @@ method, the default on Linux before Python 3.14, connect in each worker; see
 options, and `conn.cursor(adbc_stmt_kwargs=...)` takes statement options. `DatabaseOptions`,
 `ConnectionOptions` and `StatementOptions` list the keys. They are `StrEnum`s, so members work as
 dictionary keys, but the typed driver manager getters, such as `get_option_int`, need `.value`.
+Use string values in `db_kwargs` and `conn_kwargs` for compatibility with driver manager 1.8.
+The `autocommit` keyword overrides `ConnectionOptions.AUTOCOMMIT` in `conn_kwargs`.
 The [option reference][options] lists types, defaults and accepted values.
 
 ```python

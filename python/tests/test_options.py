@@ -124,12 +124,17 @@ def test_option_enums_are_exported_without_aliases():
 def test_low_level_connect_accepts_option_members_directly(monkeypatch):
     monkeypatch.setattr(spanner_adbc, "_driver_path", lambda: "/driver.so")
     monkeypatch.setattr(spanner_adbc.adbc_driver_manager, "AdbcDatabase", lambda **kwargs: kwargs)
-    options = {DatabaseOptions.URI: "spanner:///ignored", DatabaseOptions.EMULATOR: "true"}
+    options = {
+        DatabaseOptions.URI: "spanner:///ignored",
+        DatabaseOptions.EMULATOR: "true",
+        DatabaseOptions.RPC_TIMEOUT_CONNECT: "12.5",
+    }
     assert spanner_adbc.connect("spanner:///projects/p/instances/i/databases/d", options) == {
         "driver": "/driver.so",
         "entrypoint": spanner_adbc.ENTRYPOINT,
         "uri": "spanner:///projects/p/instances/i/databases/d",
         "spanner.emulator": "true",
+        "spanner.rpc.timeout_seconds.connect": "12.5",
     }
     assert options[DatabaseOptions.URI] == "spanner:///ignored"
 
@@ -152,19 +157,50 @@ def test_dbapi_connect_forwards_options(monkeypatch, autocommit):
     }
 
 
-def test_connection_option_round_trips_through_kwargs(spanner_database):
-    conn = spanner.connect(
+@pytest.mark.parametrize("autocommit", [False, True])
+def test_autocommit_keyword_overrides_connection_option(spanner_database, autocommit):
+    options = {ConnectionOptions.AUTOCOMMIT: "false" if autocommit else "true"}
+    with spanner.connect(
         db_kwargs=database_options(spanner_database),
-        conn_kwargs={ConnectionOptions.REQUEST_TAG: "adbc-py-e2e"},
+        conn_kwargs=options,
+        autocommit=autocommit,
+    ) as conn:
+        assert conn.adbc_connection.get_option(ConnectionOptions.AUTOCOMMIT.value) == (
+            "true" if autocommit else "false"
+        )
+    assert options[ConnectionOptions.AUTOCOMMIT] == ("false" if autocommit else "true")
+
+
+def test_clone_preserves_original_connection_options(spanner_database):
+    options = {ConnectionOptions.REQUEST_TAG: "original"}
+    with spanner.connect(
+        db_kwargs=database_options(spanner_database), conn_kwargs=options
+    ) as conn:
+        options[ConnectionOptions.REQUEST_TAG] = "changed"
+        with conn.adbc_clone() as clone:
+            assert clone.adbc_connection.get_option(ConnectionOptions.REQUEST_TAG.value) == "original"
+
+
+def test_connection_option_round_trips_through_kwargs(spanner_database):
+    options = database_options(spanner_database)
+    options[DatabaseOptions.RPC_TIMEOUT_CONNECT] = "12.5"
+    with spanner.connect(
+        db_kwargs=options,
+        conn_kwargs={
+            ConnectionOptions.REQUEST_TAG: "adbc-py-e2e",
+            ConnectionOptions.RPC_TIMEOUT_QUERY: "15.5",
+            ConnectionOptions.RETRY_MAX_ATTEMPTS: "1",
+        },
         autocommit=True,
-    )
-    try:
+    ) as conn:
+        assert conn.adbc_database.get_option_float(DatabaseOptions.RPC_TIMEOUT_CONNECT.value) == 12.5
         assert (
             conn.adbc_connection.get_option(ConnectionOptions.REQUEST_TAG.value)
             == "adbc-py-e2e"
         )
-        with conn.cursor(adbc_stmt_kwargs={StatementOptions.ROWS_PER_BATCH: "1024"}) as cur:
+        assert conn.adbc_connection.get_option_float(ConnectionOptions.RPC_TIMEOUT_QUERY.value) == 15.5
+        assert conn.adbc_connection.get_option_int(ConnectionOptions.RETRY_MAX_ATTEMPTS.value) == 1
+        with conn.cursor(adbc_stmt_kwargs={StatementOptions.ROWS_PER_BATCH: 1024}) as cur:
+            assert cur.adbc_statement.get_option_int(StatementOptions.ROWS_PER_BATCH.value) == 1024
             cur.execute("SELECT 1 AS one")
             assert cur.fetchone()[0] == 1
-    finally:
-        conn.close()

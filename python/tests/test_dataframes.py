@@ -21,7 +21,6 @@ def _connect(database):
     )
 
 
-# Expected values; _create_and_fill inserts them as SQL literals.
 ROWS = [
     {
         "Id": 1,
@@ -64,25 +63,16 @@ _COLUMNS = "Id, Name, Active, Score, Ts, Dt, Amount, Tags"
 def _create_and_fill(cur, name):
     cur.execute(f"DROP TABLE IF EXISTS {name}")
     cur.execute(_DDL.format(name=name))
-    for row in ROWS:
-        tags = ", ".join(str(t) for t in row["Tags"])
-        cur.execute(
-            f"INSERT INTO {name} ({_COLUMNS}) VALUES ("
-            f"  {row['Id']},"
-            f"  '{row['Name']}',"
-            f"  {str(row['Active']).lower()},"
-            f"  {row['Score']},"
-            f"  TIMESTAMP '{row['Ts'].strftime('%Y-%m-%d %H:%M:%S')}+00',"
-            f"  DATE '{row['Dt'].isoformat()}',"
-            f"  NUMERIC '{row['Amount']}',"
-            f"  [{tags}]"
-            ")"
-        )
+    columns = _COLUMNS.split(", ")
+    parameters = ", ".join(f"@{column}" for column in columns)
+    cur.executemany(
+        f"INSERT INTO {name} ({_COLUMNS}) VALUES ({parameters})",
+        [tuple(row[column] for column in columns) for row in ROWS],
+    )
 
 
 def test_polars_read_dtypes_and_values(spanner_database):
-    conn = _connect(spanner_database)
-    try:
+    with _connect(spanner_database) as conn:
         with conn.cursor() as cur:
             _create_and_fill(cur, "AdbcPlRead")
 
@@ -112,14 +102,11 @@ def test_polars_read_dtypes_and_values(spanner_database):
         # Decimal(38, 9) compares equal to the shorter literals numerically.
         assert df["Amount"].to_list() == [r["Amount"] for r in ROWS]
         assert df["Tags"].to_list() == [r["Tags"] for r in ROWS]
-    finally:
-        conn.close()
 
 
 def test_pandas_read_dtypes_and_values(spanner_database):
     pytest.importorskip("pandas")
-    conn = _connect(spanner_database)
-    try:
+    with _connect(spanner_database) as conn:
         with conn.cursor() as cur:
             _create_and_fill(cur, "AdbcPdRead")
 
@@ -140,13 +127,10 @@ def test_pandas_read_dtypes_and_values(spanner_database):
         assert df["Dt"].tolist() == [r["Dt"] for r in ROWS]
         assert df["Amount"].tolist() == [r["Amount"] for r in ROWS]
         assert [list(t) for t in df["Tags"]] == [r["Tags"] for r in ROWS]
-    finally:
-        conn.close()
 
 
 def test_bulk_ingest_from_dataframe(spanner_database):
-    conn = _connect(spanner_database)
-    try:
+    with _connect(spanner_database) as conn:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS AdbcDfIngest")
             cur.execute(_DDL.format(name="AdbcDfIngest"))
@@ -179,14 +163,11 @@ def test_bulk_ingest_from_dataframe(spanner_database):
             )
 
         assert_frame_equal(out, frame)
-    finally:
-        conn.close()
 
 
 def test_bulk_ingest_array_element_types(spanner_database):
     # DATE, TIMESTAMP and NUMERIC strings are coerced from the column context.
-    conn = _connect(spanner_database)
-    try:
+    with _connect(spanner_database) as conn:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS AdbcArrIngest")
             cur.execute(
@@ -243,5 +224,3 @@ def test_bulk_ingest_array_element_types(spanner_database):
             )
 
         assert_frame_equal(out, frame)
-    finally:
-        conn.close()

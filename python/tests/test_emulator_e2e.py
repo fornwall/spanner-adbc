@@ -21,8 +21,7 @@ def _connect(database, *, autocommit):
 
 
 def test_ddl_dml_query_roundtrip(spanner_database):
-    conn = _connect(spanner_database, autocommit=True)
-    try:
+    with _connect(spanner_database, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS Singers")
             cur.execute(
@@ -44,13 +43,10 @@ def test_ddl_dml_query_roundtrip(spanner_database):
         assert table.column("SingerId").to_pylist() == [1, 2]
         assert table.column("FirstName").to_pylist() == ["Alice", "Bob"]
         assert table.column("Active").to_pylist() == [True, False]
-    finally:
-        conn.close()
 
 
 def test_dbapi_type_objects_match_result_columns(spanner_database):
-    conn = _connect(spanner_database, autocommit=True)
-    try:
+    with _connect(spanner_database, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT @n AS n, @s AS s, @b AS b, @d AS d, @t AS t",
@@ -64,8 +60,6 @@ def test_dbapi_type_objects_match_result_columns(spanner_database):
             )
             columns = {d[0]: d[1] for d in cur.description}
             row = cur.fetchone()
-    finally:
-        conn.close()
     assert columns["n"] == spanner.NUMBER
     assert columns["s"] == spanner.STRING
     assert columns["b"] == spanner.BINARY
@@ -75,8 +69,7 @@ def test_dbapi_type_objects_match_result_columns(spanner_database):
 
 
 def test_execute_partitions_round_trip(spanner_database):
-    conn = _connect(spanner_database, autocommit=True)
-    try:
+    with _connect(spanner_database, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS AdbcPyPartition")
             cur.execute("CREATE TABLE AdbcPyPartition (Id INT64 NOT NULL) PRIMARY KEY (Id)")
@@ -116,13 +109,10 @@ def test_execute_partitions_round_trip(spanner_database):
             seen.update(ids)
 
         assert seen == set(range(1, 201))
-    finally:
-        conn.close()
 
 
 def test_manual_commit_and_rollback(spanner_database):
-    conn = _connect(spanner_database, autocommit=False)
-    try:
+    with _connect(spanner_database, autocommit=False) as conn:
         # DDL applies immediately, outside the manual transaction.
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS AdbcPyTxn")
@@ -148,13 +138,10 @@ def test_manual_commit_and_rollback(spanner_database):
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS n FROM AdbcPyTxn")
             assert cur.fetch_arrow_table().column("n").to_pylist() == [1]
-    finally:
-        conn.close()
 
 
 def test_failed_commit_keeps_buffer_until_rollback(spanner_database):
-    conn = _connect(spanner_database, autocommit=False)
-    try:
+    with _connect(spanner_database, autocommit=False) as conn:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS AdbcPyFailedCommit")
             cur.execute("CREATE TABLE AdbcPyFailedCommit (Id INT64 NOT NULL) PRIMARY KEY (Id)")
@@ -179,13 +166,10 @@ def test_failed_commit_keeps_buffer_until_rollback(spanner_database):
             cur.execute("SELECT Id FROM AdbcPyFailedCommit ORDER BY Id")
             assert cur.fetchall() == [(1,), (2,)]
         conn.rollback()
-    finally:
-        conn.close()
 
 
 def test_rowcount_after_execute(spanner_database):
-    conn = _connect(spanner_database, autocommit=True)
-    try:
+    with _connect(spanner_database, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS AdbcPyRowcount")
             assert cur.rowcount == -1
@@ -209,23 +193,17 @@ def test_rowcount_after_execute(spanner_database):
             cur.adbc_statement.set_options(**{StatementOptions.DML_PARTITIONED.value: "true"})
             cur.execute("UPDATE AdbcPyRowcount SET V = 'p' WHERE TRUE")
             assert cur.rowcount == 2
-    finally:
-        conn.close()
 
-    conn = _connect(spanner_database, autocommit=False)
-    try:
+    with _connect(spanner_database, autocommit=False) as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM AdbcPyRowcount WHERE TRUE")
             # Buffered DML runs at commit, so its count is unknown.
             assert cur.rowcount == -1
         conn.commit()
-    finally:
-        conn.close()
 
 
 def test_constraint_violations_raise_integrity_error(spanner_database):
-    conn = _connect(spanner_database, autocommit=True)
-    try:
+    with _connect(spanner_database, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS AdbcPyIntegrity")
             cur.execute(
@@ -243,15 +221,10 @@ def test_constraint_violations_raise_integrity_error(spanner_database):
                     pa.table({"Id": pa.array([1], pa.int64()), "Name": ["c"]}),
                     mode="append",
                 )
-    finally:
-        conn.close()
 
 
 def test_question_mark_placeholder_error_names_the_fix(spanner_database):
-    conn = _connect(spanner_database, autocommit=True)
-    try:
+    with _connect(spanner_database, autocommit=True) as conn:
         with conn.cursor() as cur:
             with pytest.raises(spanner.ProgrammingError, match="@p1"):
                 cur.execute("SELECT ? AS x", (1,))
-    finally:
-        conn.close()

@@ -8,6 +8,7 @@ the library with ``python -m spanner_adbc.manifest install``.
 
 import functools
 import pathlib
+import sys
 from collections.abc import Mapping
 
 import adbc_driver_manager
@@ -61,11 +62,14 @@ def _db_kwargs(uri: str | None, db_kwargs: Mapping[str, str] | None) -> dict[str
 def _driver_path() -> str:
     """Absolute path to the shared library bundled in this wheel."""
     here = pathlib.Path(__file__).resolve().parent
-    for name in ("libspanner_adbc.so", "libspanner_adbc.dylib", "spanner_adbc.dll"):
-        candidate = here / name
-        if candidate.is_file():
-            return str(candidate)
+    name = {"darwin": "libspanner_adbc.dylib", "win32": "spanner_adbc.dll"}.get(
+        sys.platform, "libspanner_adbc.so"
+    )
+    candidate = here / name
+    if candidate.is_file():
+        return str(candidate)
     raise RuntimeError(
-        f"spanner_adbc: no Spanner driver library in {here}. Install a wheel for your "
-        "platform, or copy the library that `cargo build` writes to target/ into that directory."
+        f"spanner_adbc: no Spanner driver library in {here} (expected {name}). "
+        "Install a wheel for your platform, or copy the library that `cargo build` "
+        "writes to target/debug/ into that directory."
     )
