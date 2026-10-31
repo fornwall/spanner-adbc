@@ -19,16 +19,14 @@ use google_cloud_spanner::model::StructType;
 use crate::conversion::TimestampPrecision;
 use crate::driver::{Connected, SharedDatabaseAdmin};
 use crate::error::{
-    annotate, err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option,
-    unsupported,
+    annotate, commit_outcome_unknown, err, from_spanner, invalid_argument, invalid_state,
+    is_mutation_limit_exceeded, option_not_set, unknown_option, unsupported,
 };
 use crate::options::{SharedConfig, impl_typed_option_getters};
 use crate::reader::stream_query;
 use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable};
 use crate::sql::qualified_table;
-use crate::statement::{
-    DEFAULT_ROWS_PER_BATCH, SpannerStatement, commit_outcome_unknown, is_mutation_limit_exceeded,
-};
+use crate::statement::{DEFAULT_ROWS_PER_BATCH, SpannerStatement};
 use crate::timeout::with_timeout;
 
 mod exec;

@@ -39,6 +39,27 @@ pub(crate) fn annotate(mut error: Error, f: impl FnOnce(&str) -> String) -> Erro
     error
 }
 
+/// Whether a failed write may still have been committed. A timeout or cancel drops the in-flight
+/// commit, and a transport failure or `UNAVAILABLE` can follow a commit the server applied. Other
+/// `IO` codes, such as `ABORTED`, mean the commit was rejected.
+pub(crate) fn commit_outcome_unknown(error: &Error) -> bool {
+    match error.status {
+        Status::Timeout | Status::Cancelled => true,
+        Status::IO => [0, Code::Unavailable as i32].contains(&error.vendor_code),
+        _ => false,
+    }
+}
+
+/// Spanner's mutation limit rejection lets autocommit ingest retry with smaller chunks.
+/// Other invalid arguments, including the commit byte limit, must keep their original handling.
+pub(crate) fn is_mutation_limit_exceeded(error: &Error) -> bool {
+    error.status == Status::InvalidArguments
+        && error
+            .message
+            .to_ascii_lowercase()
+            .contains("too many mutations")
+}
+
 /// An `InvalidState` error, for operations called out of order.
 pub(crate) fn invalid_state(message: impl Into<String>) -> Error {
     err(message, Status::InvalidState)

@@ -8,12 +8,13 @@ use arrow_schema::{Schema, SchemaRef};
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::{BeginTransactionOption, ReadWriteTransaction};
 
-use super::{
-    SpannerStatement, check_partitioned_dml, commit_outcome_unknown, is_mutation_limit_exceeded,
-};
+use super::{SpannerStatement, check_partitioned_dml};
 use crate::bind;
 use crate::connection::{lock_txn, runner_builder};
-use crate::error::{annotate, from_spanner, invalid_argument, invalid_state, unsupported};
+use crate::error::{
+    annotate, commit_outcome_unknown, from_spanner, invalid_argument, invalid_state,
+    is_mutation_limit_exceeded, unsupported,
+};
 use crate::runtime::block_on_cancellable;
 use crate::timeout::with_timeout;
 

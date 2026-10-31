@@ -503,3 +503,60 @@ fn chain_walks_from_the_outermost_error_to_the_innermost() {
         .expect("the driver error must be reachable through the chain");
     assert_eq!(recovered.status, Status::Cancelled);
 }
+
+#[test]
+fn commit_outcome_is_unknown_after_a_timeout_cancel_or_transport_failure() {
+    let error = |status, vendor_code| {
+        let mut error = err("commit failed", status);
+        error.vendor_code = vendor_code;
+        error
+    };
+    for (status, vendor_code, unknown) in [
+        (Status::Timeout, 0, true),
+        (Status::Cancelled, 1, true),
+        (Status::IO, 0, true),
+        (Status::IO, Code::Unavailable as i32, true),
+        (Status::IO, Code::Aborted as i32, false),
+        (Status::IO, Code::ResourceExhausted as i32, false),
+        (Status::Integrity, Code::AlreadyExists as i32, false),
+    ] {
+        assert_eq!(
+            commit_outcome_unknown(&error(status, vendor_code)),
+            unknown,
+            "{status:?} {vendor_code}"
+        );
+    }
+}
+
+#[test]
+fn mutation_limit_predicate_matches_only_the_too_many_mutations_error() {
+    let mut over_limit = err(
+        "Spanner error: The transaction contains too many mutations. Insert and update \
+         operations count with the multiplicity of the number of columns they affect. ...Please \
+         reduce the number of writes, or use fewer indexes. (Maximum number: 80000)",
+        Status::InvalidArguments,
+    );
+    over_limit.vendor_code = 3; // INVALID_ARGUMENT
+    assert!(is_mutation_limit_exceeded(&over_limit));
+
+    let mut wrong_status = over_limit.clone();
+    wrong_status.status = Status::Internal;
+    assert!(!is_mutation_limit_exceeded(&wrong_status));
+
+    for message in [
+        "Spanner error: Invalid value for column Foo: expected INT64",
+        "Spanner error: Syntax error: Unexpected token",
+        "Spanner error: The commit request is too large",
+        "Spanner error: Table not found: Nope",
+    ] {
+        let other = err(message, Status::InvalidArguments);
+        assert!(
+            !is_mutation_limit_exceeded(&other),
+            "must not match: {message}"
+        );
+    }
+
+    let mut dup = err("Spanner error: row already exists", Status::AlreadyExists);
+    dup.vendor_code = 6;
+    assert!(!is_mutation_limit_exceeded(&dup));
+}

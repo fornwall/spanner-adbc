@@ -7,13 +7,15 @@ use std::ops::Range;
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
 use arrow_array::{Array, RecordBatch};
-use google_cloud_gax::error::rpc::Code;
 use google_cloud_spanner::mutation::{Mutation, MutationGroup};
 
 use super::{SpannerStatement, string_option};
 use crate::bind;
 use crate::connection::{TxnKind, lock_txn, write_mutations_txn};
-use crate::error::{annotate, err, from_spanner, from_status_parts, invalid_state, unsupported};
+use crate::error::{
+    annotate, commit_outcome_unknown, err, from_spanner, from_status_parts, invalid_state,
+    is_mutation_limit_exceeded, unsupported,
+};
 use crate::runtime::block_on_cancellable;
 use crate::timeout::with_timeout;
 
@@ -548,32 +550,6 @@ fn note_rows_already_committed(error: Error, committed: i64) -> Error {
         );
     }
     annotate(error, |message| format!("{message} ({note})"))
-}
-
-/// Whether a failed write may still have been committed. A timeout or cancel drops the in-flight
-/// commit, and a transport failure or `UNAVAILABLE` can follow a commit the server applied. Other
-/// `IO` codes, such as `ABORTED`, mean the commit was rejected.
-pub(crate) fn commit_outcome_unknown(error: &Error) -> bool {
-    match error.status {
-        Status::Timeout | Status::Cancelled => true,
-        Status::IO => [0, Code::Unavailable as i32].contains(&error.vendor_code),
-        _ => false,
-    }
-}
-
-/// Whether `error` is Spanner's per-commit mutation limit rejection, which an autocommit ingest
-/// recovers from by splitting the chunk.
-///
-/// Spanner reports it as `INVALID_ARGUMENT` with "The transaction contains too many mutations",
-/// wording that has survived each increase of the limit. Other `INVALID_ARGUMENT`s, such as bad
-/// values or schema mismatches, must propagate to the ingest error remapping. The commit size
-/// limit isn't matched: the byte budget keeps chunks well under it, and its wording is less stable.
-pub(crate) fn is_mutation_limit_exceeded(error: &Error) -> bool {
-    error.status == Status::InvalidArguments
-        && error
-            .message
-            .to_ascii_lowercase()
-            .contains("too many mutations")
 }
 
 /// The batch's Arrow bytes per row. Counts only the rows a sliced batch references: a slice keeps
