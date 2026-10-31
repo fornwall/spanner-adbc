@@ -8,8 +8,7 @@ use arrow_schema::{Schema, SchemaRef};
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::{BeginTransactionOption, ReadWriteTransaction};
 
-use super::{SpannerStatement, check_partitioned_dml};
-use crate::bind;
+use super::{SpannerStatement, bound_statements, check_partitioned_dml};
 use crate::connection::{lock_txn, runner_builder};
 use crate::error::{
     annotate, commit_outcome_unknown, from_spanner, invalid_argument, invalid_state,
@@ -32,29 +31,14 @@ pub(super) enum DmlOutcome {
 }
 
 impl SpannerStatement {
-    /// Bind each row to the single DML statement in `sql`. Directed reads apply only to read-only
-    /// queries, so this uses `sql_builder`.
-    fn build_bound_statements(&self, sql: &str) -> Result<Vec<SpannerSql>> {
-        let builder = self.sql_builder(sql);
-        let mut statements = Vec::new();
-        for batch in &self.bound {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            // Resolving names lexes the SQL, so do it once per batch.
-            let names = bind::resolve_parameter_names(sql, batch, self.bind_by_name)?;
-            for row in 0..batch.num_rows() {
-                statements.push(bind::bind_params(builder.clone(), &names, batch, row)?.build());
-            }
-        }
-        Ok(statements)
-    }
-
     fn build_dml_statements(&self, parts: &[&str]) -> Result<Vec<SpannerSql>> {
         if !self.bound.is_empty() {
             return match parts {
                 [] => Ok(Vec::new()),
-                [sql] => self.build_bound_statements(sql),
+                [sql] => {
+                    bound_statements(sql, self.sql_builder(sql), &self.bound, self.bind_by_name)?
+                        .collect()
+                }
                 _ => Err(invalid_argument(
                     "bound parameters require a single DML statement; execute each statement separately",
                 )),

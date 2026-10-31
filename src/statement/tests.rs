@@ -151,6 +151,22 @@ fn string_option_requires_a_string_value() {
 }
 
 #[test]
+fn bound_queries_convert_values_only_as_each_statement_is_requested() {
+    let schema = Arc::new(Schema::new(vec![Field::new("p", DataType::Date32, false)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(arrow_array::Date32Array::from(vec![0, i32::MAX]))],
+    )
+    .unwrap();
+    let sql = "SELECT @p";
+    let mut statements = bound_statements(sql, SpannerSql::builder(sql), &[batch], true).unwrap();
+    assert!(statements.next().unwrap().is_ok());
+    let error = statements.next().unwrap().unwrap_err();
+    assert!(error.message.contains("out of range"), "{error}");
+    assert!(statements.next().is_none());
+}
+
+#[test]
 fn split_batches_caps_rows_per_batch() {
     let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
     let batch = |n: i64| {
@@ -266,6 +282,40 @@ mod mock {
         statement.set_sql_query(sql).unwrap();
         statement.bind(one_row()).unwrap();
         statement
+    }
+
+    #[test]
+    fn invalid_parameters_fail_before_queries_or_writes_are_sent() {
+        let server = start();
+        let mut connection = connect(&server);
+        let mut statement = connection.new_statement().unwrap();
+        statement.set_sql_query("SELECT @p, @missing").unwrap();
+        statement
+            .bind(
+                RecordBatch::try_new(
+                    one_row().schema(),
+                    vec![Arc::new(Int64Array::from(vec![1, 2]))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let error = statement.execute().err().unwrap();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(rpc_count(&server), 0);
+
+        statement.set_sql_query("UPDATE t SET c = @p").unwrap();
+        statement
+            .bind(
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new("p", DataType::Date32, false)])),
+                    vec![Arc::new(Date32Array::from(vec![0, i32::MAX]))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let error = statement.execute_update().unwrap_err();
+        assert!(error.message.contains("out of range"), "{error}");
+        assert_eq!(rpc_count(&server), 0);
     }
 
     /// Every execution consumes bound rows, even one rejected before any RPC, so a reused handle
@@ -1037,6 +1087,50 @@ mod manual_txn {
                 "{sql}: later queries share the transaction the first successful query began"
             );
         }
+    }
+
+    #[test]
+    fn bound_queries_preserve_batch_order_and_skip_empty_batches() {
+        let mut mock = MockSpanner::new();
+        mock.expect_execute_streaming_sql().returning(|request| {
+            let request = request.into_inner();
+            let inline_begin = matches!(
+                request.transaction.and_then(|txn| txn.selector),
+                Some(v1::transaction_selector::Selector::Begin(_))
+            );
+            let mut response = result(inline_begin, b"ro-1");
+            response.values = vec![request.params.unwrap().fields["p"].clone()];
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(Ok(response)).unwrap();
+            Ok(tonic::Response::new(rx))
+        });
+        let server = crate::mock_server::MockServer::serve(mock);
+        let mut connection = server.connect();
+        let mut statement = connection.new_statement().unwrap();
+        statement.set_sql_query("SELECT @p").unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("p", DataType::Int64, false)]));
+        let batches = [vec![], vec![1, 2], vec![], vec![3]].map(|values| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::Int64Array::from(values))],
+            )
+        });
+        statement
+            .bind_stream(Box::new(arrow_array::RecordBatchIterator::new(
+                batches, schema,
+            )))
+            .unwrap();
+        let mut values = Vec::new();
+        for batch in statement.execute().unwrap() {
+            let batch = batch.unwrap();
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            values.extend(column.iter().map(|value| value.unwrap().to_owned()));
+        }
+        assert_eq!(values, ["1", "2", "3"]);
     }
 
     /// A query bound to several rows runs each row's statement in the manual transaction's

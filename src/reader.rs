@@ -227,12 +227,6 @@ impl RecordBatchReader for SpannerBatchReader {
     }
 }
 
-/// Builds a bound query's per-row statements lazily, so a large `executemany` SELECT holds one
-/// statement at a time. A bind failure surfaces as `Some(Err(..))`.
-pub(crate) trait BoundStatementSource: Send {
-    fn next_statement(&mut self) -> Option<Result<SpannerSql>>;
-}
-
 /// Stream the results of a bound query's per-row statements as one reader, executing them all in
 /// `transaction` so every row sees the same snapshot.
 ///
@@ -244,12 +238,12 @@ pub(crate) async fn stream_bound_query(
     runtime: SharedRuntime,
     cancel: CancelSignal,
     transaction: Arc<MultiUseReadOnlyTransaction>,
-    mut statements: Box<dyn BoundStatementSource>,
+    mut statements: Box<dyn Iterator<Item = Result<SpannerSql>> + Send>,
     batch_size: usize,
     precision: TimestampPrecision,
     fetch_timeout: Option<Duration>,
 ) -> Result<SpannerBatchReader> {
-    let mut result_set = match statements.next_statement() {
+    let mut result_set = match statements.next() {
         Some(statement) => Some(
             transaction
                 .execute_query(statement?)
@@ -283,7 +277,7 @@ pub(crate) async fn stream_bound_query(
 /// execution of the next row's statement.
 struct BoundQueryChunks {
     transaction: Arc<MultiUseReadOnlyTransaction>,
-    statements: Box<dyn BoundStatementSource>,
+    statements: Box<dyn Iterator<Item = Result<SpannerSql>> + Send>,
     /// The result set currently being drained.
     result_set: Option<ResultSet>,
     batch_size: usize,
@@ -302,7 +296,7 @@ impl BoundQueryChunks {
                 }
                 self.result_set = None;
             }
-            let Some(statement) = self.statements.next_statement() else {
+            let Some(statement) = self.statements.next() else {
                 return Ok(Vec::new());
             };
             let rs = self.transaction.execute_query(statement?).await;

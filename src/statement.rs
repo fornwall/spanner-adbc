@@ -37,7 +37,7 @@ use crate::error::{
 use crate::options::{
     SharedConfig, bool_option, bool_option_unsettable, impl_typed_option_getters,
 };
-use crate::reader::{BoundStatementSource, stream_bound_query, stream_query};
+use crate::reader::{stream_bound_query, stream_query};
 use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable};
 use crate::timeout::with_timeout;
 
@@ -47,36 +47,6 @@ pub(crate) const DEFAULT_ROWS_PER_BATCH: usize = 8192;
 
 /// The reader [`Statement::execute`] returns.
 type ResultReader = Box<dyn RecordBatchReader + Send + 'static>;
-
-/// Builds each statement of a multi-row bound query only when the reader asks for it, so a large
-/// `executemany` SELECT doesn't hold one statement per row in memory.
-struct LazyBoundStatements {
-    /// Fully configured read-only builder, cloned per row before binding.
-    base_builder: StatementBuilder,
-    /// Resolved parameter names for each non-empty bound batch.
-    groups: Vec<(Vec<String>, RecordBatch)>,
-    group: usize,
-    /// Next row to bind within `groups[group]`.
-    row: usize,
-}
-
-impl BoundStatementSource for LazyBoundStatements {
-    fn next_statement(&mut self) -> Option<Result<SpannerSql>> {
-        loop {
-            let (names, batch) = self.groups.get(self.group)?;
-            if self.row >= batch.num_rows() {
-                self.group += 1;
-                self.row = 0;
-                continue;
-            }
-            let row = self.row;
-            self.row += 1;
-            return Some(
-                bind::bind_params(self.base_builder.clone(), names, batch, row).map(|b| b.build()),
-            );
-        }
-    }
-}
 
 /// An ADBC statement bound to a Spanner [`DatabaseClient`].
 #[derive(Debug)]
@@ -225,23 +195,12 @@ impl SpannerStatement {
     /// Run a query once per bound row, streaming the concatenated results. All rows share one
     /// multi-use read-only transaction, so they read the same snapshot.
     fn execute_multi_row_query(&self, sql: &str) -> Result<ResultReader> {
-        // Resolve parameter names up front so a mismatch fails before any statement runs; only
-        // the per-row binding is deferred to the reader.
-        let groups = self
-            .bound
-            .iter()
-            .filter(|batch| batch.num_rows() > 0)
-            .map(|batch| {
-                let names = bind::resolve_parameter_names(sql, batch, self.bind_by_name)?;
-                Ok((names, batch.clone()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let statements: Box<dyn BoundStatementSource> = Box::new(LazyBoundStatements {
-            base_builder: self.read_sql_builder(sql),
-            groups,
-            group: 0,
-            row: 0,
-        });
+        let statements = bound_statements(
+            sql,
+            self.read_sql_builder(sql),
+            &self.bound,
+            self.bind_by_name,
+        )?;
         let bound = self.config.read_staleness.multi_use_timestamp_bound();
         let manual_txn = self.manual_read_transaction()?;
         let client = self.client.clone();
@@ -990,6 +949,33 @@ impl Statement for SpannerStatement {
         // The next operation gets a fresh signal, so a cancel while idle doesn't affect it.
         Box::new(SlotCancelHandle::new(self.cancel.clone()))
     }
+}
+
+/// Resolve parameter names before execution, then bind each row lazily so large queries need
+/// only one statement at a time. DML collects the iterator before buffering or executing writes.
+fn bound_statements(
+    sql: &str,
+    builder: StatementBuilder,
+    batches: &[RecordBatch],
+    bind_by_name: bool,
+) -> Result<Box<dyn Iterator<Item = Result<SpannerSql>> + Send>> {
+    let groups = batches
+        .iter()
+        .filter(|batch| batch.num_rows() > 0)
+        .map(|batch| {
+            let names = bind::resolve_parameter_names(sql, batch, bind_by_name)?;
+            Ok((names, batch.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Box::new(groups.into_iter().flat_map(
+        move |(names, batch)| {
+            let builder = builder.clone();
+            (0..batch.num_rows()).map(move |row| {
+                bind::bind_params(builder.clone(), &names, &batch, row)
+                    .map(|builder| builder.build())
+            })
+        },
+    )))
 }
 
 /// Parse a string option, naming `key` in the error.
