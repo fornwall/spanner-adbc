@@ -23,7 +23,7 @@ esac
 cd "$REPO_ROOT"
 
 # Pin the upstream query corpus and test behavior for reproducible runs.
-VALIDATION_REF="${ADBC_VALIDATION_REF:-9f9f4417a08d6c082193842bc5caaa36e65908a0}"
+VALIDATION_REF="${ADBC_VALIDATION_REF:-5db1f44782f4868c5ae9e89d6ac9812ca6e1758c}"
 VALIDATION_REPO="${ADBC_VALIDATION_REPO:-adbc-drivers/validation}"
 
 if [ "${1:-}" = --no-prepare ]; then
@@ -38,7 +38,8 @@ else
   requirement="git+https://github.com/${VALIDATION_REPO}@${VALIDATION_REF}"
   if [ "$installed" != "$requirement" ]; then
     echo ">> installing the validation suite at $VALIDATION_REPO@$VALIDATION_REF"
-    "$PYTHON" -m pip install "adbc_drivers_validation @ $requirement"
+    # Upstream keeps the package version unchanged across revisions.
+    "$PYTHON" -m pip install "adbc_drivers_validation @ $requirement" --upgrade --force-reinstall
   fi
 fi
 

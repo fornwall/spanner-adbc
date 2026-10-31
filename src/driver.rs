@@ -13,8 +13,8 @@ use adbc_core::options::{OptionDatabase, OptionValue};
 use adbc_core::{Database, Driver, Optionable};
 use google_cloud_auth::credentials::Credentials;
 use google_cloud_gax::client_builder::internal::ClientConfig;
-use google_cloud_spanner::client::{DatabaseAdmin, DatabaseClient, Spanner};
-use google_cloud_spanner::omni::{InstanceType, SpannerBuilderExt};
+use google_cloud_spanner::client::{DatabaseAdmin, DatabaseClient, Spanner, SpannerBuilderExt};
+use google_cloud_spanner::omni::InstanceType;
 
 use crate::connection::SpannerConnection;
 use crate::error::{

@@ -24,6 +24,7 @@ class SpannerQuirks(model.DriverQuirks):
         connection_get_statistics=True,
         connection_transactions=True,
         get_objects=True,
+        get_objects_tabletypes_filter=True,
         get_objects_constraints_check=True,
         # The DDL hook below creates only the declared constraints each test expects.
         # Hidden rowid constraints are omitted from metadata; declared key order is
@@ -66,6 +67,12 @@ class SpannerQuirks(model.DriverQuirks):
         return f"@p{index}"
 
     def query_override(self, context: str, default: str) -> str:
+        if context == "TestConnection.get_objects_view.create_view":
+            # Spanner views require qualified columns and a security mode.
+            return default.replace(
+                " AS SELECT * ",
+                " SQL SECURITY INVOKER AS SELECT source.ints, source.strs ",
+            ) + " AS source"
         if context == "TestConnection.test_get_table_schema_schema":
             return default.replace(
                 "(spam INT, eggs VARCHAR)", "(spam INT64, eggs STRING(MAX))"

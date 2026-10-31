@@ -15,9 +15,8 @@ scripts/run-foundry-validation.sh --no-prepare  # reuse that build and Python en
 ```
 
 You need Python 3.13+ with pip (required by the
-[pinned suite](https://github.com/adbc-drivers/validation/blob/9f9f4417a08d6c082193842bc5caaa36e65908a0/pyproject.toml)),
-Rust, git and curl, plus Docker for the emulator. Python 3.13 is used in CI so native
-dependencies install from wheels; the Python package workflow covers the newest Python.
+[pinned suite](https://github.com/adbc-drivers/validation/blob/5db1f44782f4868c5ae9e89d6ac9812ca6e1758c/pyproject.toml)),
+Rust, git and curl, plus Docker for the emulator. CI uses Python 3.15.2 with dependency wheels.
 `PYTHON` selects the interpreter. The
 [script](../scripts/run-foundry-validation.sh) builds the driver, installs the pinned suite if
 needed, sets up the target database and runs pytest. `ADBC_VALIDATION_REF` and
@@ -52,9 +51,9 @@ python -m pytest foundry-validation/harness_tests -q  # test the skip guards wit
 - [`tests/spanner.py`](tests/spanner.py) declares capabilities, connection options, identifier
   quoting, `@pN` parameters and DDL overrides. Metadata tests expect catalog `adbc-test` and the
   default schema `""`. Primary key, foreign key and CHECK constraints, XDBC type names,
-  nullability, identity and generated-column flags, named-schema metadata and ingest, and exact
-  statistics are enabled. The connection fixture creates `validation_schema` for schema-scoped
-  tests.
+  nullability, identity and generated-column flags, table type filters, named-schema metadata
+  and ingest, and exact statistics are enabled. The connection fixture creates
+  `validation_schema` for schema-scoped tests.
 - [`queries/spanner/`](queries/spanner/) overrides the upstream bind, select, literal and ingest
   cases with native type names, typed parameters, explicit `INSERT` column lists and
   deterministic ordering. The `.txtcase` files hold the expected schemas and skip reasons.

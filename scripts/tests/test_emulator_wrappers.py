@@ -302,7 +302,7 @@ for arg in sys.argv:
 import json, os, sys
 if sys.argv[1:4] == ["-m", "pip", "freeze"]:
     print("adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@"
-          "9f9f4417a08d6c082193842bc5caaa36e65908a0")
+          "5db1f44782f4868c5ae9e89d6ac9812ca6e1758c")
     sys.exit(0)
 with open(os.environ["WRAPPER_LOG"], "a") as log:
     log.write(json.dumps(["python", os.getcwd(), *sys.argv[1:]]) + "\\n")
@@ -321,7 +321,7 @@ with open(os.environ["WRAPPER_LOG"], "a") as log:
 import json, os, sys
 if sys.argv[1:4] == ["-m", "pip", "freeze"]:
     print("adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@"
-          "9f9f4417a08d6c082193842bc5caaa36e65908a0")
+          "5db1f44782f4868c5ae9e89d6ac9812ca6e1758c")
     sys.exit(0)
 with open(os.environ["WRAPPER_LOG"], "a") as log:
     log.write(json.dumps(["python", *sys.argv[1:]]) + "\\n")

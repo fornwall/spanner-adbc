@@ -54,7 +54,7 @@ and test commands.
 
 ## Dependencies
 
-[CONTRIBUTING.md](CONTRIBUTING.md#dependency-pins) explains why the Google Cloud, ADBC and Arrow
+[CONTRIBUTING.md](CONTRIBUTING.md#dependency-pins) explains why the Google Cloud and ADBC
 crates are pinned to git revisions.
 
 - Read revisions from `Cargo.toml` and `Cargo.lock`, and find the matching source with

@@ -38,10 +38,8 @@ wildcards = "allow"
 unknown-registry = "deny"
 unknown-git = "deny"
 # The google-cloud-* crates share a revision with the unpublished spanner-grpc-mock;
-# adbc_* tracks upstream main with the validation suite; arrow-* needs unreleased
-# FFI_ArrowArrayStream APIs (see Cargo.toml).
+# adbc_* tracks upstream main with the validation suite.
 allow-git = [
     "https://github.com/googleapis/google-cloud-rust",
     "https://github.com/apache/arrow-adbc",
-    "https://github.com/apache/arrow-rs",
 ]

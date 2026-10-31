@@ -18,7 +18,6 @@ class Pins(unittest.TestCase):
     def test_each_family_uses_one_revision(self):
         for repository in (
             "apache/arrow-adbc",
-            "apache/arrow-rs",
             "googleapis/google-cloud-rust",
         ):
             with self.subTest(repository=repository):

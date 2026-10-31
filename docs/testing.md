@@ -56,7 +56,7 @@ network IP on port 9010.
 
 ### Omni
 
-`scripts/with-omni.sh` needs Docker and GNU `timeout`. It runs Omni `2026.r4-lts` (set
+`scripts/with-omni.sh` needs Docker and GNU `timeout`. It runs Omni `2026.r4-lts.1` (set
 `SPANNER_OMNI_IMAGE` to test another [release](https://docs.cloud.google.com/spanner-omni/download)),
 publishes ports 15000 to 15025 on localhost, creates `default/default/adbc-test` and removes the
 container and its storage on exit.

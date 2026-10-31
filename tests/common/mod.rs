@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use adbc_core::Database;
 use google_cloud_lro::Poller;
-use google_cloud_spanner::client::Spanner;
-use google_cloud_spanner::omni::{InstanceType, SpannerBuilderExt};
+use google_cloud_spanner::client::{Spanner, SpannerBuilderExt};
+use google_cloud_spanner::omni::InstanceType;
 use google_cloud_spanner_admin_instance_v1::model::Instance;
 
 pub(crate) mod omni;

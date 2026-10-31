@@ -2,7 +2,7 @@
 //!
 //! An [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) driver for
 //! [Google Cloud Spanner](https://cloud.google.com/spanner), built on the `google-cloud-spanner`
-//! preview client and the [`adbc_core`] traits. Query results are returned as Arrow
+//! client and the [`adbc_core`] traits. Query results are returned as Arrow
 //! [`RecordBatch`](arrow_array::RecordBatch)es.
 //!
 //! The driver follows the standard ADBC object hierarchy:

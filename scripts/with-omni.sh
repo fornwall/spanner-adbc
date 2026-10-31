@@ -4,7 +4,7 @@
 set -euo pipefail
 
 # Latest published release: https://docs.cloud.google.com/spanner-omni/download
-IMAGE="${SPANNER_OMNI_IMAGE:-us-docker.pkg.dev/spanner-omni/images/spanner-omni:2026.r4-lts}"
+IMAGE="${SPANNER_OMNI_IMAGE:-us-docker.pkg.dev/spanner-omni/images/spanner-omni:2026.r4-lts.1}"
 CONTAINER="${SPANNER_OMNI_CONTAINER:-spanner-adbc-omni}"
 
 if [ "$#" -eq 0 ]; then

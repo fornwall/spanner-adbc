@@ -53,17 +53,18 @@ Keep pull requests focused.
 
 ## Dependency pins
 
-`Cargo.toml` pins three dependency families to git revisions:
+`Cargo.toml` pins two dependency families to git revisions:
 
 - The Google Cloud crates, all on one google-cloud-rust revision. This includes
   `spanner-grpc-mock`, which the mock-server tests use and which isn't published.
 - `adbc_core`, `adbc_ffi` and `adbc_driver_manager`, which track arrow-adbc `main`. The C++
   validation suite (`ARROW_ADBC_TAG` in `adbc-validation/CMakeLists.txt`) uses the same revision,
   and `src/ffi/abi.rs` transcribes that revision's `adbc.h`.
-- The `arrow-*` crates, patched to arrow-rs `main` in `[patch.crates-io]`. Arrow 60 lacks the
-  `FFI_ArrowArrayStream` constructor and accessors that the C ABI needs.
 
-Each family on its own prevents publishing to crates.io, so the release configuration sets
+The `arrow-*` crates use crates.io releases starting at 60.1, which supplies the
+`FFI_ArrowArrayStream` constructor and accessors that the C ABI needs.
+
+Each git-pinned family prevents publishing to crates.io, so the release configuration sets
 `publish = false`. Rust users of the crate have to match the pins; see the
 [README](README.md#rust).
 
@@ -81,9 +82,9 @@ When moving a family to crates.io, update these together:
 - The `allow-git` entries in `deny.toml`, once a repository has no git dependencies left.
 - The dependency notes in `README.md`, this file and [AGENTS.md](AGENTS.md#dependencies).
 
-For Google Cloud, also check that `spanner-grpc-mock` is published and compatible. For Arrow,
-revisit the version ranges so they keep matching `adbc_core`'s. Keep `publish = false` until
-every family can come from the registry.
+For Google Cloud, also check that `spanner-grpc-mock` is published and compatible. Keep Arrow's
+version ranges within `adbc_core`'s. Keep `publish = false` until every family can come from the
+registry.
 
 ## Versioning
 
