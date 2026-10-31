@@ -8,17 +8,15 @@ use std::ffi::{c_char, c_void};
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{OptionStatement, OptionValue};
 use adbc_core::{Connection, Optionable, Statement};
-use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
+use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
-use arrow_array::{RecordBatch, StructArray};
-use arrow_schema::{DataType, Schema};
+use arrow_schema::Schema;
 
 use super::abi::{AdbcConnection, AdbcError, AdbcPartitions, AdbcStatement, AdbcStatusCode};
 use super::guard::{byte_slice, catch, missing_argument, required_output, required_str, write_out};
 use super::handle::{Exported, finish};
-use super::import::{BoundStreamReader, contain_import, validate_imported};
+use super::import::{BoundStreamReader, import_batch};
 use super::options::{FfiHandle, already_populated, slot_of, with_state};
-use crate::error::invalid_argument;
 use crate::statement::SpannerStatement;
 
 pub(super) const KIND: &str = "statement";
@@ -137,48 +135,7 @@ pub(super) unsafe extern "C" fn statement_bind(
 ) -> AdbcStatusCode {
     unsafe {
         with_state(statement, error, |state| {
-            // Arrow's importer can panic on released inputs. Reject them before taking ownership,
-            // so a caller mistake does not consume the other input.
-            let Some(values_ref) = values.as_ref() else {
-                return Err(invalid_argument("values must not be null"));
-            };
-            if values_ref.release().is_none() {
-                return Err(invalid_argument("values has already been released"));
-            }
-            let Some(schema_ref) = schema.as_ref() else {
-                return Err(invalid_argument("schema must not be null"));
-            };
-            if schema_ref.release().is_none() {
-                return Err(invalid_argument("schema has already been released"));
-            }
-            // ADBC transfers ownership of both inputs.
-            let values = FFI_ArrowArray::from_raw(values);
-            let schema = FFI_ArrowSchema::from_raw(schema);
-            // The importer also asserts on other malformed input; `contain_import` reports that
-            // as an error instead of a panic that would poison the statement.
-            let data = contain_import(|| from_ffi(values, &schema)).map_err(|failure| {
-                invalid_argument(format!(
-                    "bind values are not a valid Arrow array: {failure}"
-                ))
-            })?;
-            let DataType::Struct(fields) = data.data_type() else {
-                return Err(invalid_argument(format!(
-                    "bind values must be a struct array, not {}",
-                    data.data_type()
-                )));
-            };
-            validate_imported(&data, fields).map_err(|failure| {
-                invalid_argument(format!(
-                    "bind values are not a valid Arrow array: {failure}"
-                ))
-            })?;
-            if data.null_count() != 0 {
-                return Err(invalid_argument(
-                    "bind values must not contain top-level null rows; put null values in the \
-                     individual columns instead",
-                ));
-            }
-            state.bind(RecordBatch::from(StructArray::from(data)))
+            state.bind(import_batch(values, schema)?)
         })
     }
 }

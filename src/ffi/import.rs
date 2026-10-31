@@ -1,18 +1,49 @@
-//! Import of the Arrow C streams passed to `AdbcStatementBindStream`.
+//! Import and validation of the Arrow C data passed to statement binding.
 
 use std::ffi::{CStr, c_int};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use adbc_core::error::Result;
-use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
+use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi, from_ffi_and_data_type};
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
-use arrow_array::{RecordBatch, RecordBatchOptions, RecordBatchReader, StructArray};
+use arrow_array::{Array, RecordBatch, RecordBatchOptions, RecordBatchReader, StructArray};
 use arrow_data::ArrayData;
-use arrow_schema::{ArrowError, DataType, Fields, Schema, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Schema, SchemaRef};
 
 use super::guard::{drop_panic_payload, panic_message};
 use crate::error::invalid_argument;
+
+/// # Safety
+/// `values` and `schema` must be null or point to valid Arrow C data. Ownership transfers only
+/// after both inputs have been checked for null pointers and release callbacks.
+pub(super) unsafe fn import_batch(
+    values: *mut FFI_ArrowArray,
+    schema: *mut FFI_ArrowSchema,
+) -> Result<RecordBatch> {
+    let Some(values_ref) = (unsafe { values.as_ref() }) else {
+        return Err(invalid_argument("values must not be null"));
+    };
+    if values_ref.release().is_none() {
+        return Err(invalid_argument("values has already been released"));
+    }
+    let Some(schema_ref) = (unsafe { schema.as_ref() }) else {
+        return Err(invalid_argument("schema must not be null"));
+    };
+    if schema_ref.release().is_none() {
+        return Err(invalid_argument("schema has already been released"));
+    }
+    let values = unsafe { FFI_ArrowArray::from_raw(values) };
+    let schema = unsafe { FFI_ArrowSchema::from_raw(schema) };
+    contain_import(|| unsafe { from_ffi(values, &schema) })
+        .and_then(checked_struct)
+        .map(RecordBatch::from)
+        .map_err(|failure| {
+            invalid_argument(format!(
+                "bind values are not a valid Arrow array: {failure}"
+            ))
+        })
+}
 
 #[derive(Debug)]
 pub(super) struct BoundStreamReader {
@@ -108,22 +139,17 @@ impl Iterator for BoundStreamReader {
             from_ffi_and_data_type(array, DataType::Struct(self.schema.fields().clone()))
         })
         .and_then(|data| {
-            validate_imported(&data, self.schema.fields()).map_err(|failure| {
+            checked_struct(data).map_err(|failure| {
                 ArrowError::CDataInterface(format!(
                     "bound stream returned an invalid Arrow array: {failure}"
                 ))
-            })?;
-            if data.null_count() != 0 {
-                return Err(ArrowError::CDataInterface(
-                    "bound stream must not contain top-level null rows; put null values in the \
-                     individual columns instead"
-                        .to_owned(),
-                ));
-            }
-            let row_count = data.len();
+            })
+        })
+        .and_then(|array| {
+            let row_count = array.len();
             RecordBatch::try_new_with_options(
                 self.schema.clone(),
-                StructArray::from(data).into_parts().1,
+                array.into_parts().1,
                 &RecordBatchOptions::new().with_row_count(Some(row_count)),
             )
         });
@@ -142,7 +168,7 @@ impl RecordBatchReader for BoundStreamReader {
 /// malformed input, such as a struct whose children disagree with its fields at any depth.
 /// Catching the panic here keeps a caller's mistake from poisoning the statement in `dispatch`.
 /// Unwinding drops the imported structs, which runs their release callbacks.
-pub(super) fn contain_import<T>(
+fn contain_import<T>(
     import: impl FnOnce() -> std::result::Result<T, ArrowError>,
 ) -> std::result::Result<T, ArrowError> {
     std::panic::catch_unwind(AssertUnwindSafe(import)).unwrap_or_else(|cause| {
@@ -161,19 +187,30 @@ pub(super) fn contain_import<T>(
 ///
 /// Buffer bounds cannot be checked: the C interface passes pointers without allocation lengths,
 /// so producers must still uphold `from_ffi`'s safety contract.
-pub(super) fn validate_imported(
-    data: &ArrayData,
-    fields: &Fields,
-) -> std::result::Result<(), String> {
+fn checked_struct(data: ArrayData) -> std::result::Result<StructArray, ArrowError> {
+    let DataType::Struct(fields) = data.data_type() else {
+        return Err(ArrowError::CDataInterface(format!(
+            "values must be a struct array, not {}",
+            data.data_type()
+        )));
+    };
     // The struct has no values of its own; `validate_full` checks each column recursively.
-    data.validate_data()
-        .map_err(|failure| format!("the top-level struct is invalid: {failure}"))?;
+    data.validate_data().map_err(|failure| {
+        ArrowError::CDataInterface(format!("the top-level struct is invalid: {failure}"))
+    })?;
     for (field, column) in fields.iter().zip(data.child_data()) {
-        column
-            .validate_full()
-            .map_err(|failure| format!("column {:?} is invalid: {failure}", field.name()))?;
+        column.validate_full().map_err(|failure| {
+            ArrowError::CDataInterface(format!("column {:?} is invalid: {failure}", field.name()))
+        })?;
     }
-    Ok(())
+    if data.null_count() != 0 {
+        return Err(ArrowError::CDataInterface(
+            "values must not contain top-level null rows; put null values in the individual \
+             columns instead"
+                .to_owned(),
+        ));
+    }
+    Ok(StructArray::from(data))
 }
 
 fn stream_error(stream: &mut FFI_ArrowArrayStream, callback: &str, code: c_int) -> String {
@@ -188,3 +225,6 @@ fn stream_error(stream: &mut FFI_ArrowArrayStream, callback: &str, code: c_int) 
     };
     format!("bound Arrow C stream {callback} failed with error code {code}: {detail}")
 }
+
+#[cfg(test)]
+mod tests;
