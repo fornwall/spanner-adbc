@@ -107,7 +107,7 @@ impl TimestampPrecision {
 pub(crate) async fn result_set_to_batch(
     mut rs: ResultSet,
     precision: TimestampPrecision,
-) -> Result<(SchemaRef, RecordBatch)> {
+) -> Result<RecordBatch> {
     let mut rows: Vec<Row> = Vec::new();
     while let Some(row) = rs.next().await {
         rows.push(row.map_err(from_spanner)?);
@@ -123,10 +123,9 @@ pub(crate) fn rows_to_batch(
     metadata: &ResultSetMetadata,
     rows: &[Row],
     precision: TimestampPrecision,
-) -> Result<(SchemaRef, RecordBatch)> {
+) -> Result<RecordBatch> {
     let schema = build_schema(metadata, precision)?;
-    let batch = build_batch(schema.clone(), rows)?;
-    Ok((schema, batch))
+    build_batch(schema, rows)
 }
 
 /// Build the result schema from column metadata. The client rejects rows that arrive without

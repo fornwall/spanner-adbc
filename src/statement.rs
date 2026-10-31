@@ -207,8 +207,9 @@ impl SpannerStatement {
                         .execute_query(statement)
                         .await
                         .map_err(from_spanner)?;
-                    let (schema, _batch) = result_set_to_batch(result_set, precision).await?;
-                    Ok::<SchemaRef, Error>(schema)
+                    Ok::<SchemaRef, Error>(
+                        result_set_to_batch(result_set, precision).await?.schema(),
+                    )
                 },
             ),
         )
@@ -533,7 +534,7 @@ impl SpannerStatement {
                             .set_type(google_cloud_spanner::model::Type::from(ty.clone()))
                     }),
             );
-            let (schema, _batch) = result_set_to_batch(plan_rs, precision).await?;
+            let schema = result_set_to_batch(plan_rs, precision).await?.schema();
 
             let mut txn_builder = client.batch_read_only_transaction();
             if let Some(b) = bound {

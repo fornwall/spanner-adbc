@@ -3,7 +3,6 @@
 
 use adbc_core::error::{Result, Status};
 use arrow_array::{RecordBatch, StringArray};
-use arrow_schema::SchemaRef;
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::{Statement as SpannerSql, StatementBuilder};
 use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, TimestampBound};
@@ -80,7 +79,7 @@ pub(crate) fn table_exists(
             config.timeouts.query_timeout(),
             crate::OPTION_RPC_TIMEOUT_QUERY,
             async {
-                let (_schema, columns) =
+                let columns =
                     query_single_use(client, None, lookup, TimestampPrecision::default()).await?;
                 Ok(columns.num_rows() > 0)
             },
@@ -94,7 +93,7 @@ pub(crate) async fn query_single_use(
     bound: Option<TimestampBound>,
     statement: SpannerSql,
     precision: TimestampPrecision,
-) -> Result<(SchemaRef, RecordBatch)> {
+) -> Result<RecordBatch> {
     let result_set = crate::staleness::single_use(client, bound)
         .execute_query(statement)
         .await
@@ -163,8 +162,7 @@ pub(crate) async fn query_txn(
         .execute_query(statement.into())
         .await
         .map_err(from_spanner)?;
-    let (_schema, batch) = result_set_to_batch(result_set, TimestampPrecision::default()).await?;
-    Ok(batch)
+    result_set_to_batch(result_set, TimestampPrecision::default()).await
 }
 
 /// Column `index` of an `INFORMATION_SCHEMA` batch as a `T`.

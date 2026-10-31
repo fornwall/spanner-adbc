@@ -330,13 +330,13 @@ impl Connection for SpannerConnection {
             ),
         )?;
         match selected {
-            Ok((schema, _batch)) => with_declared_nullability(&schema, &columns?.1),
+            Ok(batch) => with_declared_nullability(batch.schema_ref(), &columns?),
             // A missing table is INVALID_ARGUMENT ("Table not found") from the query analyzer, but
             // ADBC wants NotFound. Other statuses keep their error: INFORMATION_SCHEMA hides
             // tables a role cannot read, which would turn a permission error into NotFound.
             Err(error)
                 if matches!(error.status, Status::InvalidArguments | Status::NotFound)
-                    && columns.is_ok_and(|(_, columns)| columns.num_rows() == 0) =>
+                    && columns.is_ok_and(|columns| columns.num_rows() == 0) =>
             {
                 Err(err(format!("table {table} not found"), Status::NotFound))
             }

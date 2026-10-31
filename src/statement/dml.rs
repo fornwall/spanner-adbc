@@ -151,9 +151,9 @@ impl SpannerStatement {
         let mut batches = Vec::with_capacity(results.len());
         let mut affected = 0i64;
         for (metadata, rows, count) in &results {
-            let (sch, batch) =
+            let batch =
                 crate::conversion::rows_to_batch(metadata, rows, self.config.timestamp_precision)?;
-            schema.get_or_insert(sch);
+            schema.get_or_insert_with(|| batch.schema());
             batches.push(batch);
             affected += count;
         }
