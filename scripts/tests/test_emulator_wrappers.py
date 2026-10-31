@@ -66,6 +66,7 @@ print("200", end="")
     def run_wrapper(self, wrapper, exit_code=0, command=None):
         result = subprocess.run(
             ["bash", str(SCRIPTS / wrapper), *(command or ["bash", "-c", f"exit {exit_code}"])],
+            cwd=self.root,
             env=self.env,
             capture_output=True,
             text=True,

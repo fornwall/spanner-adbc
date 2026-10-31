@@ -24,28 +24,8 @@ for dependency in docker curl; do
   }
 done
 
-# Public images need no registry credentials; bypass broken credential helpers.
-# The replacement config has no contexts, so keep the active context's endpoint.
-if [ -z "${DOCKER_HOST:-}" ]; then
-  DOCKER_HOST="$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)"
-  [ -n "$DOCKER_HOST" ] && export DOCKER_HOST
-fi
-unset DOCKER_CONTEXT
-DOCKER_CONFIG="$(mktemp -d)"
-export DOCKER_CONFIG
-echo '{}' > "$DOCKER_CONFIG/config.json"
-
-cleanup() {
-  # Docker writes the ID after creation, even if starting the container fails.
-  # A name collision creates no ID, so it cannot remove someone else's container.
-  if [ -s "$DOCKER_CONFIG/emulator.cid" ]; then
-    docker rm -f "$(cat "$DOCKER_CONFIG/emulator.cid")" >/dev/null 2>&1 || true
-  fi
-  rm -rf "$DOCKER_CONFIG"
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+source "$(dirname "${BASH_SOURCE[0]}")/backend-docker.sh"
+setup_backend_docker emulator
 
 echo ">> starting Spanner emulator ($IMAGE) as '$CONTAINER'"
 docker run -d --pull always --name "$CONTAINER" --cidfile "$DOCKER_CONFIG/emulator.cid" \

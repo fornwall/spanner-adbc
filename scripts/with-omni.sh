@@ -18,27 +18,8 @@ for dependency in docker timeout; do
   }
 done
 
-# Public images need no registry credentials; bypass broken credential helpers.
-# The replacement config has no contexts, so keep the active context's endpoint.
-if [ -z "${DOCKER_HOST:-}" ]; then
-  DOCKER_HOST="$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)"
-  [ -n "$DOCKER_HOST" ] && export DOCKER_HOST
-fi
-unset DOCKER_CONTEXT
-DOCKER_CONFIG="$(mktemp -d)"
-export DOCKER_CONFIG
-echo '{}' > "$DOCKER_CONFIG/config.json"
-
-cleanup() {
-  if [ -s "$DOCKER_CONFIG/omni.cid" ]; then
-    # Include the anonymous /spanner volume created by the image.
-    docker rm -fv "$(cat "$DOCKER_CONFIG/omni.cid")" >/dev/null 2>&1 || true
-  fi
-  rm -rf "$DOCKER_CONFIG"
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+source "$(dirname "${BASH_SOURCE[0]}")/backend-docker.sh"
+setup_backend_docker omni
 
 echo ">> starting Spanner Omni ($IMAGE) as '$CONTAINER'"
 docker run -d --pull always --name "$CONTAINER" --cidfile "$DOCKER_CONFIG/omni.cid" \

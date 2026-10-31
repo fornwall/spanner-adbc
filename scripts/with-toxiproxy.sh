@@ -24,29 +24,8 @@ for dependency in docker curl; do
   }
 done
 
-# Public images need no registry credentials; bypass broken credential helpers.
-# The replacement config has no contexts, so keep the active context's endpoint.
-if [ -z "${DOCKER_HOST:-}" ]; then
-  DOCKER_HOST="$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)"
-  [ -n "$DOCKER_HOST" ] && export DOCKER_HOST
-fi
-unset DOCKER_CONTEXT
-DOCKER_CONFIG="$(mktemp -d)"
-export DOCKER_CONFIG
-echo '{}' > "$DOCKER_CONFIG/config.json"
-
-cleanup() {
-  # Remove only containers created by this invocation, including failed starts.
-  for cidfile in "$DOCKER_CONFIG/toxiproxy.cid" "$DOCKER_CONFIG/emulator.cid"; do
-    if [ -s "$cidfile" ]; then
-      docker rm -f "$(cat "$cidfile")" >/dev/null 2>&1 || true
-    fi
-  done
-  rm -rf "$DOCKER_CONFIG"
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+source "$(dirname "${BASH_SOURCE[0]}")/backend-docker.sh"
+setup_backend_docker emulator toxiproxy
 
 wait_for_api() {
   local url="$1" cidfile="$2" deadline
