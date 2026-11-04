@@ -53,38 +53,38 @@ Keep pull requests focused.
 
 ## Dependency pins
 
-`Cargo.toml` pins two dependency families to git revisions:
+`Cargo.toml` pins the Google Cloud crates to one google-cloud-rust revision. This includes
+`spanner-grpc-mock`, which the mock-server tests use and which isn't published.
 
-- The Google Cloud crates, all on one google-cloud-rust revision. This includes
-  `spanner-grpc-mock`, which the mock-server tests use and which isn't published.
-- `adbc_core`, `adbc_ffi` and `adbc_driver_manager`, which track arrow-adbc `main`. The C++
-  validation suite (`ARROW_ADBC_TAG` in `adbc-validation/CMakeLists.txt`) uses the same revision,
-  and `src/ffi/abi.rs` transcribes that revision's `adbc.h`.
+`adbc_core`, `adbc_ffi` and `adbc_driver_manager` use one crates.io release. The C++ validation
+suite (`ARROW_ADBC_TAG` in `adbc-validation/CMakeLists.txt`) uses the matching
+`apache-arrow-adbc-N` tag, where crate version `0.N.x` comes from release `N`, and
+`src/ffi/abi.rs` transcribes that tag's `adbc.h`.
 
 The `arrow-*` crates use crates.io releases starting at 60.1, which supplies the
 `FFI_ArrowArrayStream` constructor and accessors that the C ABI needs.
 
-Each git-pinned family prevents publishing to crates.io, so the release configuration sets
-`publish = false`. Rust users of the crate have to match the pins; see the
+The git pin prevents publishing to crates.io, so the release configuration sets
+`publish = false`. Rust users of the crate have to match it; see the
 [README](README.md#rust).
 
-Keep each family on a single revision, which `scripts/tests/test_pins.py` checks. Before
-removing a pin, check that a registry release has the APIs the driver uses.
+`scripts/tests/test_pins.py` checks that the Google Cloud crates share a revision and that the
+ADBC crates and tag share a release. Before removing the pin, check that a registry release has
+the APIs the driver uses.
 
 ### Registry migration checklist
 
-When moving a family to crates.io, update these together:
+When moving the Google Cloud crates to crates.io, update these together:
 
-- The affected dependencies and dev-dependencies in `Cargo.toml`. Downstream users must use the
-  same `adbc_core`.
-- For ADBC, `ARROW_ADBC_TAG` in `adbc-validation/CMakeLists.txt` and the definitions in
-  `src/ffi/abi.rs`.
-- The `allow-git` entries in `deny.toml`, once a repository has no git dependencies left.
+- The affected dependencies and dev-dependencies in `Cargo.toml`.
+- The `allow-git` entry in `deny.toml`, once the repository has no git dependencies left.
 - The dependency notes in `README.md`, this file and [AGENTS.md](AGENTS.md#dependencies).
 
-For Google Cloud, also check that `spanner-grpc-mock` is published and compatible. Keep Arrow's
-version ranges within `adbc_core`'s. Keep `publish = false` until every family can come from the
-registry.
+Also check that `spanner-grpc-mock` is published and compatible. Keep `publish = false` until
+every dependency can come from the registry.
+
+When updating ADBC, update `ARROW_ADBC_TAG` and the definitions in `src/ffi/abi.rs` with the
+crates, and keep Arrow's version ranges within `adbc_core`'s.
 
 ## Versioning
 

@@ -63,10 +63,10 @@ name = "conversion"
 harness = false
 
 [dependencies]
-# Keep each git dependency family on one revision; see CONTRIBUTING.md for migration steps.
-# ADBC main supplies InfoCode::Other, needed to omit unknown info codes.
+# Keep the Google Cloud crates on one git revision; see CONTRIBUTING.md for migration steps.
+# Keep the adbc_* crates on one release, matching ARROW_ADBC_TAG in adbc-validation/CMakeLists.txt.
 # The C ABI is implemented in src/ffi/; adbc_ffi is only a test dependency.
-adbc_core = { git = "https://github.com/apache/arrow-adbc", rev = "aa2c1c2496d287e111d70d382e5d9af07568488b" }
+adbc_core = "0.25"
 # Arrow 60.1 supplies the C Stream constructor and accessors used by the C ABI.
 # Stay within adbc_core's Arrow range so its public types unify with ours.
 # ffi supplies the Arrow C Data and Stream interfaces.
@@ -80,13 +80,13 @@ libc = "0.2"
 # Keep Google Cloud crates aligned with the unpublished spanner-grpc-mock.
 # Disable unused builtin-metrics (Cloud Monitoring) to reduce library size.
 # Retain the default rustls crypto provider for TLS.
-google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "5a2297f47973775e925ce49d37971b03ce358fba", default-features = false, features = ["default-rustls-provider"] }
+google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "02a7a23f6e2df39f68c9af709475459d062dbc88", default-features = false, features = ["default-rustls-provider"] }
 # Anonymous, ADC and explicit credentials.
-google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "5a2297f47973775e925ce49d37971b03ce358fba" }
+google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "02a7a23f6e2df39f68c9af709475459d062dbc88" }
 # Poll admin DDL operations.
-google-cloud-lro = { git = "https://github.com/googleapis/google-cloud-rust", rev = "5a2297f47973775e925ce49d37971b03ce358fba" }
+google-cloud-lro = { git = "https://github.com/googleapis/google-cloud-rust", rev = "02a7a23f6e2df39f68c9af709475459d062dbc88" }
 # Structured protobuf details in Spanner errors; already a client dependency.
-google-cloud-wkt = { git = "https://github.com/googleapis/google-cloud-rust", rev = "5a2297f47973775e925ce49d37971b03ce358fba" }
+google-cloud-wkt = { git = "https://github.com/googleapis/google-cloud-rust", rev = "02a7a23f6e2df39f68c9af709475459d062dbc88" }
 # Bridge synchronous ADBC methods to the async Spanner client.
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 # Bound concurrent per-table statistics scans.
@@ -101,12 +101,12 @@ http = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 arbitrary = { version = "1", features = ["derive"], optional = true }
 # Forward structured gRPC status details into ADBC errors.
-google-cloud-gax = { git = "https://github.com/googleapis/google-cloud-rust", rev = "5a2297f47973775e925ce49d37971b03ce358fba" }
+google-cloud-gax = { git = "https://github.com/googleapis/google-cloud-rust", rev = "02a7a23f6e2df39f68c9af709475459d062dbc88" }
 # Use gRPC for DDL on every backend; Omni does not expose the SDK admin client's REST API.
-google-cloud-gax-internal = { git = "https://github.com/googleapis/google-cloud-rust", rev = "5a2297f47973775e925ce49d37971b03ce358fba", features = ["_internal-grpc-client"] }
-google-cloud-spanner-admin-database-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "5a2297f47973775e925ce49d37971b03ce358fba" }
-google-cloud-longrunning = { git = "https://github.com/googleapis/google-cloud-rust", rev = "5a2297f47973775e925ce49d37971b03ce358fba" }
-google-cloud-rpc = { git = "https://github.com/googleapis/google-cloud-rust", rev = "5a2297f47973775e925ce49d37971b03ce358fba" }
+google-cloud-gax-internal = { git = "https://github.com/googleapis/google-cloud-rust", rev = "02a7a23f6e2df39f68c9af709475459d062dbc88", features = ["_internal-grpc-client"] }
+google-cloud-spanner-admin-database-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "02a7a23f6e2df39f68c9af709475459d062dbc88" }
+google-cloud-longrunning = { git = "https://github.com/googleapis/google-cloud-rust", rev = "02a7a23f6e2df39f68c9af709475459d062dbc88" }
+google-cloud-rpc = { git = "https://github.com/googleapis/google-cloud-rust", rev = "02a7a23f6e2df39f68c9af709475459d062dbc88" }
 # Wire messages for the two DDL RPCs; already used by the Spanner client.
 prost = "0.14"
 prost-types = "0.14"
@@ -159,18 +159,18 @@ debug = true
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"] }
 proptest = "1"
-# Load the driver through the C ABI; keep the ADBC revision aligned with adbc_core.
-adbc_driver_manager = { git = "https://github.com/apache/arrow-adbc", rev = "aa2c1c2496d287e111d70d382e5d9af07568488b" }
+# Load the driver through the C ABI; keep the ADBC release aligned with adbc_core.
+adbc_driver_manager = "0.25"
 # Independent ABI definitions for raw lifecycle tests, separate from src/ffi/abi.rs.
-adbc_ffi = { git = "https://github.com/apache/arrow-adbc", rev = "aa2c1c2496d287e111d70d382e5d9af07568488b" }
+adbc_ffi = "0.25"
 # Load raw FFI functions to test invalid lifecycle operations.
 libloading = "0.9"
 # Create emulator test instances and databases; keep Google Cloud revisions aligned.
-google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "5a2297f47973775e925ce49d37971b03ce358fba" }
+google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "02a7a23f6e2df39f68c9af709475459d062dbc88" }
 # Offline benchmarks without plotters/rayon.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # Offline gRPC fault injection using the pinned client's own mock server.
-spanner-grpc-mock = { git = "https://github.com/googleapis/google-cloud-rust", rev = "5a2297f47973775e925ce49d37971b03ce358fba" }
+spanner-grpc-mock = { git = "https://github.com/googleapis/google-cloud-rust", rev = "02a7a23f6e2df39f68c9af709475459d062dbc88" }
 # Wire messages and error details for the mock server; match the Google Cloud graph.
 tonic = "0.14"
 tonic-prost = "0.14"

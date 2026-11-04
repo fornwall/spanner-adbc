@@ -20,11 +20,11 @@ if(SPANNER_VALIDATION_SANITIZE)
   add_link_options(-fsanitize=${SPANNER_VALIDATION_SANITIZE})
 endif()
 
-# Keep this revision in sync with adbc_core, adbc_ffi and adbc_driver_manager
+# Keep this release in sync with adbc_core, adbc_ffi and adbc_driver_manager
 # in Cargo.toml. The suite uses the upstream SQL-rewriting and identifier-quoting hooks.
-# FORCE replaces revisions cached in restored or incremental build trees.
-set(ARROW_ADBC_TAG "aa2c1c2496d287e111d70d382e5d9af07568488b"
-    CACHE STRING "arrow-adbc revision (apache/arrow-adbc main, see above)" FORCE)
+# FORCE replaces releases cached in restored or incremental build trees.
+set(ARROW_ADBC_TAG "apache-arrow-adbc-25"
+    CACHE STRING "arrow-adbc release tag (see above)" FORCE)
 
 include(FetchContent)
 
@@ -45,7 +45,7 @@ FetchContent_Declare(
   arrow_adbc
   GIT_REPOSITORY https://github.com/apache/arrow-adbc.git
   GIT_TAG ${ARROW_ADBC_TAG}
-  # A full clone is required to fetch a pinned commit behind the current branch tip.
+  GIT_SHALLOW TRUE
   # The C/C++ project lives under c/ in the monorepo.
   SOURCE_SUBDIR c)
 # Use the fetched GoogleTest: imported targets from a host installation can be

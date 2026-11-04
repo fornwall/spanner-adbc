@@ -1,6 +1,6 @@
 # Known limitations
 
-These limitations come from the Google Cloud client and ADBC revisions pinned in
+These limitations come from the Google Cloud client revision and ADBC release in
 [Cargo.toml](../Cargo.toml). The [README](../README.md#limitations) lists unsupported features,
 and [transactions](transactions.md) describes transaction behavior.
 

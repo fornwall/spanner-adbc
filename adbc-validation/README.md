@@ -22,7 +22,7 @@ database. Without a configured target it starts an emulator. The target is chose
 Spanner database must already exist and is reached with ADC; use a dedicated test database.
 
 [CMakeLists.txt](CMakeLists.txt) pins arrow-adbc with `ARROW_ADBC_TAG` and fetches and builds
-the C++ dependencies. Keep that revision in line with the arrow-adbc crates in `Cargo.toml`.
+the C++ dependencies. Keep that release in line with the arrow-adbc crates in `Cargo.toml`.
 `ADBC_VALIDATION_BUILD_DIR` overrides the build directory.
 
 `--full` runs each case in its own process through CTest and prints failures, but always exits

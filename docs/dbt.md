@@ -15,7 +15,7 @@ plus an experimental `Generic` variant that loads a library by name and entrypoi
 could load this driver (library `spanner_adbc`, entrypoint `AdbcSpannerInit`), but a usable
 adapter also needs upstream changes to dbt: a profile type and its authentication options, a SQL
 dialect, metadata queries, and macros and materializations.
-Use the C ABI rather than a Rust dependency on this crate, whose git-pinned ADBC and Arrow
+Use the C ABI rather than a Rust dependency on this crate, whose ADBC and Arrow
 crates differ from dbt's.
 
 ## Driver behavior that shapes an adapter

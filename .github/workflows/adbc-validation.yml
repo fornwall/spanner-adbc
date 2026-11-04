@@ -67,9 +67,9 @@ jobs:
         if: matrix.rust-sanitize != ''
         uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
         with:
-          version: "23.1.4"
+          version: "23.1.5"
           # The action's bundled release list predates LLVM 23.
-          force-url: https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.4/LLVM-23.1.4-Linux-X64.tar.xz
+          force-url: https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.5/LLVM-23.1.5-Linux-X64.tar.xz
           directory: ${{ runner.temp }}/llvm
           env: true
 

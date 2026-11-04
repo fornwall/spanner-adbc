@@ -183,10 +183,10 @@ Binding and ingest accept most Arrow types and widen narrow ones. Some Spanner t
 
 ## Rust
 
-The crate isn't on crates.io because it depends on git revisions of the Google Cloud and ADBC
-crates. To use it, add it as a git dependency and use the same `adbc_core` revision as
-this repository's [Cargo.toml](Cargo.toml). Arrow comes from crates.io.
-[Dependency pins](CONTRIBUTING.md#dependency-pins) explains why the pins exist.
+The crate isn't on crates.io because it depends on a git revision of the Google Cloud crates.
+To use it, add it as a git dependency and use the same `adbc_core` release as this repository's
+[Cargo.toml](Cargo.toml). ADBC and Arrow come from crates.io.
+[Dependency pins](CONTRIBUTING.md#dependency-pins) explains why the pin exists.
 Leave the `strip-logging` feature off, since Cargo would apply it to
 every crate in your build and silence their logging.
 

@@ -6,8 +6,8 @@ and [transactions](transactions.md) for transaction rules.
 
 ## ADBC support
 
-The driver implements ADBC API 1.1.0, as defined by the `adbc.h` of the arrow-adbc revision
-pinned in [Cargo.toml](../Cargo.toml). `AdbcSpannerInit` and the fallback `AdbcDriverInit` fill
+The driver implements ADBC API 1.1.0, as defined by the `adbc.h` of the arrow-adbc release
+in [Cargo.toml](../Cargo.toml). `AdbcSpannerInit` and the fallback `AdbcDriverInit` fill
 in a 1.0.0 or 1.1.0 driver table and return `NOT_IMPLEMENTED` for any other version, so a driver
 manager can retry with an older one. `get_info` reports `DriverAdbcVersion` as 1.1.0
 (`1001000`).

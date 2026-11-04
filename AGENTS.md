@@ -54,16 +54,16 @@ and test commands.
 
 ## Dependencies
 
-[CONTRIBUTING.md](CONTRIBUTING.md#dependency-pins) explains why the Google Cloud and ADBC
-crates are pinned to git revisions.
+[CONTRIBUTING.md](CONTRIBUTING.md#dependency-pins) explains why the Google Cloud crates are
+pinned to a git revision.
 
 - Read revisions from `Cargo.toml` and `Cargo.lock`, and find the matching source with
   `cargo metadata --format-version 1 --locked`. Don't guess checkout hashes or rely on API
   documentation for another revision.
 - Keep `adbc_core`, `adbc_ffi`, `adbc_driver_manager` and CMake's `ARROW_ADBC_TAG` on one
-  revision; `src/ffi/abi.rs` transcribes that revision's `c/include/arrow-adbc/adbc.h`.
+  release; `src/ffi/abi.rs` transcribes that release's `c/include/arrow-adbc/adbc.h`.
 - Keep all Google Cloud crates, including `spanner-grpc-mock`, on one revision.
-- Don't drop a pin just to use a registry release. When a release has the required APIs, follow
+- Don't drop the pin just to use a registry release. When a release has the required APIs, follow
   the [registry migration checklist](CONTRIBUTING.md#registry-migration-checklist).
 
 ## Releases
