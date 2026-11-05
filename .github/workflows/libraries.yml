@@ -232,8 +232,9 @@ jobs:
           sha="${{ github.sha }}"
           repo="${{ github.repository }}"
           required=(ci.yml adbc-validation.yml foundry-validation.yml)
-          # Allow 30 minutes for runs to register and complete; missing runs block publishing.
-          deadline=$(( SECONDS + 1800 ))
+          # Allow 75 minutes for runs to register and complete; missing runs block publishing.
+          # This covers Foundry's 60-minute job timeout plus queueing.
+          deadline=$(( SECONDS + 4500 ))
           while true; do
             pending=()
             for wf in "${required[@]}"; do
@@ -257,7 +258,7 @@ jobs:
               exit 0
             fi
             if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::timed out after 30m waiting for these workflows to complete on ${sha}: ${pending[*]}" >&2
+              echo "::error::timed out after 75m waiting for these workflows to complete on ${sha}: ${pending[*]}" >&2
               exit 1
             fi
             sleep 20
