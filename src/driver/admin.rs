@@ -26,11 +26,11 @@ use wire::{OperationResult, WireGetOperation, WireOperation, WireUpdateDatabaseD
 pub(crate) async fn database_admin(
     mut config: ClientConfig,
 ) -> google_cloud_gax::client_builder::Result<DatabaseAdmin> {
-    // Cloud schema changes take seconds to minutes. The default poll interval doubles up to a
-    // minute, so it can notice completion almost as late again as the change took.
+    // Cloud schema changes take seconds to minutes and callers block on each one. The default
+    // poll interval doubles up to a minute, which can nearly double the wait.
     let polling = ExponentialBackoffBuilder::new()
-        .with_initial_delay(Duration::from_secs(1))
-        .with_maximum_delay(Duration::from_secs(10))
+        .with_initial_delay(Duration::from_millis(250))
+        .with_maximum_delay(Duration::from_secs(2))
         .with_scaling(1.5)
         .clamp();
     config.polling_backoff_policy = Some(Arc::new(polling));
