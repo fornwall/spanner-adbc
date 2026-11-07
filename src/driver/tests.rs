@@ -175,6 +175,15 @@ fn a_non_string_uri_is_rejected() {
 }
 
 #[test]
+fn the_uri_option_can_be_spelled_as_an_other_key() {
+    let mut db = new_database();
+    let key = || OptionDatabase::Other("uri".into());
+    let uri = "spanner:///projects/p/instances/i/databases/d";
+    db.set_option(key(), uri.into()).unwrap();
+    assert_eq!(db.get_option_string(key()).unwrap(), uri);
+}
+
+#[test]
 fn keyfile_path_round_trips_but_inline_json_is_write_only() {
     let mut db = new_database();
     db.set_option(

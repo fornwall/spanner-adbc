@@ -8,6 +8,7 @@ use credentials::{CredentialChoice, first_token};
 pub(crate) use uri::ensure_scheme;
 use uri::{URI_FORM, is_plaintext_endpoint};
 
+use adbc_core::constants::{ADBC_OPTION_PASSWORD, ADBC_OPTION_URI, ADBC_OPTION_USERNAME};
 use adbc_core::error::{Result, Status};
 use adbc_core::options::{OptionDatabase, OptionValue};
 use adbc_core::{Database, Driver, Optionable};
@@ -18,11 +19,12 @@ use google_cloud_spanner::omni::InstanceType;
 
 use crate::connection::SpannerConnection;
 use crate::error::{
-    err, from_builder, from_spanner, invalid_argument, invalid_state, option_not_set,
+    err, from_builder, from_spanner, invalid_argument, invalid_state, not_found, option_not_set,
     unknown_option, unsupported,
 };
 use crate::options::{
-    F64Range, f64_option, impl_typed_option_getters, non_empty_string_option, shown,
+    F64Range, bool_option, f64_option, impl_typed_option_getters, non_empty_string_option, shown,
+    string_option,
 };
 use crate::runtime::{SharedRuntime, block_on, new_runtime};
 use crate::{
@@ -483,20 +485,16 @@ impl Optionable for SpannerDatabase {
         // Any option may change what the cached stack was built from. Dropping it even when the
         // set fails below only costs a rebuild.
         *self.connected.get_mut().unwrap() = None;
-        match &key {
-            OptionDatabase::Uri => {
-                let value = string_value(&key, value)?;
-                self.set_uri_option(value)?
-            }
-            OptionDatabase::Other(name) if name == OPTION_ENDPOINT => {
-                let endpoint = string_value(&key, value)?;
+        let name = key.as_ref();
+        match name {
+            ADBC_OPTION_URI => self.set_uri_option(string_option(value, name)?)?,
+            OPTION_ENDPOINT => {
+                let endpoint = string_option(value, name)?;
                 self.endpoint = (!endpoint.trim().is_empty()).then_some(endpoint);
             }
-            OptionDatabase::Other(name) if name == OPTION_EMULATOR => {
-                self.emulator = bool_value(&key, value)?
-            }
-            OptionDatabase::Other(name) if name == OPTION_INSTANCE_TYPE => {
-                self.instance_type = match string_value(&key, value)?.as_str() {
+            OPTION_EMULATOR => self.emulator = bool_option(value, name)?,
+            OPTION_INSTANCE_TYPE => {
+                self.instance_type = match string_option(value, name)?.as_str() {
                     "cloud" => InstanceType::Cloud,
                     "omni" => InstanceType::Omni,
                     other => {
@@ -506,22 +504,18 @@ impl Optionable for SpannerDatabase {
                     }
                 };
             }
-            OptionDatabase::Other(name) if name == OPTION_KEYFILE => {
-                self.keyfile = non_empty_string_option(value, name)?
-            }
-            OptionDatabase::Other(name) if name == OPTION_KEYFILE_JSON => {
-                self.keyfile_json = non_empty_string_option(value, name)?
-            }
-            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_TARGET_PRINCIPAL => {
+            OPTION_KEYFILE => self.keyfile = non_empty_string_option(value, name)?,
+            OPTION_KEYFILE_JSON => self.keyfile_json = non_empty_string_option(value, name)?,
+            OPTION_IMPERSONATE_TARGET_PRINCIPAL => {
                 self.impersonate_target_principal = non_empty_string_option(value, name)?
             }
-            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_DELEGATES => {
-                self.impersonate_delegates = comma_separated(&string_value(&key, value)?)
+            OPTION_IMPERSONATE_DELEGATES => {
+                self.impersonate_delegates = comma_separated(&string_option(value, name)?)
             }
-            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_SCOPES => {
-                self.impersonate_scopes = comma_separated(&string_value(&key, value)?)
+            OPTION_IMPERSONATE_SCOPES => {
+                self.impersonate_scopes = comma_separated(&string_option(value, name)?)
             }
-            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_LIFETIME => {
+            OPTION_IMPERSONATE_LIFETIME => {
                 let seconds = u64_seconds_value(name, value)?;
                 if seconds.is_some_and(|seconds| !(1..=43200).contains(&seconds)) {
                     return Err(invalid_argument(format!(
@@ -530,48 +524,31 @@ impl Optionable for SpannerDatabase {
                 }
                 self.impersonate_lifetime_secs = seconds;
             }
-            OptionDatabase::Other(name) if name == OPTION_ACCESS_TOKEN => {
-                self.access_token = non_empty_string_option(value, name)?
-            }
-            OptionDatabase::Other(name) if name == OPTION_QUOTA_PROJECT => {
-                self.quota_project = non_empty_string_option(value, name)?
-            }
-            OptionDatabase::Other(name) if name == OPTION_RPC_TIMEOUT_CONNECT => {
+            OPTION_ACCESS_TOKEN => self.access_token = non_empty_string_option(value, name)?,
+            OPTION_QUOTA_PROJECT => self.quota_project = non_empty_string_option(value, name)?,
+            OPTION_RPC_TIMEOUT_CONNECT => {
                 self.connect_timeout_secs = f64_option(value, name, F64Range::NonNegativeSeconds)?
             }
-            OptionDatabase::Username | OptionDatabase::Password => {
+            ADBC_OPTION_USERNAME | ADBC_OPTION_PASSWORD => {
                 return Err(unsupported(format!(
-                    "Spanner does not use the {} option; it authenticates with Application \
+                    "Spanner does not use the {name} option; it authenticates with Application \
                      Default Credentials unless {OPTION_KEYFILE}, {OPTION_KEYFILE_JSON}, \
-                     {OPTION_ACCESS_TOKEN} or {OPTION_IMPERSONATE_TARGET_PRINCIPAL} is set",
-                    key.as_ref()
+                     {OPTION_ACCESS_TOKEN} or {OPTION_IMPERSONATE_TARGET_PRINCIPAL} is set"
                 )));
             }
-            other => {
-                return Err(unknown_option("database", other.as_ref()));
-            }
+            _ => return Err(unknown_option("database", name)),
         }
         Ok(())
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
-        // Secrets are write-only, so tools that dump options cannot print a credential.
-        if let OptionDatabase::Other(name) = &key
-            && (name == OPTION_KEYFILE_JSON || name == OPTION_ACCESS_TOKEN)
-        {
-            return Err(err(
-                format!("option {name} is write-only (it holds a secret) and cannot be read back"),
-                Status::NotFound,
-            ));
-        }
-        let value = match &key {
+        let name = key.as_ref();
+        let value = match name {
             // adbc.h: `GetOption` returns the option value, so the URI comes back as set.
-            OptionDatabase::Uri => self.uri.clone(),
-            OptionDatabase::Other(name) if name == OPTION_ENDPOINT => self.endpoint.clone(),
-            OptionDatabase::Other(name) if name == OPTION_EMULATOR => {
-                Some(self.emulator.to_string())
-            }
-            OptionDatabase::Other(name) if name == OPTION_INSTANCE_TYPE => Some(
+            ADBC_OPTION_URI => self.uri.clone(),
+            OPTION_ENDPOINT => self.endpoint.clone(),
+            OPTION_EMULATOR => Some(self.emulator.to_string()),
+            OPTION_INSTANCE_TYPE => Some(
                 if self.instance_type == InstanceType::Omni {
                     "omni"
                 } else {
@@ -579,29 +556,27 @@ impl Optionable for SpannerDatabase {
                 }
                 .to_string(),
             ),
-            OptionDatabase::Other(name) if name == OPTION_KEYFILE => self.keyfile.clone(),
-            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_TARGET_PRINCIPAL => {
-                self.impersonate_target_principal.clone()
-            }
-            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_DELEGATES => {
-                (!self.impersonate_delegates.is_empty())
-                    .then(|| self.impersonate_delegates.join(","))
-            }
-            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_SCOPES => {
+            OPTION_KEYFILE => self.keyfile.clone(),
+            OPTION_IMPERSONATE_TARGET_PRINCIPAL => self.impersonate_target_principal.clone(),
+            OPTION_IMPERSONATE_DELEGATES => (!self.impersonate_delegates.is_empty())
+                .then(|| self.impersonate_delegates.join(",")),
+            OPTION_IMPERSONATE_SCOPES => {
                 (!self.impersonate_scopes.is_empty()).then(|| self.impersonate_scopes.join(","))
             }
-            OptionDatabase::Other(name) if name == OPTION_IMPERSONATE_LIFETIME => {
+            OPTION_IMPERSONATE_LIFETIME => {
                 self.impersonate_lifetime_secs.map(|secs| secs.to_string())
             }
-            OptionDatabase::Other(name) if name == OPTION_QUOTA_PROJECT => {
-                self.quota_project.clone()
-            }
-            OptionDatabase::Other(name) if name == OPTION_RPC_TIMEOUT_CONNECT => {
-                self.connect_timeout_secs.map(|secs| secs.to_string())
+            OPTION_QUOTA_PROJECT => self.quota_project.clone(),
+            OPTION_RPC_TIMEOUT_CONNECT => self.connect_timeout_secs.map(|secs| secs.to_string()),
+            // Secrets are write-only, so tools that dump options cannot print a credential.
+            OPTION_KEYFILE_JSON | OPTION_ACCESS_TOKEN => {
+                return Err(not_found(format!(
+                    "option {name} is write-only (it holds a secret) and cannot be read back"
+                )));
             }
             _ => None,
         };
-        value.ok_or_else(|| option_not_set(key.as_ref()))
+        value.ok_or_else(|| option_not_set(name))
     }
 
     impl_typed_option_getters!();
@@ -629,10 +604,6 @@ impl Database for SpannerDatabase {
     }
 }
 
-fn string_value(key: &OptionDatabase, value: OptionValue) -> Result<String> {
-    crate::options::string_option(value, key.as_ref())
-}
-
 /// Split a comma-separated value, trimming entries and dropping empty ones.
 fn comma_separated(value: &str) -> Vec<String> {
     value
@@ -658,10 +629,6 @@ fn u64_seconds_value(key: &str, value: OptionValue) -> Result<Option<u64>> {
             shown(&value)
         ))
     })
-}
-
-fn bool_value(key: &OptionDatabase, value: OptionValue) -> Result<bool> {
-    crate::options::bool_option(value, key.as_ref())
 }
 
 #[cfg(test)]

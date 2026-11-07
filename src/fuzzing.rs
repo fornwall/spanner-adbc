@@ -189,8 +189,8 @@ pub fn exercise_database_options(ops: Vec<(String, OptValue)>) {
     }
 }
 
-/// Set an arbitrary `uri` option, which [`exercise_database_options`] cannot reach because it
-/// only sets `Other(key)`. No network I/O.
+/// Set an arbitrary `uri` option, which the random keys of [`exercise_database_options`] rarely
+/// name. No network I/O.
 pub fn expand_connection_uri(uri: &str) {
     use adbc_core::Optionable;
     use adbc_core::options::{OptionDatabase, OptionValue};
