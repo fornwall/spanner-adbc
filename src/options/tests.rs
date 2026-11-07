@@ -60,16 +60,19 @@ fn numeric_parsers_name_the_option_and_echo_the_value() {
 
 #[test]
 fn typed_getters_parse_the_stored_string() {
-    assert_eq!(int_from_stored_string(Ok("-5".into()), "o").unwrap(), -5);
     assert_eq!(
-        double_from_stored_string(Ok("1.5".into()), "o").unwrap(),
+        parse_stored::<i64>(Ok("-5".into()), "o", "an integer").unwrap(),
+        -5
+    );
+    assert_eq!(
+        parse_stored::<f64>(Ok("1.5".into()), "o", "a number").unwrap(),
         1.5
     );
     // NotFound would mean the option is unset.
-    let error = int_from_stored_string(Ok("1.5".into()), "o").unwrap_err();
+    let error = parse_stored::<i64>(Ok("1.5".into()), "o", "an integer").unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     assert_eq!(error.message, "option o value \"1.5\" is not an integer");
-    let error = double_from_stored_string(Ok("true".into()), "o").unwrap_err();
+    let error = parse_stored::<f64>(Ok("true".into()), "o", "a number").unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
 }
 
@@ -77,10 +80,10 @@ fn typed_getters_parse_the_stored_string() {
 fn typed_getters_propagate_the_string_lookup_error_unchanged() {
     let unset = || crate::error::option_not_set("o");
     let expected = unset().message;
-    let error = int_from_stored_string(Err(unset()), "o").unwrap_err();
+    let error = parse_stored::<i64>(Err(unset()), "o", "an integer").unwrap_err();
     assert_eq!(error.status, Status::NotFound);
     assert_eq!(error.message, expected);
-    let error = double_from_stored_string(Err(unset()), "o").unwrap_err();
+    let error = parse_stored::<f64>(Err(unset()), "o", "a number").unwrap_err();
     assert_eq!(error.status, Status::NotFound);
     assert_eq!(error.message, expected);
 }

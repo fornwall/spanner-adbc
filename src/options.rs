@@ -1,10 +1,10 @@
 //! Option value parsing, and the configuration shared by connections and statements. The
 //! parsers take the option key and name it in their errors.
 
-use std::time::Duration;
-
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use adbc_core::error::Result;
 use adbc_core::options::OptionValue;
@@ -163,23 +163,19 @@ pub(crate) fn positive_usize(value: OptionValue, key: &str) -> Result<usize> {
     })
 }
 
-/// Parse a `get_option_string` result for `get_option_int`.
+/// Parse a `get_option_string` result for `get_option_int` or `get_option_double`.
 ///
 /// Lookup errors pass through unchanged, since ADBC's `NotFound` means unset or unknown. A value
-/// that is not an integer is `InvalidArguments`.
-pub(crate) fn int_from_stored_string(stored: Result<String>, key: &str) -> Result<i64> {
+/// that is not `expected` is `InvalidArguments`.
+pub(crate) fn parse_stored<T: FromStr>(
+    stored: Result<String>,
+    key: &str,
+    expected: &str,
+) -> Result<T> {
     let value = stored?;
     value
-        .parse::<i64>()
-        .map_err(|_| invalid_argument(format!("option {key} value {value:?} is not an integer")))
-}
-
-/// Parse a `get_option_string` result for `get_option_double`, as [`int_from_stored_string`].
-pub(crate) fn double_from_stored_string(stored: Result<String>, key: &str) -> Result<f64> {
-    let value = stored?;
-    value
-        .parse::<f64>()
-        .map_err(|_| invalid_argument(format!("option {key} value {value:?} is not a number")))
+        .parse()
+        .map_err(|_| invalid_argument(format!("option {key} value {value:?} is not {expected}")))
 }
 
 /// Implement `get_option_bytes`, `get_option_int` and `get_option_double` in terms of
@@ -191,13 +187,13 @@ macro_rules! impl_typed_option_getters {
         }
 
         fn get_option_int(&self, key: Self::Option) -> Result<i64> {
-            let name = key.as_ref().to_string();
-            crate::options::int_from_stored_string(self.get_option_string(key), &name)
+            let stored = self.get_option_string(key.clone());
+            crate::options::parse_stored(stored, key.as_ref(), "an integer")
         }
 
         fn get_option_double(&self, key: Self::Option) -> Result<f64> {
-            let name = key.as_ref().to_string();
-            crate::options::double_from_stored_string(self.get_option_string(key), &name)
+            let stored = self.get_option_string(key.clone());
+            crate::options::parse_stored(stored, key.as_ref(), "a number")
         }
     };
 }
