@@ -14,7 +14,7 @@ use crate::conversion::TimestampPrecision;
 use crate::directed_read::{self, DirectedRead};
 use crate::error::invalid_argument;
 use crate::query_options::QueryOptionsConfig;
-use crate::request::{CommitStats, RequestConfig};
+use crate::request::{CommitStats, RequestConfig, parse_max_commit_delay, parse_priority};
 use crate::retry::RetryConfig;
 use crate::staleness::{ReadStaleness, parse_read_bound};
 use crate::timeout::RpcTimeouts;
@@ -245,15 +245,25 @@ impl SharedConfig {
             crate::OPTION_READ_STALENESS => {
                 self.read_staleness.set(value, key, parse_read_bound)?
             }
-            crate::OPTION_REQUEST_PRIORITY => self.request.set_priority(value)?,
-            crate::OPTION_REQUEST_TAG => self.request.set_request_tag(value)?,
+            crate::OPTION_REQUEST_PRIORITY => {
+                self.request.priority.set(value, key, parse_priority)?
+            }
+            crate::OPTION_REQUEST_TAG => {
+                self.request.request_tag = non_empty_string_option(value, key)?
+            }
             crate::OPTION_DIRECTED_READ => {
                 self.directed_read.set(value, key, directed_read::parse)?
             }
-            crate::OPTION_MAX_COMMIT_DELAY => self.request.set_max_commit_delay(value)?,
-            crate::OPTION_COMMIT_STATS => self.request.set_commit_stats(value)?,
+            crate::OPTION_MAX_COMMIT_DELAY => {
+                self.request
+                    .max_commit_delay
+                    .set(value, key, parse_max_commit_delay)?
+            }
+            crate::OPTION_COMMIT_STATS => {
+                self.request.return_commit_stats = bool_option_unsettable(value, key)?
+            }
             crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS => {
-                self.request.set_exclude_txn_from_change_streams(value)?
+                self.request.exclude_txn_from_change_streams = bool_option_unsettable(value, key)?
             }
             crate::OPTION_QUERY_OPTIMIZER_VERSION => {
                 self.query_options.optimizer_version = non_empty_string_option(value, key)?
@@ -297,15 +307,15 @@ impl SharedConfig {
     pub(crate) fn option_string(&self, key: &str) -> Result<String> {
         let value: Option<String> = match key {
             crate::OPTION_READ_STALENESS => self.read_staleness.raw().map(str::to_string),
-            crate::OPTION_REQUEST_PRIORITY => self.request.priority_string().map(str::to_string),
-            crate::OPTION_REQUEST_TAG => self.request.request_tag_string().map(str::to_string),
+            crate::OPTION_REQUEST_PRIORITY => self.request.priority.raw().map(str::to_string),
+            crate::OPTION_REQUEST_TAG => self.request.request_tag.clone(),
             crate::OPTION_DIRECTED_READ => self.directed_read.raw().map(str::to_string),
             crate::OPTION_MAX_COMMIT_DELAY => {
-                self.request.max_commit_delay_string().map(str::to_string)
+                self.request.max_commit_delay.raw().map(str::to_string)
             }
-            crate::OPTION_COMMIT_STATS => Some(self.request.return_commit_stats().to_string()),
+            crate::OPTION_COMMIT_STATS => Some(self.request.return_commit_stats.to_string()),
             crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS => {
-                Some(self.request.exclude_txn_from_change_streams().to_string())
+                Some(self.request.exclude_txn_from_change_streams.to_string())
             }
             crate::OPTION_COMMIT_STATS_MUTATION_COUNT => {
                 self.commit_stats.mutation_count().map(|n| n.to_string())

@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adbc_core::error::Result;
-use adbc_core::options::OptionValue;
 use google_cloud_spanner::builder::{
     BatchDmlBuilder, BatchWriteTransactionBuilder, TransactionRunnerBuilder,
     WriteOnlyTransactionBuilder,
@@ -14,13 +13,13 @@ use google_cloud_spanner::model::request_options::Priority;
 use google_cloud_spanner::statement::StatementBuilder;
 
 use crate::error::invalid_argument;
-use crate::options::{RawParsed, bool_option_unsettable, non_empty_string_option};
+use crate::options::RawParsed;
 use crate::staleness::parse_duration;
 
 /// Spanner rejects larger values at commit; checking at set time gives a clearer error.
 const MAX_COMMIT_DELAY_CAP: Duration = Duration::from_millis(500);
 
-fn parse_priority(value: &str) -> Result<Priority> {
+pub(crate) fn parse_priority(value: &str) -> Result<Priority> {
     match value {
         "low" => Ok(Priority::Low),
         "medium" => Ok(Priority::Medium),
@@ -62,8 +61,8 @@ macro_rules! apply_to_commit_builder {
             if let Some(tag) = &self.transaction_tag {
                 builder = builder.set_transaction_tag(tag.as_str());
             }
-            if let Some(delay) = self.commit_delay() {
-                builder = builder.set_max_commit_delay(delay);
+            if let Some(delay) = self.max_commit_delay.parsed() {
+                builder = builder.set_max_commit_delay(*delay);
             }
             if self.return_commit_stats {
                 builder = builder.set_return_commit_stats(true);
@@ -80,77 +79,15 @@ macro_rules! apply_to_commit_builder {
 /// override everything except the transaction tag.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RequestConfig {
-    priority: RawParsed<Priority>,
-    request_tag: Option<String>,
-    transaction_tag: Option<String>,
-    max_commit_delay: RawParsed<Duration>,
-    return_commit_stats: bool,
-    exclude_txn_from_change_streams: bool,
+    pub(crate) priority: RawParsed<Priority>,
+    pub(crate) request_tag: Option<String>,
+    pub(crate) transaction_tag: Option<String>,
+    pub(crate) max_commit_delay: RawParsed<Duration>,
+    pub(crate) return_commit_stats: bool,
+    pub(crate) exclude_txn_from_change_streams: bool,
 }
 
 impl RequestConfig {
-    pub(crate) fn set_priority(&mut self, value: OptionValue) -> Result<()> {
-        self.priority
-            .set(value, crate::OPTION_REQUEST_PRIORITY, parse_priority)
-    }
-
-    pub(crate) fn set_request_tag(&mut self, value: OptionValue) -> Result<()> {
-        self.request_tag = non_empty_string_option(value, crate::OPTION_REQUEST_TAG)?;
-        Ok(())
-    }
-
-    pub(crate) fn set_transaction_tag(&mut self, value: OptionValue) -> Result<()> {
-        self.transaction_tag = non_empty_string_option(value, crate::OPTION_TRANSACTION_TAG)?;
-        Ok(())
-    }
-
-    pub(crate) fn set_max_commit_delay(&mut self, value: OptionValue) -> Result<()> {
-        self.max_commit_delay.set(
-            value,
-            crate::OPTION_MAX_COMMIT_DELAY,
-            parse_max_commit_delay,
-        )
-    }
-
-    pub(crate) fn set_commit_stats(&mut self, value: OptionValue) -> Result<()> {
-        self.return_commit_stats = bool_option_unsettable(value, crate::OPTION_COMMIT_STATS)?;
-        Ok(())
-    }
-
-    pub(crate) fn return_commit_stats(&self) -> bool {
-        self.return_commit_stats
-    }
-
-    pub(crate) fn set_exclude_txn_from_change_streams(&mut self, value: OptionValue) -> Result<()> {
-        self.exclude_txn_from_change_streams =
-            bool_option_unsettable(value, crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS)?;
-        Ok(())
-    }
-
-    pub(crate) fn exclude_txn_from_change_streams(&self) -> bool {
-        self.exclude_txn_from_change_streams
-    }
-
-    pub(crate) fn priority_string(&self) -> Option<&str> {
-        self.priority.raw()
-    }
-
-    pub(crate) fn request_tag_string(&self) -> Option<&str> {
-        self.request_tag.as_deref()
-    }
-
-    pub(crate) fn transaction_tag_string(&self) -> Option<&str> {
-        self.transaction_tag.as_deref()
-    }
-
-    pub(crate) fn max_commit_delay_string(&self) -> Option<&str> {
-        self.max_commit_delay.raw()
-    }
-
-    fn commit_delay(&self) -> Option<Duration> {
-        self.max_commit_delay.parsed().copied()
-    }
-
     apply_to_request_builder! {
         /// Apply the priority and request tag to a query or DML statement.
         apply_to_statement(StatementBuilder)
@@ -225,7 +162,7 @@ impl CommitStats {
 }
 
 /// Parse a `spanner.commit.max_delay` duration of at most 500ms.
-fn parse_max_commit_delay(value: &str) -> Result<Duration> {
+pub(crate) fn parse_max_commit_delay(value: &str) -> Result<Duration> {
     let duration = parse_duration(value, crate::OPTION_MAX_COMMIT_DELAY)?;
     if duration > MAX_COMMIT_DELAY_CAP {
         return Err(invalid_argument(format!(

@@ -114,17 +114,12 @@ fn filtered_query_binds_each_present_pattern() {
 fn configured() -> SharedConfig {
     let mut config = SharedConfig::default();
     config
-        .request
-        .set_priority(OptionValue::String("low".into()))
+        .set_option(crate::OPTION_REQUEST_PRIORITY, "low".into())
         .unwrap();
     config
-        .request
-        .set_request_tag(OptionValue::String("user-request-tag".into()))
+        .set_option(crate::OPTION_REQUEST_TAG, "user-request-tag".into())
         .unwrap();
-    config
-        .request
-        .set_transaction_tag(OptionValue::String("user-txn-tag".into()))
-        .unwrap();
+    config.request.transaction_tag = Some("user-txn-tag".into());
     config
         .set_option(
             crate::OPTION_DIRECTED_READ,

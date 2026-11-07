@@ -22,7 +22,7 @@ use crate::error::{
     annotate, commit_outcome_unknown, err, from_spanner, invalid_argument, invalid_state,
     is_mutation_limit_exceeded, option_not_set, unknown_option, unsupported,
 };
-use crate::options::{SharedConfig, impl_typed_option_getters};
+use crate::options::{SharedConfig, impl_typed_option_getters, non_empty_string_option};
 use crate::reader::stream_query;
 use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable};
 use crate::sql::qualified_table;
@@ -169,7 +169,7 @@ impl Optionable for SpannerConnection {
             }
             // Connection-only: the tag applies to the whole read/write transaction.
             OptionConnection::Other(k) if k == crate::OPTION_TRANSACTION_TAG => {
-                self.config.request.set_transaction_tag(value)?;
+                self.config.request.transaction_tag = non_empty_string_option(value, k)?;
             }
             // Options shared with statements.
             OptionConnection::Other(k) => {
@@ -201,9 +201,9 @@ impl Optionable for SpannerConnection {
             OptionConnection::Other(k) if k == crate::OPTION_TRANSACTION_TAG => self
                 .config
                 .request
-                .transaction_tag_string()
-                .map(str::to_string)
-                .ok_or_else(|| option_not_set(crate::OPTION_TRANSACTION_TAG)),
+                .transaction_tag
+                .clone()
+                .ok_or_else(|| option_not_set(k)),
             OptionConnection::Other(k) => self.config.option_string(k),
             // The default schema is unnamed: "" in INFORMATION_SCHEMA.
             OptionConnection::CurrentCatalog => Ok(self.catalog().to_string()),
