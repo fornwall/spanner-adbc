@@ -206,7 +206,8 @@ Only accept them from trusted sources.
 
 Cancelling interrupts the handle's current blocking call and stays in effect for that
 operation, including later result fetches. The next operation starts uncancelled. Cancelling an
-idle handle succeeds; the driver doesn't track whether an operation is running.
+idle handle succeeds; the driver doesn't track whether an operation is running. It only stops the
+wait for a commit or schema change, which may still be applied.
 
 ## Errors
 
