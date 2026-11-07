@@ -72,9 +72,9 @@ pub(super) fn isolation_to_adbc_string(isolation: &IsolationLevel) -> &'static s
 /// The statements run as one `ExecuteBatchDml`; Spanner applies the mutations at commit, after
 /// every statement. The runner replays the closure on abort.
 ///
-/// `last_statements` marks the batch as the transaction's last request, letting Spanner commit in
-/// the same round trip. Only autocommit DML may pass `true`; a manual commit with buffered
-/// mutations has more to apply.
+/// `last_statements` tells Spanner that only the commit follows the batch, which may defer some
+/// errors to it. Only autocommit DML may pass `true`; a manual commit with buffered mutations has
+/// more to apply.
 ///
 /// The update timeout covers the whole transaction, including abort retries. A commit that timed
 /// out may still have landed.
@@ -137,10 +137,9 @@ pub(crate) fn run_batch_txn(
 /// Commit `mutations` without DML in one write-only transaction. Used by mutations-only manual
 /// commits and by each chunk of an autocommit bulk ingest.
 ///
-/// A read/write runner that replays its commit after an ambiguous transport failure can apply the
-/// mutations twice. `write` begins the transaction with a mutation key and retries `ABORTED`
-/// internally, so success means the mutations were applied once. Isolation does not apply: the
-/// transaction performs no reads, and the builder has no isolation setter.
+/// `write` begins the transaction with a mutation key and retries `ABORTED` internally, so
+/// success means the mutations were applied once. Isolation does not apply: the transaction
+/// performs no reads, and the builder has no isolation setter.
 ///
 /// The client converts each mutation as it consumes them, so a caller that must keep its
 /// mutations can pass a cloning iterator instead of a cloned buffer.
