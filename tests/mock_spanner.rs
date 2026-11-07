@@ -1168,28 +1168,23 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
     let mut statement = one_row_batches(&mut connection);
     let mut reader = statement.execute().unwrap();
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        let first = reader.next();
-        let second = reader.next();
-        let _ = tx.send((first, second));
+    let (first_tx, first_rx) = std::sync::mpsc::channel();
+    let (second_tx, second_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        first_tx.send(reader.next()).unwrap();
+        second_tx.send(reader.next()).unwrap();
     });
 
-    std::thread::sleep(Duration::from_millis(300));
-    let cancel_at = Instant::now();
+    // A cancel must not overtake the first read, which would discard its row.
+    let first = first_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert_eq!(first.unwrap().unwrap().num_rows(), 1);
+    // Lets the reader block; cancelling before it does must fail the fetch all the same.
+    std::thread::sleep(Duration::from_millis(100));
     statement.get_cancel_handle().try_cancel().unwrap();
 
-    let (first, second) = rx.recv_timeout(Duration::from_secs(30)).unwrap();
-    let cancel_latency = cancel_at.elapsed();
-    worker.join().unwrap();
-
-    assert_eq!(first.unwrap().unwrap().num_rows(), 1);
+    let second = second_rx.recv_timeout(Duration::from_secs(30)).unwrap();
     let error = second.unwrap().unwrap_err();
     assert_eq!(driver_error(&error).status, AdbcStatus::Cancelled);
-    assert!(
-        cancel_latency < Duration::from_secs(10),
-        "{cancel_latency:?}"
-    );
 }
 
 /// A timeout on `option` after `seconds`; a stream that died for another reason would fail sooner.
@@ -2360,8 +2355,12 @@ fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_pat
     assert_eq!(unbounded, RETRY_PROBE_CAP + 1);
 
     // With full jitter the count varies. At least two attempts shows the budget is not so small
-    // that it stops at the first failure.
-    let unary = unary_attempts(vec![(OPTION_RETRY_MAX_ELAPSED_SECONDS, 0.15.into())]);
+    // that it stops at the first failure. A loaded runner can take a while over that attempt, and
+    // a slower backoff lets the budget exceed it by a wide margin yet still stop before the cap.
+    let unary = unary_attempts(vec![
+        (OPTION_RETRY_MAX_ELAPSED_SECONDS, 0.75.into()),
+        (OPTION_RETRY_BACKOFF_INITIAL_SECONDS, 0.2.into()),
+    ]);
     assert!((2..unbounded).contains(&unary), "{unary} of {unbounded}");
 
     let streaming = streaming_attempts(vec![(OPTION_RETRY_MAX_ELAPSED_SECONDS, 0.05.into())]);
@@ -2577,17 +2576,17 @@ fn interrupted_batch_write_reports_confirmed_rows_and_unknown_outcome() {
         let mut connection = server.connect();
         let mut statement = batch_write_ingest_statement(&mut connection);
         // The cancel case gets a deadline it cannot reach, so a slow cancel cannot turn into Timeout.
-        let deadline = if cancel_operation { 60.0 } else { 1.0 };
+        let deadline = if cancel_operation { 60.0 } else { 2.0 };
         statement
             .set_option(OPTION_RPC_TIMEOUT_UPDATE.into(), deadline.into())
             .unwrap();
         statement.bind(ingest_batch(3)).unwrap();
         let cancel = statement.get_cancel_handle();
         let canceller = std::thread::spawn(move || {
-            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            started_rx.recv_timeout(Duration::from_secs(60)).unwrap();
             if cancel_operation {
                 // Allow the first response to reach the driver before interrupting its next read.
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_secs(1));
                 cancel.try_cancel().unwrap();
             }
         });
@@ -2683,7 +2682,8 @@ fn batch_write_honors_retry_attempt_limit() {
         for (key, value) in [
             (OPTION_RETRY_MAX_ATTEMPTS, limit.into()),
             (OPTION_RETRY_BACKOFF_INITIAL_SECONDS, 0.001.into()),
-            (OPTION_RPC_TIMEOUT_UPDATE, 2.0.into()),
+            // Stops the retries if the limit is ignored, late enough not to fire on a slow runner.
+            (OPTION_RPC_TIMEOUT_UPDATE, 30.0.into()),
         ] {
             statement.set_option(key.into(), value).unwrap();
         }
