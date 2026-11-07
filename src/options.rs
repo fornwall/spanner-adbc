@@ -11,7 +11,7 @@ use adbc_core::options::OptionValue;
 use google_cloud_spanner::model::transaction_options::IsolationLevel;
 
 use crate::conversion::TimestampPrecision;
-use crate::directed_read::{self, DirectedRead};
+use crate::directed_read::DirectedRead;
 use crate::error::invalid_argument;
 use crate::query_options::QueryOptionsConfig;
 use crate::request::{CommitStats, RequestConfig, parse_max_commit_delay, parse_priority};
@@ -241,61 +241,45 @@ impl SharedConfig {
 
     /// Apply a shared option. Returns `false` for keys this configuration does not handle.
     pub(crate) fn set_option(&mut self, key: &str, value: OptionValue) -> Result<bool> {
+        use crate::*;
+        let timeout = |value| f64_option(value, key, F64Range::NonNegativeSeconds);
+        let seconds = |value| f64_option(value, key, F64Range::PositiveSeconds);
         match key {
-            crate::OPTION_READ_STALENESS => {
-                self.read_staleness.set(value, key, parse_read_bound)?
-            }
-            crate::OPTION_REQUEST_PRIORITY => {
-                self.request.priority.set(value, key, parse_priority)?
-            }
-            crate::OPTION_REQUEST_TAG => {
-                self.request.request_tag = non_empty_string_option(value, key)?
-            }
-            crate::OPTION_DIRECTED_READ => {
-                self.directed_read.set(value, key, directed_read::parse)?
-            }
-            crate::OPTION_MAX_COMMIT_DELAY => {
+            OPTION_READ_STALENESS => self.read_staleness.set(value, key, parse_read_bound)?,
+            OPTION_REQUEST_PRIORITY => self.request.priority.set(value, key, parse_priority)?,
+            OPTION_REQUEST_TAG => self.request.request_tag = non_empty_string_option(value, key)?,
+            OPTION_DIRECTED_READ => self.directed_read.set(value, key, directed_read::parse)?,
+            OPTION_MAX_COMMIT_DELAY => {
                 self.request
                     .max_commit_delay
                     .set(value, key, parse_max_commit_delay)?
             }
-            crate::OPTION_COMMIT_STATS => {
+            OPTION_COMMIT_STATS => {
                 self.request.return_commit_stats = bool_option_unsettable(value, key)?
             }
-            crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS => {
+            OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS => {
                 self.request.exclude_txn_from_change_streams = bool_option_unsettable(value, key)?
             }
-            crate::OPTION_QUERY_OPTIMIZER_VERSION => {
+            OPTION_QUERY_OPTIMIZER_VERSION => {
                 self.query_options.optimizer_version = non_empty_string_option(value, key)?
             }
-            crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
+            OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
                 self.query_options.optimizer_statistics_package =
                     non_empty_string_option(value, key)?
             }
-            crate::OPTION_MAX_TIMESTAMP_PRECISION => {
+            OPTION_MAX_TIMESTAMP_PRECISION => {
                 self.timestamp_precision = TimestampPrecision::parse_option(value)?
             }
-            crate::OPTION_RPC_TIMEOUT_QUERY => {
-                self.timeouts.query = f64_option(value, key, F64Range::NonNegativeSeconds)?
+            OPTION_RPC_TIMEOUT_QUERY => self.timeouts.query = timeout(value)?,
+            OPTION_RPC_TIMEOUT_UPDATE => self.timeouts.update = timeout(value)?,
+            OPTION_RPC_TIMEOUT_FETCH => self.timeouts.fetch = timeout(value)?,
+            OPTION_RETRY_MAX_ATTEMPTS => self.retry.set_max_attempts(value)?,
+            OPTION_RETRY_MAX_ELAPSED_SECONDS => self.retry.max_elapsed_seconds = seconds(value)?,
+            OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
+                self.retry.backoff_initial_seconds = seconds(value)?
             }
-            crate::OPTION_RPC_TIMEOUT_UPDATE => {
-                self.timeouts.update = f64_option(value, key, F64Range::NonNegativeSeconds)?
-            }
-            crate::OPTION_RPC_TIMEOUT_FETCH => {
-                self.timeouts.fetch = f64_option(value, key, F64Range::NonNegativeSeconds)?
-            }
-            crate::OPTION_RETRY_MAX_ATTEMPTS => self.retry.set_max_attempts(value)?,
-            crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
-                self.retry.max_elapsed_seconds = f64_option(value, key, F64Range::PositiveSeconds)?
-            }
-            crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
-                self.retry.backoff_initial_seconds =
-                    f64_option(value, key, F64Range::PositiveSeconds)?
-            }
-            crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
-                self.retry.backoff_max_seconds = f64_option(value, key, F64Range::PositiveSeconds)?
-            }
-            crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
+            OPTION_RETRY_BACKOFF_MAX_SECONDS => self.retry.backoff_max_seconds = seconds(value)?,
+            OPTION_RETRY_BACKOFF_MULTIPLIER => {
                 self.retry.backoff_multiplier = f64_option(value, key, F64Range::PositiveFactor)?
             }
             _ => return Ok(false),
@@ -305,44 +289,39 @@ impl SharedConfig {
 
     /// Return a shared option, or `NotFound` when it is unset or unknown.
     pub(crate) fn option_string(&self, key: &str) -> Result<String> {
+        use crate::*;
         let value: Option<String> = match key {
-            crate::OPTION_READ_STALENESS => self.read_staleness.raw().map(str::to_string),
-            crate::OPTION_REQUEST_PRIORITY => self.request.priority.raw().map(str::to_string),
-            crate::OPTION_REQUEST_TAG => self.request.request_tag.clone(),
-            crate::OPTION_DIRECTED_READ => self.directed_read.raw().map(str::to_string),
-            crate::OPTION_MAX_COMMIT_DELAY => {
-                self.request.max_commit_delay.raw().map(str::to_string)
-            }
-            crate::OPTION_COMMIT_STATS => Some(self.request.return_commit_stats.to_string()),
-            crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS => {
+            OPTION_READ_STALENESS => self.read_staleness.raw().map(str::to_string),
+            OPTION_REQUEST_PRIORITY => self.request.priority.raw().map(str::to_string),
+            OPTION_REQUEST_TAG => self.request.request_tag.clone(),
+            OPTION_DIRECTED_READ => self.directed_read.raw().map(str::to_string),
+            OPTION_MAX_COMMIT_DELAY => self.request.max_commit_delay.raw().map(str::to_string),
+            OPTION_COMMIT_STATS => Some(self.request.return_commit_stats.to_string()),
+            OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS => {
                 Some(self.request.exclude_txn_from_change_streams.to_string())
             }
-            crate::OPTION_COMMIT_STATS_MUTATION_COUNT => {
+            OPTION_COMMIT_STATS_MUTATION_COUNT => {
                 self.commit_stats.mutation_count().map(|n| n.to_string())
             }
-            crate::OPTION_QUERY_OPTIMIZER_VERSION => self.query_options.optimizer_version.clone(),
-            crate::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
+            OPTION_QUERY_OPTIMIZER_VERSION => self.query_options.optimizer_version.clone(),
+            OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE => {
                 self.query_options.optimizer_statistics_package.clone()
             }
-            crate::OPTION_MAX_TIMESTAMP_PRECISION => {
-                Some(self.timestamp_precision.as_str().to_string())
-            }
-            crate::OPTION_RPC_TIMEOUT_QUERY => self.timeouts.query.map(|s| s.to_string()),
-            crate::OPTION_RPC_TIMEOUT_UPDATE => self.timeouts.update.map(|s| s.to_string()),
-            crate::OPTION_RPC_TIMEOUT_FETCH => self.timeouts.fetch.map(|s| s.to_string()),
-            crate::OPTION_RETRY_MAX_ATTEMPTS => self.retry.max_attempts.map(|n| n.to_string()),
-            crate::OPTION_RETRY_MAX_ELAPSED_SECONDS => {
+            OPTION_MAX_TIMESTAMP_PRECISION => Some(self.timestamp_precision.as_str().to_string()),
+            OPTION_RPC_TIMEOUT_QUERY => self.timeouts.query.map(|s| s.to_string()),
+            OPTION_RPC_TIMEOUT_UPDATE => self.timeouts.update.map(|s| s.to_string()),
+            OPTION_RPC_TIMEOUT_FETCH => self.timeouts.fetch.map(|s| s.to_string()),
+            OPTION_RETRY_MAX_ATTEMPTS => self.retry.max_attempts.map(|n| n.to_string()),
+            OPTION_RETRY_MAX_ELAPSED_SECONDS => {
                 self.retry.max_elapsed_seconds.map(|s| s.to_string())
             }
-            crate::OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
+            OPTION_RETRY_BACKOFF_INITIAL_SECONDS => {
                 self.retry.backoff_initial_seconds.map(|s| s.to_string())
             }
-            crate::OPTION_RETRY_BACKOFF_MAX_SECONDS => {
+            OPTION_RETRY_BACKOFF_MAX_SECONDS => {
                 self.retry.backoff_max_seconds.map(|s| s.to_string())
             }
-            crate::OPTION_RETRY_BACKOFF_MULTIPLIER => {
-                self.retry.backoff_multiplier.map(|m| m.to_string())
-            }
+            OPTION_RETRY_BACKOFF_MULTIPLIER => self.retry.backoff_multiplier.map(|m| m.to_string()),
             _ => None,
         };
         value.ok_or_else(|| crate::error::option_not_set(key))
