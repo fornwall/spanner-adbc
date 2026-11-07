@@ -280,9 +280,10 @@ only covers about 1677 to 2262. `spanner.max_timestamp_precision` chooses betwee
   microsecond `-1`.
 
 The mode applies to all results and schemas, including `THEN RETURN` rows, metadata schemas and
-partition reads. `read_partition` uses the reading connection's mode, so match it to the
-producing statement. Clearing the option restores `nanoseconds_error_on_overflow`. Bound
-timestamps keep their own unit; this option only affects reads.
+partition reads. An out-of-range `THEN RETURN` row rolls its DML back. `read_partition` uses the
+reading connection's mode, so match it to the producing statement. Clearing the option restores
+`nanoseconds_error_on_overflow`. Bound timestamps keep their own unit; this option only affects
+reads.
 
 ## RPC timeouts
 
