@@ -53,13 +53,9 @@ pub(crate) fn struct_fields(struct_field: &FieldRef) -> Result<Fields> {
     }
 }
 
-/// Group `child` into non-null lists of the given `lengths`.
-pub(crate) fn list_of(item: FieldRef, lengths: &[usize], child: ArrayRef) -> Result<ArrayRef> {
-    list_of_nullable(item, lengths, child, None)
-}
-
-/// Like [`list_of`], with `nulls` marking null entries. A null entry's length must be 0.
-pub(crate) fn list_of_nullable(
+/// Group `child` into lists of the given `lengths`, with `nulls` marking null entries. A null
+/// entry's length must be 0.
+pub(crate) fn list_of(
     item: FieldRef,
     lengths: &[usize],
     child: ArrayRef,
@@ -106,7 +102,7 @@ pub(crate) fn struct_list(
         .map(|f| Ok(child(f)?.unwrap_or_else(|| new_null_array(f.data_type(), len))))
         .collect::<Result<Vec<_>>>()?;
     let items = StructArray::try_new(fields, children, None).map_err(arrow_err)?;
-    list_of_nullable(item, lengths, Arc::new(items), nulls)
+    list_of(item, lengths, Arc::new(items), nulls)
 }
 
 /// A non-null string array of `values`.

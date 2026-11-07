@@ -7,7 +7,7 @@ fn list_of_offset_overflow_is_an_error_not_a_panic() {
     let item = Arc::new(Field::new("item", DataType::Int64, false));
     let child: ArrayRef = Arc::new(Int64Array::from(Vec::<i64>::new()));
     let too_long = vec![usize::MAX, 1];
-    let error = list_of(item, &too_long, child).unwrap_err();
+    let error = list_of(item, &too_long, child, None).unwrap_err();
     assert_eq!(error.status, Status::Internal);
 }
 
@@ -47,13 +47,13 @@ fn shape_lookups_find_their_target_or_name_what_was_missing() {
 /// `get_objects` needs NULL lists as distinct from empty ones, e.g. a primary key's absent
 /// `constraint_column_usage`.
 #[test]
-fn list_of_nullable_nulls_an_entry_without_shifting_its_neighbours() {
+fn list_of_nulls_an_entry_without_shifting_its_neighbours() {
     let item = Arc::new(Field::new("item", DataType::Int64, true));
     let child: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
     let lengths = [2, 0, 1];
 
     let nulls = NullBuffer::from(vec![true, false, true]);
-    let list = list_of_nullable(item.clone(), &lengths, child.clone(), Some(nulls)).unwrap();
+    let list = list_of(item.clone(), &lengths, child.clone(), Some(nulls)).unwrap();
     let list = list.as_any().downcast_ref::<ListArray>().unwrap();
     assert_eq!(list.len(), 3);
     assert!(list.is_valid(0));
@@ -76,7 +76,7 @@ fn list_of_nullable_nulls_an_entry_without_shifting_its_neighbours() {
     );
 
     // Without a mask, a zero length is an empty list.
-    let list = list_of(item, &lengths, child).unwrap();
+    let list = list_of(item, &lengths, child, None).unwrap();
     let list = list.as_any().downcast_ref::<ListArray>().unwrap();
     assert!((0..3).all(|row| list.is_valid(row)));
     assert_eq!(list.value(1).len(), 0);

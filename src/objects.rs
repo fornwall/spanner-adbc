@@ -468,7 +468,7 @@ fn constraints_list(field: &FieldRef, catalog: &str, tables: &[&Table]) -> Resul
                     .iter()
                     .flat_map(|c| c.columns.iter().map(String::as_str)),
             );
-            list_of(list_item(f)?, &lengths, names).map(Some)
+            list_of(list_item(f)?, &lengths, names, None).map(Some)
         }
         "constraint_column_usage" => usages_list(f, catalog, &constraints).map(Some),
         _ => Ok(None),
