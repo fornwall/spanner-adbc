@@ -124,9 +124,9 @@ For ingest, `adbc.ingest.target_table` selects the table and `adbc.ingest.mode` 
 to create or replace it. Each row becomes an insert mutation. Autocommit ingest commits in
 chunks, so a large ingest is not atomic; in a manual transaction all mutations wait for one
 commit. The driver converts every bound value first and rejects nulls in non-nullable fields, so
-a bad value fails before any DDL runs or any chunk commits. In manual mode, an append checks the
-table and its columns before buffering, so a missing table returns `NotFound` and an unknown
-column `AlreadyExists` at execution rather than at commit.
+a bad value fails before any DDL runs or any chunk commits. In manual mode, `append` and
+`create_append` check the table and its columns before buffering, so a missing table returns
+`NotFound` and an unknown column `AlreadyExists` at execution rather than at commit.
 
 Creating or replacing the table is DDL and happens immediately, even in manual mode. Its columns
 come from the Arrow schema, with non-nullable fields as `NOT NULL` columns. The table declares no

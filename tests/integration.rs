@@ -3116,6 +3116,48 @@ fn bulk_ingest_empty_stream_does_not_hijack_other_paths() {
     );
 }
 
+/// `create_append` onto a table without a bound column fails with `AlreadyExists` at execution,
+/// as `append` does, even when no insert runs then to report it.
+#[test]
+fn bulk_ingest_create_append_reports_a_mismatch_at_execution() {
+    let Some(mut fx) = fixture() else {
+        return;
+    };
+    let connection = &mut fx.connection;
+    let table = "AdbcCreateAppendMismatch";
+    run(
+        connection,
+        &format!("DROP TABLE IF EXISTS {table}; CREATE TABLE {table} (Id INT64) PRIMARY KEY (Id)"),
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("Id", DataType::Int64, false),
+            Field::new("Extra", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![2])),
+        ],
+    )
+    .unwrap();
+    for (autocommit, batch) in [
+        (true, batch.clone()),
+        (true, batch.slice(0, 0)),
+        (false, batch),
+    ] {
+        set_autocommit(connection, autocommit);
+        let mut statement = ingest_stmt(connection, table, "create_append");
+        statement.bind(batch).unwrap();
+        let error = statement
+            .execute_update()
+            .expect_err("the column is missing");
+        assert_eq!(error.status, Status::AlreadyExists, "{error}");
+    }
+    connection.rollback().expect("nothing was buffered");
+    set_autocommit(connection, true);
+    drop_tables(connection, &[table]);
+}
+
 /// When a later chunk of a multi-chunk ingest fails, the error reports how many rows earlier
 /// chunks already committed.
 #[test]

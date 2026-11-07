@@ -246,11 +246,14 @@ impl SpannerStatement {
         Ok(Some(total))
     }
 
-    /// Check an `append` target for what ADBC requires: `NotFound` for a missing table and
-    /// `AlreadyExists` for a bound column it lacks. The other modes create the table. If the
-    /// probe fails, the ingest proceeds.
+    /// Check an `append` or `create_append` target for what ADBC requires: `NotFound` for a missing
+    /// table and `AlreadyExists` for a bound column it lacks. The other modes just created the
+    /// table from this schema. If the probe fails, the ingest proceeds.
     fn check_append_target(&self, table: &str, schema: &Schema) -> Result<()> {
-        if self.ingest_mode != IngestMode::Append {
+        if !matches!(
+            self.ingest_mode,
+            IngestMode::Append | IngestMode::CreateAppend
+        ) {
             return Ok(());
         }
         let columns = match self.append_target_columns(table) {
