@@ -54,7 +54,7 @@ pub(super) unsafe extern "C" fn database_init(
                     Status::Internal,
                 )
             })?;
-            let database = driver.new_database_with_opts(options.entries.clone())?;
+            let database = driver.new_database_with_opts(options.to_vec())?;
             *state = State::Ready(database);
             Ok(())
         })

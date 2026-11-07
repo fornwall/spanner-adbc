@@ -202,7 +202,7 @@ fn the_vtable_slots_do_what_their_names_say() {
         ADBC_STATUS_OK
     );
     let state = unsafe { handle::lock_state(&raw mut database) }.unwrap();
-    let buffered = state.pending(database::KIND).unwrap().entries.clone();
+    let buffered = state.pending(database::KIND).unwrap().to_vec();
     drop(state);
     assert_eq!(buffered.len(), 4);
     assert!(matches!(&buffered[0].1, OptionValue::String(v) if v == "http://127.0.0.1:1"));
@@ -273,7 +273,7 @@ fn the_vtable_slots_do_what_their_names_say() {
         ADBC_STATUS_OK
     );
     let state = unsafe { handle::lock_state(&raw mut connection) }.unwrap();
-    let buffered = state.pending(connection::KIND).unwrap().entries.clone();
+    let buffered = state.pending(connection::KIND).unwrap().to_vec();
     drop(state);
     assert_eq!(buffered.len(), 4);
     assert_eq!(buffered[0].0, OptionConnection::AutoCommit);

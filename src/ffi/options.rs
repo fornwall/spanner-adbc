@@ -38,7 +38,8 @@ where
     fn set(&mut self, key: K, value: OptionValue) -> Result<()> {
         match self {
             Self::Pending(options) => {
-                options.set(key, value);
+                options.retain(|(existing, _)| *existing != key);
+                options.push((key, value));
                 Ok(())
             }
             Self::Ready(state) => state.set_option(key, value),

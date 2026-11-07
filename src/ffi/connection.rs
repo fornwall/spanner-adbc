@@ -44,7 +44,7 @@ pub(super) unsafe extern "C" fn connection_init(
             let options = state.pending(KIND)?;
             let mut database = lock_state(database)?;
             let database = database.ready(super::database::KIND)?;
-            let ready = database.new_connection_with_opts(options.entries.clone())?;
+            let ready = database.new_connection_with_opts(options.to_vec())?;
             // Install cancellation before publishing a state that can start operations.
             install_cancel_handle(connection, ready.get_cancel_handle());
             *state = State::Ready(ready);

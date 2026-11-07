@@ -52,15 +52,20 @@ impl CancelHandle for RecordingCancel {
 }
 
 #[test]
-fn option_buffer_keeps_order_and_collapses_repeats() {
-    let mut buffer = OptionBuffer {
-        entries: Vec::new(),
-    };
-    buffer.set(OptionDatabase::Uri, "first".into());
-    buffer.set(OptionDatabase::Other("x".into()), "y".into());
-    buffer.set(OptionDatabase::Uri, "second".into());
+fn pending_options_keep_their_order_and_collapse_repeats() {
+    use crate::ffi::options::OptionTarget;
 
-    let entries = buffer.entries.clone();
+    let mut state = crate::ffi::database::State::default();
+    let set = [
+        (OptionDatabase::Uri, "first"),
+        (OptionDatabase::Other("x".into()), "y"),
+        (OptionDatabase::Uri, "second"),
+    ];
+    for (key, value) in set {
+        state.set(key, value.into()).unwrap();
+    }
+
+    let entries = state.pending("database").unwrap();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].0, OptionDatabase::Other("x".into()));
     assert_eq!(entries[1].0, OptionDatabase::Uri);

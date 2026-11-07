@@ -36,7 +36,7 @@ fn drop_pending(connection: &mut AdbcConnection) {
 /// The options buffered by a pending connection.
 fn buffered(connection: &mut AdbcConnection) -> Vec<(OptionConnection, OptionValue)> {
     let state = unsafe { lock_state(&raw mut *connection) }.unwrap();
-    state.pending(KIND).unwrap().entries.clone()
+    state.pending(KIND).unwrap().to_vec()
 }
 
 #[test]

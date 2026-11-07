@@ -30,41 +30,19 @@ pub(super) trait FfiHandle {
     fn private_data(handle: *mut Self) -> *mut *mut c_void;
 }
 
-/// Options set before `Init`, ordered by each key's latest set.
-///
-/// Order matters because a URI expands into individual options: an endpoint set after the URI
-/// must override it, even if the endpoint was also set before.
-pub(crate) struct OptionBuffer<K> {
-    /// Cloned, not taken, by `Init`, so a failed `Init` can be retried.
-    pub(super) entries: Vec<(K, OptionValue)>,
-}
-
-impl<K: PartialEq> OptionBuffer<K> {
-    pub(crate) fn set(&mut self, key: K, value: OptionValue) {
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|(existing, _)| *existing == key)
-        {
-            self.entries.remove(index);
-        }
-        self.entries.push((key, value));
-    }
-}
-
 /// A database or connection before or after `Init`. ADBC splits construction across
 /// `New`/`SetOption`/`Init`, while the driver's constructors take all options at once.
 pub(crate) enum Staged<K, S> {
-    Pending(OptionBuffer<K>),
+    /// Options set before `Init`, ordered by each key's latest set: a URI expands into individual
+    /// options, so an endpoint set after it must override it, even if also set before.
+    Pending(Vec<(K, OptionValue)>),
     Ready(S),
 }
 
 /// The state `New` installs.
 impl<K, S> Default for Staged<K, S> {
     fn default() -> Self {
-        Self::Pending(OptionBuffer {
-            entries: Vec::new(),
-        })
+        Self::Pending(Vec::new())
     }
 }
 
@@ -77,8 +55,9 @@ impl<K, S> Staged<K, S> {
         }
     }
 
-    /// The buffered options, or `InvalidState` after `Init`.
-    pub(crate) fn pending(&self, kind: &str) -> Result<&OptionBuffer<K>> {
+    /// The buffered options, or `InvalidState` after `Init`. `Init` clones them rather than taking
+    /// them, so a failed `Init` can be retried.
+    pub(crate) fn pending(&self, kind: &str) -> Result<&[(K, OptionValue)]> {
         match self {
             Self::Pending(options) => Ok(options),
             Self::Ready(_) => Err(Error::with_message_and_status(
