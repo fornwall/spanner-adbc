@@ -326,3 +326,26 @@ fn a_nested_column_that_disagrees_with_the_bound_schema_is_an_error_not_a_panic(
     assert!(failure.contains("invalid Arrow array"), "{failure}");
     assert!(reader.next().is_none());
 }
+
+/// Validation can panic as well as import: Arrow expects a fixed-size list's value count to fit in
+/// a `usize`. The panic must not reach `dispatch`, where it would poison the statement.
+#[test]
+fn a_panic_during_validation_is_an_error() {
+    use arrow_schema::Field;
+
+    let rows = 1 << 40;
+    let item = Arc::new(Field::new_list_field(DataType::Int64, true));
+    let list_type = DataType::FixedSizeList(item, i32::MAX);
+    let builder = ArrayData::builder(list_type.clone())
+        .len(rows)
+        .child_data(vec![Int64Array::from(vec![1]).to_data()]);
+    let list = unsafe { builder.build_unchecked() };
+    let fields = vec![Field::new("list", list_type, true)];
+    let builder = ArrayData::builder(DataType::Struct(fields.into()))
+        .len(rows)
+        .child_data(vec![list]);
+    let (mut values, mut schema) = to_ffi(&unsafe { builder.build_unchecked() }).unwrap();
+
+    let failure = unsafe { import_batch(&raw mut values, &raw mut schema) }.unwrap_err();
+    assert!(failure.message.contains("integer overflow"), "{failure}");
+}

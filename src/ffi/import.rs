@@ -35,8 +35,7 @@ pub(super) unsafe fn import_batch(
     }
     let values = unsafe { FFI_ArrowArray::from_raw(values) };
     let schema = unsafe { FFI_ArrowSchema::from_raw(schema) };
-    contain_import(|| unsafe { from_ffi(values, &schema) })
-        .and_then(checked_struct)
+    contain_import(|| checked_struct(unsafe { from_ffi(values, &schema) }?))
         .map(RecordBatch::from)
         .map_err(|failure| {
             invalid_argument(format!(
@@ -135,15 +134,14 @@ impl Iterator for BoundStreamReader {
                 self.schema.fields().len(),
             ))));
         }
-        let result = contain_import(|| unsafe {
-            from_ffi_and_data_type(array, DataType::Struct(self.schema.fields().clone()))
+        let result = contain_import(|| {
+            let fields = self.schema.fields().clone();
+            checked_struct(unsafe { from_ffi_and_data_type(array, DataType::Struct(fields)) }?)
         })
-        .and_then(|data| {
-            checked_struct(data).map_err(|failure| {
-                ArrowError::CDataInterface(format!(
-                    "bound stream returned an invalid Arrow array: {failure}"
-                ))
-            })
+        .map_err(|failure| {
+            ArrowError::CDataInterface(format!(
+                "bound stream returned an invalid Arrow array: {failure}"
+            ))
         })
         .and_then(|array| {
             let row_count = array.len();
@@ -164,8 +162,8 @@ impl RecordBatchReader for BoundStreamReader {
     }
 }
 
-/// Run an Arrow C data import. Arrow's importer asserts instead of returning an error on some
-/// malformed input, such as a struct whose children disagree with its fields at any depth.
+/// Run an Arrow C data import and its validation. Arrow asserts instead of returning an error on
+/// some malformed input, such as a struct whose children disagree with its fields at any depth.
 /// Catching the panic here keeps a caller's mistake from poisoning the statement in `dispatch`.
 /// Unwinding drops the imported structs, which runs their release callbacks.
 fn contain_import<T>(
