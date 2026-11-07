@@ -6,11 +6,11 @@
 //! `google.spanner.v1.Spanner` service is scripted; [`GatedEndpoint`] makes the admin channel
 //! silent for DDL deadline and cancellation tests.
 //!
-//! mockall matches expectations in FIFO order. [`MockServer::start`] serves `CreateSession` before
-//! the test's script and rejects every unscripted RPC with `UNIMPLEMENTED` after it: a mockall
-//! panic in the server task would reach the client as a retryable transport error and hang.
-//! Call counts such as `.times(n)` are only upper bounds: the mock is dropped with the aborted
-//! server task, which swallows unmet expectations, so tests count calls themselves.
+//! mockall matches expectations in FIFO order. [`MockServer::serve`] adds `CreateSession` and an
+//! `UNIMPLEMENTED` answer to every other RPC after the test's script: a mockall panic in the server
+//! task would reach the client as a retryable transport error and hang. Call counts such as
+//! `.times(n)` are only upper bounds: the mock is dropped with the aborted server task, which
+//! swallows unmet expectations, so tests count calls themselves.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,181 +23,22 @@ use arrow_array::cast::AsArray;
 use arrow_array::{Date32Array, Int64Array, RecordBatch, RecordBatchReader, StringArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use prost::Message;
-use spanner_adbc::{SpannerConnection, SpannerDatabase, SpannerDriver, SpannerStatement};
+use spanner_adbc::{
+    OPTION_EMULATOR, OPTION_ENDPOINT, SpannerConnection, SpannerDatabase, SpannerDriver,
+    SpannerStatement,
+};
 use spanner_grpc_mock::MockSpanner;
 use spanner_grpc_mock::google::spanner::v1;
 
-/// Not validated by the mock; session names are derived from it.
-const DATABASE: &str = "projects/mock-project/instances/mock-instance/databases/mock-db";
+#[path = "../src/mock_server.rs"]
+mod mock_server;
+use mock_server::{DATABASE_URI, MockServer, emulator_database};
 
-// ---------------------------------------------------------------------------
-// Harness
-// ---------------------------------------------------------------------------
-
-/// A mock Spanner server on an ephemeral localhost port, with its own Tokio runtime.
-struct MockServer {
-    /// `http://127.0.0.1:<port>`
-    endpoint: String,
-    server: tokio::task::JoinHandle<()>,
-    _runtime: tokio::runtime::Runtime,
-}
-
-impl MockServer {
-    fn start(script: impl FnOnce(&mut MockSpanner)) -> Self {
-        let mut mock = MockSpanner::new();
-        serve_sessions(&mut mock);
-        script(&mut mock);
-        Self::serve(mock)
-    }
-
-    fn serve(mut mock: MockSpanner) -> Self {
-        reject_unscripted_rpcs(&mut mock);
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("build mock-server runtime");
-        let (endpoint, server) = runtime
-            .block_on(spanner_grpc_mock::start("127.0.0.1:0", mock))
-            .expect("start mock Spanner server");
-        Self {
-            endpoint,
-            server,
-            _runtime: runtime,
-        }
-    }
-
-    fn connect(&self) -> SpannerConnection {
-        connect_to(&self.endpoint)
-    }
-}
-
-fn connect_to(endpoint: &str) -> SpannerConnection {
-    emulator_database(endpoint)
-        .new_connection()
-        .expect("connect to mock server")
-}
-
-/// A database in emulator mode (plaintext, anonymous credentials). The explicit endpoint overrides
-/// any ambient `SPANNER_EMULATOR_HOST`.
-fn emulator_database(endpoint: &str) -> SpannerDatabase {
-    let mut driver = SpannerDriver::try_new().expect("create driver");
-    driver
-        .new_database_with_opts([
-            (
-                OptionDatabase::Uri,
-                OptionValue::String(format!("spanner:///{DATABASE}")),
-            ),
-            (
-                OptionDatabase::Other(spanner_adbc::OPTION_ENDPOINT.into()),
-                OptionValue::String(endpoint.to_string()),
-            ),
-            (
-                OptionDatabase::Other(spanner_adbc::OPTION_EMULATOR.into()),
-                OptionValue::String("true".into()),
-            ),
-        ])
-        .expect("create database")
-}
-
-impl Drop for MockServer {
-    fn drop(&mut self) {
-        self.server.abort();
-    }
-}
-
-/// The client creates one multiplexed session per `DatabaseClient`, and a background task may
-/// re-create it, so this expectation is unbounded.
-fn serve_sessions(mock: &mut MockSpanner) {
-    mock.expect_create_session().returning(|request| {
-        let database = request.into_inner().database;
-        Ok(tonic::Response::new(v1::Session {
-            name: format!("{database}/sessions/mock-session"),
-            multiplexed: true,
-            ..Default::default()
-        }))
-    });
-}
-
-/// Catch-alls returning `UNIMPLEMENTED`, which the client does not retry.
-fn reject_unscripted_rpcs(mock: &mut MockSpanner) {
-    macro_rules! reject {
-        ($($method:ident),+ $(,)?) => {
-            $(
-                mock.$method().returning(|_| {
-                    Err(tonic::Status::unimplemented(concat!(
-                        "mock spanner server: unscripted RPC ",
-                        stringify!($method),
-                    )))
-                });
-            )+
-        };
-    }
-    reject!(
-        expect_create_session,
-        expect_batch_create_sessions,
-        expect_get_session,
-        expect_list_sessions,
-        expect_delete_session,
-        expect_execute_sql,
-        expect_execute_streaming_sql,
-        expect_execute_batch_dml,
-        expect_read,
-        expect_streaming_read,
-        expect_begin_transaction,
-        expect_commit,
-        expect_rollback,
-        expect_partition_query,
-        expect_partition_read,
-        expect_batch_write,
-        expect_fetch_cache_update,
-    );
-}
-
-/// Aborts the test process if `what` outlives `limit`, so a hang fails CI instead of stalling it.
-struct Watchdog {
-    disarmed: Arc<AtomicBool>,
-}
-
-impl Watchdog {
-    fn arm(limit: Duration, what: &'static str) -> Self {
-        let disarmed = Arc::new(AtomicBool::new(false));
-        let flag = disarmed.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(limit);
-            if !flag.load(Ordering::SeqCst) {
-                eprintln!("watchdog: {what} still running after {limit:?}; aborting");
-                std::process::abort();
-            }
-        });
-        Self { disarmed }
-    }
-}
-
-impl Drop for Watchdog {
-    fn drop(&mut self) {
-        self.disarmed.store(true, Ordering::SeqCst);
-    }
-}
-
-/// Arms a [`Watchdog`] named after the enclosing function. The default limit is two minutes.
-macro_rules! watchdog {
-    () => {
-        watchdog!(Duration::from_secs(120))
-    };
-    ($limit:expr) => {{
-        fn marker() {}
-        fn name_of<T>(_: T) -> &'static str {
-            std::any::type_name::<T>()
-        }
-        // `type_name` of a nested fn item is `<crate>::<enclosing fn>::marker`.
-        let path = name_of(marker);
-        let enclosing = path
-            .strip_suffix("::marker")
-            .and_then(|path| path.rsplit("::").next())
-            .unwrap_or(path);
-        Watchdog::arm($limit, enclosing)
-    }};
+/// Serves the test's script. See the module docs for how unscripted RPCs are answered.
+fn start_server(script: impl FnOnce(&mut MockSpanner)) -> MockServer {
+    let mut mock = MockSpanner::new();
+    script(&mut mock);
+    MockServer::serve(mock)
 }
 
 /// A TCP proxy in front of a [`MockServer`] that can stop answering new connections.
@@ -259,7 +100,7 @@ impl GatedEndpoint {
     }
 
     fn connect(&self) -> SpannerConnection {
-        connect_to(&self.endpoint)
+        emulator_database(&self.endpoint).new_connection().unwrap()
     }
 }
 
@@ -578,8 +419,7 @@ fn serve_begin_transaction(mock: &mut MockSpanner) {
 
 #[test]
 fn omni_connects_with_explicit_endpoint_and_default_anonymous_credentials() {
-    let _watchdog = watchdog!();
-    let server = MockServer::start(|mock| {
+    let server = start_server(|mock| {
         mock.expect_execute_streaming_sql().returning(|_| {
             Ok(stream_of(vec![Ok(partial_result_set(
                 true,
@@ -592,7 +432,7 @@ fn omni_connects_with_explicit_endpoint_and_default_anonymous_credentials() {
     let mut driver = SpannerDriver::try_new().unwrap();
     let database = driver
         .new_database_with_opts([
-            (OptionDatabase::Uri, format!("spanner:///{DATABASE}").into()),
+            (OptionDatabase::Uri, DATABASE_URI.into()),
             (
                 OptionDatabase::Other(spanner_adbc::OPTION_INSTANCE_TYPE.into()),
                 "omni".into(),
@@ -622,10 +462,9 @@ fn omni_connects_with_explicit_endpoint_and_default_anonymous_credentials() {
 
 #[test]
 fn bound_dml_strips_leading_and_trailing_terminators() {
-    let _watchdog = watchdog!();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded = requests.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_batch_dml(mock, recorded);
         mock.expect_commit().returning(|_| commit_ok());
     });
@@ -656,10 +495,9 @@ fn bound_dml_strips_leading_and_trailing_terminators() {
 
 #[test]
 fn bound_dml_returning_and_partitioned_preserve_parameters() {
-    let _watchdog = watchdog!();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded = requests.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_begin_transaction(mock);
         mock.expect_execute_streaming_sql()
             .returning(move |request| {
@@ -707,13 +545,12 @@ fn bound_dml_returning_and_partitioned_preserve_parameters() {
 
 #[test]
 fn bound_returning_dml_commits_with_the_explicit_transaction_id() {
-    let _watchdog = watchdog!();
     let begins = Arc::new(Mutex::new(Vec::new()));
     let requests = Arc::new(Mutex::new(Vec::new()));
     let commits = Arc::new(Mutex::new(Vec::new()));
     let (record_begins, record_requests, record_commits) =
         (begins.clone(), requests.clone(), commits.clone());
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         mock.expect_begin_transaction()
             .once()
             .returning(move |request| {
@@ -801,8 +638,7 @@ fn bound_returning_dml_commits_with_the_explicit_transaction_id() {
 
 #[test]
 fn bound_dml_rejects_batches_before_buffering_manual_work() {
-    let _watchdog = watchdog!();
-    let server = MockServer::start(|_| {});
+    let server = start_server(|_| {});
     let mut connection = server.connect();
     disable_autocommit(&mut connection);
     for sql in [
@@ -821,10 +657,9 @@ fn bound_dml_rejects_batches_before_buffering_manual_work() {
 
 #[test]
 fn mock_server_round_trips_a_query() {
-    let _watchdog = watchdog!();
     let seen_sql: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let record_sql = seen_sql.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         mock.expect_execute_streaming_sql()
             .returning(move |request| {
                 *record_sql.lock().unwrap() = Some(request.into_inner().sql);
@@ -866,9 +701,8 @@ fn mock_server_round_trips_a_query() {
 /// Unknown wire kinds must fail even on the UTF-8 fallback, including inside lists.
 #[test]
 fn unknown_wire_values_are_not_rendered_as_json() {
-    let _watchdog = watchdog!();
     for nested in [false, true] {
-        let server = MockServer::start(move |mock| {
+        let server = start_server(move |mock| {
             mock.expect_execute_streaming_sql().returning(move |_| {
                 let mut value = prost_types::Value {
                     kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
@@ -906,8 +740,7 @@ fn unknown_wire_values_are_not_rendered_as_json() {
 /// A keyed protobuf Struct cannot represent positional Spanner STRUCT fields with duplicate names.
 #[test]
 fn keyed_struct_wire_value_errors() {
-    let _watchdog = watchdog!();
-    let server = MockServer::start(|mock| {
+    let server = start_server(|mock| {
         mock.expect_execute_streaming_sql().returning(|_| {
             // STRUCT<x INT64, x INT64>: a map cannot preserve both fields named x.
             let fields =
@@ -955,8 +788,7 @@ fn keyed_struct_wire_value_errors() {
 /// `InvalidState`. Queries in autocommit mode or in a fresh manual transaction still run.
 #[test]
 fn query_while_dml_buffered_in_manual_txn_is_rejected() {
-    let _watchdog = watchdog!();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_streaming_sql_begin_aware(mock, &["v1", "v2"], None);
     });
     let mut connection = server.connect();
@@ -1034,11 +866,10 @@ fn query_while_dml_buffered_in_manual_txn_is_rejected() {
 /// RPC.
 #[test]
 fn manual_transaction_queries_share_one_read_only_transaction() {
-    let _watchdog = watchdog!();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let server = {
         let record = requests.clone();
-        MockServer::start(move |mock| {
+        start_server(move |mock| {
             serve_streaming_sql_begin_aware(mock, &["v1"], Some(record));
         })
     };
@@ -1123,10 +954,9 @@ fn manual_transaction_queries_share_one_read_only_transaction() {
 /// returns no count. This backs the ADBC call with a NULL output stream.
 #[test]
 fn execute_update_routes_a_query_to_the_read_only_path() {
-    let _watchdog = watchdog!();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let record = seen.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_streaming_sql_begin_aware(mock, &["v1", "v2"], Some(record));
     });
 
@@ -1181,8 +1011,7 @@ fn execute_update_routes_a_query_to_the_read_only_path() {
 /// statement cannot apply them later.
 #[test]
 fn execute_partitions_rejects_multiple_bound_rows_and_consumes_them() {
-    let _watchdog = watchdog!();
-    let server = MockServer::start(|_| {});
+    let server = start_server(|_| {});
     let mut connection = server.connect();
 
     let mut statement = connection.new_statement().expect("new statement");
@@ -1215,11 +1044,10 @@ fn execute_partitions_rejects_multiple_bound_rows_and_consumes_them() {
 
 #[test]
 fn empty_partitions_retain_the_planned_types_at_the_readers_timestamp_precision() {
-    let _watchdog = watchdog!();
     let partition_queries = Arc::new(Mutex::new(Vec::new()));
     let queries = Arc::new(Mutex::new(Vec::new()));
     let (record_partition_queries, record_queries) = (partition_queries.clone(), queries.clone());
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_begin_transaction(mock);
         mock.expect_partition_query()
             .once()
@@ -1317,9 +1145,8 @@ fn empty_partitions_retain_the_planned_types_at_the_readers_timestamp_precision(
 
 #[test]
 fn execute_schema_binds_the_first_nonempty_batch() {
-    let _watchdog = watchdog!();
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let server = MockServer::start({
+    let server = start_server({
         let requests = requests.clone();
         move |mock| serve_streaming_sql_begin_aware(mock, &[], Some(requests))
     });
@@ -1358,8 +1185,7 @@ fn execute_schema_binds_the_first_nonempty_batch() {
 
 #[test]
 fn bind_stream_rejects_schema_changes_without_replacing_previous_bindings() {
-    let _watchdog = watchdog!();
-    let server = MockServer::start(|_| {});
+    let server = start_server(|_| {});
     let mut connection = server.connect();
     let mut statement = connection.new_statement().unwrap();
     let original = Arc::new(Schema::new(vec![Field::new(
@@ -1398,8 +1224,7 @@ fn bind_stream_rejects_schema_changes_without_replacing_previous_bindings() {
 /// A failed bound query still consumes its rows, so a reused statement cannot apply them later.
 #[test]
 fn failed_bound_query_still_consumes_bound_rows() {
-    let _watchdog = watchdog!();
-    let server = MockServer::start(|mock| {
+    let server = start_server(|mock| {
         mock.expect_execute_streaming_sql().returning(|_| {
             Err(tonic::Status::failed_precondition(
                 "the mock server rejected the bound query",
@@ -1439,8 +1264,7 @@ fn failed_bound_query_still_consumes_bound_rows() {
 /// read-your-writes guard as `execute`.
 #[test]
 fn execute_update_query_in_manual_mode_buffers_nothing() {
-    let _watchdog = watchdog!();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_streaming_sql_begin_aware(mock, &["v1"], None);
     });
 
@@ -1506,8 +1330,7 @@ fn execute_update_query_in_manual_mode_buffers_nothing() {
 /// Unlike the unit tests in `src/error.rs`, this decodes the detail from a real gRPC trailer.
 #[test]
 fn aborted_surfaces_vendor_code_and_retry_info_detail() {
-    let _watchdog = watchdog!();
-    let server = MockServer::start(|mock| {
+    let server = start_server(|mock| {
         mock.expect_execute_streaming_sql().returning(|_| {
             Err(aborted_with_retry_info(
                 "Transaction was aborted by the mock server",
@@ -1564,12 +1387,11 @@ fn aborted_surfaces_vendor_code_and_retry_info_detail() {
 /// fails with a non-retryable status, that error reaches the caller.
 #[test]
 fn unavailable_mid_stream_surfaces_a_clean_error() {
-    let _watchdog = watchdog!();
     let calls = Arc::new(AtomicUsize::new(0));
     let resume_tokens: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let calls_in_mock = calls.clone();
     let tokens_in_mock = resume_tokens.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         mock.expect_execute_streaming_sql()
             .returning(move |request| {
                 if calls_in_mock.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -1629,7 +1451,6 @@ fn unavailable_mid_stream_surfaces_a_clean_error() {
 /// went silent.
 #[test]
 fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
-    let _watchdog = watchdog!();
     let (server, _open_streams) = silent_stream_server(1);
     let mut connection = server.connect();
     let mut statement = connection.new_statement().expect("new statement");
@@ -1685,8 +1506,7 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
 /// Without the driver deadline, the admin client's own ~60 s deadline would fail with `Internal`.
 #[test]
 fn ddl_update_timeout_fires_on_a_silent_admin_endpoint() {
-    let _watchdog = watchdog!();
-    let server = MockServer::start(|_mock| {});
+    let server = start_server(|_mock| {});
     let gate = GatedEndpoint::start(&server.endpoint);
     let mut connection = gate.connect();
     gate.go_silent();
@@ -1732,7 +1552,7 @@ fn ddl_update_timeout_fires_on_a_silent_admin_endpoint() {
 fn silent_stream_server(rows: usize) -> (MockServer, Arc<Mutex<Vec<PartialResultSetSender>>>) {
     let open_streams: Arc<Mutex<Vec<PartialResultSetSender>>> = Arc::new(Mutex::new(Vec::new()));
     let streams_in_mock = open_streams.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         mock.expect_execute_streaming_sql().returning(move |_| {
             let (tx, rx) = tokio::sync::mpsc::channel(rows.max(1));
             for i in 0..rows {
@@ -1776,7 +1596,6 @@ fn silent_stream_reader(
 /// blocks.
 #[test]
 fn fetch_timeout_fires_on_a_silent_stream() {
-    let _watchdog = watchdog!();
     let (server, _open_streams) = silent_stream_server(1);
     let mut connection = server.connect();
 
@@ -1825,7 +1644,6 @@ fn fetch_timeout_fires_on_a_silent_stream() {
 /// else turns the silence into an error.
 #[test]
 fn silent_stream_without_the_fetch_deadline_never_times_out() {
-    let _watchdog = watchdog!();
     let (server, _open_streams) = silent_stream_server(1);
     let mut connection = server.connect();
     let mut reader = silent_stream_reader(&mut connection, None);
@@ -1852,7 +1670,6 @@ fn silent_stream_without_the_fetch_deadline_never_times_out() {
 /// `spanner.rpc.timeout_seconds.query` bounds `execute`, which waits for the first batch.
 #[test]
 fn query_timeout_fires_on_a_stream_that_is_silent_from_the_start() {
-    let _watchdog = watchdog!();
     let (server, _open_streams) = silent_stream_server(0);
     let mut connection = server.connect();
 
@@ -1896,9 +1713,8 @@ fn query_timeout_fires_on_a_stream_that_is_silent_from_the_start() {
 /// old reader could resume, or end cleanly after a buffered batch and truncate the result.
 #[test]
 fn new_operation_does_not_uncancel_an_earlier_streamed_reader() {
-    let _watchdog = watchdog!();
     // With one row per batch, the old reader has row 2 buffered and row 3 pending at the cancel.
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         mock.expect_execute_streaming_sql().returning(move |_| {
             Ok(stream_of(vec![Ok(partial_result_set(
                 true,
@@ -1960,10 +1776,9 @@ fn new_operation_does_not_uncancel_an_earlier_streamed_reader() {
 /// with more than 40 mutations.
 #[test]
 fn ingest_bisects_a_chunk_that_overshoots_the_mutation_limit() {
-    let _watchdog = watchdog!();
     let commit_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
     let sizes_in_mock = commit_sizes.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_begin_transaction(mock);
         mock.expect_commit().returning(move |request| {
             let mutations = request.into_inner().mutations.len();
@@ -2010,10 +1825,9 @@ fn ingest_bisects_a_chunk_that_overshoots_the_mutation_limit() {
 /// Other commit errors propagate after a single attempt.
 #[test]
 fn ingest_does_not_bisect_a_non_mutation_limit_error() {
-    let _watchdog = watchdog!();
     let commits = Arc::new(AtomicUsize::new(0));
     let commits_in_mock = commits.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_begin_transaction(mock);
         mock.expect_commit().returning(move |_| {
             commits_in_mock.fetch_add(1, Ordering::SeqCst);
@@ -2049,10 +1863,9 @@ fn ingest_does_not_bisect_a_non_mutation_limit_error() {
 /// annotated error unchanged.
 #[test]
 fn cancelled_ingest_commit_reports_ambiguous_outcome() {
-    let _watchdog = watchdog!();
     let commits = Arc::new(AtomicUsize::new(0));
     let commits_in_mock = commits.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_begin_transaction(mock);
         mock.expect_commit().returning(move |_| {
             commits_in_mock.fetch_add(1, Ordering::SeqCst);
@@ -2087,10 +1900,9 @@ fn cancelled_ingest_commit_reports_ambiguous_outcome() {
 /// the original commit error is returned unchanged.
 #[test]
 fn ingest_append_keeps_the_original_error_when_the_exists_probe_fails() {
-    let _watchdog = watchdog!();
     let probes = Arc::new(AtomicUsize::new(0));
     let probes_in_mock = probes.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_begin_transaction(mock);
         // Neither a constraint violation nor the mutation limit, both of which skip the probe.
         mock.expect_commit().returning(|_| {
@@ -2146,10 +1958,9 @@ fn ingest_append_keeps_the_original_error_when_the_exists_probe_fails() {
 /// details the same way.
 #[test]
 fn batch_write_group_failure_forwards_status_details() {
-    let _watchdog = watchdog!();
     let batch_writes = Arc::new(AtomicUsize::new(0));
     let writes_in_mock = batch_writes.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         mock.expect_batch_write().returning(move |_| {
             writes_in_mock.fetch_add(1, Ordering::SeqCst);
             Ok(stream_of(vec![Ok(batch_write_group_already_exists(0))]))
@@ -2215,8 +2026,7 @@ fn batch_write_group_failure_forwards_status_details() {
 /// committed.
 #[test]
 fn batch_write_folds_same_chunk_applied_rows_into_committed_count() {
-    let _watchdog = watchdog!();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         mock.expect_batch_write().returning(move |_| {
             Ok(stream_of(vec![
                 Ok(batch_write_groups_ok(vec![0, 1])),
@@ -2252,10 +2062,9 @@ fn batch_write_folds_same_chunk_applied_rows_into_committed_count() {
 /// later commit would apply a partial batch.
 #[test]
 fn manual_ingest_conversion_failure_leaves_txn_buffer_untouched() {
-    let _watchdog = watchdog!();
     let commit_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
     let sizes_in_mock = commit_sizes.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         // Serves the append target's column probe and the query after the failure.
         serve_streaming_sql_begin_aware(mock, &["d"], None);
         serve_begin_transaction(mock);
@@ -2328,13 +2137,12 @@ fn manual_ingest_conversion_failure_leaves_txn_buffer_untouched() {
 /// carries `spanner.commit.max_delay`.
 #[test]
 fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
-    let _watchdog = watchdog!();
     // Not derivable from the two ingested rows.
     const SCRIPTED_MUTATION_COUNT: i64 = 4242;
 
     let commits: Arc<Mutex<Vec<v1::CommitRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let record_commits = commits.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         mock.expect_begin_transaction().returning(|_| {
             Ok(tonic::Response::new(v1::Transaction {
                 id: b"mock-txn-1".to_vec(),
@@ -2413,7 +2221,6 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
 /// connection, overridden per statement, and the connection's value on a manual commit.
 #[test]
 fn max_commit_delay_reaches_the_wire_on_runner_commits() {
-    let _watchdog = watchdog!();
     const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
 
     fn delay_millis(millis: i32) -> Option<prost_types::Duration> {
@@ -2425,7 +2232,7 @@ fn max_commit_delay_reaches_the_wire_on_runner_commits() {
 
     let commits: Arc<Mutex<Vec<v1::CommitRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let record = commits.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_begin_transaction(mock);
         serve_batch_dml(mock, BatchDmlRequests::default());
         mock.expect_commit().returning(move |request| {
@@ -2510,12 +2317,11 @@ fn isolation_level_reaches_transaction_options_on_the_begin() {
     use adbc_core::constants::*;
     use v1::transaction_options::IsolationLevel;
 
-    let _watchdog = watchdog!();
     const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
 
     let batches: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let record = batches.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_begin_transaction(mock);
         serve_batch_dml(mock, record.clone());
         mock.expect_commit().returning(|_| commit_ok());
@@ -2586,14 +2392,13 @@ fn isolation_level_reaches_transaction_options_on_the_begin() {
 /// read/write runner, which begins inline.
 #[test]
 fn mutations_only_manual_commit_uses_the_write_only_path() {
-    let _watchdog = watchdog!();
     let begins: Arc<Mutex<Vec<v1::BeginTransactionRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let commits: Arc<Mutex<Vec<v1::CommitRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let batch_dml: BatchDmlRequests = Arc::new(Mutex::new(Vec::new()));
     let record_begins = begins.clone();
     let record_commits = commits.clone();
     let record_batch_dml = batch_dml.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         mock.expect_begin_transaction().returning(move |request| {
             record_begins.lock().unwrap().push(request.into_inner());
             Ok(tonic::Response::new(v1::Transaction {
@@ -2703,12 +2508,11 @@ fn mutations_only_manual_commit_uses_the_write_only_path() {
 /// rollback, queries and query-transaction commits still work.
 #[test]
 fn read_only_connection_rejects_the_commit_of_buffered_dml() {
-    let _watchdog = watchdog!();
     let batch_dml: BatchDmlRequests = Arc::new(Mutex::new(Vec::new()));
     let commits = Arc::new(AtomicUsize::new(0));
     let record_batch_dml = batch_dml.clone();
     let count_commits = commits.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_streaming_sql_begin_aware(mock, &["v0"], None);
         serve_begin_transaction(mock);
         serve_batch_dml(mock, record_batch_dml.clone());
@@ -2864,10 +2668,9 @@ fn read_only_bound(
 fn read_staleness_reaches_the_wire_on_single_use_queries() {
     use v1::transaction_options::read_only::TimestampBound as WireBound;
 
-    let _watchdog = watchdog!();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let record = requests.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_streaming_sql_begin_aware(mock, &["v1"], Some(record));
     });
 
@@ -2948,13 +2751,12 @@ fn read_staleness_reaches_the_wire_on_metadata_reads() {
     use adbc_core::options::ObjectDepth;
     use v1::transaction_options::read_only::TimestampBound as WireBound;
 
-    let _watchdog = watchdog!();
     let expected = WireBound::ExactStaleness(prost_types::Duration {
         seconds: 10,
         nanos: 0,
     });
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let server = MockServer::start({
+    let server = start_server({
         let record = requests.clone();
         move |mock| serve_streaming_sql_begin_aware(mock, &["default"], Some(record))
     });
@@ -3009,7 +2811,7 @@ fn read_staleness_reaches_the_wire_on_metadata_reads() {
 fn bound_query_transaction_selectors(staleness: &str) -> Vec<Option<v1::TransactionSelector>> {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let record = requests.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_streaming_sql_begin_aware(mock, &["v"], Some(record));
     });
 
@@ -3049,7 +2851,6 @@ fn bound_query_transaction_selectors(staleness: &str) -> Vec<Option<v1::Transact
 fn bounded_staleness_is_pinned_for_multi_use_bound_queries() {
     use v1::transaction_options::read_only::TimestampBound as WireBound;
 
-    let _watchdog = watchdog!();
     let cases = [
         (
             "max:500ms",
@@ -3106,7 +2907,6 @@ fn bounded_staleness_is_pinned_for_multi_use_bound_queries() {
 fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
     use v1::directed_read_options as dro;
 
-    let _watchdog = watchdog!();
     const QUERY_SQL: &str = "SELECT c FROM MockTable";
     const OVERRIDE_QUERY_SQL: &str = "SELECT c FROM OtherMockTable";
     const INSERT_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
@@ -3116,7 +2916,7 @@ fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
     let batch_dml: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let record_streaming = streaming.clone();
     let record_batch_dml = batch_dml.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_begin_transaction(mock);
         serve_streaming_sql_begin_aware(mock, &["v"], Some(record_streaming));
         serve_batch_dml(mock, record_batch_dml.clone());
@@ -3234,10 +3034,9 @@ fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
 /// partly overridden.
 #[test]
 fn query_optimizer_options_reach_the_wire_on_queries() {
-    let _watchdog = watchdog!();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let record = requests.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_streaming_sql_begin_aware(mock, &["v1"], Some(record));
     });
 
@@ -3331,13 +3130,12 @@ fn query_optimizer_options_reach_the_wire_on_queries() {
 /// a manual commit does not, since buffered mutations may follow it.
 #[test]
 fn autocommit_batch_dml_is_flagged_last_statements_but_manual_commit_is_not() {
-    let _watchdog = watchdog!();
     const BATCH_SQL: &str =
         "DELETE FROM MockTable WHERE TRUE; INSERT INTO MockTable (c) VALUES ('x')";
 
     let batch_dml: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let record = batch_dml.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_begin_transaction(mock);
         serve_batch_dml(mock, record.clone());
         mock.expect_commit().returning(|_| commit_ok());
@@ -3391,10 +3189,9 @@ fn autocommit_batch_dml_is_flagged_last_statements_but_manual_commit_is_not() {
 /// request tags on BatchWrite, so none is sent.
 #[test]
 fn batch_write_carries_the_request_options_and_change_stream_exclusion() {
-    let _watchdog = watchdog!();
     let requests: Arc<Mutex<Vec<v1::BatchWriteRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let record = requests.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         mock.expect_batch_write().returning(move |request| {
             record.lock().unwrap().push(request.into_inner());
             Ok(stream_of(vec![Ok(v1::BatchWriteResponse {
@@ -3481,7 +3278,6 @@ fn batch_write_carries_the_request_options_and_change_stream_exclusion() {
 /// The change-stream exclusion reaches the transaction options of autocommit DML.
 #[test]
 fn exclude_from_change_streams_reaches_the_wire_on_runner_commits() {
-    let _watchdog = watchdog!();
     const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
 
     // Options from each begin, whether inline on `ExecuteBatchDml` or an explicit
@@ -3489,7 +3285,7 @@ fn exclude_from_change_streams_reaches_the_wire_on_runner_commits() {
     let begins: Arc<Mutex<Vec<v1::TransactionOptions>>> = Arc::new(Mutex::new(Vec::new()));
     let record_explicit = begins.clone();
     let record_inline = begins.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         mock.expect_begin_transaction().returning(move |request| {
             if let Some(options) = request.into_inner().options {
                 record_explicit.lock().unwrap().push(options);
@@ -3577,7 +3373,6 @@ fn exclude_from_change_streams_reaches_the_wire_on_runner_commits() {
 /// transaction statistics. The emulator ignores `RequestOptions`, so only the mock covers this.
 #[test]
 fn request_priority_reaches_metadata_reads_but_tags_do_not() {
-    let _watchdog = watchdog!();
     const USER_QUERY: &str = "SELECT c FROM MockTable";
     const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
 
@@ -3585,7 +3380,7 @@ fn request_priority_reaches_metadata_reads_but_tags_do_not() {
     let batch_dml: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let commits: Arc<Mutex<Vec<v1::CommitRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let (rec_q, rec_b, rec_c) = (queries.clone(), batch_dml.clone(), commits.clone());
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         serve_begin_transaction(mock);
         mock.expect_execute_streaming_sql()
             .returning(move |request| {
@@ -3741,7 +3536,6 @@ fn start_counting_sessions(sessions: Arc<AtomicUsize>) -> MockServer {
 /// discards it.
 #[test]
 fn connections_share_one_client_stack_until_an_option_is_set() {
-    let _watchdog = watchdog!();
     let sessions = Arc::new(AtomicUsize::new(0));
     let server = start_counting_sessions(sessions.clone());
     let mut database = emulator_database(&server.endpoint);
@@ -3789,8 +3583,7 @@ fn connections_share_one_client_stack_until_an_option_is_set() {
 /// accepted. Enabling it is not implemented.
 #[test]
 fn exec_incremental_spec_default_is_a_no_op() {
-    let _watchdog = watchdog!();
-    let server = MockServer::start(|_| {});
+    let server = start_server(|_| {});
     let mut connection = server.connect();
     let mut statement = connection.new_statement().expect("new statement");
 
@@ -3854,7 +3647,7 @@ fn set_constant_backoff(statement: &mut impl Statement) {
 fn streaming_attempts(key: &str, value: OptionValue) -> usize {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_in_mock = calls.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         mock.expect_execute_streaming_sql().returning(move |_| {
             let n = calls_in_mock.fetch_add(1, Ordering::SeqCst);
             if n >= RETRY_PROBE_CAP {
@@ -3888,7 +3681,7 @@ fn streaming_attempts(key: &str, value: OptionValue) -> usize {
 fn unary_attempts(key: &str, value: OptionValue) -> usize {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_in_mock = calls.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         mock.expect_execute_batch_dml().returning(move |_| {
             let n = calls_in_mock.fetch_add(1, Ordering::SeqCst);
             if n >= RETRY_PROBE_CAP {
@@ -3917,7 +3710,6 @@ fn unary_attempts(key: &str, value: OptionValue) -> usize {
 
 #[test]
 fn retry_max_attempts_is_exact_on_unary_rpcs() {
-    let _watchdog = watchdog!();
     for max_attempts in [1_i64, 2, 3] {
         let attempts = unary_attempts(
             spanner_adbc::OPTION_RETRY_MAX_ATTEMPTS,
@@ -3932,7 +3724,6 @@ fn retry_max_attempts_is_exact_on_unary_rpcs() {
 
 #[test]
 fn retry_max_attempts_is_exact_on_the_streaming_path() {
-    let _watchdog = watchdog!();
     for max_attempts in [1_i64, 2, 3] {
         let attempts = streaming_attempts(
             spanner_adbc::OPTION_RETRY_MAX_ATTEMPTS,
@@ -3951,8 +3742,6 @@ fn retry_max_attempts_is_exact_on_the_streaming_path() {
 /// callers can use `spanner.rpc.timeout_seconds.{query,fetch}` instead.
 #[test]
 fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_path() {
-    let _watchdog = watchdog!(Duration::from_secs(240));
-
     let unbounded = unary_attempts(
         spanner_adbc::OPTION_RETRY_MAX_ELAPSED_SECONDS,
         OptionValue::String(String::new()),
@@ -3992,12 +3781,11 @@ fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_pat
 /// concurrently created table cannot fail the call and all counts share a timestamp.
 #[test]
 fn get_statistics_shares_one_read_only_transaction() {
-    let _watchdog = watchdog!();
     let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
         Arc::new(Mutex::new(Vec::new()));
     let server = {
         let record = selectors.clone();
-        MockServer::start(move |mock| {
+        start_server(move |mock| {
             let record = record.clone();
             mock.expect_execute_streaming_sql()
                 .returning(move |request| {
@@ -4094,8 +3882,7 @@ fn get_statistics_shares_one_read_only_transaction() {
 fn the_catalog_level_reports_the_database_id_and_filters_round_trip() {
     use adbc_core::options::ObjectDepth;
 
-    let _watchdog = watchdog!();
-    let server = MockServer::start(|_mock| {});
+    let server = start_server(|_mock| {});
     let mut connection = server.connect();
 
     let catalogs = |connection: &SpannerConnection, filter: Option<&str>| -> Vec<String> {
@@ -4117,9 +3904,9 @@ fn the_catalog_level_reports_the_database_id_and_filters_round_trip() {
             .collect()
     };
 
-    assert_eq!(catalogs(&connection, None), ["mock-db"]);
-    assert_eq!(catalogs(&connection, Some("mock-db")), ["mock-db"]);
-    assert_eq!(catalogs(&connection, Some("mock%")), ["mock-db"]);
+    assert_eq!(catalogs(&connection, None), ["d"]);
+    assert_eq!(catalogs(&connection, Some("d")), ["d"]);
+    assert_eq!(catalogs(&connection, Some("d%")), ["d"]);
     assert!(catalogs(&connection, Some("other-db")).is_empty());
     // "" selects objects without a catalog.
     assert!(catalogs(&connection, Some("")).is_empty());
@@ -4128,12 +3915,12 @@ fn the_catalog_level_reports_the_database_id_and_filters_round_trip() {
         connection
             .get_option_string(OptionConnection::CurrentCatalog)
             .expect("read the current catalog"),
-        "mock-db"
+        "d"
     );
     connection
         .set_option(
             OptionConnection::CurrentCatalog,
-            OptionValue::String("mock-db".into()),
+            OptionValue::String("d".into()),
         )
         .expect("setting the current catalog to its own value is a no-op");
     let rejected = connection
@@ -4148,7 +3935,7 @@ fn the_catalog_level_reports_the_database_id_and_filters_round_trip() {
     statement
         .set_option(
             OptionStatement::TargetCatalog,
-            OptionValue::String("mock-db".into()),
+            OptionValue::String("d".into()),
         )
         .expect("ingest into the connection's own catalog");
     let rejected = statement
@@ -4162,7 +3949,6 @@ fn the_catalog_level_reports_the_database_id_and_filters_round_trip() {
 
 #[test]
 fn ingest_operational_errors_keep_status_and_details_without_metadata_probes() {
-    let _watchdog = watchdog!();
     for (code, expected) in [
         (tonic::Code::PermissionDenied, AdbcStatus::Unauthorized),
         (tonic::Code::Unauthenticated, AdbcStatus::Unauthenticated),
@@ -4175,7 +3961,7 @@ fn ingest_operational_errors_keep_status_and_details_without_metadata_probes() {
     ] {
         let probes = Arc::new(AtomicUsize::new(0));
         let record_probes = probes.clone();
-        let server = MockServer::start(move |mock| {
+        let server = start_server(move |mock| {
             mock.expect_batch_write().returning(move |_| {
                 let mut response = batch_write_group_already_exists(0);
                 let status = response.status.as_mut().unwrap();
@@ -4211,8 +3997,7 @@ fn ingest_operational_errors_keep_status_and_details_without_metadata_probes() {
 
 #[test]
 fn cancel_before_first_batch_discards_rows_fetched_by_execute() {
-    let _watchdog = watchdog!();
-    let server = MockServer::start(|mock| {
+    let server = start_server(|mock| {
         mock.expect_execute_streaming_sql().returning(|_| {
             Ok(stream_of(vec![Ok(partial_result_set(
                 true,
@@ -4238,9 +4023,8 @@ fn cancel_before_first_batch_discards_rows_fetched_by_execute() {
 
 #[test]
 fn conversion_error_ends_the_reader_in_first_and_later_batches() {
-    let _watchdog = watchdog!();
     for bad_row in 0..2 {
-        let server = MockServer::start(move |mock| {
+        let server = start_server(move |mock| {
             mock.expect_execute_streaming_sql().returning(move |_| {
                 let mut values = vec![string_value("1"), string_value("2"), string_value("3")];
                 values[bad_row] = string_value("invalid integer");
@@ -4279,10 +4063,9 @@ fn conversion_error_ends_the_reader_in_first_and_later_batches() {
 
 #[test]
 fn interrupted_batch_write_reports_confirmed_rows_and_unknown_outcome() {
-    let _watchdog = watchdog!();
     for cancel_operation in [false, true] {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let server = MockServer::start(move |mock| {
+        let server = start_server(move |mock| {
             mock.expect_batch_write().returning(move |_| {
                 let (tx, rx) = tokio::sync::mpsc::channel(1);
                 tx.try_send(Ok(batch_write_groups_ok(vec![0, 1]))).unwrap();
@@ -4334,10 +4117,9 @@ fn interrupted_batch_write_reports_confirmed_rows_and_unknown_outcome() {
 
 #[test]
 fn ingest_table_probe_inherits_read_options_without_tags() {
-    let _watchdog = watchdog!();
     let queries = Arc::new(Mutex::new(Vec::new()));
     let recorded = queries.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         // The probe finds the ingested column.
         serve_streaming_sql_begin_aware(mock, &["c"], Some(recorded));
     });
@@ -4378,10 +4160,9 @@ fn ingest_table_probe_inherits_read_options_without_tags() {
 
 #[test]
 fn ingest_table_probe_honors_retry_limit() {
-    let _watchdog = watchdog!();
     let attempts = Arc::new(AtomicUsize::new(0));
     let recorded = attempts.clone();
-    let server = MockServer::start(move |mock| {
+    let server = start_server(move |mock| {
         mock.expect_execute_streaming_sql().returning(move |_| {
             if recorded.fetch_add(1, Ordering::SeqCst) == 0 {
                 Err(tonic::Status::unavailable("probe unavailable"))
@@ -4411,11 +4192,10 @@ fn ingest_table_probe_honors_retry_limit() {
 
 #[test]
 fn batch_write_honors_retry_attempt_limit() {
-    let _watchdog = watchdog!();
     for limit in [1, 3] {
         let attempts = Arc::new(AtomicUsize::new(0));
         let recorded = attempts.clone();
-        let server = MockServer::start(move |mock| {
+        let server = start_server(move |mock| {
             mock.expect_batch_write().returning(move |_| {
                 recorded.fetch_add(1, Ordering::SeqCst);
                 Err(tonic::Status::unavailable("batch write unavailable"))
@@ -4450,8 +4230,7 @@ fn batch_write_honors_retry_attempt_limit() {
 
 #[test]
 fn query_consumes_empty_stream_ingest_schema() {
-    let _watchdog = watchdog!();
-    let server = MockServer::start(|mock| {
+    let server = start_server(|mock| {
         mock.expect_execute_streaming_sql().returning(|_| {
             Ok(stream_of(vec![Ok(partial_result_set(
                 true,

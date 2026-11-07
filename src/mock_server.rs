@@ -1,4 +1,5 @@
-//! An in-process mock Spanner server for unit tests, as in `tests/mock_spanner.rs`.
+//! An in-process mock Spanner server for unit tests and `tests/mock_spanner.rs`, which includes this
+//! file by path and so reaches the driver through `super`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,10 +10,12 @@ use adbc_core::{Database, Driver};
 use spanner_grpc_mock::MockSpanner;
 use spanner_grpc_mock::google::spanner::v1;
 
-use crate::{SpannerConnection, SpannerDriver};
+use super::{OPTION_EMULATOR, OPTION_ENDPOINT, SpannerConnection, SpannerDatabase, SpannerDriver};
+
+pub(crate) const DATABASE_URI: &str = "spanner:///projects/p/instances/i/databases/d";
 
 pub(crate) struct MockServer {
-    endpoint: String,
+    pub(crate) endpoint: String,
     server: tokio::task::JoinHandle<()>,
     finished: Arc<AtomicBool>,
     _runtime: tokio::runtime::Runtime,
@@ -91,28 +94,22 @@ impl MockServer {
         }
     }
 
-    /// A connection in emulator mode, which skips credentials and TLS.
     pub(crate) fn connect(&self) -> SpannerConnection {
-        let mut driver = SpannerDriver::try_new().unwrap();
-        driver
-            .new_database_with_opts([
-                (
-                    OptionDatabase::Uri,
-                    OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
-                ),
-                (
-                    OptionDatabase::Other(crate::OPTION_ENDPOINT.into()),
-                    OptionValue::String(self.endpoint.clone()),
-                ),
-                (
-                    OptionDatabase::Other(crate::OPTION_EMULATOR.into()),
-                    OptionValue::String("true".into()),
-                ),
-            ])
-            .unwrap()
-            .new_connection()
-            .unwrap()
+        emulator_database(&self.endpoint).new_connection().unwrap()
     }
+}
+
+/// A database in emulator mode, which skips credentials and TLS. The explicit endpoint overrides
+/// any ambient `SPANNER_EMULATOR_HOST`.
+pub(crate) fn emulator_database(endpoint: &str) -> SpannerDatabase {
+    SpannerDriver::try_new()
+        .unwrap()
+        .new_database_with_opts([
+            (OptionDatabase::Uri, OptionValue::from(DATABASE_URI)),
+            (OPTION_ENDPOINT.into(), endpoint.into()),
+            (OPTION_EMULATOR.into(), "true".into()),
+        ])
+        .unwrap()
 }
 
 impl Drop for MockServer {
