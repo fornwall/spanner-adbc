@@ -58,6 +58,9 @@ struct PollThroughFaults;
 
 impl PollingErrorPolicy for PollThroughFaults {
     fn on_error(&self, state: &PollingState, error: Error) -> RetryResult {
+        if refused_by_proxy(&error) {
+            return RetryResult::Permanent(error);
+        }
         match SpannerRetryPolicy::new().on_error(&RetryState::new(true), error) {
             RetryResult::Continue(error) if state.start.elapsed() >= FAILING_POLLS_LIMIT => {
                 RetryResult::Exhausted(error)
@@ -65,6 +68,20 @@ impl PollingErrorPolicy for PollThroughFaults {
             result => result,
         }
     }
+}
+
+/// A non-gRPC reply is a transport error, which the data plane retries whatever the HTTP status.
+/// The codes are tonic's for a 401, 403 and 404; a proxy's 5xx during a restart maps to others.
+fn refused_by_proxy(error: &Error) -> bool {
+    use tonic::Code;
+    crate::error::chain(error)
+        .filter_map(|source| source.downcast_ref::<tonic::Status>())
+        .any(|status| {
+            matches!(
+                status.code(),
+                Code::Unauthenticated | Code::PermissionDenied | Code::Unimplemented
+            )
+        })
 }
 
 #[derive(Debug)]

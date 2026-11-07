@@ -25,6 +25,8 @@ struct State {
     responses: VecDeque<std::result::Result<WireOperation, tonic::Status>>,
     /// Polls left to answer by resetting their stream, as a lost connection would.
     reset_polls: usize,
+    /// HTTP statuses to answer the next polls with instead of gRPC, as a proxy would.
+    proxy_replies: VecDeque<u16>,
 }
 
 // Both requests use a string field numbered 1 (database/name). Decode with the DDL
@@ -80,6 +82,14 @@ impl<const POLLING: bool> Service<http::Request<tonic::body::Body>> for Mock<POL
                 "/google.spanner.admin.database.v1.DatabaseAdmin/UpdateDatabaseDdl"
             }
         );
+        if POLLING && let Some(status) = self.0.lock().unwrap().proxy_replies.pop_front() {
+            let reply = http::Response::builder()
+                .status(status)
+                .header("content-type", "text/html")
+                .body(tonic::body::Body::empty())
+                .unwrap();
+            return Box::pin(async { Ok(reply) });
+        }
         let service = self.clone();
         Box::pin(async move {
             Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
@@ -92,13 +102,13 @@ impl<const POLLING: bool> Service<http::Request<tonic::body::Body>> for Mock<POL
 fn run(
     responses: Vec<std::result::Result<WireOperation, tonic::Status>>,
 ) -> (Result<()>, Vec<Recorded>) {
-    run_resetting_polls(responses, 0)
+    run_with(State {
+        responses: responses.into(),
+        ..Default::default()
+    })
 }
 
-fn run_resetting_polls(
-    responses: Vec<std::result::Result<WireOperation, tonic::Status>>,
-    reset_polls: usize,
-) -> (Result<()>, Vec<Recorded>) {
+fn run_with(state: State) -> (Result<()>, Vec<Recorded>) {
     let runtime = crate::runtime::new_runtime().unwrap();
     let mut database = crate::driver::SpannerDatabase::new(runtime.clone());
     database.access_token = Some("admin-test-token".into());
@@ -114,11 +124,7 @@ fn run_resetting_polls(
         let mut config = ClientConfig::default();
         config.endpoint = Some(format!("http://{}", listener.local_addr().unwrap()));
         config.cred = Some(credentials);
-        let state = Arc::new(Mutex::new(State {
-            responses: responses.into(),
-            reset_polls,
-            ..Default::default()
-        }));
+        let state = Arc::new(Mutex::new(state));
         let incoming = futures_util::stream::unfold(listener, |listener| async {
             Some((listener.accept().await.map(|(stream, _)| stream), listener))
         });
@@ -150,20 +156,7 @@ fn run_resetting_polls(
 
 #[test]
 fn ddl_and_operation_polling_use_grpc_with_credentials_and_routing() {
-    let (result, requests) = run(vec![
-        Ok(WireOperation {
-            name: OPERATION.into(),
-            ..Default::default()
-        }),
-        Ok(WireOperation {
-            name: OPERATION.into(),
-            done: true,
-            result: Some(OperationResult::Response(prost_types::Any {
-                type_url: "type.googleapis.com/google.protobuf.Empty".into(),
-                value: Vec::new(),
-            })),
-        }),
-    ]);
+    let (result, requests) = run(vec![pending(), done()]);
     result.unwrap();
     assert_eq!(requests.len(), 2);
     assert!(!requests[0].polling);
@@ -202,10 +195,7 @@ fn ddl_and_operation_polling_use_grpc_with_credentials_and_routing() {
 #[test]
 fn terminal_operation_errors_are_returned_without_polling_again() {
     let (result, requests) = run(vec![
-        Ok(WireOperation {
-            name: OPERATION.into(),
-            ..Default::default()
-        }),
+        pending(),
         Ok(WireOperation {
             name: OPERATION.into(),
             done: true,
@@ -236,25 +226,51 @@ fn ambiguous_ddl_failures_are_not_retried() {
     assert_eq!(requests.len(), 1);
 }
 
+fn pending() -> std::result::Result<WireOperation, tonic::Status> {
+    Ok(WireOperation {
+        name: OPERATION.into(),
+        ..Default::default()
+    })
+}
+
+fn done() -> std::result::Result<WireOperation, tonic::Status> {
+    Ok(WireOperation {
+        name: OPERATION.into(),
+        done: true,
+        result: Some(OperationResult::Response(prost_types::Any {
+            type_url: "type.googleapis.com/google.protobuf.Empty".into(),
+            value: Vec::new(),
+        })),
+    })
+}
+
 #[test]
 fn polling_outlasts_a_reset_stream() {
-    let (result, requests) = run_resetting_polls(
-        vec![
-            Ok(WireOperation {
-                name: OPERATION.into(),
-                ..Default::default()
-            }),
-            Ok(WireOperation {
-                name: OPERATION.into(),
-                done: true,
-                result: Some(OperationResult::Response(prost_types::Any {
-                    type_url: "type.googleapis.com/google.protobuf.Empty".into(),
-                    value: Vec::new(),
-                })),
-            }),
-        ],
-        1,
-    );
+    let (result, requests) = run_with(State {
+        responses: vec![pending(), done()].into(),
+        reset_polls: 1,
+        ..Default::default()
+    });
     result.unwrap();
     assert_eq!(requests.len(), 3);
+}
+
+#[test]
+fn a_proxy_refusing_a_poll_ends_polling_but_a_failing_one_does_not() {
+    for refusal in [401, 403, 404] {
+        let (result, requests) = run_with(State {
+            responses: vec![pending()].into(),
+            proxy_replies: vec![refusal].into(),
+            ..Default::default()
+        });
+        assert!(result.unwrap_err().is_transport(), "HTTP {refusal}");
+        assert_eq!(requests.len(), 1, "HTTP {refusal}");
+    }
+    let (result, requests) = run_with(State {
+        responses: vec![pending(), done()].into(),
+        proxy_replies: vec![500, 502, 503].into(),
+        ..Default::default()
+    });
+    result.unwrap();
+    assert_eq!(requests.len(), 2);
 }
