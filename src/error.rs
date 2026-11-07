@@ -40,11 +40,12 @@ pub(crate) fn annotate(mut error: Error, f: impl FnOnce(&str) -> String) -> Erro
 }
 
 /// Whether a failed write may still have been committed. A timeout or cancel drops the in-flight
-/// commit, and a transport failure or `UNAVAILABLE` can follow a commit the server applied. Other
-/// `IO` codes, such as `ABORTED`, mean the commit was rejected.
+/// commit, and a transport failure, `UNAVAILABLE`, `INTERNAL` or an undecodable response can
+/// follow a commit the server applied. `UNKNOWN` is how Spanner reports losing track of a commit.
+/// Other `IO` codes, such as `ABORTED`, mean the commit was rejected.
 pub(crate) fn commit_outcome_unknown(error: &Error) -> bool {
     match error.status {
-        Status::Timeout | Status::Cancelled => true,
+        Status::Timeout | Status::Cancelled | Status::Unknown | Status::Internal => true,
         Status::IO => [0, Code::Unavailable as i32].contains(&error.vendor_code),
         _ => false,
     }

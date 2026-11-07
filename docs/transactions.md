@@ -75,9 +75,9 @@ the same way, and fails inside a manual write transaction.
 At commit, buffered DML runs as one `ExecuteBatchDml`, followed by the buffered mutations. All
 mutations therefore apply after all DML, whatever order the ingests and DML were issued in.
 Mutation-only work uses the write-only path, which is protected against replay. If the commit
-fails, the buffer is kept. A commit that was cancelled, timed out or lost its connection may
-still have been applied, and its error says so; committing the kept work again could apply it
-twice, so roll back to discard it. If the commit succeeds, only the applied work is removed, so
+fails, the buffer is kept. A commit that was cancelled, timed out, lost its connection or failed
+with `UNKNOWN` or `INTERNAL` may still have been applied, and its error says so; committing the
+kept work again could apply it twice, so roll back to discard it. If the commit succeeds, only the applied work is removed, so
 work buffered concurrently survives. Turning autocommit back on also commits pending work.
 
 With `adbc.connection.readonly=true`, new writes and commits of pending writes fail with
