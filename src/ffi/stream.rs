@@ -31,15 +31,16 @@ struct PrivateData {
     reader: Box<dyn RecordBatchReader + Send>,
     last_error: Option<LastError>,
     /// The error returned by [`error_from_array_stream`], which must stay valid until the stream
-    /// is released.
-    exported_error: AdbcError,
+    /// is released. Boxed because each callback reborrows this struct, which would invalidate a
+    /// pointer into it.
+    exported_error: Box<AdbcError>,
     panicked: bool,
 }
 
 impl Drop for PrivateData {
     fn drop(&mut self) {
         if let Some(release) = self.exported_error.release {
-            unsafe { release(&raw mut self.exported_error) };
+            unsafe { release(&raw mut *self.exported_error) };
         }
     }
 }
@@ -58,7 +59,7 @@ pub(super) fn export_reader(reader: Box<dyn RecordBatchReader + Send>) -> FFI_Ar
     let private_data = Box::new(PrivateData {
         reader,
         last_error: None,
-        exported_error: AdbcError::default(),
+        exported_error: Box::default(),
         panicked: false,
     });
     // SAFETY: the callbacks below implement the Arrow C Stream contract over a `PrivateData`,
@@ -161,7 +162,7 @@ pub(super) unsafe extern "C" fn error_from_array_stream(
         return std::ptr::null();
     }
     let private = unsafe { private_data(stream) };
-    let exported = &raw mut private.exported_error;
+    let exported = &raw mut *private.exported_error;
     let code = match private.last_error.as_ref() {
         // Nothing pending: OK and an empty error, as the reference C++ drivers do.
         None => {

@@ -203,6 +203,20 @@ fn error_from_array_stream_rejects_foreign_and_null_streams() {
     assert_eq!(status, 0xEE);
 }
 
+/// The stream owns the returned error, so a host may keep reading it between callbacks. Only Miri
+/// can observe a callback invalidating it.
+#[test]
+fn an_exported_error_stays_readable_across_later_callbacks() {
+    let mut stream = error_stream(ArrowError::MemoryError("no room".to_owned()));
+    let mut array = FFI_ArrowArray::empty();
+    unsafe { stream.get_next().unwrap()(&raw mut stream, &raw mut array) };
+    let exported = unsafe { error_from_array_stream(&raw mut stream, null()) };
+
+    let mut schema = FFI_ArrowSchema::empty();
+    unsafe { stream.get_schema().unwrap()(&raw mut stream, &raw mut schema) };
+    assert!(!unsafe { (*exported).message }.is_null());
+}
+
 #[test]
 fn contains_reader_panics_in_get_next() {
     let mut stream = export_reader(Box::new(PanickingReader));
