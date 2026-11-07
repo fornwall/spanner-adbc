@@ -502,7 +502,7 @@ impl PartitionDescriptor {
                     .iter()
                     .map(|field| {
                         let ty = field.r#type.as_deref().cloned().unwrap_or_default().into();
-                        crate::conversion::arrow_field(&field.name, &ty, true, precision)
+                        crate::conversion::arrow_field(&field.name, &ty, precision)
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Arc::new(Schema::new(fields)))

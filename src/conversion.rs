@@ -138,31 +138,29 @@ pub(crate) fn build_schema(
         .column_names()
         .iter()
         .zip(metadata.column_types())
-        .map(|(name, ty)| arrow_field(name, ty, true, precision).map_err(within("column", name)))
+        .map(|(name, ty)| arrow_field(name, ty, precision).map_err(within("column", name)))
         .collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(Schema::new(fields)))
 }
 
-/// Build the Arrow field for a Spanner column type, tagging `JSON` with the `arrow.json`
+/// Build the nullable Arrow field for a Spanner column type, tagging `JSON` with the `arrow.json`
 /// extension. Rejects types nested deeper than [`MAX_TYPE_NESTING_DEPTH`].
 pub(crate) fn arrow_field(
     name: impl Into<String>,
     ty: &Type,
-    nullable: bool,
     precision: TimestampPrecision,
 ) -> Result<Field> {
-    arrow_field_at(name, ty, nullable, precision, 0)
+    arrow_field_at(name, ty, precision, 0)
 }
 
 /// [`arrow_field`] at nesting `depth`.
 fn arrow_field_at(
     name: impl Into<String>,
     ty: &Type,
-    nullable: bool,
     precision: TimestampPrecision,
     depth: usize,
 ) -> Result<Field> {
-    let field = Field::new(name, arrow_type(ty, precision, depth)?, nullable);
+    let field = Field::new(name, arrow_type(ty, precision, depth)?, true);
     Ok(if ty.code() == TypeCode::Json {
         field.with_metadata(json_extension_metadata())
     } else {
@@ -231,7 +229,6 @@ fn arrow_type(ty: &Type, precision: TimestampPrecision, depth: usize) -> Result<
                 DataType::List(Arc::new(arrow_field_at(
                     LIST_ITEM,
                     element,
-                    true,
                     precision,
                     depth + 1,
                 )?))
@@ -263,7 +260,7 @@ fn struct_fields(
                 .cloned()
                 .map(Type::from)
                 .unwrap_or_default();
-            arrow_field_at(&f.name, &field_type, true, precision, depth + 1)
+            arrow_field_at(&f.name, &field_type, precision, depth + 1)
         })
         .collect()
 }
@@ -284,12 +281,7 @@ pub(crate) fn build_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch
 
     // An explicit row count lets a result with no columns form a batch.
     let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
-    RecordBatch::try_new_with_options(schema, arrays, &options).map_err(|e| {
-        err(
-            format!("failed to build record batch: {e}"),
-            Status::Internal,
-        )
-    })
+    RecordBatch::try_new_with_options(schema, arrays, &options).map_err(arrow_err)
 }
 
 /// Prefix an error with the column or struct field it occurred in, so errors are traceable in
@@ -314,10 +306,7 @@ fn present(value: Option<&Value>) -> Option<&Value> {
 }
 
 fn arrow_err(e: ArrowError) -> adbc_core::error::Error {
-    err(
-        format!("failed to build Arrow array: {e}"),
-        Status::Internal,
-    )
+    err(format!("failed to build Arrow data: {e}"), Status::Internal)
 }
 
 /// Error for a non-NULL value that cannot be decoded as its type. Mapping it to NULL instead would
@@ -488,11 +477,11 @@ fn build_list(field: &FieldRef, values: &[Option<&Value>]) -> Result<ArrayRef> {
     for &value in values {
         match present(value) {
             None => validity.append_null(),
-            Some(v) if v.kind() == Kind::List => {
-                children.extend(v.as_list().expect("list kind").iter().map(Some));
+            Some(v) => {
+                let list = v.as_list().ok_or_else(|| decode_error("ARRAY", v))?;
+                children.extend(list.iter().map(Some));
                 validity.append_non_null();
             }
-            Some(v) => return Err(decode_error("ARRAY", v)),
         }
         // `children.len()` is the running element count, which may exceed the i32 offset range.
         let offset = i32::try_from(children.len()).map_err(|_| {
@@ -525,8 +514,8 @@ fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> 
                 rows.push(None);
                 validity.append_null();
             }
-            Some(v) if v.kind() == Kind::List => {
-                let list = v.as_list().expect("list kind");
+            Some(v) => {
+                let list = v.as_list().ok_or_else(|| decode_error("STRUCT", v))?;
                 if list.len() != fields.len() {
                     return Err(err(
                         format!(
@@ -540,7 +529,6 @@ fn build_struct(fields: &Fields, values: &[Option<&Value>]) -> Result<ArrayRef> 
                 rows.push(Some(list));
                 validity.append_non_null();
             }
-            Some(v) => return Err(decode_error("STRUCT", v)),
         }
     }
     // Reuse one column of pointers instead of allocating a rows x fields matrix.

@@ -795,12 +795,9 @@ impl Statement for SpannerStatement {
                 match ty {
                     // Same mapping as result columns, so JSON parameters carry the `arrow.json`
                     // tag that binding recognizes.
-                    Some(ty) => crate::conversion::arrow_field(
-                        &name,
-                        ty,
-                        true,
-                        self.config.timestamp_precision,
-                    ),
+                    Some(ty) => {
+                        crate::conversion::arrow_field(&name, ty, self.config.timestamp_precision)
+                    }
                     None => Ok(Field::new(name, DataType::Null, true)),
                 }
             })

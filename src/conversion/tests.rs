@@ -32,7 +32,7 @@ fn struct_type(fields: Vec<(&str, Type)>) -> Type {
 }
 
 fn mapped(precision: TimestampPrecision, ty: &Type) -> Field {
-    arrow_field("c", ty, true, precision).unwrap()
+    arrow_field("c", ty, precision).unwrap()
 }
 
 /// Build `data_type` from `values` followed by an absent slot, which reads as NULL.
@@ -135,7 +135,7 @@ fn pathologically_nested_struct_type_fails_loudly_instead_of_overflowing() {
                     .set_fields([model::struct_type::Field::new().set_name("f").set_type(ty)]),
             );
     }
-    let error = arrow_field("deep", &ty.into(), true, TimestampPrecision::default()).unwrap_err();
+    let error = arrow_field("deep", &ty.into(), TimestampPrecision::default()).unwrap_err();
     assert_eq!(error.status, Status::Internal);
     assert!(error.message.contains("maximum depth"), "{error}");
 }
