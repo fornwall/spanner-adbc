@@ -10,6 +10,7 @@ use google_cloud_spanner::transaction::{BeginTransactionOption, ReadWriteTransac
 
 use super::{SpannerStatement, bound_statements, check_partitioned_dml};
 use crate::connection::{lock_txn, runner_builder};
+use crate::conversion::rows_to_batch;
 use crate::error::{
     annotate, commit_outcome_unknown, from_spanner, invalid_argument, invalid_state,
     is_mutation_limit_exceeded, unsupported,
@@ -80,6 +81,7 @@ impl SpannerStatement {
         let isolation = self.config.isolation.clone();
         let request = self.config.request.clone();
         let retry = self.config.retry;
+        let precision = self.config.timestamp_precision;
         // The update timeout covers the whole transaction.
         let update_timeout = self.config.timeouts.update_timeout();
         let transaction = async move {
@@ -105,7 +107,11 @@ impl SpannerStatement {
                             // the stream. `THEN RETURN` yields one row per affected row, so the
                             // drained row count is the fallback.
                             let count = result_set.update_count().unwrap_or(rows.len() as i64);
-                            results.push((result_set.metadata().clone(), rows, count));
+                            // Failing here rolls back; after the commit it would report applied
+                            // DML as failed.
+                            let batch = rows_to_batch(result_set.metadata(), &rows, precision)
+                                .map_err(google_cloud_spanner::Error::deser)?;
+                            results.push((batch, count));
                         }
                         Ok(results)
                     }
@@ -131,17 +137,11 @@ impl SpannerStatement {
         .map_err(note_dml_failure)?;
         self.config.commit_stats.record(mutation_count);
 
-        let mut schema = None;
-        let mut batches = Vec::with_capacity(results.len());
-        let mut affected = 0i64;
-        for (metadata, rows, count) in &results {
-            let batch =
-                crate::conversion::rows_to_batch(metadata, rows, self.config.timestamp_precision)?;
-            schema.get_or_insert_with(|| batch.schema());
-            batches.push(batch);
-            affected += count;
-        }
-        let schema = schema.unwrap_or_else(|| Arc::new(Schema::empty()));
+        let schema = results
+            .first()
+            .map_or_else(|| Arc::new(Schema::empty()), |(batch, _)| batch.schema());
+        let affected = results.iter().map(|(_, count)| count).sum();
+        let batches = results.into_iter().map(|(batch, _)| batch).collect();
         Ok((batches, schema, affected))
     }
 

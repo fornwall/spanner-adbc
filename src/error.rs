@@ -111,6 +111,10 @@ pub(crate) fn chain<'a>(
 /// `RetryInfo` on `ABORTED` is rare because the client's transaction runner consumes it. Without
 /// details, `details` is `None`, never `Some(vec![])`.
 pub(crate) fn from_spanner(error: google_cloud_spanner::Error) -> Error {
+    // A transaction body fails with a driver error by wrapping it in a client error.
+    if let Some(error) = chain(&error).find_map(|e| e.downcast_ref::<Error>()) {
+        return error.clone();
+    }
     if let Some(error) = authentication_error(&error) {
         return error;
     }

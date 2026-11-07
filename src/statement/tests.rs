@@ -1054,6 +1054,49 @@ mod manual_txn {
         );
     }
 
+    /// Returned rows that can't convert must fail the transaction: an error after the commit would
+    /// report applied DML as failed, inviting a retry that applies it twice.
+    #[test]
+    fn returning_dml_rows_that_cannot_convert_roll_back() {
+        let commits = Arc::new(Mutex::new(0));
+        let rollbacks = Arc::new(Mutex::new(0));
+        let mut mock = MockSpanner::new();
+        mock.expect_execute_streaming_sql().returning(|_| {
+            let mut response = result(true, b"rw-txn");
+            let metadata = response.metadata.as_mut().unwrap();
+            metadata.row_type.as_mut().unwrap().fields[0].r#type = Some(v1::Type {
+                code: v1::TypeCode::Timestamp as i32,
+                ..Default::default()
+            });
+            // Outside what `Timestamp(Nanosecond)` can hold.
+            response.values = vec![prost_types::Value {
+                kind: Some(prost_types::value::Kind::StringValue(
+                    "0001-01-01T00:00:00Z".into(),
+                )),
+            }];
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(Ok(response)).unwrap();
+            Ok(tonic::Response::new(rx))
+        });
+        let count = commits.clone();
+        mock.expect_commit().returning(move |_| {
+            *count.lock().unwrap() += 1;
+            Ok(tonic::Response::new(v1::CommitResponse::default()))
+        });
+        let count = rollbacks.clone();
+        mock.expect_rollback().returning(move |_| {
+            *count.lock().unwrap() += 1;
+            Ok(tonic::Response::new(()))
+        });
+        let server = crate::mock_server::MockServer::serve(mock);
+        let mut connection = server.connect();
+        let mut statement = sql_statement(&mut connection, "UPDATE t SET c = c THEN RETURN c");
+        let error = statement.execute_update().unwrap_err();
+        assert_eq!(error.status, Status::InvalidData, "{error}");
+        assert_eq!(*commits.lock().unwrap(), 0, "the DML was committed");
+        assert_eq!(*rollbacks.lock().unwrap(), 1);
+    }
+
     /// A failed first query begins nothing, so it must not poison the manual transaction: with
     /// an inline begin the client marks the unstarted transaction permanently failed.
     #[test]
