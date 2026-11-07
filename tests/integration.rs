@@ -3959,9 +3959,10 @@ fn change_stream_via_plain_sql() {
         "INSERT INTO AdbcChangeStream (Id, Name) VALUES (1, 'alpha'), (2, 'beta')",
     );
 
-    // The emulator keeps no history, so the window must start at or after now.
-    let start = Utc::now() + chrono::Duration::milliseconds(500);
-    let end = Utc::now() + chrono::Duration::seconds(3);
+    // The emulator rejects a start in the past, so leave room for a stalled runner to send the
+    // query in time. The read runs until the end of the window.
+    let start = Utc::now() + chrono::Duration::seconds(2);
+    let end = start + chrono::Duration::seconds(1);
     let start_lit = start.to_rfc3339_opts(SecondsFormat::Nanos, true);
     let end_lit = end.to_rfc3339_opts(SecondsFormat::Nanos, true);
     let read_sql = format!(
