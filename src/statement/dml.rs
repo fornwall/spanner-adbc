@@ -157,13 +157,14 @@ impl SpannerStatement {
         let Some(statement) = statements.pop() else {
             return Ok(0);
         };
-        let exclude_from_change_streams = self.config.request.exclude_txn_from_change_streams;
-        let client = self.client.clone();
-        self.block_on_update(async move {
-            let transaction = client
-                .partitioned_dml_transaction()
-                .set_exclude_txn_from_change_streams(exclude_from_change_streams)
-                .build();
+        let transaction = self
+            .client
+            .partitioned_dml_transaction()
+            .set_exclude_txn_from_change_streams(
+                self.config.request.exclude_txn_from_change_streams,
+            )
+            .build();
+        self.block_on_update(async {
             transaction
                 .execute_update(statement)
                 .await

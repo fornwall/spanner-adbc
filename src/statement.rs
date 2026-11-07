@@ -174,15 +174,12 @@ impl SpannerStatement {
     /// Return the result schema of `sql` from a `QueryMode::Plan` probe, which scans no rows.
     /// Binds the first bound parameter row so `@param` references resolve.
     fn plan_query_schema(&self, sql: &str) -> Result<SchemaRef> {
-        let client = self.client.clone();
         // The schema is versioned too, so probe at the same staleness as the data read.
         let read_bound = self.config.read_staleness.timestamp_bound();
         let precision = self.config.timestamp_precision;
         let statement = self.build_query_statement(sql, true)?;
-        self.block_on_query(async move {
-            let batch = query_single_use(&client, read_bound, statement, precision).await?;
-            Ok(batch.schema())
-        })
+        let probe = query_single_use(&self.client, read_bound, statement, precision);
+        Ok(self.block_on_query(probe)?.schema())
     }
 
     /// Run a query once per bound row, streaming the concatenated results. All rows share one
@@ -196,27 +193,20 @@ impl SpannerStatement {
         )?;
         let bound = self.config.read_staleness.multi_use_timestamp_bound();
         let manual_txn = self.manual_read_transaction()?;
-        let client = self.client.clone();
-        let runtime = self.runtime.clone();
-        let cancel = self.cancel.current();
-        let batch_size = self.rows_per_batch;
-        let precision = self.config.timestamp_precision;
-        let fetch_timeout = self.config.timeouts.fetch_timeout();
-        let txn = manual_txn.clone();
         let reader = self
-            .block_on_query(async move {
-                let transaction = match txn {
-                    Some(txn) => txn,
-                    None => Arc::new(crate::staleness::multi_use(&client, bound).await?),
+            .block_on_query(async {
+                let transaction = match &manual_txn {
+                    Some(txn) => txn.clone(),
+                    None => Arc::new(crate::staleness::multi_use(&self.client, bound).await?),
                 };
                 stream_bound_query(
-                    runtime,
-                    cancel,
+                    self.runtime.clone(),
+                    self.cancel.current(),
                     transaction,
                     statements,
-                    batch_size,
-                    precision,
-                    fetch_timeout,
+                    self.rows_per_batch,
+                    self.config.timestamp_precision,
+                    self.config.timeouts.fetch_timeout(),
                 )
                 .await
             })
@@ -247,33 +237,26 @@ impl SpannerStatement {
         let statement = self.build_query_statement(sql, false)?;
         let bound = self.config.read_staleness.timestamp_bound();
         let manual_txn = self.manual_read_transaction()?;
-        let client = self.client.clone();
-        let runtime = self.runtime.clone();
-        let cancel = self.cancel.current();
-        let batch_size = self.rows_per_batch;
-        let precision = self.config.timestamp_precision;
-        let fetch_timeout = self.config.timeouts.fetch_timeout();
-        let txn = manual_txn.clone();
         // `stream_query` fetches the first chunk to settle the schema, within the query timeout;
         // the reader converts the rest one chunk at a time, each within the fetch timeout.
         let reader = self
-            .block_on_query(async move {
-                let result_set = match txn {
+            .block_on_query(async {
+                let result_set = match &manual_txn {
                     Some(txn) => txn.execute_query(statement).await,
                     None => {
-                        crate::staleness::single_use(&client, bound)
+                        crate::staleness::single_use(&self.client, bound)
                             .execute_query(statement)
                             .await
                     }
                 }
                 .map_err(from_spanner)?;
                 stream_query(
-                    runtime,
-                    cancel,
+                    self.runtime.clone(),
+                    self.cancel.current(),
                     result_set,
-                    batch_size,
-                    precision,
-                    fetch_timeout,
+                    self.rows_per_batch,
+                    self.config.timestamp_precision,
+                    self.config.timeouts.fetch_timeout(),
                     None,
                 )
                 .await
@@ -311,21 +294,19 @@ impl SpannerStatement {
                 "cannot execute DDL: the connection is read-only",
             ));
         }
-        let admin_cell = self.admin.clone();
-        let database = self.database.clone();
-        self.block_on_update(async move {
-            // Built once per client stack to avoid repeating endpoint and credential
-            // setup; a failed build is not cached.
-            let admin = admin_cell.client().await?;
+        self.block_on_update(async {
+            // Built once per client stack to avoid repeating endpoint and credential setup; a
+            // failed build is not cached.
+            let admin = self.admin.client().await?;
             admin
                 .update_database_ddl()
-                .set_database(database)
+                .set_database(self.database.clone())
                 .set_statements(statements)
                 .poller()
                 .until_done()
                 .await
                 .map_err(from_spanner)?;
-            Ok::<(), Error>(())
+            Ok(())
         })
     }
 
@@ -421,16 +402,14 @@ impl SpannerStatement {
         // `DatabaseClient`, so descriptors outlive this statement.
         let plan_stmt = self.build_query_statement(sql, true)?;
         let query_stmt = self.build_query_statement(sql, false)?;
-        let client = self.client.clone();
-        let data_boost = self.data_boost;
         // `read_partition` decodes with the reading connection's `spanner.max_timestamp_precision`,
         // so the two connections should use the same setting.
         let precision = self.config.timestamp_precision;
         // Baked into the batch transaction, so every partition reads at this bound.
         let bound = self.config.read_staleness.multi_use_timestamp_bound();
 
-        let partition_op = async move {
-            let plan_rs = crate::staleness::single_use(&client, bound.clone())
+        let (schema, partitions) = self.block_on_query(async {
+            let plan_rs = crate::staleness::single_use(&self.client, bound.clone())
                 .execute_query(plan_stmt)
                 .await
                 .map_err(from_spanner)?;
@@ -449,7 +428,7 @@ impl SpannerStatement {
             );
             let schema = result_set_to_batch(plan_rs, precision).await?.schema();
 
-            let mut txn_builder = client.batch_read_only_transaction();
+            let mut txn_builder = self.client.batch_read_only_transaction();
             if let Some(b) = bound {
                 txn_builder = txn_builder.set_timestamp_bound(b);
             }
@@ -464,14 +443,13 @@ impl SpannerStatement {
                 .into_iter()
                 .map(|partition| {
                     crate::connection::encode_partition(&crate::connection::PartitionDescriptor {
-                        partition: partition.set_data_boost(data_boost),
+                        partition: partition.set_data_boost(self.data_boost),
                         row_type: Some(row_type.clone()),
                     })
                 })
                 .collect::<Result<Vec<Vec<u8>>>>()?;
-            Ok::<_, Error>((schema, tokens))
-        };
-        let (schema, partitions) = self.block_on_query(partition_op)?;
+            Ok((schema, tokens))
+        })?;
 
         Ok(PartitionedResult {
             partitions,
@@ -504,14 +482,15 @@ impl SpannerStatement {
             }
             return self.plan_dml_parameter_types(sql);
         }
-        let plan_builder = self.read_sql_builder(sql).set_query_mode(QueryMode::Plan);
-        let client = self.client.clone();
+        let plan_statement = self
+            .read_sql_builder(sql)
+            .set_query_mode(QueryMode::Plan)
+            .build();
         // Plan against the schema version the query will read, as `plan_query_schema` does.
         let read_bound = self.config.read_staleness.timestamp_bound();
-        self.block_on_query(async move {
-            let transaction = crate::staleness::single_use(&client, read_bound);
-            let result_set = transaction
-                .execute_query(plan_builder.build())
+        self.block_on_query(async {
+            let result_set = crate::staleness::single_use(&self.client, read_bound)
+                .execute_query(plan_statement)
                 .await
                 .map_err(from_spanner)?;
             // Metadata arrives with the first response; a PLAN has no rows to drain.
