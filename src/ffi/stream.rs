@@ -15,10 +15,10 @@ use arrow_schema::ArrowError;
 
 use libc::{EACCES, ECANCELED, EEXIST, EINVAL, EIO, ENOENT, ENOMEM, ENOSYS, ENOTSUP, ETIMEDOUT};
 
-use super::abi::{ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA, ADBC_STATUS_OK, AdbcError, AdbcStatusCode};
+use super::abi::{ADBC_STATUS_OK, AdbcError, AdbcStatusCode};
 use super::error::export_error;
 use super::guard::{drop_panic_payload, panic_message, sanitized_cstring};
-use crate::error::chain;
+use crate::error::{chain, invalid_argument};
 
 /// A callback failure, as the C string `get_last_error` returns and as the structured error
 /// [`error_from_array_stream`] exports.
@@ -27,36 +27,28 @@ struct LastError {
     error: Error,
 }
 
-/// Marks [`PrivateData`] for [`error_from_array_stream`]. The release callback address is checked
-/// first; the magic guards against a linker folding an identical foreign function onto it.
-const STREAM_MAGIC: u64 = 0x5350_414e_5354_524d; // "SPANSTRM"
-
 struct PrivateData {
-    magic: u64,
     reader: Box<dyn RecordBatchReader + Send>,
     last_error: Option<LastError>,
     /// The error returned by [`error_from_array_stream`], which must stay valid until the stream
     /// is released.
-    exported_error: Option<Box<AdbcError>>,
+    exported_error: AdbcError,
     panicked: bool,
 }
 
 impl Drop for PrivateData {
     fn drop(&mut self) {
-        if let Some(mut exported) = self.exported_error.take()
-            && let Some(release) = exported.release
-        {
-            unsafe { release(&raw mut *exported) };
+        if let Some(release) = self.exported_error.release {
+            unsafe { release(&raw mut self.exported_error) };
         }
     }
 }
 
 pub(super) fn export_reader(reader: Box<dyn RecordBatchReader + Send>) -> FFI_ArrowArrayStream {
     let private_data = Box::new(PrivateData {
-        magic: STREAM_MAGIC,
         reader,
         last_error: None,
-        exported_error: None,
+        exported_error: AdbcError::default(),
         panicked: false,
     });
     // SAFETY: the callbacks below implement the Arrow C Stream contract over a `PrivateData`,
@@ -135,18 +127,18 @@ unsafe extern "C" fn get_last_error(stream: *mut FFI_ArrowArrayStream) -> *const
 /// `AdbcErrorFromArrayStream`: the structured error behind a failed stream callback, which the
 /// Arrow C stream interface can only report as an errno and a message.
 ///
-/// Streams from [`export_reader`] are recognized by their [`release`] callback and
-/// [`STREAM_MAGIC`]. Foreign and released streams get null, with `status` untouched, as adbc.h
-/// specifies.
+/// Streams from [`export_reader`] are recognized by their [`release`] callback. Foreign and
+/// released streams get null, with `status` untouched, as adbc.h specifies.
 ///
 /// # Safety
 /// `stream` must be null or point to a valid or released `ArrowArrayStream`; `status` must be
 /// null or writable.
+// Guard-exempt: only clones an error and formats it for export.
 pub(super) unsafe extern "C" fn error_from_array_stream(
     stream: *mut FFI_ArrowArrayStream,
     status: *mut AdbcStatusCode,
 ) -> *const AdbcError {
-    if stream.is_null() || unsafe { (*stream).private_data().is_null() } {
+    if stream.is_null() {
         return std::ptr::null();
     }
     let ours = unsafe { (*stream).release() }.is_some_and(|callback| {
@@ -158,52 +150,27 @@ pub(super) unsafe extern "C" fn error_from_array_stream(
     if !ours {
         return std::ptr::null();
     }
-    catch_unwind(AssertUnwindSafe(|| {
-        let private = unsafe { private_data(stream) };
-        if private.magic != STREAM_MAGIC {
-            return std::ptr::null();
-        }
-        // Kept in `PrivateData` to outlive this call. Exporting again releases the previous
-        // error first.
-        let exported = private.exported_error.get_or_insert_with(|| {
-            Box::new(AdbcError {
-                message: std::ptr::null_mut(),
-                vendor_code: ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA,
-                sqlstate: [0; 5],
-                release: None,
-                private_data: std::ptr::null_mut(),
-                private_driver: std::ptr::null(),
-            })
-        });
-        match private.last_error.as_ref() {
-            None => {
-                // Nothing pending: OK and an empty error, as the reference C++ drivers do.
-                if let Some(release) = exported.release {
-                    unsafe { release(&raw mut **exported) };
-                }
-                if !status.is_null() {
-                    unsafe { std::ptr::write_unaligned(status, ADBC_STATUS_OK) };
-                }
+    let private = unsafe { private_data(stream) };
+    let exported = &raw mut private.exported_error;
+    let code = match private.last_error.as_ref() {
+        // Nothing pending: OK and an empty error, as the reference C++ drivers do.
+        None => {
+            if let Some(release) = private.exported_error.release {
+                unsafe { release(exported) };
             }
-            Some(last) => {
-                // `export_error` picks the layout from the sentinel; this driver-owned storage
-                // is always 1.1.0.
-                exported.vendor_code = ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA;
-                unsafe { export_error(&raw mut **exported, last.error.clone()) };
-                if !status.is_null() {
-                    unsafe {
-                        std::ptr::write_unaligned(status, AdbcStatusCode::from(last.error.status));
-                    }
-                }
-            }
+            ADBC_STATUS_OK
         }
-        // The driver manager writes `private_driver` through the returned pointer.
-        (&raw mut **exported).cast_const()
-    }))
-    .unwrap_or_else(|cause| {
-        drop_panic_payload(cause);
-        std::ptr::null()
-    })
+        // Exporting again releases the previous error first.
+        Some(last) => {
+            unsafe { export_error(exported, last.error.clone()) };
+            AdbcStatusCode::from(last.error.status)
+        }
+    };
+    if !status.is_null() {
+        unsafe { std::ptr::write_unaligned(status, code) };
+    }
+    // The driver manager writes `private_driver` through the returned pointer.
+    exported.cast_const()
 }
 
 // `inline(never)` keeps one copy of this function, so its address identifies our streams in
@@ -266,11 +233,8 @@ impl PrivateData {
         });
     }
 
-    fn fail(&mut self, message: impl Into<String>) -> c_int {
-        self.set_error(Error::with_message_and_status(
-            message.into(),
-            Status::InvalidArguments,
-        ));
+    fn fail(&mut self, message: &str) -> c_int {
+        self.set_error(invalid_argument(message));
         EINVAL
     }
 
