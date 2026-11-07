@@ -364,8 +364,7 @@ fn permanent_token_failure_is_unauthenticated_without_response_secrets() {
             "error": "invalid_grant", "error_description": "SECRET-REFRESH-TOKEN"
         }),
     )]);
-    let mut db = new_database();
-    db.database = Some("projects/p/instances/i/databases/d".into());
+    let mut db = database_with_path();
     db.endpoint = Some("https://127.0.0.1:1".into());
     db.connect_timeout_secs = Some(5.0);
     db.keyfile_json = Some(user_json(&url).to_string());

@@ -1,5 +1,6 @@
 use super::*;
-use crate::driver::tests::new_database;
+use crate::driver::tests::{get, new_database, set};
+use adbc_core::constants::ADBC_OPTION_URI;
 use adbc_core::error::Status;
 use adbc_core::options::{OptionDatabase, OptionValue};
 
@@ -135,27 +136,15 @@ fn an_explicit_option_set_after_the_uri_wins() {
         &format!("spanner:///{DB_PATH}?spanner.endpoint=http://from-uri:9010"),
     )
     .unwrap();
-    db.set_option(
-        OptionDatabase::Other(OPTION_ENDPOINT.into()),
-        OptionValue::String("http://explicit:9010".into()),
-    )
-    .unwrap();
+    set(&mut db, OPTION_ENDPOINT, "http://explicit:9010");
     assert_eq!(db.endpoint.as_deref(), Some("http://explicit:9010"));
 }
 
 #[test]
 fn a_uri_set_after_an_explicit_option_overwrites_only_what_it_carries() {
     let mut db = new_database();
-    db.set_option(
-        OptionDatabase::Other(OPTION_ENDPOINT.into()),
-        OptionValue::String("http://explicit:9010".into()),
-    )
-    .unwrap();
-    db.set_option(
-        OptionDatabase::Other(OPTION_EMULATOR.into()),
-        OptionValue::String("true".into()),
-    )
-    .unwrap();
+    set(&mut db, OPTION_ENDPOINT, "http://explicit:9010");
+    set(&mut db, OPTION_EMULATOR, "true");
     set_uri(
         &mut db,
         &format!("spanner:///{DB_PATH}?spanner.endpoint=http://from-uri:9010"),
@@ -171,7 +160,7 @@ fn a_uri_set_after_an_explicit_option_overwrites_only_what_it_carries() {
     assert_eq!(db.endpoint.as_deref(), Some("http://from-uri:9010"));
     assert!(db.emulator);
     assert_eq!(
-        db.get_option_string(OptionDatabase::Uri).unwrap(),
+        get(&db, ADBC_OPTION_URI).unwrap(),
         "spanner:///projects/p2/instances/i2/databases/d2"
     );
 }
@@ -241,18 +230,12 @@ fn a_rejected_uri_leaves_the_configuration_untouched() {
     let error = set_uri(&mut db, "bogus").unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     assert_eq!(
-        db.get_option_string(OptionDatabase::Uri)
-            .unwrap_err()
-            .status,
+        get(&db, ADBC_OPTION_URI).unwrap_err().status,
         Status::NotFound
     );
     let good = format!("spanner:///{DB_PATH}");
     set_uri(&mut db, &good).unwrap();
-    db.set_option(
-        OptionDatabase::Other(OPTION_ENDPOINT.into()),
-        OptionValue::String("http://kept:9010".into()),
-    )
-    .unwrap();
+    set(&mut db, OPTION_ENDPOINT, "http://kept:9010");
     for bad in [
         "spanner:///projects/p2/instances/i2/databases/d2?bogus.key=1".to_string(),
         "spanner:///projects/p2/instances/i2/databases/d2?spanner.emulator=maybe".to_string(),
@@ -271,7 +254,7 @@ fn a_rejected_uri_leaves_the_configuration_untouched() {
             "uri: {bad}"
         );
         assert!(!db.emulator, "uri: {bad}");
-        assert_eq!(db.get_option_string(OptionDatabase::Uri).unwrap(), good);
+        assert_eq!(get(&db, ADBC_OPTION_URI).unwrap(), good);
     }
 }
 
@@ -345,25 +328,14 @@ fn a_uri_survives_a_set_get_set_replay() {
     );
     let mut db = new_database();
     set_uri(&mut db, &uri).unwrap();
-    let dumped = db.get_option_string(OptionDatabase::Uri).unwrap();
+    let dumped = get(&db, ADBC_OPTION_URI).unwrap();
     assert_eq!(dumped, uri);
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Other(OPTION_ENDPOINT.into()))
-            .unwrap(),
-        "http://localhost:9010"
-    );
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Other(OPTION_EMULATOR.into()))
-            .unwrap(),
-        "true"
-    );
+    assert_eq!(get(&db, OPTION_ENDPOINT).unwrap(), "http://localhost:9010");
+    assert_eq!(get(&db, OPTION_EMULATOR).unwrap(), "true");
 
     let mut replayed = new_database();
     set_uri(&mut replayed, &dumped).unwrap();
-    assert_eq!(
-        replayed.get_option_string(OptionDatabase::Uri).unwrap(),
-        uri
-    );
+    assert_eq!(get(&replayed, ADBC_OPTION_URI).unwrap(), uri);
     assert_eq!(replayed.database, db.database);
     assert_eq!(replayed.endpoint, db.endpoint);
     assert_eq!(replayed.emulator, db.emulator);

@@ -1,8 +1,24 @@
 use super::*;
 use adbc_core::error::{Error, Status};
 
+const URI: &str = "spanner:///projects/p/instances/i/databases/d";
+
 pub(super) fn new_database() -> SpannerDatabase {
     SpannerDatabase::new(new_runtime().unwrap())
+}
+
+pub(super) fn database_with_path() -> SpannerDatabase {
+    let mut db = new_database();
+    db.database = Some("projects/p/instances/i/databases/d".into());
+    db
+}
+
+pub(super) fn set(db: &mut SpannerDatabase, key: &str, value: &str) {
+    db.set_option(key.into(), value.into()).unwrap();
+}
+
+pub(super) fn get(db: &SpannerDatabase, key: &str) -> Result<String> {
+    db.get_option_string(key.into())
 }
 
 /// Blocking on a current-thread runtime's own thread panics, and Tokio catches a task's panic, so
@@ -29,12 +45,11 @@ fn omni_options_validate_before_connecting() {
     let mut db = new_database();
     let key = || OptionDatabase::Other(OPTION_INSTANCE_TYPE.into());
     assert_eq!(db.get_option_string(key()).unwrap(), "cloud");
-    db.set_option(
-        OptionDatabase::Uri,
-        "spanner:///projects/default/instances/default/databases/test?spanner.instance_type=omni"
-            .into(),
-    )
-    .unwrap();
+    set(
+        &mut db,
+        ADBC_OPTION_URI,
+        "spanner:///projects/default/instances/default/databases/test?spanner.instance_type=omni",
+    );
     assert_eq!(db.get_option_string(key()).unwrap(), "omni");
     let error = db.connect().unwrap_err();
     assert_eq!(error.status, Status::InvalidState);
@@ -50,13 +65,8 @@ fn omni_options_validate_before_connecting() {
         );
         assert_eq!(db.get_option_string(key()).unwrap(), "omni");
     }
-    db.set_option(
-        OptionDatabase::Other(OPTION_ENDPOINT.into()),
-        "http://localhost:15000".into(),
-    )
-    .unwrap();
-    db.set_option(OptionDatabase::Other(OPTION_EMULATOR.into()), "true".into())
-        .unwrap();
+    set(&mut db, OPTION_ENDPOINT, "http://localhost:15000");
+    set(&mut db, OPTION_EMULATOR, "true");
     assert!(
         db.connect()
             .unwrap_err()
@@ -75,8 +85,7 @@ fn debug_redacts_credential_fields() {
         assert!(rendered.contains(absent), "{rendered}");
     }
 
-    let mut db = new_database();
-    db.database = Some("projects/p/instances/i/databases/d".into());
+    let mut db = database_with_path();
     db.keyfile = Some("/etc/secret/key.json".into());
     db.keyfile_json = Some(r#"{"private_key":"SUPER-SECRET-PRIVATE-KEY"}"#.into());
     db.access_token = Some("ya29.LIVE-BEARER-TOKEN".into());
@@ -118,11 +127,7 @@ fn typed_option_getters_distinguish_unset_from_non_integer() {
     assert_eq!(error.status, Status::NotFound);
     assert!(error.message.contains("is not set"), "{}", error.message);
 
-    db.set_option(
-        OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into()),
-        OptionValue::String("900".into()),
-    )
-    .unwrap();
+    set(&mut db, OPTION_IMPERSONATE_LIFETIME, "900");
     assert_eq!(
         db.get_option_int(OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into()))
             .unwrap(),
@@ -135,11 +140,7 @@ fn typed_option_getters_distinguish_unset_from_non_integer() {
     );
 
     // A set value that is not an integer is InvalidArguments; NotFound means unset or unknown.
-    db.set_option(
-        OptionDatabase::Uri,
-        OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
-    )
-    .unwrap();
+    set(&mut db, ADBC_OPTION_URI, URI);
     let error = db.get_option_int(OptionDatabase::Uri).unwrap_err();
     assert_eq!(error.status, Status::InvalidArguments);
     assert!(
@@ -197,33 +198,22 @@ fn a_non_string_uri_is_rejected() {
 fn the_uri_option_can_be_spelled_as_an_other_key() {
     let mut db = new_database();
     let key = || OptionDatabase::Other("uri".into());
-    let uri = "spanner:///projects/p/instances/i/databases/d";
-    db.set_option(key(), uri.into()).unwrap();
-    assert_eq!(db.get_option_string(key()).unwrap(), uri);
+    db.set_option(key(), URI.into()).unwrap();
+    assert_eq!(db.get_option_string(key()).unwrap(), URI);
 }
 
 #[test]
 fn keyfile_path_round_trips_but_inline_json_is_write_only() {
     let mut db = new_database();
-    db.set_option(
-        OptionDatabase::Other(OPTION_KEYFILE.into()),
-        OptionValue::String("/path/to/key.json".into()),
-    )
-    .unwrap();
+    set(&mut db, OPTION_KEYFILE, "/path/to/key.json");
     let secret_json = r#"{"type":"service_account","private_key":"SUPER-SECRET-PRIVATE-KEY"}"#;
     db.set_option(
         OptionDatabase::Other(OPTION_KEYFILE_JSON.into()),
         OptionValue::String(secret_json.into()),
     )
     .unwrap();
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Other(OPTION_KEYFILE.into()))
-            .unwrap(),
-        "/path/to/key.json"
-    );
-    let error = db
-        .get_option_string(OptionDatabase::Other(OPTION_KEYFILE_JSON.into()))
-        .unwrap_err();
+    assert_eq!(get(&db, OPTION_KEYFILE).unwrap(), "/path/to/key.json");
+    let error = get(&db, OPTION_KEYFILE_JSON).unwrap_err();
     assert_eq!(error.status, Status::NotFound);
     assert!(error.message.contains("write-only"), "{}", error.message);
     assert!(
@@ -265,10 +255,7 @@ fn every_database_a_driver_creates_shares_the_drivers_runtime() {
     let mut driver = SpannerDriver::try_new().unwrap();
     let first = driver.new_database().unwrap();
     let second = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
-        )])
+        .new_database_with_opts([(OptionDatabase::Uri, URI.into())])
         .unwrap();
 
     assert!(
@@ -305,13 +292,13 @@ fn a_uri_host_authority_endpoint_is_dialed() {
     let port = listener.local_addr().unwrap().port();
     listener.set_nonblocking(true).unwrap();
     let mut db = new_database();
-    db.set_option(
-        OptionDatabase::Uri,
-        OptionValue::String(format!(
+    set(
+        &mut db,
+        ADBC_OPTION_URI,
+        &format!(
             "spanner://127.0.0.1:{port}/projects/p/instances/i/databases/d?spanner.emulator=true"
-        )),
-    )
-    .unwrap();
+        ),
+    );
     // The listener speaks no gRPC, so the connect attempt never succeeds; leave it running.
     let connecting = std::thread::spawn(move || db.connect().map(|_| ()));
     let start = std::time::Instant::now();
@@ -332,11 +319,7 @@ fn a_uri_host_authority_endpoint_is_dialed() {
 #[test]
 fn a_blank_endpoint_unsets_it() {
     let mut db = new_database();
-    db.set_option(
-        OptionDatabase::Uri,
-        OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
-    )
-    .unwrap();
+    set(&mut db, ADBC_OPTION_URI, URI);
     let key = || OptionDatabase::Other(OPTION_ENDPOINT.into());
     db.set_option(key(), "http://127.0.0.1:1".into()).unwrap();
     for blank in ["", "  "] {
@@ -359,13 +342,11 @@ fn a_blank_endpoint_unsets_it() {
 #[test]
 fn emulator_mode_without_an_endpoint_is_rejected() {
     let mut db = new_database();
-    db.set_option(
-        OptionDatabase::Uri,
-        OptionValue::String(
-            "spanner:///projects/p/instances/i/databases/d?spanner.emulator=true".into(),
-        ),
-    )
-    .unwrap();
+    set(
+        &mut db,
+        ADBC_OPTION_URI,
+        "spanner:///projects/p/instances/i/databases/d?spanner.emulator=true",
+    );
     let error = db.resolve_target(None).unwrap_err();
     assert_eq!(error.status, Status::InvalidState);
     assert!(
@@ -376,19 +357,14 @@ fn emulator_mode_without_an_endpoint_is_rejected() {
 
     let target = db.resolve_target(Some("localhost:9010")).unwrap();
     assert_eq!(target.endpoint.as_deref(), Some("http://localhost:9010"));
-    db.set_option(
-        OptionDatabase::Other(OPTION_ENDPOINT.into()),
-        "localhost:9010".into(),
-    )
-    .unwrap();
+    set(&mut db, OPTION_ENDPOINT, "localhost:9010");
     assert!(db.resolve_target(None).unwrap().emulator);
 }
 
 /// `0` disables the deadline, so a connect that fails by itself still reports its own error.
 #[test]
 fn a_disabled_connect_timeout_still_reports_credential_errors() {
-    let mut db = new_database();
-    db.database = Some("projects/p/instances/i/databases/d".into());
+    let mut db = database_with_path();
     db.connect_timeout_secs = Some(0.0);
     db.keyfile_json = Some("not json".into());
     let error = db.connect_with(None).unwrap_err();
@@ -462,14 +438,14 @@ fn connect_in_background(db: Arc<SpannerDatabase>) -> std::sync::mpsc::Receiver<
 
 fn database_with_connect_timeout(endpoint_port: u16, seconds: &str) -> SpannerDatabase {
     let mut db = new_database();
-    db.set_option(
-        OptionDatabase::Uri,
-        OptionValue::String(format!(
+    set(
+        &mut db,
+        ADBC_OPTION_URI,
+        &format!(
             "spanner://127.0.0.1:{endpoint_port}/projects/p/instances/i/databases/d\
              ?spanner.emulator=true"
-        )),
-    )
-    .unwrap();
+        ),
+    );
     db.set_option(connect_timeout_key(), seconds.into())
         .unwrap();
     db
@@ -550,21 +526,13 @@ fn connecting_to_a_silent_listener_times_out_without_blocking_debug() {
 #[test]
 fn the_timeout_error_can_tell_an_endpoint_from_the_environment() {
     let mut db = new_database();
-    db.set_option(
-        OptionDatabase::Uri,
-        OptionValue::String("spanner:///projects/p/instances/i/databases/d".into()),
-    )
-    .unwrap();
+    set(&mut db, ADBC_OPTION_URI, URI);
     assert!(
         db.resolve_target(Some("localhost:9010"))
             .unwrap()
             .endpoint_from_env
     );
-    db.set_option(
-        OptionDatabase::Other(OPTION_ENDPOINT.into()),
-        "localhost:9010".into(),
-    )
-    .unwrap();
+    set(&mut db, OPTION_ENDPOINT, "localhost:9010");
     assert!(
         !db.resolve_target(Some("localhost:9010"))
             .unwrap()

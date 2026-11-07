@@ -1,5 +1,5 @@
 use super::*;
-use crate::driver::tests::new_database;
+use crate::driver::tests::{database_with_path, get, new_database, set};
 use crate::runtime::new_runtime;
 use crate::{OPTION_IMPERSONATE_DELEGATES, OPTION_IMPERSONATE_LIFETIME, OPTION_IMPERSONATE_SCOPES};
 use adbc_core::Optionable;
@@ -53,8 +53,7 @@ fn emulator_mode_refuses_every_credential_option_and_a_quota_project() {
                 "`SPANNER_EMULATOR_HOST` environment variable",
             ),
         ] {
-            let mut db = new_database();
-            db.database = Some("projects/p/instances/i/databases/d".into());
+            let mut db = database_with_path();
             db.emulator = from_option;
             set(&mut db);
             let error = db.connect_with(emulator_host).unwrap_err();
@@ -70,8 +69,7 @@ fn emulator_mode_refuses_every_credential_option_and_a_quota_project() {
 /// report the connect timeout, so the error names the credentials and the cause instead.
 #[test]
 fn a_token_that_never_arrives_is_unauthenticated() {
-    let mut db = new_database();
-    db.database = Some("projects/p/instances/i/databases/d".into());
+    let mut db = database_with_path();
     db.endpoint = Some("https://127.0.0.1:1".into());
     db.connect_timeout_secs = Some(0.5);
     db.keyfile_json = Some(
@@ -158,19 +156,11 @@ fn first_token_retries_transient_failures_and_keeps_only_the_io_cause() {
 fn access_token_is_write_only() {
     let mut db = new_database();
     assert_eq!(
-        db.get_option_string(OptionDatabase::Other(OPTION_ACCESS_TOKEN.into()))
-            .unwrap_err()
-            .status,
+        get(&db, OPTION_ACCESS_TOKEN).unwrap_err().status,
         Status::NotFound
     );
-    db.set_option(
-        OptionDatabase::Other(OPTION_ACCESS_TOKEN.into()),
-        OptionValue::String("ya29.LIVE-BEARER-TOKEN".into()),
-    )
-    .unwrap();
-    let error = db
-        .get_option_string(OptionDatabase::Other(OPTION_ACCESS_TOKEN.into()))
-        .unwrap_err();
+    set(&mut db, OPTION_ACCESS_TOKEN, "ya29.LIVE-BEARER-TOKEN");
+    let error = get(&db, OPTION_ACCESS_TOKEN).unwrap_err();
     assert_eq!(error.status, Status::NotFound);
     assert!(error.message.contains("write-only"), "{}", error.message);
     assert!(
@@ -190,8 +180,7 @@ fn access_token_is_write_only() {
 #[test]
 fn access_token_conflicts_with_other_credential_options() {
     let base = || {
-        let mut db = new_database();
-        db.database = Some("projects/p/instances/i/databases/d".into());
+        let mut db = database_with_path();
         db.access_token = Some("ya29.test-token".into());
         db
     };
@@ -335,8 +324,7 @@ fn access_token_credentials_send_the_quota_project_header() {
 
 #[test]
 fn quota_project_does_not_conflict_with_an_access_token() {
-    let mut db = new_database();
-    db.database = Some("projects/p/instances/i/databases/d".into());
+    let mut db = database_with_path();
     db.access_token = Some("ya29.test-token".into());
     db.quota_project = Some("my-billing-project".into());
     assert!(db.resolve_target(None).is_ok());
@@ -427,8 +415,7 @@ fn anonymous_default_replaces_only_adc() {
 }
 
 fn omni_database(endpoint: &str) -> SpannerDatabase {
-    let mut db = new_database();
-    db.database = Some("projects/p/instances/i/databases/d".into());
+    let mut db = database_with_path();
     db.instance_type = google_cloud_spanner::omni::InstanceType::Omni;
     db.endpoint = Some(endpoint.into());
     db
@@ -481,8 +468,7 @@ fn a_plaintext_endpoint_without_credentials_refuses_a_quota_project() {
         "10.0.0.5:9010",
         "grpc://10.0.0.5:9010",
     ] {
-        let mut db = new_database();
-        db.database = Some("projects/p/instances/i/databases/d".into());
+        let mut db = database_with_path();
         db.endpoint = Some(endpoint.into());
         let target = db.resolve_target(None).unwrap();
         assert!(target.anonymous_default, "{endpoint}");
@@ -518,8 +504,7 @@ fn a_tls_cloud_endpoint_keeps_adc_and_the_quota_project() {
         Some("https://spanner.example.com"),
         Some("HTTPS://h:443"),
     ] {
-        let mut db = new_database();
-        db.database = Some("projects/p/instances/i/databases/d".into());
+        let mut db = database_with_path();
         db.endpoint = endpoint.map(str::to_owned);
         db.quota_project = Some("my-billing-project".into());
         let target = db.resolve_target(None).unwrap();
@@ -627,29 +612,23 @@ fn credential_build_failure_never_leaks_key_material() {
 #[test]
 fn impersonation_options_round_trip_and_split() {
     let mut db = new_database();
-    db.set_option(
-        OptionDatabase::Other(OPTION_IMPERSONATE_TARGET_PRINCIPAL.into()),
-        OptionValue::String("target@project.iam.gserviceaccount.com".into()),
-    )
-    .unwrap();
+    set(
+        &mut db,
+        OPTION_IMPERSONATE_TARGET_PRINCIPAL,
+        "target@project.iam.gserviceaccount.com",
+    );
     // Whitespace and a trailing comma are tolerated.
-    db.set_option(
-        OptionDatabase::Other(OPTION_IMPERSONATE_DELEGATES.into()),
-        OptionValue::String("a@p.iam.gserviceaccount.com, b@p.iam.gserviceaccount.com,".into()),
-    )
-    .unwrap();
-    db.set_option(
-        OptionDatabase::Other(OPTION_IMPERSONATE_SCOPES.into()),
-        OptionValue::String(
-            "https://www.googleapis.com/auth/spanner.data,https://www.googleapis.com/auth/cloud-platform".into(),
-        ),
-    )
-    .unwrap();
-    db.set_option(
-        OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into()),
-        OptionValue::String("1800".into()),
-    )
-    .unwrap();
+    set(
+        &mut db,
+        OPTION_IMPERSONATE_DELEGATES,
+        "a@p.iam.gserviceaccount.com, b@p.iam.gserviceaccount.com,",
+    );
+    set(
+        &mut db,
+        OPTION_IMPERSONATE_SCOPES,
+        "https://www.googleapis.com/auth/spanner.data,https://www.googleapis.com/auth/cloud-platform",
+    );
+    set(&mut db, OPTION_IMPERSONATE_LIFETIME, "1800");
 
     assert_eq!(
         db.impersonate_target_principal.as_deref(),
@@ -672,22 +651,14 @@ fn impersonation_options_round_trip_and_split() {
     assert_eq!(db.impersonate_lifetime_secs, Some(1800));
 
     assert_eq!(
-        db.get_option_string(OptionDatabase::Other(
-            OPTION_IMPERSONATE_TARGET_PRINCIPAL.into()
-        ))
-        .unwrap(),
+        get(&db, OPTION_IMPERSONATE_TARGET_PRINCIPAL).unwrap(),
         "target@project.iam.gserviceaccount.com"
     );
     assert_eq!(
-        db.get_option_string(OptionDatabase::Other(OPTION_IMPERSONATE_DELEGATES.into()))
-            .unwrap(),
+        get(&db, OPTION_IMPERSONATE_DELEGATES).unwrap(),
         "a@p.iam.gserviceaccount.com,b@p.iam.gserviceaccount.com"
     );
-    assert_eq!(
-        db.get_option_string(OptionDatabase::Other(OPTION_IMPERSONATE_LIFETIME.into()))
-            .unwrap(),
-        "1800"
-    );
+    assert_eq!(get(&db, OPTION_IMPERSONATE_LIFETIME).unwrap(), "1800");
 }
 
 #[test]
