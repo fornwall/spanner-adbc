@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// A Rust caller may use the synchronous API, and drop the last handle, from an async task.
@@ -126,7 +127,7 @@ fn begin_operation_does_not_uncancel_an_earlier_operations_signal() {
 fn cancel_handle_reports_ok_when_nothing_is_in_flight() {
     let runtime = new_runtime().unwrap();
     let slot = Arc::new(CancelSlot::new());
-    let handle = SlotCancelHandle::new(slot.clone());
+    let handle = SlotCancelHandle(slot.clone());
     assert!(
         handle.try_cancel().is_ok(),
         "an idle cancel still reports Ok"
@@ -149,12 +150,12 @@ enum Step {
 /// Replays a script of chunks, counting fetches. Past the end it returns empty chunks.
 struct ScriptedSource {
     steps: std::collections::VecDeque<Step>,
-    calls: Arc<std::sync::atomic::AtomicUsize>,
+    calls: Arc<AtomicUsize>,
 }
 
 impl ScriptedSource {
-    fn new(steps: Vec<Step>) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    fn new(steps: Vec<Step>) -> (Self, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
         let source = Self {
             steps: steps.into(),
             calls: calls.clone(),
@@ -180,7 +181,7 @@ impl ChunkSource for ScriptedSource {
 }
 
 /// Wait, bounded, until the background task has made `at_least` fetches.
-fn wait_for_calls(calls: &std::sync::atomic::AtomicUsize, at_least: usize) {
+fn wait_for_calls(calls: &AtomicUsize, at_least: usize) {
     for _ in 0..1000 {
         if calls.load(Ordering::SeqCst) >= at_least {
             return;

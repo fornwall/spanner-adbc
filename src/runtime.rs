@@ -4,12 +4,11 @@
 use std::future::Future;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use adbc_core::CancelHandle;
 use adbc_core::error::{Error, Result, Status};
 use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::error::{err, invalid_state};
@@ -65,55 +64,23 @@ impl Drop for DriverRuntime {
 ///
 /// Cancellation stays set between fetches. [`CancelSlot::begin_operation`] replaces the signal
 /// for new work without reviving older cancelled readers or cancelling the new operation.
-#[derive(Clone)]
-pub(crate) struct CancelSignal(Arc<CancelInner>);
-
-impl std::fmt::Debug for CancelSignal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CancelSignal")
-            .field("cancelled", &self.0.cancelled.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
-    }
-}
-
-struct CancelInner {
-    /// Set by `signal()` and never cleared.
-    cancelled: AtomicBool,
-    /// Wakes tasks waiting in [`CancelSignal::cancelled`].
-    notify: Notify,
-}
+#[derive(Clone, Debug)]
+pub(crate) struct CancelSignal(Arc<watch::Sender<bool>>);
 
 impl CancelSignal {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(CancelInner {
-            cancelled: AtomicBool::new(false),
-            notify: Notify::new(),
-        }))
+        Self(Arc::new(watch::Sender::new(false)))
     }
 
     /// Latch cancellation and wake current waiters.
     pub(crate) fn signal(&self) {
-        // Set the flag before waking so woken waiters observe it.
-        self.0.cancelled.store(true, Ordering::Release);
-        self.0.notify.notify_waiters();
+        self.0.send_replace(true);
     }
 
     /// Wait until this signal is cancelled. Completes immediately if it already is.
     pub(crate) async fn cancelled(&self) {
-        loop {
-            if self.0.cancelled.load(Ordering::Acquire) {
-                return;
-            }
-            let notified = self.0.notify.notified();
-            tokio::pin!(notified);
-            // Re-check after registering: `notify_waiters` only wakes registered waiters, so a
-            // `signal()` since the first check would otherwise be missed.
-            notified.as_mut().enable();
-            if self.0.cancelled.load(Ordering::Acquire) {
-                return;
-            }
-            notified.await;
-        }
+        // Holding the sender, `self` keeps the channel open.
+        let _ = self.0.subscribe().wait_for(|&cancelled| cancelled).await;
     }
 }
 
@@ -151,13 +118,7 @@ impl CancelSlot {
 /// The C++ `MetadataGetObjectsCancel` test also expects success. The next operation replaces the
 /// signal, so it does not inherit an idle cancel.
 #[derive(Debug)]
-pub(crate) struct SlotCancelHandle(Arc<CancelSlot>);
-
-impl SlotCancelHandle {
-    pub(crate) fn new(slot: Arc<CancelSlot>) -> Self {
-        Self(slot)
-    }
-}
+pub(crate) struct SlotCancelHandle(pub(crate) Arc<CancelSlot>);
 
 impl CancelHandle for SlotCancelHandle {
     fn try_cancel(&self) -> Result<()> {

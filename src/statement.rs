@@ -947,7 +947,7 @@ impl Statement for SpannerStatement {
     fn get_cancel_handle(&self) -> Box<dyn CancelHandle> {
         // Cancels the current operation, including later chunk fetches of its streaming reader.
         // The next operation gets a fresh signal, so a cancel while idle doesn't affect it.
-        Box::new(SlotCancelHandle::new(self.cancel.clone()))
+        Box::new(SlotCancelHandle(self.cancel.clone()))
     }
 }
 

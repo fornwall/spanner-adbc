@@ -232,7 +232,7 @@ impl Connection for SpannerConnection {
     fn get_cancel_handle(&self) -> Box<dyn CancelHandle> {
         // The signal is sticky, so a cancel between two chunk fetches still cancels the next one.
         // Statements have their own signal and are unaffected.
-        Box::new(SlotCancelHandle::new(self.cancel.clone()))
+        Box::new(SlotCancelHandle(self.cancel.clone()))
     }
 
     /// Driver and vendor metadata from static constants; makes no RPC.
