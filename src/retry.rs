@@ -97,18 +97,13 @@ impl RetryConfig {
     /// The client's default [`SpannerRetryPolicy`] bounded by the configured limits, or `None`
     /// when no limit is set.
     fn retry_policy_arg(&self) -> Option<RetryPolicyArg> {
+        let policy = SpannerRetryPolicy::new();
         match (self.max_attempts, self.max_elapsed_duration()) {
             (None, None) => None,
-            (Some(attempts), None) => Some(
-                SpannerRetryPolicy::new()
-                    .with_attempt_limit(attempts)
-                    .into(),
-            ),
-            (None, Some(elapsed)) => {
-                Some(SpannerRetryPolicy::new().with_time_limit(elapsed).into())
-            }
+            (Some(attempts), None) => Some(policy.with_attempt_limit(attempts).into()),
+            (None, Some(elapsed)) => Some(policy.with_time_limit(elapsed).into()),
             (Some(attempts), Some(elapsed)) => Some(
-                SpannerRetryPolicy::new()
+                policy
                     .with_time_limit(elapsed)
                     .with_attempt_limit(attempts)
                     .into(),
