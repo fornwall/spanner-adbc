@@ -11,8 +11,37 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod flows;
 
+/// Every option that selects credentials, and the quota project, with a value for each.
+const CREDENTIAL_OPTIONS: [(&str, &str); 5] = [
+    (OPTION_KEYFILE, "/path/to/key.json"),
+    (OPTION_KEYFILE_JSON, "{}"),
+    (
+        OPTION_IMPERSONATE_TARGET_PRINCIPAL,
+        "t@p.iam.gserviceaccount.com",
+    ),
+    (OPTION_ACCESS_TOKEN, "ya29.token"),
+    (OPTION_QUOTA_PROJECT, "billing"),
+];
+
 fn s(value: &str) -> OptionValue {
     OptionValue::String(value.into())
+}
+
+/// Run test `name` again in a child process with `env`, since parallel tests share the
+/// environment.
+fn run_in_child(name: &str, env: &[(&str, &std::ffi::OsStr)]) {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .envs(env.iter().copied())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("1 passed"),
+        "the child ran no test: {stdout}"
+    );
 }
 
 /// Emulator mode comes from the option or from `SPANNER_EMULATOR_HOST`, passed in because
@@ -21,30 +50,7 @@ fn s(value: &str) -> OptionValue {
 /// unauthenticated, to another endpoint.
 #[test]
 fn emulator_mode_refuses_every_credential_option_and_a_quota_project() {
-    type Set = fn(&mut SpannerDatabase);
-    let cases: [(Set, &str); 5] = [
-        (
-            |db| db.keyfile = Some("/path/to/key.json".into()),
-            OPTION_KEYFILE,
-        ),
-        (
-            |db| db.keyfile_json = Some("{}".into()),
-            OPTION_KEYFILE_JSON,
-        ),
-        (
-            |db| db.impersonate_target_principal = Some("t@p.iam.gserviceaccount.com".into()),
-            OPTION_IMPERSONATE_TARGET_PRINCIPAL,
-        ),
-        (
-            |db| db.access_token = Some("ya29.token".into()),
-            OPTION_ACCESS_TOKEN,
-        ),
-        (
-            |db| db.quota_project = Some("billing".into()),
-            OPTION_QUOTA_PROJECT,
-        ),
-    ];
-    for (set, option) in cases {
+    for (option, value) in CREDENTIAL_OPTIONS {
         for (from_option, emulator_host, cause) in [
             (true, None, "`spanner.emulator` option"),
             (
@@ -55,7 +61,7 @@ fn emulator_mode_refuses_every_credential_option_and_a_quota_project() {
         ] {
             let mut db = database_with_path();
             db.emulator = from_option;
-            set(&mut db);
+            set(&mut db, option, value);
             let error = db.connect_with(emulator_host).unwrap_err();
             assert_eq!(error.status, Status::InvalidState, "{option}");
             for needle in ["emulator mode", cause, option] {
@@ -185,28 +191,16 @@ fn access_token_conflicts_with_other_credential_options() {
         db
     };
     assert!(base().resolve_target(None).is_ok());
-    for (mutate, expected) in [
+    for (expected, value) in [
+        (OPTION_KEYFILE, "/path/key.json"),
+        (OPTION_KEYFILE_JSON, "{\"type\":\"service_account\"}"),
         (
-            Box::new(|db: &mut SpannerDatabase| db.keyfile = Some("/path/key.json".into()))
-                as Box<dyn Fn(&mut SpannerDatabase)>,
-            OPTION_KEYFILE,
-        ),
-        (
-            Box::new(|db: &mut SpannerDatabase| {
-                db.keyfile_json = Some("{\"type\":\"service_account\"}".into())
-            }),
-            OPTION_KEYFILE_JSON,
-        ),
-        (
-            Box::new(|db: &mut SpannerDatabase| {
-                db.impersonate_target_principal =
-                    Some("target@project.iam.gserviceaccount.com".into())
-            }),
             OPTION_IMPERSONATE_TARGET_PRINCIPAL,
+            "target@project.iam.gserviceaccount.com",
         ),
     ] {
         let mut db = base();
-        mutate(&mut db);
+        set(&mut db, expected, value);
         let error = db.resolve_target(None).unwrap_err();
         assert_eq!(error.status, Status::InvalidState, "{expected}");
         for option in [OPTION_ACCESS_TOKEN, expected] {
@@ -264,17 +258,8 @@ fn access_token_with_illegal_header_characters_is_rejected_without_leaking() {
 /// credential, which would block emulator mode or read the keyfile path "".
 #[test]
 fn an_empty_credential_option_unsets_it() {
-    for (option, value) in [
-        (OPTION_KEYFILE, "/path/to/key.json"),
-        (OPTION_KEYFILE_JSON, "{}"),
-        (
-            OPTION_IMPERSONATE_TARGET_PRINCIPAL,
-            "t@p.iam.gserviceaccount.com",
-        ),
-        (OPTION_IMPERSONATE_LIFETIME, "600"),
-        (OPTION_ACCESS_TOKEN, "ya29.token"),
-        (OPTION_QUOTA_PROJECT, "billing"),
-    ] {
+    let lifetime = (OPTION_IMPERSONATE_LIFETIME, "600");
+    for (option, value) in CREDENTIAL_OPTIONS.into_iter().chain([lifetime]) {
         let key = || OptionDatabase::Other(option.into());
         let mut db = new_database();
         db.set_option(key(), s(value)).unwrap();
@@ -742,23 +727,14 @@ fn impersonation_delegates_use_iam_resource_names() {
     }
 }
 
-/// ADC naming a missing file fails with the path, which is safe to show and the likely fix. The
-/// variable is set only for a child test process, since parallel tests share the environment.
+/// ADC naming a missing file fails with the path, which is safe to show and the likely fix.
 #[test]
 fn adc_naming_a_missing_key_file_reports_the_path() {
     const MISSING: &str = "/nonexistent/spanner-adbc-adc-key.json";
     if std::env::var("GOOGLE_APPLICATION_CREDENTIALS").as_deref() != Ok(MISSING) {
-        let name = "driver::credentials::tests::adc_naming_a_missing_key_file_reports_the_path";
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name, "--nocapture"])
-            .env("GOOGLE_APPLICATION_CREDENTIALS", MISSING)
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "{stdout}");
-        assert!(
-            stdout.contains("1 passed"),
-            "the child ran no test: {stdout}"
+        run_in_child(
+            "driver::credentials::tests::adc_naming_a_missing_key_file_reports_the_path",
+            &[("GOOGLE_APPLICATION_CREDENTIALS", MISSING.as_ref())],
         );
         return;
     }

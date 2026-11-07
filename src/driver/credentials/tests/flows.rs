@@ -325,20 +325,13 @@ fn adc_loads_a_service_account_file_and_prefers_the_environment_quota_project() 
     const CHILD: &str = "SPANNER_ADBC_TEST_ADC_QUOTA_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let file = CredentialFile::new(&service_account_json());
-        let name = "driver::credentials::tests::flows::adc_loads_a_service_account_file_and_prefers_the_environment_quota_project";
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name, "--nocapture"])
-            .env(CHILD, "1")
-            .env("GOOGLE_APPLICATION_CREDENTIALS", &file.0)
-            .env("GOOGLE_CLOUD_QUOTA_PROJECT", "environment-project")
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "{stdout}\n{stderr}");
-        assert!(
-            stdout.contains("1 passed"),
-            "the child ran no test: {stdout}"
+        run_in_child(
+            "driver::credentials::tests::flows::adc_loads_a_service_account_file_and_prefers_the_environment_quota_project",
+            &[
+                (CHILD, "1".as_ref()),
+                ("GOOGLE_APPLICATION_CREDENTIALS", file.0.as_ref()),
+                ("GOOGLE_CLOUD_QUOTA_PROJECT", "environment-project".as_ref()),
+            ],
         );
         return;
     }
