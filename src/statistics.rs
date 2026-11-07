@@ -149,35 +149,39 @@ fn prepare_tables(
         .collect()
 }
 
+/// The (column, statistic key) of each result column, with no column for a table-level statistic.
+type Plan = Vec<(Option<String>, i16)>;
+
 /// A per-table aggregate statistics query, prepared but not yet run.
 struct PreparedTable {
     schema: String,
     table: String,
     /// The single-scan aggregate `SELECT`.
     sql: String,
-    /// Maps each result column after the row count to its (column, statistic key).
-    plan: Vec<(String, i16)>,
+    plan: Plan,
 }
 
-/// Build the single-scan aggregate query for one table: `COUNT(*)` plus per-column
-/// `COUNTIF(... IS NULL)` and (for groupable columns) `COUNT(DISTINCT ...)`. Returns the SQL and a
-/// `plan` mapping each result column after the row count to its (column name, statistic key).
+/// Build the single-scan aggregate query for one table and its [`Plan`]: `COUNT(*)` plus per-column
+/// `COUNTIF(... IS NULL)` and (for groupable columns) `COUNT(DISTINCT ...)`.
 fn build_table_query(
     schema: &str,
     table: &str,
     columns: &[(&str, bool)],
-) -> Result<(String, Vec<(String, i16)>)> {
-    use adbc_core::constants::{ADBC_STATISTIC_DISTINCT_COUNT_KEY, ADBC_STATISTIC_NULL_COUNT_KEY};
+) -> Result<(String, Plan)> {
+    use adbc_core::constants::{
+        ADBC_STATISTIC_DISTINCT_COUNT_KEY, ADBC_STATISTIC_NULL_COUNT_KEY,
+        ADBC_STATISTIC_ROW_COUNT_KEY,
+    };
 
     let mut exprs = vec!["COUNT(*)".to_string()];
-    let mut plan: Vec<(String, i16)> = Vec::new();
+    let mut plan: Plan = vec![(None, ADBC_STATISTIC_ROW_COUNT_KEY)];
     for &(name, groupable) in columns {
         let quoted = quote_ident(name)?;
         exprs.push(format!("COUNTIF({quoted} IS NULL)"));
-        plan.push((name.to_string(), ADBC_STATISTIC_NULL_COUNT_KEY));
+        plan.push((Some(name.to_string()), ADBC_STATISTIC_NULL_COUNT_KEY));
         if groupable {
             exprs.push(format!("COUNT(DISTINCT {quoted})"));
-            plan.push((name.to_string(), ADBC_STATISTIC_DISTINCT_COUNT_KEY));
+            plan.push((Some(name.to_string()), ADBC_STATISTIC_DISTINCT_COUNT_KEY));
         }
     }
     let sql = format!(
@@ -188,57 +192,37 @@ fn build_table_query(
     Ok((sql, plan))
 }
 
-/// Extract the `ROW_COUNT` and per-column `NULL_COUNT`/`DISTINCT_COUNT` statistics from a table's
-/// single-row aggregate result, using the `plan` produced by [`build_table_query`].
-fn parse_table_statistics(
-    batch: &RecordBatch,
-    table: &str,
-    plan: Vec<(String, i16)>,
-) -> Result<Vec<Statistic>> {
-    use adbc_core::constants::ADBC_STATISTIC_ROW_COUNT_KEY;
-
-    if batch.num_rows() != 1 || batch.num_columns() != plan.len() + 1 {
+/// Extract the statistics in `plan` from a table's single-row aggregate result.
+fn parse_table_statistics(batch: &RecordBatch, table: &str, plan: Plan) -> Result<Vec<Statistic>> {
+    if batch.num_rows() != 1 || batch.num_columns() != plan.len() {
         return Err(err(
             "statistic aggregate has an unexpected number of rows or columns",
             Status::Internal,
         ));
     }
-    let value = |index: usize| -> Result<i64> {
-        batch
-            .column(index)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .filter(|a| !a.is_null(0))
-            .map(|a| a.value(0))
-            .filter(|&count| count >= 0)
-            .ok_or_else(|| {
-                err(
+    plan.into_iter()
+        .enumerate()
+        .map(|(index, (column, key))| {
+            let counts = crate::metadata::column::<Int64Array>(batch, index)?;
+            if counts.is_null(0) || counts.value(0) < 0 {
+                return Err(err(
                     "statistic aggregate is not a non-null, non-negative integer",
                     Status::Internal,
-                )
+                ));
+            }
+            Ok(Statistic {
+                table: table.to_string(),
+                column,
+                key,
+                value: counts.value(0),
             })
-    };
-    let mut out = vec![Statistic {
-        table: table.to_string(),
-        column: None,
-        key: ADBC_STATISTIC_ROW_COUNT_KEY,
-        value: value(0)?,
-    }];
-    for (index, (column, key)) in plan.into_iter().enumerate() {
-        out.push(Statistic {
-            table: table.to_string(),
-            column: Some(column),
-            key,
-            value: value(index + 1)?,
-        });
-    }
-    Ok(out)
+        })
+        .collect()
 }
 
 /// Whether a SPANNER_TYPE supports COUNT(DISTINCT). Unsupported types must be skipped
 /// or the entire table scan fails.
-fn is_groupable(spanner_type: &str) -> bool {
-    let t = spanner_type.trim_start();
+fn is_groupable(t: &str) -> bool {
     !(t.starts_with("ARRAY")
         || t.starts_with("STRUCT")
         || t.starts_with("PROTO")

@@ -93,7 +93,7 @@ fn build_reports_each_statistic_exactly_and_never_as_approximate() {
     );
 }
 
-/// `plan[i]` names the statistic at result column `i + 1`.
+/// `plan[i]` names the statistic at result column `i`.
 #[test]
 fn build_table_query_pairs_each_aggregate_with_its_plan_entry() {
     let columns = vec![
@@ -112,18 +112,19 @@ fn build_table_query_pairs_each_aggregate_with_its_plan_entry() {
     assert_eq!(
         plan,
         vec![
-            ("Id".to_string(), ADBC_STATISTIC_NULL_COUNT_KEY),
-            ("Id".to_string(), ADBC_STATISTIC_DISTINCT_COUNT_KEY),
-            ("Tags".to_string(), ADBC_STATISTIC_NULL_COUNT_KEY),
-            ("Name".to_string(), ADBC_STATISTIC_NULL_COUNT_KEY),
-            ("Name".to_string(), ADBC_STATISTIC_DISTINCT_COUNT_KEY),
+            (None, ADBC_STATISTIC_ROW_COUNT_KEY),
+            (Some("Id".to_string()), ADBC_STATISTIC_NULL_COUNT_KEY),
+            (Some("Id".to_string()), ADBC_STATISTIC_DISTINCT_COUNT_KEY),
+            (Some("Tags".to_string()), ADBC_STATISTIC_NULL_COUNT_KEY),
+            (Some("Name".to_string()), ADBC_STATISTIC_NULL_COUNT_KEY),
+            (Some("Name".to_string()), ADBC_STATISTIC_DISTINCT_COUNT_KEY),
         ]
     );
 
     // A non-empty schema qualifies the table; a table with no columns is just the row count.
     let (sql, plan) = build_table_query("app", "Users", &[]).unwrap();
     assert_eq!(sql, "SELECT COUNT(*) FROM `app`.`Users`");
-    assert!(plan.is_empty());
+    assert_eq!(plan, vec![(None, ADBC_STATISTIC_ROW_COUNT_KEY)]);
 }
 
 #[test]
@@ -220,7 +221,12 @@ fn parse_table_statistics_rejects_malformed_aggregates() {
         }))
         .unwrap()
     };
-    let null_count = || vec![("Id".to_string(), ADBC_STATISTIC_NULL_COUNT_KEY)];
+    let row_count = || vec![(None, ADBC_STATISTIC_ROW_COUNT_KEY)];
+    let null_count = || {
+        let mut plan = row_count();
+        plan.push((Some("Id".to_string()), ADBC_STATISTIC_NULL_COUNT_KEY));
+        plan
+    };
     let string_aggregate = RecordBatch::try_from_iter([
         ("c0", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
         ("c1", Arc::new(StringArray::from(vec!["3"])) as ArrayRef),
@@ -240,15 +246,19 @@ fn parse_table_statistics_rejects_malformed_aggregates() {
         (
             "an extra aggregate",
             counts(vec![vec![Some(1)], vec![Some(0)]]),
-            Vec::new(),
+            row_count(),
         ),
         ("a string aggregate", string_aggregate, null_count()),
-        ("a NULL count", counts(vec![vec![None]]), Vec::new()),
-        ("a negative count", counts(vec![vec![Some(-1)]]), Vec::new()),
+        ("a NULL count", counts(vec![vec![None]]), row_count()),
+        (
+            "a negative count",
+            counts(vec![vec![Some(-1)]]),
+            row_count(),
+        ),
         (
             "no columns",
             RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty())),
-            Vec::new(),
+            row_count(),
         ),
     ];
     for (case, batch, plan) in cases {
