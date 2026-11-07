@@ -22,13 +22,6 @@ fn v100_error(private_data: *mut c_void, private_driver: *const AdbcDriver) -> A
     }
 }
 
-/// Run the 1.0.0 release callback `export_error` installed.
-fn release_v100(out: &mut AdbcError) {
-    let release: unsafe extern "C" fn(*mut AdbcErrorV100) =
-        unsafe { std::mem::transmute(out.release.unwrap()) };
-    unsafe { release((&raw mut *out).cast::<AdbcErrorV100>()) };
-}
-
 #[test]
 fn exports_a_message_and_releases_idempotently() {
     let mut out = zeroed_error();
@@ -82,7 +75,7 @@ fn a_1_0_0_caller_keeps_its_trailing_bytes() {
     assert_eq!(out.private_data, sentinel_data);
     assert_eq!(out.private_driver, sentinel_driver);
 
-    release_v100(&mut out);
+    unsafe { (out.release.unwrap())(&raw mut out) };
     assert_eq!(out.private_data, sentinel_data);
 }
 
@@ -109,7 +102,7 @@ fn a_1_0_0_caller_is_not_relabelled_by_a_sentinel_valued_vendor_code() {
     assert_eq!(out.private_data, sentinel_data);
     assert_eq!(out.private_driver, sentinel_driver);
 
-    release_v100(&mut out);
+    unsafe { (out.release.unwrap())(&raw mut out) };
 }
 
 #[test]
@@ -163,7 +156,7 @@ fn the_detail_getters_ignore_private_data_on_a_1_0_0_error() {
     assert_eq!(unsafe { error_get_detail_count(&raw const out) }, 0);
     assert!(unsafe { error_get_detail(&raw const out, 0) }.key.is_null());
 
-    release_v100(&mut out);
+    unsafe { (out.release.unwrap())(&raw mut out) };
 }
 
 #[test]

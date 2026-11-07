@@ -69,7 +69,7 @@ fn driver_vtable_matches_the_c_header() {
 #[test]
 #[cfg(target_pointer_width = "64")]
 fn the_remaining_structs_match_the_c_header() {
-    assert_eq!(ADBC_ERROR_1_0_0_SIZE, 32);
+    assert_eq!(std::mem::offset_of!(AdbcError, private_data), 32);
     assert_eq!(size_of::<AdbcError>(), 48);
     assert_eq!(size_of::<AdbcPartitions>(), 40);
     assert_eq!(size_of::<AdbcErrorDetail>(), 24);

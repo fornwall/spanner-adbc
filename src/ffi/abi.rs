@@ -42,17 +42,6 @@ pub(crate) struct AdbcError {
     pub(crate) private_driver: *const AdbcDriver,
 }
 
-/// The 1.0.0 prefix of [`AdbcError`], for writing back into a caller-allocated struct that has no
-/// room for the 1.1.0 tail.
-#[repr(C)]
-#[derive(Debug)]
-pub(crate) struct AdbcErrorV100 {
-    pub(crate) message: *mut c_char,
-    pub(crate) vendor_code: i32,
-    pub(crate) sqlstate: [c_char; 5],
-    pub(crate) release: Option<unsafe extern "C" fn(*mut Self)>,
-}
-
 #[repr(C)]
 #[derive(Debug)]
 pub(crate) struct AdbcErrorDetail {
@@ -219,13 +208,6 @@ pub(crate) struct AdbcDriver {
 /// `offsetof(struct AdbcDriver, ErrorGetDetailCount)`: the size of a 1.0.0 caller's allocation.
 pub(crate) const ADBC_DRIVER_1_0_0_SIZE: usize =
     std::mem::offset_of!(AdbcDriver, ErrorGetDetailCount);
-
-/// `offsetof(struct AdbcError, private_data)`: the size of a 1.0.0 caller's allocation.
-pub(crate) const ADBC_ERROR_1_0_0_SIZE: usize = std::mem::offset_of!(AdbcError, private_data);
-
-// `error.rs` writes 1.0.0 errors through `AdbcErrorV100`, which is sound only while it matches
-// the 1.0.0 prefix of `AdbcError`.
-const _: () = assert!(ADBC_ERROR_1_0_0_SIZE == size_of::<AdbcErrorV100>());
 
 #[cfg(test)]
 mod tests;

@@ -1,17 +1,10 @@
 //! Helpers shared by the C ABI unit tests.
 
-use super::abi::{ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA, AdbcError};
+use super::abi::AdbcError;
 
 /// A zeroed `AdbcError` as a 1.1.0 caller passes it, with the sentinel `vendor_code`.
 pub(super) fn zeroed_error() -> AdbcError {
-    AdbcError {
-        message: std::ptr::null_mut(),
-        vendor_code: ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA,
-        sqlstate: [0; 5],
-        release: None,
-        private_data: std::ptr::null_mut(),
-        private_driver: std::ptr::null(),
-    }
+    AdbcError::default()
 }
 
 /// Run the error's release callback, if set.
