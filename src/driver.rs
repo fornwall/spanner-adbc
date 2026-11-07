@@ -392,7 +392,9 @@ impl SpannerDatabase {
         // An access token is a complete credential, so a keyfile or impersonation target alongside
         // it is ambiguous.
         if self.access_token.is_some()
-            && let Some(conflict) = self.conflicting_credential_with_access_token()
+            && let Some(conflict) = self
+                .explicit_credential_option()
+                .filter(|option| *option != OPTION_ACCESS_TOKEN)
         {
             return Err(invalid_state(format!(
                 "the `{OPTION_ACCESS_TOKEN}` option supplies a complete OAuth2 credential and \

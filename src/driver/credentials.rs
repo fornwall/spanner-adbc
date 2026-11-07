@@ -69,9 +69,7 @@ impl SpannerDatabase {
     }
 
     /// The first credential option that is set. Ambient ADC does not count, so it cannot block
-    /// emulator use. [`OPTION_ACCESS_TOKEN`] comes last so that
-    /// [`conflicting_credential_with_access_token`](Self::conflicting_credential_with_access_token)
-    /// can filter it out.
+    /// emulator use. [`OPTION_ACCESS_TOKEN`] comes last, so anything else set alongside it shows.
     pub(super) fn explicit_credential_option(&self) -> Option<&'static str> {
         if self.keyfile_json.is_some() {
             Some(OPTION_KEYFILE_JSON)
@@ -84,12 +82,6 @@ impl SpannerDatabase {
         } else {
             None
         }
-    }
-
-    /// A keyfile or impersonation option that conflicts with [`OPTION_ACCESS_TOKEN`].
-    pub(super) fn conflicting_credential_with_access_token(&self) -> Option<&'static str> {
-        self.explicit_credential_option()
-            .filter(|option| *option != OPTION_ACCESS_TOKEN)
     }
 
     /// `emulator` is the resolved mode: the option or `SPANNER_EMULATOR_HOST`.
@@ -188,7 +180,7 @@ pub(super) async fn first_token(
 /// The innermost I/O error behind a token failure, such as a failed DNS lookup. Other errors in
 /// the chain can quote token responses, so they are left out.
 fn io_cause(error: &(dyn std::error::Error + 'static)) -> String {
-    std::iter::successors(Some(error), |e| e.source())
+    crate::error::chain(error)
         .filter_map(|e| e.downcast_ref::<std::io::Error>())
         .last()
         .map_or_else(|| "a transient error".to_owned(), ToString::to_string)

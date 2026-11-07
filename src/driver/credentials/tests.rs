@@ -195,7 +195,6 @@ fn access_token_conflicts_with_other_credential_options() {
         db.access_token = Some("ya29.test-token".into());
         db
     };
-    assert_eq!(base().conflicting_credential_with_access_token(), None);
     assert!(base().resolve_target(None).is_ok());
     for (mutate, expected) in [
         (
@@ -337,9 +336,10 @@ fn access_token_credentials_send_the_quota_project_header() {
 #[test]
 fn quota_project_does_not_conflict_with_an_access_token() {
     let mut db = new_database();
+    db.database = Some("projects/p/instances/i/databases/d".into());
     db.access_token = Some("ya29.test-token".into());
     db.quota_project = Some("my-billing-project".into());
-    assert_eq!(db.conflicting_credential_with_access_token(), None);
+    assert!(db.resolve_target(None).is_ok());
     assert_eq!(db.explicit_credential_option(), Some(OPTION_ACCESS_TOKEN));
 }
 
