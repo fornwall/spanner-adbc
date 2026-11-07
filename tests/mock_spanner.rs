@@ -3642,8 +3642,7 @@ fn set_constant_backoff(statement: &mut impl Statement) {
     }
 }
 
-/// Counts `ExecuteStreamingSql` attempts with retry option `key` set to `value`. The fault arrives
-/// mid-stream because the client never retries a failed initial streaming RPC.
+/// Counts `ExecuteStreamingSql` attempts with retry option `key` set to `value`.
 fn streaming_attempts(key: &str, value: OptionValue) -> usize {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_in_mock = calls.clone();

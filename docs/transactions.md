@@ -142,10 +142,9 @@ first request has no ID yet; see [known limitations](limitations.md#interrupted-
 
 ### Streaming queries and batch DML
 
-Query results stream in bounded Arrow chunks. The client resumes interrupted streams from the
-last resume token. A long stretch of results without a token can exhaust its buffer and
-disable resumption, and an error before the stream opens isn't handled by resumption at all.
-See [retry tuning](options.md#retry-tuning).
+Query results stream in bounded Arrow chunks. The client retries a failed first request and
+resumes interrupted streams from the last resume token. A long stretch of results without a token
+can exhaust its buffer and disable resumption. See [retry tuning](options.md#retry-tuning).
 
 `ExecuteBatchDml` runs statements in order in one read/write transaction. The driver sets
 `last_statements=true` for autocommit batches and `false` for manual commits. `THEN RETURN` DML

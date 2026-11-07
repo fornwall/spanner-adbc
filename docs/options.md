@@ -338,9 +338,8 @@ policy with no attempt limit. Use the `update` timeout to bound it.
 | `max_elapsed_seconds` | Limits retry time | No effect; see [known limitations](limitations.md#streaming-retries-ignore-the-elapsed-time-limit) |
 | Neither set | No limit | At most 10 attempts |
 
-If the first request of a query stream fails, the stream's resume loop isn't involved. Setting
-only `max_elapsed_seconds` replaces the default streaming policy and its 10-attempt limit, so
-also set `max_attempts` if you want an attempt limit. Use the `query` and `fetch` timeouts to
+Setting only `max_elapsed_seconds` replaces the default streaming policy and its 10-attempt
+limit, so also set `max_attempts` if you want an attempt limit. Use the `query` and `fetch` timeouts to
 bound the initial request and each subsequent chunk, and the `update` timeout for BatchWrite.
 The fetch deadline restarts for each chunk, so these settings don't bound the total time to read
 all results.
