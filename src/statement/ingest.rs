@@ -6,22 +6,19 @@ use std::ops::Range;
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
+use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch};
 use google_cloud_spanner::mutation::{Mutation, MutationGroup};
 
 use super::{SpannerStatement, string_option};
 use crate::bind;
 use crate::connection::{TxnKind, lock_txn, write_mutations_txn};
+use crate::conversion::TimestampPrecision;
 use crate::error::{
     annotate, commit_outcome_unknown, err, from_spanner, from_status_parts, invalid_state,
     is_mutation_limit_exceeded, unsupported,
 };
-
-/// The left join keeps a row, with a NULL column name, for a table without columns.
-const TABLE_COLUMNS_SQL: &str = "SELECT c.COLUMN_NAME FROM INFORMATION_SCHEMA.TABLES t \
-     LEFT JOIN INFORMATION_SCHEMA.COLUMNS c \
-     ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME \
-     WHERE LOWER(t.TABLE_SCHEMA) = LOWER(@schema) AND LOWER(t.TABLE_NAME) = LOWER(@table)";
+use crate::metadata::{query_single_use, table_columns_query};
 
 impl SpannerStatement {
     /// DDL to run before an ingest in the create/replace modes; `None` for append.
@@ -321,26 +318,15 @@ impl SpannerStatement {
     /// The lowercased column names of `table` in the ingest target schema, or `None` if there is
     /// no such table. Spanner names are case-insensitive ASCII.
     fn append_target_columns(&self, table: &str) -> Result<Option<HashSet<String>>> {
-        let statement = crate::metadata::metadata_sql_builder(&self.config, TABLE_COLUMNS_SQL)
-            .add_param("schema", self.target_db_schema.as_deref().unwrap_or(""))
-            .add_param("table", table)
-            .build();
-        let client = self.client.clone();
-        self.block_on_query(async move {
-            let mut rows = crate::staleness::single_use(&client, None)
-                .execute_query(statement)
-                .await
-                .map_err(from_spanner)?;
-            let mut columns = None;
-            while let Some(row) = rows.next().await {
-                let row = row.map_err(from_spanner)?;
-                let columns = columns.get_or_insert_with(HashSet::new);
-                if let Some(name) = row.raw_values().first().and_then(|v| v.as_str()) {
-                    columns.insert(name.to_ascii_lowercase());
-                }
-            }
-            Ok(columns)
-        })
+        let db_schema = self.target_db_schema.as_deref().unwrap_or("");
+        let lookup = table_columns_query(&self.config, db_schema, table);
+        let precision = TimestampPrecision::default();
+        let found = self.block_on_query(query_single_use(&self.client, None, lookup, precision))?;
+        // A table without columns has one row with a null name.
+        Ok((found.num_rows() > 0).then(|| {
+            let names = found.column(0).as_string::<i32>();
+            names.iter().flatten().map(str::to_ascii_lowercase).collect()
+        }))
     }
 
     /// Build insert mutations for the flattened row range `[start, end)` of the bound batches.
