@@ -13,19 +13,14 @@
 //! strings bind as `JSON`; Arrow `Null` leaves inference to SQL. Mutations use the target column's
 //! type instead.
 
-use std::ops::Range;
-
 use adbc_core::error::Result;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    ArrowPrimitiveType, ArrowTimestampType, Date32Type, Date64Type, Float16Type, Float32Type,
-    Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, TimestampMicrosecondType,
-    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type,
-    UInt32Type,
+    Date32Type, Date64Type, Float16Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type,
+    Int64Type, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type,
 };
-use arrow_array::{
-    Array, Decimal128Array, OffsetSizeTrait, RecordBatch, downcast_dictionary_array,
-};
+use arrow_array::{Array, Decimal128Array, RecordBatch, downcast_dictionary_array};
 use arrow_schema::{DataType, Field, TimeUnit};
 use chrono::{DateTime, Datelike, NaiveDate, SecondsFormat, Utc};
 use google_cloud_spanner::mutation::Mutation;
@@ -46,7 +41,11 @@ pub(crate) fn bind_params(
 ) -> Result<StatementBuilder> {
     let fields = batch.schema_ref().fields();
     for ((name, field), column) in names.iter().zip(fields).zip(batch.columns()) {
-        builder = bind_one(builder, name, field, column.as_ref(), row)?;
+        let value = cell_value(Target::Parameter(name), column.as_ref(), row)?;
+        builder = match parameter_type(field) {
+            Some(t) => builder.add_typed_param(name, value, t),
+            None => builder.add_param(name, value),
+        };
     }
     Ok(builder)
 }
@@ -124,59 +123,61 @@ fn resolve_names(sql: &str, batch: &RecordBatch, bind_by_name: bool) -> Result<V
     Ok(params)
 }
 
-/// Bind one cell with its Arrow logical type, preserving JSON extension metadata.
-fn bind_one(
-    builder: StatementBuilder,
-    name: &str,
-    field: &Field,
-    column: &dyn Array,
-    row: usize,
-) -> Result<StatementBuilder> {
-    let (value, param_type) = cell_value(Target::Parameter(name), field, column, row)?;
-    let param_type = param_type.or_else(|| parameter_type(column.data_type()));
-    Ok(match param_type {
-        Some(t) => builder.add_typed_param(name, value, t),
-        None => builder.add_param(name, value),
-    })
-}
-
-/// Type an already-validated binding. Arrow `Null` (including list elements) needs SQL context.
-/// Keep this separate from value encoding: mutation values take their type from the target table.
-fn parameter_type(data_type: &DataType) -> Option<Type> {
-    match dictionary_values(data_type) {
+/// The wire type of a parameter: its Arrow logical type, or `JSON` for tagged strings. Arrow `Null`
+/// (including list elements) needs SQL context. Keep this separate from value encoding: mutation
+/// values take their type from the target table.
+fn parameter_type(field: &Field) -> Option<Type> {
+    match dictionary_values(field.data_type()) {
         DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
-            Some(types::array(parameter_type(item.data_type())?))
+            Some(types::array(parameter_type(item)?))
         }
-        scalar => scalar_type(scalar).map(|(spanner_type, _)| spanner_type),
+        _ if is_json_field(field) => Some(types::json()),
+        scalar => scalar_type(scalar).map(|(spanner_type, _)| spanner_type()),
     }
 }
 
-/// The Spanner type and DDL column type of a scalar that [`scalar_binder`] accepts. Arrow `Null`
-/// has neither.
-fn scalar_type(data_type: &DataType) -> Option<(Type, &'static str)> {
+/// Builds a Spanner type only when one is needed, since [`is_bindable`] runs for every cell.
+type TypeFn = fn() -> Type;
+
+/// The Spanner type and DDL column type of a scalar that [`cell_value`] accepts. Arrow `Null` has
+/// neither. Keep new type support aligned with the read mapping.
+fn scalar_type(data_type: &DataType) -> Option<(TypeFn, &'static str)> {
     Some(match data_type {
-        DataType::Boolean => (types::bool(), "BOOL"),
+        DataType::Boolean => (types::bool, "BOOL"),
+        // UInt64 is excluded because its range exceeds INT64.
         DataType::Int8
         | DataType::Int16
         | DataType::Int32
         | DataType::Int64
         | DataType::UInt8
         | DataType::UInt16
-        | DataType::UInt32 => (types::int64(), "INT64"),
-        DataType::Float16 | DataType::Float32 => (types::float32(), "FLOAT32"),
-        DataType::Float64 => (types::float64(), "FLOAT64"),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-            (types::string(), "STRING(MAX)")
-        }
+        | DataType::UInt32 => (types::int64, "INT64"),
+        DataType::Float16 | DataType::Float32 => (types::float32, "FLOAT32"),
+        DataType::Float64 => (types::float64, "FLOAT64"),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => (types::string, "STRING(MAX)"),
         DataType::Binary
         | DataType::LargeBinary
         | DataType::BinaryView
-        | DataType::FixedSizeBinary(_) => (types::bytes(), "BYTES(MAX)"),
-        DataType::Date32 | DataType::Date64 => (types::date(), "DATE"),
-        DataType::Timestamp(_, _) => (types::timestamp(), "TIMESTAMP"),
-        DataType::Decimal128(_, _) => (types::numeric(), "NUMERIC"),
+        | DataType::FixedSizeBinary(_) => (types::bytes, "BYTES(MAX)"),
+        DataType::Date32 | DataType::Date64 => (types::date, "DATE"),
+        DataType::Timestamp(_, _) => (types::timestamp, "TIMESTAMP"),
+        // A larger scale, possible in an imported schema, would overflow `numeric_string`'s i128
+        // divisor.
+        DataType::Decimal128(_, scale) if *scale <= 38 => (types::numeric, "NUMERIC"),
         _ => return None,
     })
+}
+
+/// Whether [`cell_value`] encodes `data_type`: scalars and arrays of them, dictionary-encoded or
+/// not. An unsupported type fails even on a null or empty cell.
+fn is_bindable(data_type: &DataType) -> bool {
+    let is_scalar = |t: &DataType| matches!(t, DataType::Null) || scalar_type(t).is_some();
+    match dictionary_values(data_type) {
+        DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
+            is_scalar(dictionary_values(item.data_type()))
+        }
+        scalar => is_scalar(scalar),
+    }
 }
 
 /// The value type of a possibly nested dictionary type.
@@ -192,8 +193,7 @@ fn dictionary_values(mut data_type: &DataType) -> &DataType {
 pub(crate) fn insert_mutation(table: &str, batch: &RecordBatch, row: usize) -> Result<Mutation> {
     let mut builder = Mutation::new_insert_builder(table);
     for (field, column) in batch.schema_ref().fields().iter().zip(batch.columns()) {
-        let target = Target::Column(field.name());
-        let (value, _param_type) = cell_value(target, field, column.as_ref(), row)?;
+        let value = cell_value(Target::Column(field.name()), column.as_ref(), row)?;
         builder = builder.set(field.name().clone()).to(value);
     }
     Ok(builder.build())
@@ -221,7 +221,7 @@ pub(crate) fn check_ingest_values(batch: &RecordBatch) -> Result<()> {
             batch.num_rows()
         };
         for row in 0..rows {
-            cell_value(Target::Column(field.name()), field, column.as_ref(), row)?;
+            cell_value(Target::Column(field.name()), column.as_ref(), row)?;
         }
     }
     Ok(())
@@ -234,7 +234,13 @@ fn values_always_convert(data_type: &DataType) -> bool {
         DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
             values_always_convert(item.data_type())
         }
-        scalar => !matches!(scalar_binder(scalar), Some(ScalarBinder::Checked(_))),
+        scalar => !matches!(
+            scalar,
+            DataType::Date32
+                | DataType::Date64
+                | DataType::Timestamp(_, _)
+                | DataType::Decimal128(_, _)
+        ),
     }
 }
 
@@ -246,58 +252,80 @@ pub(crate) fn mutation_table(db_schema: Option<&str>, table_name: &str) -> Strin
     }
 }
 
-/// Encode a cell for a query or mutation. Only JSON parameters need an explicit wire type.
-fn cell_value(
-    target: Target<'_>,
-    field: &Field,
-    column: &dyn Array,
-    row: usize,
-) -> Result<(Value, Option<Type>)> {
+/// Encode a cell for a query or mutation, retaining its value and nulls. Smaller integers and
+/// floats widen losslessly.
+fn cell_value(target: Target<'_>, column: &dyn Array, row: usize) -> Result<Value> {
     let data_type = column.data_type();
-    match data_type {
-        DataType::List(item) => {
-            list_cell_value(target, data_type, item, list_elements::<i32>(column, row))
+    if !is_bindable(data_type) {
+        return Err(unsupported(target, dictionary_values(data_type)));
+    }
+    // NullArray has no validity buffer, so its physical `is_null` returns false.
+    if column.is_null(row) || matches!(data_type, DataType::Null) {
+        return Ok(Value::null());
+    }
+    Ok(match data_type {
+        DataType::List(_) => list_value(target, &column.as_list::<i32>().value(row))?,
+        DataType::LargeList(_) => list_value(target, &column.as_list::<i64>().value(row))?,
+        DataType::FixedSizeList(_, _) => {
+            list_value(target, &column.as_fixed_size_list().value(row))?
         }
-        DataType::LargeList(item) => {
-            list_cell_value(target, data_type, item, list_elements::<i64>(column, row))
-        }
-        DataType::FixedSizeList(item, size) => {
-            let list = column.as_fixed_size_list();
-            let start = list.value_offset_at(row);
-            let elements = list
-                .is_valid(row)
-                .then(|| (list.values().as_ref(), start..start + *size as usize));
-            list_cell_value(target, data_type, item, elements)
-        }
-        // Decode recursively, validating the logical type for null keys too.
         DataType::Dictionary(_, _) => downcast_dictionary_array!(
             column => match column.key(row) {
-                Some(value_row) => cell_value(target, field, column.values().as_ref(), value_row),
-                None => null_dictionary_value(target, field, column.values().data_type()),
+                Some(key) => cell_value(target, column.values().as_ref(), key)?,
+                None => Value::null(),
             },
             _ => unreachable!("downcast_dictionary_array dispatched a non-dictionary {data_type:?}")
         ),
-        _ => {
-            let bind = scalar_binder(data_type).ok_or_else(|| unsupported(target, data_type))?;
-            let value = bind.encode(target, column, row)?;
-            Ok((value, is_json_field(field).then(types::json)))
+        DataType::Int64 => column.as_primitive::<Int64Type>().value(row).into(),
+        DataType::Int32 => i64::from(column.as_primitive::<Int32Type>().value(row)).into(),
+        DataType::Int16 => i64::from(column.as_primitive::<Int16Type>().value(row)).into(),
+        DataType::Int8 => i64::from(column.as_primitive::<Int8Type>().value(row)).into(),
+        DataType::UInt32 => i64::from(column.as_primitive::<UInt32Type>().value(row)).into(),
+        DataType::UInt16 => i64::from(column.as_primitive::<UInt16Type>().value(row)).into(),
+        DataType::UInt8 => i64::from(column.as_primitive::<UInt8Type>().value(row)).into(),
+        DataType::Float64 => column.as_primitive::<Float64Type>().value(row).into(),
+        DataType::Float32 => f64::from(column.as_primitive::<Float32Type>().value(row)).into(),
+        DataType::Float16 => f64::from(column.as_primitive::<Float16Type>().value(row)).into(),
+        DataType::Boolean => column.as_boolean().value(row).into(),
+        DataType::Utf8 => column.as_string::<i32>().value(row).into(),
+        DataType::LargeUtf8 => column.as_string::<i64>().value(row).into(),
+        DataType::Utf8View => column.as_string_view().value(row).into(),
+        DataType::Binary => column.as_binary::<i32>().value(row).into(),
+        DataType::LargeBinary => column.as_binary::<i64>().value(row).into(),
+        DataType::BinaryView => column.as_binary_view().value(row).into(),
+        DataType::FixedSizeBinary(_) => column.as_fixed_size_binary().value(row).into(),
+        DataType::Date32 => {
+            let days = column.as_primitive::<Date32Type>().value(row);
+            date_string(target, days.into())?.into()
         }
-    }
+        DataType::Date64 => {
+            let millis = column.as_primitive::<Date64Type>().value(row);
+            date_string(target, date64_days(target, millis)?)?.into()
+        }
+        DataType::Timestamp(unit, _) => {
+            let value = match unit {
+                TimeUnit::Second => column.as_primitive::<TimestampSecondType>().value(row),
+                TimeUnit::Millisecond => {
+                    column.as_primitive::<TimestampMillisecondType>().value(row)
+                }
+                TimeUnit::Microsecond => {
+                    column.as_primitive::<TimestampMicrosecondType>().value(row)
+                }
+                TimeUnit::Nanosecond => column.as_primitive::<TimestampNanosecondType>().value(row),
+            };
+            timestamp_string(target, *unit, value)?.into()
+        }
+        DataType::Decimal128(_, _) => numeric_string(target, column.as_primitive(), row)?.into(),
+        _ => return Err(unsupported(target, data_type)),
+    })
 }
 
-/// The child values and element range of list cell `row`, or `None` for a null list.
-fn list_elements<O: OffsetSizeTrait>(
-    column: &dyn Array,
-    row: usize,
-) -> Option<(&dyn Array, Range<usize>)> {
-    let list = column.as_list::<O>();
-    let offsets = list.value_offsets();
-    list.is_valid(row).then(|| {
-        (
-            list.values().as_ref(),
-            offsets[row].as_usize()..offsets[row + 1].as_usize(),
-        )
-    })
+/// Encode a list cell's elements, consuming them; `ToValue` would deep-copy them.
+fn list_value(target: Target<'_>, elements: &dyn Array) -> Result<Value> {
+    (0..elements.len())
+        .map(|i| cell_value(target, elements, i))
+        .collect::<Result<Vec<Value>>>()
+        .map(Value::from)
 }
 
 /// What a converted value is bound to, for error messages.
@@ -319,188 +347,6 @@ impl std::fmt::Display for Target<'_> {
 fn unsupported(target: Target<'_>, data_type: &DataType) -> adbc_core::error::Error {
     invalid_argument(format!(
         "cannot bind {target}: unsupported Arrow type {data_type}"
-    ))
-}
-
-/// Scalar encoder for one array type, reused across all elements of a list. Only a `Checked`
-/// encoder can reject a value, so [`check_ingest_values`] tests the others on one row.
-///
-/// Encoders map a valid cell through `Option::into`, which consumes owned strings where
-/// `ToValue` would copy them.
-#[derive(Clone, Copy)]
-enum ScalarBinder {
-    Total(fn(&dyn Array, usize) -> Value),
-    Checked(fn(Target<'_>, &dyn Array, usize) -> Result<Value>),
-}
-
-impl ScalarBinder {
-    fn encode(self, target: Target<'_>, array: &dyn Array, row: usize) -> Result<Value> {
-        match self {
-            Self::Total(encode) => Ok(encode(array, row)),
-            Self::Checked(encode) => encode(target, array, row),
-        }
-    }
-}
-
-/// Select the shared scalar encoder, or `None` for an unsupported type. Keep new type support
-/// aligned with [`scalar_type`] and the read mapping.
-fn scalar_binder(data_type: &DataType) -> Option<ScalarBinder> {
-    use ScalarBinder::{Checked, Total};
-    Some(match data_type {
-        // Spanner uses INT64; smaller integer and float widths widen losslessly.
-        DataType::Int64 => primitive_binder::<Int64Type, i64>(),
-        DataType::Int32 => primitive_binder::<Int32Type, i64>(),
-        DataType::Int16 => primitive_binder::<Int16Type, i64>(),
-        DataType::Int8 => primitive_binder::<Int8Type, i64>(),
-        // UInt64 is excluded because its range exceeds INT64.
-        DataType::UInt32 => primitive_binder::<UInt32Type, i64>(),
-        DataType::UInt16 => primitive_binder::<UInt16Type, i64>(),
-        DataType::UInt8 => primitive_binder::<UInt8Type, i64>(),
-        DataType::Float64 => primitive_binder::<Float64Type, f64>(),
-        DataType::Float32 => primitive_binder::<Float32Type, f64>(),
-        DataType::Float16 => primitive_binder::<Float16Type, f64>(),
-        DataType::Boolean => Total(|a, i| a.is_valid(i).then(|| a.as_boolean().value(i)).into()),
-        DataType::Utf8 => Total(|a, i| a.is_valid(i).then(|| a.as_string::<i32>().value(i)).into()),
-        DataType::LargeUtf8 => {
-            Total(|a, i| a.is_valid(i).then(|| a.as_string::<i64>().value(i)).into())
-        }
-        DataType::Utf8View => {
-            Total(|a, i| a.is_valid(i).then(|| a.as_string_view().value(i)).into())
-        }
-        DataType::Binary => {
-            Total(|a, i| a.is_valid(i).then(|| a.as_binary::<i32>().value(i)).into())
-        }
-        DataType::LargeBinary => {
-            Total(|a, i| a.is_valid(i).then(|| a.as_binary::<i64>().value(i)).into())
-        }
-        DataType::BinaryView => {
-            Total(|a, i| a.is_valid(i).then(|| a.as_binary_view().value(i)).into())
-        }
-        DataType::FixedSizeBinary(_) => Total(|a, i| {
-            a.is_valid(i)
-                .then(|| a.as_fixed_size_binary().value(i))
-                .into()
-        }),
-        DataType::Date32 => Checked(|target, a, i| {
-            a.is_valid(i)
-                .then(|| date_string(target, a.as_primitive::<Date32Type>().value(i).into()))
-                .transpose()
-                .map(Value::from)
-        }),
-        DataType::Date64 => Checked(|target, a, i| {
-            a.is_valid(i)
-                .then(|| {
-                    date_string(
-                        target,
-                        date64_days(target, a.as_primitive::<Date64Type>().value(i))?,
-                    )
-                })
-                .transpose()
-                .map(Value::from)
-        }),
-        DataType::Timestamp(TimeUnit::Second, _) => timestamp_binder::<TimestampSecondType>(),
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            timestamp_binder::<TimestampMillisecondType>()
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            timestamp_binder::<TimestampMicrosecondType>()
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            timestamp_binder::<TimestampNanosecondType>()
-        }
-        // A larger scale, possible in an imported schema, would overflow `numeric_string`'s i128
-        // divisor.
-        DataType::Decimal128(_, scale) if *scale <= 38 => Checked(|target, a, i| {
-            a.is_valid(i)
-                .then(|| numeric_string(target, a.as_primitive(), i))
-                .transpose()
-                .map(Value::from)
-        }),
-        // NullArray has no validity buffer, so its physical `is_valid` returns true.
-        DataType::Null => Total(|_, _| Value::null()),
-        // List elements, as in Polars' `List(Categorical)`. Top-level dictionaries are decoded
-        // by `cell_value`, which also handles dictionaries of lists.
-        DataType::Dictionary(_, value) if scalar_binder(value).is_some() => {
-            Checked(|target, a, i| {
-                downcast_dictionary_array!(
-                    a => match a.key(i) {
-                        Some(key) => {
-                            let values = a.values();
-                            scalar_binder(values.data_type())
-                                .ok_or_else(|| unsupported(target, values.data_type()))?
-                                .encode(target, values.as_ref(), key)
-                        }
-                        None => Ok(Value::null()),
-                    },
-                    _ => unreachable!("downcast_dictionary_array dispatched a non-dictionary"),
-                )
-            })
-        }
-        _ => return None,
-    })
-}
-
-/// Widen a primitive through `From`, preserving nulls and returning a plain function pointer.
-fn primitive_binder<T, V>() -> ScalarBinder
-where
-    T: ArrowPrimitiveType,
-    V: From<T::Native> + Into<Value>,
-{
-    ScalarBinder::Total(|a, i| {
-        a.is_valid(i)
-            .then(|| V::from(a.as_primitive::<T>().value(i)))
-            .into()
-    })
-}
-
-fn timestamp_binder<T: ArrowTimestampType>() -> ScalarBinder {
-    ScalarBinder::Checked(|target, a, i| {
-        a.is_valid(i)
-            .then(|| timestamp_string(target, T::UNIT, a.as_primitive::<T>().value(i)))
-            .transpose()
-            .map(Value::from)
-    })
-}
-
-/// Validate a null dictionary cell's logical type and retain its JSON parameter type.
-fn null_dictionary_value(
-    target: Target<'_>,
-    field: &Field,
-    value_type: &DataType,
-) -> Result<(Value, Option<Type>)> {
-    let value_type = dictionary_values(value_type);
-    match value_type {
-        DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
-            list_cell_value(target, value_type, item, None)
-        }
-        _ => {
-            scalar_binder(value_type).ok_or_else(|| unsupported(target, value_type))?;
-            Ok((Value::null(), is_json_field(field).then(types::json)))
-        }
-    }
-}
-
-/// Encode a list cell from its borrowed child range, avoiding a sliced array allocation.
-/// `None` means a null array. Validate element types even for empty and null arrays.
-fn list_cell_value(
-    target: Target<'_>,
-    list_type: &DataType,
-    item: &Field,
-    elements: Option<(&dyn Array, Range<usize>)>,
-) -> Result<(Value, Option<Type>)> {
-    let bind = scalar_binder(item.data_type()).ok_or_else(|| unsupported(target, list_type))?;
-    let value = match elements {
-        None => Value::null(),
-        // Consume the elements; `ToValue` would deep-copy them.
-        Some((values, range)) => Value::from(
-            range
-                .map(|i| bind.encode(target, values, i))
-                .collect::<Result<Vec<Value>>>()?,
-        ),
-    };
-    Ok((
-        value,
-        is_json_field(item).then(|| types::array(types::json())),
     ))
 }
 
@@ -601,14 +447,14 @@ fn spanner_column_type(field: &Field) -> Result<String> {
     if is_json_field(field) {
         return Ok("JSON".to_string());
     }
-    match dictionary_values(field.data_type()) {
-        // List binding accepts scalar elements only, including for null or empty lists.
+    let data_type = dictionary_values(field.data_type());
+    match data_type {
         DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _)
-            if scalar_binder(item.data_type()).is_some() =>
+            if is_bindable(data_type) =>
         {
             Ok(format!("ARRAY<{}>", spanner_column_type(item)?))
         }
-        other => match scalar_binder(other).and(scalar_type(other)) {
+        other => match scalar_type(other) {
             Some((_, column_type)) => Ok(column_type.to_string()),
             None => Err(invalid_argument(format!(
                 "cannot create a Spanner column for Arrow type {other}; cast it to a type with a \

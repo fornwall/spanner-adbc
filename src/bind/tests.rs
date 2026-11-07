@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use adbc_core::error::Status;
 use arrow_array::builder::{ListBuilder, StringBuilder};
+use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{
     ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
     Decimal128Array, DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray, Float16Array,
@@ -31,10 +32,9 @@ fn column_batch(array: ArrayRef) -> RecordBatch {
 /// The value and parameter type that binding `array[row]` as `@p` sends.
 fn param(array: &dyn Array, row: usize) -> (Value, Option<Type>) {
     let field = Field::new("p", array.data_type().clone(), true);
-    let (value, json_type) = cell_value(Target::Parameter("p"), &field, array, row).unwrap();
     (
-        value,
-        json_type.or_else(|| parameter_type(array.data_type())),
+        cell_value(Target::Parameter("p"), array, row).unwrap(),
+        parameter_type(&field),
     )
 }
 
@@ -656,7 +656,7 @@ fn rejects_unsupported_types_naming_the_parameter_and_type() {
         }
     }
     // Arrow arrays cannot have a scale above 38, but a C ABI schema can declare one.
-    assert!(scalar_binder(&DataType::Decimal128(38, 39)).is_none());
+    assert!(!is_bindable(&DataType::Decimal128(38, 39)));
 }
 
 #[test]
@@ -719,9 +719,10 @@ fn json_tagged_strings_bind_as_json() {
     // A null outer key keeps the JSON type as well.
     let field = json_field("nested", nested.data_type().clone());
     assert_eq!(
-        cell_value(Target::Parameter("nested"), &field, &nested, 2).unwrap(),
-        (Value::null(), Some(types::json()))
+        cell_value(Target::Parameter("nested"), &nested, 2).unwrap(),
+        Value::null()
     );
+    assert_eq!(parameter_type(&field), Some(types::json()));
 }
 
 #[test]
