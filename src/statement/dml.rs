@@ -15,8 +15,6 @@ use crate::error::{
     annotate, commit_outcome_unknown, from_spanner, invalid_argument, invalid_state,
     is_mutation_limit_exceeded, unsupported,
 };
-use crate::runtime::block_on_cancellable;
-use crate::timeout::with_timeout;
 
 /// The result of routing DML through [`SpannerStatement::run_dml`].
 pub(super) enum DmlOutcome {
@@ -77,27 +75,26 @@ impl SpannerStatement {
         &self,
         statements: Vec<SpannerSql>,
     ) -> Result<(Vec<RecordBatch>, SchemaRef, i64)> {
-        let client = self.client.clone();
-        let isolation = self.config.isolation.clone();
-        let request = self.config.request.clone();
-        let retry = self.config.retry;
         let precision = self.config.timestamp_precision;
+        let mut runner = runner_builder(
+            &self.client,
+            self.config.isolation.clone(),
+            &self.config.request,
+            self.config.retry,
+        );
+        if statements.len() > 1 {
+            // Omni can return a different metadata transaction ID for each streaming DML.
+            // Explicit begin pins the original ID across the batch and its atomic commit.
+            runner = runner.set_begin_transaction_option(BeginTransactionOption::ExplicitBegin);
+        }
         // The update timeout covers the whole transaction.
-        let update_timeout = self.config.timeouts.update_timeout();
-        let transaction = async move {
-            let mut runner = runner_builder(&client, isolation, &request, retry);
-            if statements.len() > 1 {
-                // Omni can return a different metadata transaction ID for each streaming DML.
-                // Explicit begin pins the original ID across the batch and its atomic commit.
-                runner = runner.set_begin_transaction_option(BeginTransactionOption::ExplicitBegin);
-            }
-            let outcome = runner
-                .build()
-                .run(move |transaction: ReadWriteTransaction| {
-                    let statements = statements.clone();
-                    async move {
+        let outcome = self
+            .block_on_update(async {
+                runner
+                    .build()
+                    .run(async |transaction: ReadWriteTransaction| {
                         let mut results = Vec::with_capacity(statements.len());
-                        for statement in statements {
+                        for statement in statements.clone() {
                             let mut result_set = transaction.execute_query(statement).await?;
                             let mut rows = Vec::new();
                             while let Some(row) = result_set.next().await {
@@ -114,28 +111,16 @@ impl SpannerStatement {
                             results.push((batch, count));
                         }
                         Ok(results)
-                    }
-                })
-                .await
-                .map_err(from_spanner)?;
-            let mutation_count = outcome
-                .commit_response
-                .commit_stats
-                .as_ref()
-                .map(|stats| stats.mutation_count);
-            Ok::<_, Error>((outcome.result, mutation_count))
-        };
-        let (results, mutation_count) = block_on_cancellable(
-            &self.runtime,
-            &self.cancel.current(),
-            with_timeout(
-                update_timeout,
-                crate::OPTION_RPC_TIMEOUT_UPDATE,
-                transaction,
-            ),
-        )
-        .map_err(note_dml_failure)?;
-        self.config.commit_stats.record(mutation_count);
+                    })
+                    .await
+                    .map_err(from_spanner)
+            })
+            .map_err(note_dml_failure)?;
+        let stats = outcome.commit_response.commit_stats;
+        self.config
+            .commit_stats
+            .record(stats.map(|stats| stats.mutation_count));
+        let results = outcome.result;
 
         let schema = results
             .first()
@@ -204,24 +189,16 @@ impl SpannerStatement {
         };
         let exclude_from_change_streams = self.config.request.exclude_txn_from_change_streams;
         let client = self.client.clone();
-        block_on_cancellable(
-            &self.runtime,
-            &self.cancel.current(),
-            with_timeout(
-                self.config.timeouts.update_timeout(),
-                crate::OPTION_RPC_TIMEOUT_UPDATE,
-                async move {
-                    let transaction = client
-                        .partitioned_dml_transaction()
-                        .set_exclude_txn_from_change_streams(exclude_from_change_streams)
-                        .build();
-                    transaction
-                        .execute_update(statement)
-                        .await
-                        .map_err(from_spanner)
-                },
-            ),
-        )
+        self.block_on_update(async move {
+            let transaction = client
+                .partitioned_dml_transaction()
+                .set_exclude_txn_from_change_streams(exclude_from_change_streams)
+                .build();
+            transaction
+                .execute_update(statement)
+                .await
+                .map_err(from_spanner)
+        })
     }
 }
 

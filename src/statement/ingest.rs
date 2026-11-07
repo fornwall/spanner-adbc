@@ -16,8 +16,6 @@ use crate::error::{
     annotate, commit_outcome_unknown, err, from_spanner, from_status_parts, invalid_state,
     is_mutation_limit_exceeded, unsupported,
 };
-use crate::runtime::block_on_cancellable;
-use crate::timeout::with_timeout;
 
 /// The left join keeps a row, with a NULL column name, for a table without columns.
 const TABLE_COLUMNS_SQL: &str = "SELECT c.COLUMN_NAME FROM INFORMATION_SCHEMA.TABLES t \
@@ -328,29 +326,21 @@ impl SpannerStatement {
             .add_param("table", table)
             .build();
         let client = self.client.clone();
-        block_on_cancellable(
-            &self.runtime,
-            &self.cancel.current(),
-            with_timeout(
-                self.config.timeouts.query_timeout(),
-                crate::OPTION_RPC_TIMEOUT_QUERY,
-                async move {
-                    let mut rows = crate::staleness::single_use(&client, None)
-                        .execute_query(statement)
-                        .await
-                        .map_err(from_spanner)?;
-                    let mut columns = None;
-                    while let Some(row) = rows.next().await {
-                        let row = row.map_err(from_spanner)?;
-                        let columns = columns.get_or_insert_with(HashSet::new);
-                        if let Some(name) = row.raw_values().first().and_then(|v| v.as_str()) {
-                            columns.insert(name.to_ascii_lowercase());
-                        }
-                    }
-                    Ok(columns)
-                },
-            ),
-        )
+        self.block_on_query(async move {
+            let mut rows = crate::staleness::single_use(&client, None)
+                .execute_query(statement)
+                .await
+                .map_err(from_spanner)?;
+            let mut columns = None;
+            while let Some(row) = rows.next().await {
+                let row = row.map_err(from_spanner)?;
+                let columns = columns.get_or_insert_with(HashSet::new);
+                if let Some(name) = row.raw_values().first().and_then(|v| v.as_str()) {
+                    columns.insert(name.to_ascii_lowercase());
+                }
+            }
+            Ok(columns)
+        })
     }
 
     /// Build insert mutations for the flattened row range `[start, end)` of the bound batches.
@@ -453,39 +443,31 @@ impl SpannerStatement {
             )
             .build();
         let mut applied = 0_i64;
-        block_on_cancellable(
-            &self.runtime,
-            &self.cancel.current(),
-            with_timeout(
-                self.config.timeouts.update_timeout(),
-                crate::OPTION_RPC_TIMEOUT_UPDATE,
-                async {
-                    let mut stream = transaction
-                        .execute_streaming(groups)
-                        .await
-                        .map_err(from_spanner)?;
-                    let mut first_error = None;
-                    while let Some(response) = stream.next().await {
-                        let response = response.map_err(from_spanner)?;
-                        match response.status.as_ref().filter(|s| s.code != 0) {
-                            None => applied += response.indexes.len() as i64,
-                            Some(status) if first_error.is_none() => {
-                                first_error = Some(from_status_parts(
-                                    status.code,
-                                    &status.message,
-                                    &status.details,
-                                ));
-                            }
-                            Some(_) => {}
-                        }
+        self.block_on_update(async {
+            let mut stream = transaction
+                .execute_streaming(groups)
+                .await
+                .map_err(from_spanner)?;
+            let mut first_error = None;
+            while let Some(response) = stream.next().await {
+                let response = response.map_err(from_spanner)?;
+                match response.status.as_ref().filter(|s| s.code != 0) {
+                    None => applied += response.indexes.len() as i64,
+                    Some(status) if first_error.is_none() => {
+                        first_error = Some(from_status_parts(
+                            status.code,
+                            &status.message,
+                            &status.details,
+                        ));
                     }
-                    match first_error {
-                        Some(error) => Err(error),
-                        None => Ok(applied),
-                    }
-                },
-            ),
-        )
+                    Some(_) => {}
+                }
+            }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(applied),
+            }
+        })
         .map_err(|error| note_rows_already_committed(error, prior_total + applied))
     }
 }

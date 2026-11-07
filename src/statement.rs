@@ -34,6 +34,7 @@ use crate::driver::SharedDatabaseAdmin;
 use crate::error::{
     err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option, unsupported,
 };
+use crate::metadata::query_single_use;
 use crate::options::{
     SharedConfig, bool_option, bool_option_unsettable, impl_typed_option_getters,
 };
@@ -117,6 +118,20 @@ impl SpannerStatement {
         }
     }
 
+    /// Run `future` within the query timeout, cancellable through this statement.
+    fn block_on_query<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
+        let timeout = self.config.timeouts.query_timeout();
+        let future = with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, future);
+        block_on_cancellable(&self.runtime, &self.cancel.current(), future)
+    }
+
+    /// Run `future` within the update timeout, cancellable through this statement.
+    fn block_on_update<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
+        let timeout = self.config.timeouts.update_timeout();
+        let future = with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_UPDATE, future);
+        block_on_cancellable(&self.runtime, &self.cancel.current(), future)
+    }
+
     /// The connection's database id: the only catalog, as `get_objects` reports it.
     fn catalog(&self) -> &str {
         crate::metadata::database_catalog(&self.database)
@@ -165,24 +180,10 @@ impl SpannerStatement {
         let read_bound = self.config.read_staleness.timestamp_bound();
         let precision = self.config.timestamp_precision;
         let statement = self.build_query_statement(sql, true)?;
-        block_on_cancellable(
-            &self.runtime,
-            &self.cancel.current(),
-            with_timeout(
-                self.config.timeouts.query_timeout(),
-                crate::OPTION_RPC_TIMEOUT_QUERY,
-                async move {
-                    let transaction = crate::staleness::single_use(&client, read_bound);
-                    let result_set = transaction
-                        .execute_query(statement)
-                        .await
-                        .map_err(from_spanner)?;
-                    Ok::<SchemaRef, Error>(
-                        result_set_to_batch(result_set, precision).await?.schema(),
-                    )
-                },
-            ),
-        )
+        self.block_on_query(async move {
+            let batch = query_single_use(&client, read_bound, statement, precision).await?;
+            Ok(batch.schema())
+        })
     }
 
     /// An empty result reader (empty schema, no rows), for statements that yield no result set.
@@ -210,31 +211,24 @@ impl SpannerStatement {
         let precision = self.config.timestamp_precision;
         let fetch_timeout = self.config.timeouts.fetch_timeout();
         let txn = manual_txn.clone();
-        let reader = block_on_cancellable(
-            &self.runtime,
-            &self.cancel.current(),
-            with_timeout(
-                self.config.timeouts.query_timeout(),
-                crate::OPTION_RPC_TIMEOUT_QUERY,
-                async move {
-                    let transaction = match txn {
-                        Some(txn) => txn,
-                        None => Arc::new(crate::staleness::multi_use(&client, bound).await?),
-                    };
-                    stream_bound_query(
-                        runtime,
-                        cancel,
-                        transaction,
-                        statements,
-                        batch_size,
-                        precision,
-                        fetch_timeout,
-                    )
-                    .await
-                },
-            ),
-        )
-        .inspect_err(|error| self.discard_unbegun_read_txn(manual_txn.as_ref(), error))?;
+        let reader = self
+            .block_on_query(async move {
+                let transaction = match txn {
+                    Some(txn) => txn,
+                    None => Arc::new(crate::staleness::multi_use(&client, bound).await?),
+                };
+                stream_bound_query(
+                    runtime,
+                    cancel,
+                    transaction,
+                    statements,
+                    batch_size,
+                    precision,
+                    fetch_timeout,
+                )
+                .await
+            })
+            .inspect_err(|error| self.discard_unbegun_read_txn(manual_txn.as_ref(), error))?;
         Ok(Box::new(reader))
     }
 
@@ -272,36 +266,29 @@ impl SpannerStatement {
         let txn = manual_txn.clone();
         // `stream_query` fetches the first chunk to settle the schema, within the query timeout;
         // the reader converts the rest one chunk at a time, each within the fetch timeout.
-        let reader = block_on_cancellable(
-            &self.runtime,
-            &self.cancel.current(),
-            with_timeout(
-                self.config.timeouts.query_timeout(),
-                crate::OPTION_RPC_TIMEOUT_QUERY,
-                async move {
-                    let result_set = match txn {
-                        Some(txn) => txn.execute_query(statement).await,
-                        None => {
-                            crate::staleness::single_use(&client, bound)
-                                .execute_query(statement)
-                                .await
-                        }
+        let reader = self
+            .block_on_query(async move {
+                let result_set = match txn {
+                    Some(txn) => txn.execute_query(statement).await,
+                    None => {
+                        crate::staleness::single_use(&client, bound)
+                            .execute_query(statement)
+                            .await
                     }
-                    .map_err(from_spanner)?;
-                    stream_query(
-                        runtime,
-                        cancel,
-                        result_set,
-                        batch_size,
-                        precision,
-                        fetch_timeout,
-                        None,
-                    )
-                    .await
-                },
-            ),
-        )
-        .inspect_err(|error| self.discard_unbegun_read_txn(manual_txn.as_ref(), error))?;
+                }
+                .map_err(from_spanner)?;
+                stream_query(
+                    runtime,
+                    cancel,
+                    result_set,
+                    batch_size,
+                    precision,
+                    fetch_timeout,
+                    None,
+                )
+                .await
+            })
+            .inspect_err(|error| self.discard_unbegun_read_txn(manual_txn.as_ref(), error))?;
         Ok(Box::new(reader))
     }
 
@@ -336,28 +323,20 @@ impl SpannerStatement {
         }
         let admin_cell = self.admin.clone();
         let database = self.database.clone();
-        block_on_cancellable(
-            &self.runtime,
-            &self.cancel.current(),
-            with_timeout(
-                self.config.timeouts.update_timeout(),
-                crate::OPTION_RPC_TIMEOUT_UPDATE,
-                async move {
-                    // Built once per client stack to avoid repeating endpoint and credential
-                    // setup; a failed build is not cached.
-                    let admin = admin_cell.client().await?;
-                    admin
-                        .update_database_ddl()
-                        .set_database(database)
-                        .set_statements(statements)
-                        .poller()
-                        .until_done()
-                        .await
-                        .map_err(from_spanner)?;
-                    Ok::<(), Error>(())
-                },
-            ),
-        )
+        self.block_on_update(async move {
+            // Built once per client stack to avoid repeating endpoint and credential
+            // setup; a failed build is not cached.
+            let admin = admin_cell.client().await?;
+            admin
+                .update_database_ddl()
+                .set_database(database)
+                .set_statements(statements)
+                .poller()
+                .until_done()
+                .await
+                .map_err(from_spanner)?;
+            Ok::<(), Error>(())
+        })
     }
 
     fn sql(&self) -> Result<&str> {
@@ -517,15 +496,7 @@ impl SpannerStatement {
                 .collect::<Result<Vec<Vec<u8>>>>()?;
             Ok::<_, Error>((schema, tokens))
         };
-        let (schema, partitions) = block_on_cancellable(
-            &self.runtime,
-            &self.cancel.current(),
-            with_timeout(
-                self.config.timeouts.query_timeout(),
-                crate::OPTION_RPC_TIMEOUT_QUERY,
-                partition_op,
-            ),
-        )?;
+        let (schema, partitions) = self.block_on_query(partition_op)?;
 
         Ok(PartitionedResult {
             partitions,
@@ -562,23 +533,15 @@ impl SpannerStatement {
         let client = self.client.clone();
         // Plan against the schema version the query will read, as `plan_query_schema` does.
         let read_bound = self.config.read_staleness.timestamp_bound();
-        block_on_cancellable(
-            &self.runtime,
-            &self.cancel.current(),
-            with_timeout(
-                self.config.timeouts.query_timeout(),
-                crate::OPTION_RPC_TIMEOUT_QUERY,
-                async move {
-                    let transaction = crate::staleness::single_use(&client, read_bound);
-                    let result_set = transaction
-                        .execute_query(plan_builder.build())
-                        .await
-                        .map_err(from_spanner)?;
-                    // Metadata arrives with the first response; a PLAN has no rows to drain.
-                    Ok(result_set.metadata().undeclared_parameters().clone())
-                },
-            ),
-        )
+        self.block_on_query(async move {
+            let transaction = crate::staleness::single_use(&client, read_bound);
+            let result_set = transaction
+                .execute_query(plan_builder.build())
+                .await
+                .map_err(from_spanner)?;
+            // Metadata arrives with the first response; a PLAN has no rows to drain.
+            Ok(result_set.metadata().undeclared_parameters().clone())
+        })
     }
 
     /// DML arm of [`plan_parameter_types`](Self::plan_parameter_types). The closure keeps the
@@ -591,32 +554,23 @@ impl SpannerStatement {
             .sql_builder(sql)
             .set_query_mode(QueryMode::Plan)
             .build();
-        let client = self.client.clone();
-        let isolation = self.config.isolation.clone();
-        let request = self.config.request.clone();
-        let retry = self.config.retry;
-        block_on_cancellable(
-            &self.runtime,
-            &self.cancel.current(),
-            with_timeout(
-                self.config.timeouts.query_timeout(),
-                crate::OPTION_RPC_TIMEOUT_QUERY,
-                async move {
-                    let runner = runner_builder(&client, isolation, &request, retry).build();
-                    let outcome = runner
-                        .run(move |transaction: ReadWriteTransaction| {
-                            let statement = plan_stmt.clone();
-                            async move {
-                                let result_set = transaction.execute_query(statement).await?;
-                                Ok(result_set.metadata().undeclared_parameters().clone())
-                            }
-                        })
-                        .await
-                        .map_err(from_spanner)?;
-                    Ok(outcome.result)
-                },
-            ),
+        let runner = runner_builder(
+            &self.client,
+            self.config.isolation.clone(),
+            &self.config.request,
+            self.config.retry,
         )
+        .build();
+        self.block_on_query(async {
+            let outcome = runner
+                .run(async |transaction: ReadWriteTransaction| {
+                    let result_set = transaction.execute_query(plan_stmt.clone()).await?;
+                    Ok(result_set.metadata().undeclared_parameters().clone())
+                })
+                .await
+                .map_err(from_spanner)?;
+            Ok(outcome.result)
+        })
     }
 
     /// Data may be bound before the ingest target is set, so a missing destination is only
