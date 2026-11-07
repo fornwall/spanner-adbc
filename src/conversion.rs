@@ -721,37 +721,26 @@ fn scientific_numeric(b: &[u8]) -> Option<i128> {
     if int.is_empty() && frac.is_empty() {
         return None;
     }
-    // Drop the zeros that only pad the significant digits, which don't count toward the 38.
-    // `scale` is the number of digits after the decimal point.
-    let leading = |b: &[u8]| b.iter().take_while(|&&c| c == b'0').count();
-    let trailing = |b: &[u8]| b.iter().rev().take_while(|&&c| c == b'0').count();
-    let mut scale = frac.len() as i64 - i64::from(exponent);
-    let int = &int[leading(int)..];
-    let frac = if int.is_empty() {
-        &frac[leading(frac)..]
-    } else {
-        frac
-    };
-    let (int, frac) = match trailing(frac) {
-        all if all == frac.len() => {
-            let zeros = trailing(int);
-            scale -= (all + zeros) as i64;
-            (&int[..int.len() - zeros], &frac[..0])
-        }
-        zeros => {
-            scale -= zeros as i64;
-            (int, &frac[..frac.len() - zeros])
-        }
-    };
-    if int.is_empty() && frac.is_empty() {
+    // The value at scale 9 is `significand` times 10^`shift`. Padding zeros don't count toward the
+    // 38 digits, and trailing ones can absorb a negative shift.
+    let all_digits = [int, frac].concat();
+    let start = all_digits.iter().take_while(|&&c| c == b'0').count();
+    let mut significand = &all_digits[start..];
+    if significand.is_empty() {
         return Some(0);
     }
-    let shift = u32::try_from(i64::from(NUMERIC_SCALE) - scale).ok()?;
-    if int.len() + frac.len() + shift as usize > usize::from(NUMERIC_PRECISION) {
+    let mut shift = i64::from(NUMERIC_SCALE) + i64::from(exponent) - frac.len() as i64;
+    while shift < 0
+        && let [rest @ .., b'0'] = significand
+    {
+        significand = rest;
+        shift += 1;
+    }
+    let shift = u32::try_from(shift).ok()?;
+    if significand.len() + shift as usize > usize::from(NUMERIC_PRECISION) {
         return None;
     }
-    let significand = digits::<u128>(int)? * 10_u128.pow(frac.len() as u32) + digits::<u128>(frac)?;
-    Some((significand * 10_u128.pow(shift)) as i128)
+    Some((digits::<u128>(significand)? * 10_u128.pow(shift)) as i128)
 }
 
 /// Convert a Spanner value to JSON, for rendering non-string values as text.
