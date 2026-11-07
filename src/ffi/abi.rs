@@ -30,7 +30,6 @@ pub(crate) const ADBC_VERSION_1_1_0: c_int = 1_001_000;
 pub(crate) const ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA: i32 = i32::MIN;
 
 #[repr(C)]
-#[derive(Debug)]
 pub(crate) struct AdbcError {
     pub(crate) message: *mut c_char,
     pub(crate) vendor_code: i32,
@@ -43,7 +42,6 @@ pub(crate) struct AdbcError {
 }
 
 #[repr(C)]
-#[derive(Debug)]
 pub(crate) struct AdbcErrorDetail {
     pub(crate) key: *const c_char,
     pub(crate) value: *const u8,
@@ -51,28 +49,24 @@ pub(crate) struct AdbcErrorDetail {
 }
 
 #[repr(C)]
-#[derive(Debug)]
 pub(crate) struct AdbcDatabase {
     pub(crate) private_data: *mut c_void,
     pub(crate) private_driver: *const AdbcDriver,
 }
 
 #[repr(C)]
-#[derive(Debug)]
 pub(crate) struct AdbcConnection {
     pub(crate) private_data: *mut c_void,
     pub(crate) private_driver: *const AdbcDriver,
 }
 
 #[repr(C)]
-#[derive(Debug)]
 pub(crate) struct AdbcStatement {
     pub(crate) private_data: *mut c_void,
     pub(crate) private_driver: *const AdbcDriver,
 }
 
 #[repr(C)]
-#[derive(Debug)]
 pub(crate) struct AdbcPartitions {
     pub(crate) num_partitions: usize,
     pub(crate) partitions: *mut *const u8,

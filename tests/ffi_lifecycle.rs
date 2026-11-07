@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use adbc_core::error::Status;
 use adbc_core::options::{AdbcVersion, OptionDatabase, OptionStatement, OptionValue};
-use adbc_core::{Connection, Driver, Optionable, Statement};
+use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use adbc_driver_manager::ManagedDriver;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use spanner_adbc::SpannerDriver;
@@ -52,6 +52,24 @@ fn rows_sql(n: usize) -> String {
     format!("SELECT n FROM UNNEST(GENERATE_ARRAY(1, {n})) AS n ORDER BY n")
 }
 
+/// Open a database on `target` and a connection to it.
+fn connect<D: Driver>(
+    driver: &mut D,
+    target: &TestTarget,
+) -> (
+    D::DatabaseType,
+    <D::DatabaseType as Database>::ConnectionType,
+) {
+    let database = driver
+        .new_database_with_opts([(
+            OptionDatabase::Uri,
+            OptionValue::String(target.database_uri()),
+        )])
+        .expect("create database");
+    let connection = connect_with_retry(&database);
+    (database, connection)
+}
+
 /// Load the driver through the driver manager and open a database and connection.
 fn ffi_connect(
     cdylib: &Path,
@@ -67,13 +85,7 @@ fn ffi_connect(
         AdbcVersion::V110,
     )
     .expect("load driver via the driver manager");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("new_database via FFI");
-    let connection = connect_with_retry(&database);
+    let (database, connection) = connect(&mut driver, target);
     (driver, database, connection)
 }
 
@@ -138,13 +150,7 @@ fn stream_survives_statement_connection_database_release() {
     };
 
     let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let (database, mut connection) = connect(&mut driver, &target);
     let mut statement = streaming_statement(&mut connection, 1000, 100);
 
     let mut reader = statement.execute().expect("execute");
@@ -286,13 +292,7 @@ fn drop_half_consumed_reader_then_connection_still_works() {
     };
 
     let mut driver = SpannerDriver::try_new().expect("create driver");
-    let database = driver
-        .new_database_with_opts([(
-            OptionDatabase::Uri,
-            OptionValue::String(target.database_uri()),
-        )])
-        .expect("create database");
-    let mut connection = connect_with_retry(&database);
+    let (_database, mut connection) = connect(&mut driver, &target);
 
     for _ in 0..5 {
         let mut statement = streaming_statement(&mut connection, 10_000, 500);
