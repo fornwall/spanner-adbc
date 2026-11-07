@@ -1,7 +1,6 @@
 //! DML execution: manual-transaction buffering, autocommit, `THEN RETURN` and partitioned DML.
 
 use adbc_core::error::{Error, Result};
-use arrow_array::RecordBatch;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::{BeginTransactionOption, ReadWriteTransaction};
 
@@ -150,8 +149,7 @@ impl SpannerStatement {
 
     /// Execute one partitioned DML statement and return its lower-bound affected-row count.
     fn run_partitioned_dml(&self, sql: &str, parts: &[&str]) -> Result<i64> {
-        let bound_rows = self.bound.iter().map(RecordBatch::num_rows).sum();
-        check_partitioned_dml(sql, lock_txn(&self.txn).autocommit(), bound_rows)?;
+        check_partitioned_dml(sql, lock_txn(&self.txn).autocommit(), self.bound_rows())?;
         let mut statements = self.build_dml_statements(parts)?;
         // Zero bound rows leave nothing to execute, as on the batch DML path.
         let Some(statement) = statements.pop() else {

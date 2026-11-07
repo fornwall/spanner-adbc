@@ -8,6 +8,7 @@ use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch};
+use arrow_schema::Schema;
 use google_cloud_spanner::mutation::{Mutation, MutationGroup};
 
 use super::{SpannerStatement, string_option};
@@ -21,40 +22,23 @@ use crate::error::{
 use crate::metadata::{query_single_use, table_columns_query};
 
 impl SpannerStatement {
-    /// DDL to run before an ingest in the create/replace modes; `None` for append.
+    /// DDL to run before an ingest, which is none for append.
     ///
     /// `create` (the default) fails if the table exists, `create_append` creates it if absent, and
     /// `replace` drops any existing table first. Columns come from the bound data's schema.
-    fn build_ingest_table_ddl(
-        &self,
-        table: &str,
-        mode: Option<IngestMode>,
-    ) -> Result<Option<Vec<String>>> {
-        // Unset means `create`, the spec default.
-        let (if_not_exists, drop_first) = match mode {
-            Some(IngestMode::Append) => return Ok(None),
-            None | Some(IngestMode::Create) => (false, false),
-            Some(IngestMode::CreateAppend) => (true, false),
-            Some(IngestMode::Replace) => (false, true),
-        };
-        let schema = self
-            .bound_ingest_schema()
-            .ok_or_else(|| invalid_state("cannot create the ingest table: no data is bound"))?;
+    fn build_ingest_table_ddl(&self, table: &str, schema: &Schema) -> Result<Vec<String>> {
         let db_schema = self.target_db_schema.as_deref();
-        let mut statements = Vec::new();
-        if drop_first {
-            statements.push(format!(
-                "DROP TABLE IF EXISTS {}",
-                crate::sql::qualified_table(db_schema, table)?
-            ));
-        }
-        statements.push(bind::create_table_sql(
-            table,
-            db_schema,
-            &schema,
-            if_not_exists,
-        )?);
-        Ok(Some(statements))
+        let create =
+            |if_not_exists| bind::create_table_sql(table, db_schema, schema, if_not_exists);
+        Ok(match self.ingest_mode {
+            IngestMode::Append => Vec::new(),
+            IngestMode::Create => vec![create(false)?],
+            IngestMode::CreateAppend => vec![create(true)?],
+            IngestMode::Replace => {
+                let target = crate::sql::qualified_table(db_schema, table)?;
+                vec![format!("DROP TABLE IF EXISTS {target}"), create(false)?]
+            }
+        })
     }
 
     /// Whether `table` exists in the ingest target schema.
@@ -79,25 +63,23 @@ impl SpannerStatement {
     fn remap_ingest_append_error(&self, table: &str, error: Error) -> Error {
         if !matches!(
             self.ingest_mode,
-            Some(IngestMode::Append) | Some(IngestMode::CreateAppend)
+            IngestMode::Append | IngestMode::CreateAppend
         ) {
             return error;
         }
-        // Table existence says nothing about an authorization, cancellation, timeout, quota or
-        // transport failure, and probing could delay cancellation.
-        if !matches!(
-            error.status,
-            Status::InvalidArguments | Status::InvalidData | Status::NotFound | Status::Integrity
-        ) {
-            return error;
-        }
-        // The rows conflict with the table's data or constraints, not its schema. Skip the probe,
-        // whose "incompatible schema" message would misreport it, and keep the vendor code and
-        // details.
-        if error.status == Status::Integrity {
-            return annotate(error, |message| {
-                format!("bulk ingest append into table {table:?} failed: {message}")
-            });
+        match error.status {
+            // The rows conflict with the table's data or constraints, not its schema. Skip the
+            // probe, whose "incompatible schema" message would misreport it, and keep the vendor
+            // code and details.
+            Status::Integrity => {
+                return annotate(error, |message| {
+                    format!("bulk ingest append into table {table:?} failed: {message}")
+                });
+            }
+            Status::InvalidArguments | Status::InvalidData | Status::NotFound => {}
+            // Table existence says nothing about an authorization, cancellation, timeout, quota
+            // or transport failure, and probing could delay cancellation.
+            _ => return error,
         }
         match self.ingest_table_exists(table) {
             Ok(true) => err(
@@ -125,19 +107,11 @@ impl SpannerStatement {
     ///
     /// An ingest that fits in one chunk is atomic. Larger ones commit chunk by chunk, so a failure
     /// leaves earlier chunks committed; the error reports how many rows.
-    pub(super) fn run_ingest(&mut self, table: &str) -> Result<Option<i64>> {
+    pub(super) fn run_ingest(&self, table: &str) -> Result<Option<i64>> {
         // An empty bound stream still provides a schema, enough to create the table.
-        if self.bound.is_empty() && self.ingest_schema.is_none() {
+        let Some(schema) = &self.bound_schema else {
             return Err(invalid_state("cannot ingest: no data has been bound"));
-        }
-        let result = self.run_bound_ingest(table);
-        self.clear_bound();
-        result
-    }
-
-    /// Body of [`run_ingest`](Self::run_ingest), split out so the caller clears bound data on
-    /// every exit path.
-    fn run_bound_ingest(&self, table: &str) -> Result<Option<i64>> {
+        };
         if self.config.is_read_only() {
             return Err(invalid_state("cannot ingest: the connection is read-only"));
         }
@@ -146,23 +120,22 @@ impl SpannerStatement {
         // lock at buffer time; holding the connection-wide lock across the admin RPC instead
         // would stall the connection for seconds.
         lock_txn(&self.txn).check_kind_allowed(TxnKind::Dml)?;
-        self.check_ingest_names(table)?;
-        let ingest_ddl = self.build_ingest_table_ddl(table, self.ingest_mode)?;
+        self.check_ingest_names(table, schema)?;
+        let ddl = self.build_ingest_table_ddl(table, schema)?;
         // A bad value must fail before anything is written: DDL can't be rolled back, `replace`
         // drops the old table, and a chunked autocommit ingest would leave earlier chunks
         // committed.
         for batch in &self.bound {
             bind::check_ingest_values(batch)?;
         }
-        if let Some(ddl) = ingest_ddl {
+        if !ddl.is_empty() {
             self.run_ddl(ddl)
                 .map_err(|error| self.remap_ingest_ddl_error(table, error))?;
         }
         // No insert reports a missing table or column at execution when there are no rows, or
         // when the inserts are buffered until commit.
-        if self.bound.iter().all(|batch| batch.num_rows() == 0) || !lock_txn(&self.txn).autocommit()
-        {
-            self.check_append_target(table)?;
+        if self.bound_rows() == 0 || !lock_txn(&self.txn).autocommit() {
+            self.check_append_target(table, schema)?;
         }
         self.run_ingest_mutations(table)
             .map_err(|error| self.remap_ingest_append_error(table, error))
@@ -171,14 +144,11 @@ impl SpannerStatement {
     /// Reject names Spanner can never accept with `InvalidArguments` in every mode. The create
     /// modes would catch them while building DDL; `append` would send them in mutations and get
     /// back a missing-table or missing-column error.
-    fn check_ingest_names(&self, table: &str) -> Result<()> {
+    fn check_ingest_names(&self, table: &str, schema: &Schema) -> Result<()> {
         crate::sql::qualified_table(self.target_db_schema.as_deref(), table)?;
-        if let Some(schema) = self.bound_ingest_schema() {
-            for field in schema.fields() {
-                crate::sql::quote_ident(field.name()).map_err(|e| {
-                    annotate(e, |m| format!("ingest column {:?}: {m}", field.name()))
-                })?;
-            }
+        for field in schema.fields() {
+            crate::sql::quote_ident(field.name())
+                .map_err(|e| annotate(e, |m| format!("ingest column {:?}: {m}", field.name())))?;
         }
         Ok(())
     }
@@ -190,46 +160,46 @@ impl SpannerStatement {
     /// In `replace` mode, explain Spanner's refusal to drop a table that other schema objects
     /// depend on.
     fn remap_ingest_ddl_error(&self, table: &str, error: Error) -> Error {
-        if self.ingest_mode == Some(IngestMode::Replace) {
-            if error.status != Status::InvalidState
-                || !error
-                    .message
-                    .to_ascii_lowercase()
-                    .contains("cannot drop table")
+        match self.ingest_mode {
+            IngestMode::Replace
+                if error.status == Status::InvalidState
+                    && error
+                        .message
+                        .to_ascii_lowercase()
+                        .contains("cannot drop table") =>
             {
-                return error;
+                annotate(error, |message| {
+                    format!(
+                        "bulk ingest replace of table {table:?} failed: {message} Replace mode \
+                         drops and recreates only the table, so first drop the indexes, \
+                         interleaved tables, foreign keys or views that depend on it, or ingest \
+                         with mode append"
+                    )
+                })
             }
-            return annotate(error, |message| {
-                format!(
-                    "bulk ingest replace of table {table:?} failed: {message} Replace mode drops \
-                     and recreates only the table, so first drop the indexes, interleaved tables, \
-                     foreign keys or views that depend on it, or ingest with mode append"
-                )
-            });
-        }
-        if !matches!(self.ingest_mode, None | Some(IngestMode::Create)) {
-            return error;
-        }
-        // `Integrity` covers a backend reporting the table as gRPC ALREADY_EXISTS.
-        if !matches!(
-            error.status,
-            Status::InvalidArguments
-                | Status::InvalidState
-                | Status::NotFound
-                | Status::AlreadyExists
-                | Status::Integrity
-        ) {
-            return error;
-        }
-        match self.ingest_table_exists(table) {
-            Ok(true) => err(
-                format!(
-                    "bulk ingest create target table {table:?} already exists ({})",
-                    error.message
-                ),
-                Status::AlreadyExists,
-            ),
-            Ok(false) | Err(_) => error,
+            // `Integrity` covers a backend reporting the table as gRPC ALREADY_EXISTS.
+            IngestMode::Create
+                if matches!(
+                    error.status,
+                    Status::InvalidArguments
+                        | Status::InvalidState
+                        | Status::NotFound
+                        | Status::AlreadyExists
+                        | Status::Integrity
+                ) =>
+            {
+                match self.ingest_table_exists(table) {
+                    Ok(true) => err(
+                        format!(
+                            "bulk ingest create target table {table:?} already exists ({})",
+                            error.message
+                        ),
+                        Status::AlreadyExists,
+                    ),
+                    Ok(false) | Err(_) => error,
+                }
+            }
+            _ => error,
         }
     }
 
@@ -246,19 +216,9 @@ impl SpannerStatement {
     /// mutation limit is split; see [`write_mutation_range`](Self::write_mutation_range).
     fn run_ingest_mutations(&self, table: &str) -> Result<Option<i64>> {
         let target = bind::mutation_table(self.target_db_schema.as_deref(), table);
-        let manual = {
-            let txn = lock_txn(&self.txn);
-            if txn.autocommit() {
-                false
-            } else {
-                txn.check_kind_allowed(TxnKind::Dml)?;
-                true
-            }
-        };
-        if manual {
+        if !lock_txn(&self.txn).autocommit() {
             // Build outside the connection-wide txn lock, since it is O(rows).
-            let rows = self.bound.iter().map(RecordBatch::num_rows).sum();
-            let mutations = self.build_range_mutations(&target, 0, rows)?;
+            let mutations = self.build_range_mutations(&target, 0..self.bound_rows())?;
             let mut txn = lock_txn(&self.txn);
             if !txn.autocommit() {
                 // `buffer_mutation` re-checks the kind, since a concurrent statement may have
@@ -275,7 +235,13 @@ impl SpannerStatement {
         // chunk has to be split.
         let mut total = 0_i64;
         for chunk in chunk_ranges(&self.bound) {
-            total += self.commit_ingest_range(&target, chunk.start, chunk.end, total)?;
+            total += if self.ingest_batch_write {
+                // BatchWrite applies each row's group independently, so the per-commit mutation
+                // limit, and the split that works around it, don't apply.
+                self.batch_write_chunk(self.build_range_mutations(&target, chunk)?, total)?
+            } else {
+                self.write_mutation_range(&target, chunk, total)?
+            };
         }
         Ok(Some(total))
     }
@@ -283,8 +249,8 @@ impl SpannerStatement {
     /// Check an `append` target for what ADBC requires: `NotFound` for a missing table and
     /// `AlreadyExists` for a bound column it lacks. The other modes create the table. If the
     /// probe fails, the ingest proceeds.
-    fn check_append_target(&self, table: &str) -> Result<()> {
-        if self.ingest_mode != Some(IngestMode::Append) {
+    fn check_append_target(&self, table: &str, schema: &Schema) -> Result<()> {
+        if self.ingest_mode != IngestMode::Append {
             return Ok(());
         }
         let columns = match self.append_target_columns(table) {
@@ -297,13 +263,8 @@ impl SpannerStatement {
             }
             Err(_) => return Ok(()),
         };
-        let missing = self.bound_ingest_schema().and_then(|schema| {
-            let mut names = schema.fields().iter().map(|field| field.name());
-            names
-                .find(|name| !columns.contains(&name.to_ascii_lowercase()))
-                .cloned()
-        });
-        match missing {
+        let mut names = schema.fields().iter().map(|field| field.name());
+        match names.find(|name| !columns.contains(&name.to_ascii_lowercase())) {
             Some(name) => Err(err(
                 format!(
                     "bulk ingest append into table {table:?} failed: the bound data is \
@@ -325,70 +286,47 @@ impl SpannerStatement {
         // A table without columns has one row with a null name.
         Ok((found.num_rows() > 0).then(|| {
             let names = found.column(0).as_string::<i32>();
-            names.iter().flatten().map(str::to_ascii_lowercase).collect()
+            names
+                .iter()
+                .flatten()
+                .map(str::to_ascii_lowercase)
+                .collect()
         }))
     }
 
-    /// Build insert mutations for the flattened row range `[start, end)` of the bound batches.
-    fn build_range_mutations(
-        &self,
-        target: &str,
-        start: usize,
-        end: usize,
-    ) -> Result<Vec<Mutation>> {
-        let mut mutations = Vec::with_capacity(end.saturating_sub(start));
+    /// Build insert mutations for the flattened row range `rows` of the bound batches.
+    fn build_range_mutations(&self, target: &str, rows: Range<usize>) -> Result<Vec<Mutation>> {
+        let mut mutations = Vec::with_capacity(rows.len());
         let mut base = 0_usize;
         for batch in &self.bound {
-            let rows = batch.num_rows();
-            // Intersect with this batch's rows `[base, base + rows)`, as batch-local offsets.
-            let lo = start.max(base).saturating_sub(base);
-            let hi = end.min(base + rows).saturating_sub(base);
+            // Intersect with this batch's rows, as batch-local offsets.
+            let lo = rows.start.max(base) - base;
+            let hi = rows.end.min(base + batch.num_rows()) - base;
             for row in lo..hi {
                 mutations.push(bind::insert_mutation(target, batch, row)?);
             }
-            base += rows;
-            if base >= end {
+            base += batch.num_rows();
+            if base >= rows.end {
                 break;
             }
         }
         Ok(mutations)
     }
 
-    /// Commit rows `[start, end)` as one autocommit chunk, in a write-only transaction or, with
-    /// `spanner.ingest.batch_write`, through BatchWrite. Returns the number of rows written.
-    /// `prior_total` counts rows committed by earlier chunks, for the error if this one fails.
-    fn commit_ingest_range(
-        &self,
-        target: &str,
-        start: usize,
-        end: usize,
-        prior_total: i64,
-    ) -> Result<i64> {
-        if self.ingest_batch_write {
-            // BatchWrite applies each row's group independently, so the per-commit mutation
-            // limit, and the split that works around it, don't apply.
-            let mutations = self.build_range_mutations(target, start, end)?;
-            self.batch_write_chunk(mutations, prior_total)
-        } else {
-            self.write_mutation_range(target, start, end, prior_total)
-        }
-    }
-
-    /// Commit rows `[start, end)` in one write-only transaction, splitting the range in half and
-    /// retrying if Spanner rejects it for too many mutations.
+    /// Commit `rows` in one write-only transaction, splitting the range in half and retrying if
+    /// Spanner rejects it for too many mutations. Returns the number of rows written.
     ///
     /// Chunks are sized by rows times columns, but the commit also counts secondary-index entries
     /// the driver can't see, so an indexed table can still exceed the limit. Other errors, and a
     /// single row that is still too large, propagate. A split chunk is not atomic; `prior_total`
-    /// is carried through the recursion so a failure reports every row committed before it.
+    /// counts the rows committed before this range, for the error if it fails.
     fn write_mutation_range(
         &self,
         target: &str,
-        start: usize,
-        end: usize,
+        rows: Range<usize>,
         prior_total: i64,
     ) -> Result<i64> {
-        let mutations = self.build_range_mutations(target, start, end)?;
+        let mutations = self.build_range_mutations(target, rows.clone())?;
         // A commit reports no row count, but each insert mutation is one row.
         let count = mutations.len() as i64;
         // Write-only transactions have replay protection, so internal retries on `ABORTED` still
@@ -401,10 +339,10 @@ impl SpannerStatement {
             mutations,
         ) {
             Ok(()) => Ok(count),
-            Err(error) if end - start > 1 && is_mutation_limit_exceeded(&error) => {
-                let mid = start + (end - start) / 2;
-                let left = self.write_mutation_range(target, start, mid, prior_total)?;
-                let right = self.write_mutation_range(target, mid, end, prior_total + left)?;
+            Err(error) if rows.len() > 1 && is_mutation_limit_exceeded(&error) => {
+                let mid = rows.start + rows.len() / 2;
+                let left = self.write_mutation_range(target, rows.start..mid, prior_total)?;
+                let right = self.write_mutation_range(target, mid..rows.end, prior_total + left)?;
                 Ok(left + right)
             }
             Err(error) => Err(note_rows_already_committed(error, prior_total)),
@@ -497,27 +435,24 @@ pub(super) fn ingest_mode_option(key: &OptionStatement, value: OptionValue) -> R
 /// When [`commit_outcome_unknown`], the note also warns that the failing chunk may have landed.
 /// Status, vendor code and details are preserved.
 fn note_rows_already_committed(error: Error, committed: i64) -> Error {
-    let outcome_unknown = commit_outcome_unknown(&error);
-    if committed == 0 && !outcome_unknown {
-        return error;
-    }
-    let mut note = String::new();
+    let mut notes = Vec::new();
     if committed > 0 {
-        note.push_str(&format!(
+        notes.push(format!(
             "{committed} row(s) from this bulk ingest were already committed and remain in the \
              table"
         ));
     }
-    if outcome_unknown {
-        if !note.is_empty() {
-            note.push_str("; ");
-        }
-        note.push_str(
+    if commit_outcome_unknown(&error) {
+        notes.push(
             "this chunk's own commit outcome is unknown: it may still have landed server-side, so \
-             retrying could duplicate rows",
+             retrying could duplicate rows"
+                .to_string(),
         );
     }
-    annotate(error, |message| format!("{message} ({note})"))
+    if notes.is_empty() {
+        return error;
+    }
+    annotate(error, |message| format!("{message} ({})", notes.join("; ")))
 }
 
 /// The batch's Arrow bytes per row. Counts only the rows a sliced batch references: a slice keeps

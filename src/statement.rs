@@ -62,16 +62,15 @@ pub struct SpannerStatement {
     sql: Option<String>,
     /// Parameter rows or bulk-ingest data from `bind` or `bind_stream`.
     bound: Vec<RecordBatch>,
-    /// Schema of a `bind_stream` that yielded no batches; used only by bulk ingest. Kept out of
-    /// `bound` so an empty stream isn't mistaken for bound parameters.
-    ingest_schema: Option<SchemaRef>,
+    /// Schema of the bound data. A stream with no batches still has one, which bulk ingest can
+    /// use, but it leaves `bound` empty so it isn't mistaken for bound parameters.
+    bound_schema: Option<SchemaRef>,
     target_table: Option<String>,
     /// Named schema of the ingest target; `None` or empty selects the default schema.
     target_db_schema: Option<String>,
     /// Only the connection's database is accepted; stored so `get_option` round-trips it.
     target_catalog: Option<String>,
-    /// `None` means the spec default, `create`.
-    ingest_mode: Option<IngestMode>,
+    ingest_mode: IngestMode,
     /// Send autocommit ingest chunks through BatchWrite instead of write-only transactions.
     ingest_batch_write: bool,
     /// Run DML as Partitioned DML instead of in a read/write transaction.
@@ -103,11 +102,11 @@ impl SpannerStatement {
             txn,
             sql: None,
             bound: Vec::new(),
-            ingest_schema: None,
+            bound_schema: None,
             target_table: None,
             target_db_schema: None,
             target_catalog: None,
-            ingest_mode: None,
+            ingest_mode: IngestMode::Create,
             ingest_batch_write: false,
             dml_partitioned: false,
             bind_by_name: false,
@@ -156,19 +155,15 @@ impl SpannerStatement {
             .apply_to_statement(self.sql_builder(sql))
     }
 
-    /// Schema of the ingest data, falling back to the schema of an empty bound stream.
-    fn bound_ingest_schema(&self) -> Option<SchemaRef> {
-        self.bound
-            .first()
-            .map(RecordBatch::schema)
-            .or_else(|| self.ingest_schema.clone())
+    fn bound_rows(&self) -> usize {
+        self.bound.iter().map(RecordBatch::num_rows).sum()
     }
 
     /// Discard bound data once an execution consumes it, so a reused handle can't re-apply stale
     /// rows. `set_sql_query` and the ingest setters keep it, since binding may come first.
     fn clear_bound(&mut self) {
         self.bound.clear();
-        self.ingest_schema = None;
+        self.bound_schema = None;
     }
 
     /// Return the result schema of `sql` from a `QueryMode::Plan` probe, which scans no rows.
@@ -223,7 +218,7 @@ impl SpannerStatement {
     fn execute_query_reader(&self, sql: &str) -> Result<ResultReader> {
         let sql = crate::sql::strip_trailing_terminators(sql);
         self.ensure_query_allowed()?;
-        let bound_rows: usize = self.bound.iter().map(RecordBatch::num_rows).sum();
+        let bound_rows = self.bound_rows();
         if bound_rows > 1 {
             return self.execute_multi_row_query(sql);
         }
@@ -340,19 +335,15 @@ impl SpannerStatement {
     /// since clients such as the Python DBAPI run DML through `ExecuteQuery` with a result stream.
     pub(crate) fn execute_counted(&mut self) -> Result<(ResultReader, Option<i64>)> {
         self.cancel.begin_operation();
-        // FFI callers may run a bulk ingest through `ExecuteQuery` with a non-null stream
-        // pointer; it yields an empty stream.
-        if self.sql.is_none()
-            && let Some(table) = self.target_table.clone()
-        {
-            let count = self.run_ingest(&table)?;
-            return Ok((empty_reader(), count));
-        }
         self.check_bound_has_destination()?;
-        let sql = self.sql()?;
         // Bound rows are consumed even if execution fails, so a reused handle can't apply them
         // to a later statement.
-        let result = self.run_sql(sql);
+        let result = match self.target_table.as_deref() {
+            // FFI callers may run a bulk ingest through `ExecuteQuery` with a non-null stream
+            // pointer; it yields an empty stream.
+            Some(table) => self.run_ingest(table).map(|count| (empty_reader(), count)),
+            None => self.run_sql(self.sql()?),
+        };
         self.clear_bound();
         result
     }
@@ -374,7 +365,7 @@ impl SpannerStatement {
     /// Partitioned execution has no per-row fan-out, and descriptors can't be attributed to rows,
     /// so reject several bound rows instead of silently using the first.
     fn check_single_bound_row(&self) -> Result<()> {
-        let rows: usize = self.bound.iter().map(RecordBatch::num_rows).sum();
+        let rows = self.bound_rows();
         if rows > 1 {
             return Err(invalid_argument(format!(
                 "execute_partitions supports at most one bound parameter row, but {rows} rows \
@@ -530,10 +521,7 @@ impl SpannerStatement {
     /// Data may be bound before the ingest target is set, so a missing destination is only
     /// detectable at execution. The error names both remedies instead of just the missing query.
     fn check_bound_has_destination(&self) -> Result<()> {
-        if self.sql.is_none()
-            && self.target_table.is_none()
-            && (!self.bound.is_empty() || self.ingest_schema.is_some())
-        {
+        if self.sql.is_none() && self.target_table.is_none() && self.bound_schema.is_some() {
             return Err(invalid_state(
                 "data has been bound but no SQL query or bulk-ingest target is set; call \
                  set_sql_query or set the adbc.ingest.target_table option before executing",
@@ -620,7 +608,7 @@ impl Optionable for SpannerStatement {
                 )?;
             }
             OptionStatement::IngestMode => {
-                self.ingest_mode = Some(ingest_mode_option(&key, value)?);
+                self.ingest_mode = ingest_mode_option(&key, value)?;
             }
             OptionStatement::Other(k) if k == crate::OPTION_INGEST_BATCH_WRITE => {
                 self.ingest_batch_write = bool_option_unsettable(value, k)?;
@@ -661,10 +649,8 @@ impl Optionable for SpannerStatement {
             OptionStatement::TargetCatalog => self.target_catalog.clone(),
             // `set_option` only ever accepts `false`.
             OptionStatement::Temporary | OptionStatement::Incremental => Some(false.to_string()),
-            // Canonical `adbc.ingest.mode.*` spelling; unset reports the default.
-            OptionStatement::IngestMode => {
-                Some(String::from(self.ingest_mode.unwrap_or(IngestMode::Create)))
-            }
+            // Canonical `adbc.ingest.mode.*` spelling.
+            OptionStatement::IngestMode => Some(String::from(self.ingest_mode)),
             OptionStatement::Other(k) if k == crate::OPTION_INGEST_BATCH_WRITE => {
                 Some(self.ingest_batch_write.to_string())
             }
@@ -692,8 +678,8 @@ impl Optionable for SpannerStatement {
 
 impl Statement for SpannerStatement {
     fn bind(&mut self, batch: RecordBatch) -> Result<()> {
+        self.bound_schema = Some(batch.schema());
         self.bound = vec![batch];
-        self.ingest_schema = None;
         Ok(())
     }
 
@@ -720,7 +706,7 @@ impl Statement for SpannerStatement {
             }
             batches.push(batch);
         }
-        self.ingest_schema = batches.is_empty().then_some(schema);
+        self.bound_schema = Some(schema);
         self.bound = batches;
         Ok(())
     }
@@ -803,11 +789,9 @@ impl Statement for SpannerStatement {
                 }
                 // GoogleSQL parameter names are case-insensitive, and the planner reports each
                 // under the first spelling the SQL uses.
-                let ty = types.get(&name).or_else(|| {
-                    types
-                        .iter()
-                        .find_map(|(k, v)| k.eq_ignore_ascii_case(&name).then_some(v))
-                });
+                let ty = types
+                    .iter()
+                    .find_map(|(k, v)| k.eq_ignore_ascii_case(&name).then_some(v));
                 match ty {
                     // Same mapping as result columns, so JSON parameters carry the `arrow.json`
                     // tag that binding recognizes.
