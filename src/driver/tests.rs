@@ -330,6 +330,10 @@ fn a_blank_endpoint_unsets_it() {
         assert_eq!(target.endpoint.as_deref(), Some("http://localhost:9010"));
         assert!(target.emulator);
         assert_eq!(db.resolve_target(None).unwrap().endpoint, None);
+        // The client ignores a blank variable too.
+        let target = db.resolve_target(Some(blank)).unwrap();
+        assert_eq!(target.endpoint, None);
+        assert!(!target.emulator);
     }
 }
 

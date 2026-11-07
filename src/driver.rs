@@ -190,7 +190,7 @@ impl SpannerDatabase {
 
     /// Build the client stack from the current options, within [`OPTION_RPC_TIMEOUT_CONNECT`].
     ///
-    /// Outside Omni, a non-empty `SPANNER_EMULATOR_HOST` enables emulator mode and supplies the
+    /// Outside Omni, a non-blank `SPANNER_EMULATOR_HOST` enables emulator mode and supplies the
     /// endpoint unless one was set explicitly.
     pub(crate) fn connect(&self) -> Result<Connected> {
         self.connect_with(std::env::var("SPANNER_EMULATOR_HOST").ok().as_deref())
@@ -327,7 +327,7 @@ impl SpannerDatabase {
                 ));
             }
         }
-        if !omni && let Some(host) = emulator_host.filter(|host| !host.is_empty()) {
+        if !omni && let Some(host) = emulator_host.filter(|host| !host.trim().is_empty()) {
             if endpoint.is_none() {
                 endpoint = Some(host.to_owned());
                 endpoint_from_env = true;
