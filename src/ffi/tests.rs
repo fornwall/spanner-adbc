@@ -73,19 +73,19 @@ fn slots(table: &AdbcDriver) -> Vec<(&'static str, bool)> {
 const PREFIX_SLOTS: usize =
     (ADBC_DRIVER_1_0_0_SIZE - 3 * size_of::<*const c_void>()) / size_of::<*const c_void>();
 
-#[test]
-fn populates_a_1_1_0_vtable() {
+/// A vtable initialized at `version`, allocated at the 1.1.0 size so the tail can be inspected.
+fn vtable_at(version: c_int) -> AdbcDriver {
     let mut table = std::mem::MaybeUninit::<AdbcDriver>::zeroed();
     let mut error = zeroed_error();
-    let status = unsafe {
-        AdbcSpannerInit(
-            ADBC_VERSION_1_1_0,
-            table.as_mut_ptr().cast::<c_void>(),
-            &raw mut error,
-        )
-    };
+    let status =
+        unsafe { AdbcSpannerInit(version, table.as_mut_ptr().cast::<c_void>(), &raw mut error) };
     assert_eq!(status, ADBC_STATUS_OK);
-    let table = unsafe { table.assume_init() };
+    unsafe { table.assume_init() }
+}
+
+#[test]
+fn populates_a_1_1_0_vtable() {
+    let table = vtable_at(ADBC_VERSION_1_1_0);
     let slots = slots(&table);
     // Catch a field added to `AdbcDriver` but not to `slots`. All but the first three fields are
     // slots.
@@ -101,20 +101,7 @@ fn populates_a_1_1_0_vtable() {
 
 #[test]
 fn populates_every_slot_a_1_0_0_caller_can_see() {
-    // Allocated at the 1.1.0 size so the tail can be inspected.
-    let mut table = std::mem::MaybeUninit::<AdbcDriver>::zeroed();
-    let mut error = zeroed_error();
-    assert_eq!(
-        unsafe {
-            AdbcSpannerInit(
-                ADBC_VERSION_1_0_0,
-                table.as_mut_ptr().cast::<c_void>(),
-                &raw mut error,
-            )
-        },
-        ADBC_STATUS_OK
-    );
-    let table = unsafe { table.assume_init() };
+    let table = vtable_at(ADBC_VERSION_1_0_0);
     for (name, populated) in slots(&table).into_iter().take(PREFIX_SLOTS) {
         assert!(populated, "{name} is missing from the 1.0.0 prefix");
     }
@@ -130,19 +117,7 @@ fn populates_every_slot_a_1_0_0_caller_can_see() {
 fn the_vtable_slots_do_what_their_names_say() {
     use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
 
-    let mut table = std::mem::MaybeUninit::<AdbcDriver>::zeroed();
-    let mut error = zeroed_error();
-    assert_eq!(
-        unsafe {
-            AdbcSpannerInit(
-                ADBC_VERSION_1_1_0,
-                table.as_mut_ptr().cast::<c_void>(),
-                &raw mut error,
-            )
-        },
-        ADBC_STATUS_OK
-    );
-    let table = unsafe { table.assume_init() };
+    let table = vtable_at(ADBC_VERSION_1_1_0);
     let name = |value: &str| std::ffi::CString::new(value).unwrap();
 
     let mut database: abi::AdbcDatabase = zeroed();
@@ -353,16 +328,8 @@ fn rejects_a_null_vtable() {
 
 #[test]
 fn releasing_the_driver_twice_reports_invalid_state() {
-    let mut table = std::mem::MaybeUninit::<AdbcDriver>::zeroed();
+    let mut table = vtable_at(ADBC_VERSION_1_1_0);
     let mut error = zeroed_error();
-    unsafe {
-        AdbcSpannerInit(
-            ADBC_VERSION_1_1_0,
-            table.as_mut_ptr().cast::<c_void>(),
-            &raw mut error,
-        )
-    };
-    let mut table = unsafe { table.assume_init() };
     let release = table.release.unwrap();
     assert_eq!(unsafe { release(&raw mut table, null()) }, ADBC_STATUS_OK);
     assert_eq!(
