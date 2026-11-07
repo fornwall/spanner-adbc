@@ -5,12 +5,11 @@
 
 use std::ffi::{c_char, c_void};
 
-use adbc_core::error::{Error, Result, Status};
+use adbc_core::error::Result;
 use adbc_core::options::{OptionStatement, OptionValue};
 use adbc_core::{Connection, Optionable, Statement};
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
-use arrow_schema::Schema;
 
 use super::abi::{AdbcConnection, AdbcError, AdbcPartitions, AdbcStatement, AdbcStatusCode};
 use super::guard::{byte_slice, catch, required_output, required_str, write_out};
@@ -18,6 +17,7 @@ use super::handle::{
     Exported, FfiHandle, finish, install_cancel_handle, lock_state, unpopulated, with_state,
 };
 use super::import::{BoundStreamReader, import_batch};
+use super::stream::{export_reader, export_schema};
 use crate::statement::SpannerStatement;
 
 pub(super) const KIND: &str = "statement";
@@ -150,17 +150,17 @@ pub(super) unsafe extern "C" fn statement_execute_query(
 ) -> AdbcStatusCode {
     unsafe {
         with_state(statement, error, |state| {
-            // A null `out` asks for an update without results.
-            if out.is_null() {
-                let affected = state.execute_update()?.unwrap_or(-1);
-                write_rows_affected(rows_affected, affected);
-                return Ok(());
-            }
-            // DML and ingest report their count with a stream too, since the Python DBAPI runs
-            // every `execute` this way. Queries, DDL and buffered writes report -1 (unknown),
-            // which also overwrites any previous count.
-            let (reader, affected) = state.execute_counted()?;
-            std::ptr::write_unaligned(out, super::stream::export_reader(reader));
+            // A null `out` asks for an update without results. DML and ingest report their
+            // count with a stream too, since the Python DBAPI runs every `execute` this way.
+            let affected = if out.is_null() {
+                state.execute_update()?
+            } else {
+                let (reader, affected) = state.execute_counted()?;
+                std::ptr::write_unaligned(out, export_reader(reader));
+                affected
+            };
+            // Queries, DDL and buffered writes report -1 (unknown), which also overwrites any
+            // previous count.
             write_rows_affected(rows_affected, affected.unwrap_or(-1));
             Ok(())
         })
@@ -236,16 +236,6 @@ unsafe fn write_rows_affected(dst: *mut i64, value: i64) {
     if !dst.is_null() {
         unsafe { std::ptr::write_unaligned(dst, value) };
     }
-}
-
-/// Export a driver-produced schema. Failure is a driver bug, hence `Internal`.
-fn export_schema(schema: &Schema) -> Result<FFI_ArrowSchema> {
-    FFI_ArrowSchema::try_from(schema).map_err(|failure| {
-        Error::with_message_and_status(
-            format!("failed to export the result schema over the C data interface: {failure}"),
-            Status::Internal,
-        )
-    })
 }
 
 /// Owns the partition payloads and both C arrays until the release callback runs. Keeping the

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use adbc_core::error::Error;
 use arrow_array::ffi_stream::RecordBatchStreamReader;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, RecordBatchIterator};
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::SchemaRef;
 
 use super::*;
 use crate::ffi::test_support::null;

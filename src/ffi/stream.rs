@@ -11,7 +11,7 @@ use adbc_core::error::{Error, Status};
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use arrow_array::{Array, RecordBatchReader, StructArray};
-use arrow_schema::ArrowError;
+use arrow_schema::{ArrowError, Schema};
 
 use libc::{EACCES, ECANCELED, EEXIST, EINVAL, EIO, ENOENT, ENOMEM, ENOSYS, ENOTSUP, ETIMEDOUT};
 
@@ -42,6 +42,16 @@ impl Drop for PrivateData {
             unsafe { release(&raw mut self.exported_error) };
         }
     }
+}
+
+/// Export a driver-produced schema. Failure is a driver bug, hence `Internal`.
+pub(super) fn export_schema(schema: &Schema) -> Result<FFI_ArrowSchema, Error> {
+    FFI_ArrowSchema::try_from(schema).map_err(|failure| {
+        Error::with_message_and_status(
+            format!("failed to export a schema over the C data interface: {failure}"),
+            Status::Internal,
+        )
+    })
 }
 
 pub(super) fn export_reader(reader: Box<dyn RecordBatchReader + Send>) -> FFI_ArrowArrayStream {

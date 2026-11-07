@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void};
 
-use adbc_core::error::{Error, Result, Status};
+use adbc_core::error::Result;
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection};
 use adbc_core::{Connection, Database};
 use arrow_array::RecordBatchReader;
@@ -15,6 +15,7 @@ use super::guard::{
     byte_slice, optional_str, optional_str_list, required_output, required_str, write_out,
 };
 use super::handle::{FfiHandle, Staged, install_cancel_handle, lock_state, with_state};
+use super::stream::{export_reader, export_schema};
 use crate::connection::SpannerConnection;
 use crate::error::invalid_argument;
 
@@ -53,14 +54,24 @@ pub(super) unsafe extern "C" fn connection_init(
     }
 }
 
+/// Export the stream `f` returns, refusing a missing `out` before any work the caller could not
+/// collect.
+///
 /// # Safety
-/// `out` must be null or point to a writable `FFI_ArrowArrayStream`.
-unsafe fn export_stream(
-    reader: Box<dyn RecordBatchReader + Send>,
+/// `connection` must be null or point to a valid `AdbcConnection`, and `out` null or point to a
+/// writable `FFI_ArrowArrayStream`.
+unsafe fn with_stream(
+    connection: *mut AdbcConnection,
     out: *mut FFI_ArrowArrayStream,
-) -> Result<()> {
-    // On a null `out`, ownership never transferred and the stream is dropped here.
-    unsafe { write_out(out, super::stream::export_reader(reader), "out") }
+    error: *mut AdbcError,
+    f: impl FnOnce(&mut State) -> Result<Box<dyn RecordBatchReader + Send>>,
+) -> AdbcStatusCode {
+    unsafe {
+        with_state(connection, error, |state| {
+            required_output(out, "out")?;
+            write_out(out, export_reader(f(state)?), "out")
+        })
+    }
 }
 
 /// # Safety
@@ -92,22 +103,16 @@ pub(super) unsafe extern "C" fn connection_get_info(
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
     unsafe {
-        with_state(connection, error, |state| {
-            required_output(out, "out")?;
+        with_stream(connection, out, error, |state| {
             // Null requests all supported codes; an empty non-null array requests none.
-            let codes = if info_codes.is_null() {
-                None
-            } else {
-                Some(
-                    std::slice::from_raw_parts(info_codes, info_codes_length)
-                        .iter()
-                        .copied()
-                        .map(InfoCode::from)
-                        .collect::<HashSet<_>>(),
-                )
-            };
-            let reader = state.ready(KIND)?.get_info(codes)?;
-            export_stream(reader, out)
+            let codes = (!info_codes.is_null()).then(|| {
+                std::slice::from_raw_parts(info_codes, info_codes_length)
+                    .iter()
+                    .copied()
+                    .map(InfoCode::from)
+                    .collect::<HashSet<_>>()
+            });
+            state.ready(KIND)?.get_info(codes)
         })
     }
 }
@@ -131,8 +136,7 @@ pub(super) unsafe extern "C" fn connection_get_objects(
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
     unsafe {
-        with_state(connection, error, |state| {
-            required_output(out, "out")?;
+        with_stream(connection, out, error, |state| {
             // An unknown depth is a caller error, not `try_from`'s `InvalidData`.
             // ADBC_OBJECT_DEPTH_COLUMNS aliases ALL (0), so 4 is not a valid depth.
             let depth = ObjectDepth::try_from(depth).map_err(|_| {
@@ -147,15 +151,14 @@ pub(super) unsafe extern "C" fn connection_get_objects(
             let table_type = optional_str_list(table_type, "table_type")?;
             let column_name = optional_str(column_name, "column_name")?;
 
-            let reader = state.ready(KIND)?.get_objects(
+            state.ready(KIND)?.get_objects(
                 depth,
                 catalog,
                 db_schema,
                 table_name,
                 table_type,
                 column_name,
-            )?;
-            export_stream(reader, out)
+            )
         })
     }
 }
@@ -182,15 +185,7 @@ pub(super) unsafe extern "C" fn connection_get_table_schema(
             let found = state
                 .ready(KIND)?
                 .get_table_schema(catalog, db_schema, table_name)?;
-            let exported = FFI_ArrowSchema::try_from(&found).map_err(|failure| {
-                Error::with_message_and_status(
-                    format!(
-                        "failed to export the table schema over the C data interface: {failure}"
-                    ),
-                    Status::Internal,
-                )
-            })?;
-            write_out(schema, exported, "schema")
+            write_out(schema, export_schema(&found)?, "schema")
         })
     }
 }
@@ -203,10 +198,8 @@ pub(super) unsafe extern "C" fn connection_get_table_types(
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
     unsafe {
-        with_state(connection, error, |state| {
-            required_output(out, "out")?;
-            let reader = state.ready(KIND)?.get_table_types()?;
-            export_stream(reader, out)
+        with_stream(connection, out, error, |state| {
+            state.ready(KIND)?.get_table_types()
         })
     }
 }
@@ -224,20 +217,18 @@ pub(super) unsafe extern "C" fn connection_get_statistics(
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
     unsafe {
-        with_state(connection, error, |state| {
-            required_output(out, "out")?;
+        with_stream(connection, out, error, |state| {
             let catalog = optional_str(catalog, "catalog")?;
             let db_schema = optional_str(db_schema, "db_schema")?;
             let table_name = optional_str(table_name, "table_name")?;
 
-            let reader = state.ready(KIND)?.get_statistics(
+            state.ready(KIND)?.get_statistics(
                 catalog,
                 db_schema,
                 table_name,
                 // The header declares a C boolean as `char`; anything non-zero is true.
                 approximate != 0,
-            )?;
-            export_stream(reader, out)
+            )
         })
     }
 }
@@ -250,10 +241,8 @@ pub(super) unsafe extern "C" fn connection_get_statistic_names(
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
     unsafe {
-        with_state(connection, error, |state| {
-            required_output(out, "out")?;
-            let reader = state.ready(KIND)?.get_statistic_names()?;
-            export_stream(reader, out)
+        with_stream(connection, out, error, |state| {
+            state.ready(KIND)?.get_statistic_names()
         })
     }
 }
@@ -269,15 +258,13 @@ pub(super) unsafe extern "C" fn connection_read_partition(
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
     unsafe {
-        with_state(connection, error, |state| {
-            required_output(out, "out")?;
+        with_stream(connection, out, error, |state| {
             let partition = byte_slice(
                 serialized_partition,
                 serialized_length,
                 "serialized_partition",
             )?;
-            let reader = state.ready(KIND)?.read_partition(partition)?;
-            export_stream(reader, out)
+            state.ready(KIND)?.read_partition(partition)
         })
     }
 }
