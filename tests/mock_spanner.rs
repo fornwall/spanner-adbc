@@ -16,30 +16,34 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use adbc_core::error::Status as AdbcStatus;
-use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
+use adbc_core::error::{Error, Result as AdbcResult, Status as AdbcStatus};
+use adbc_core::options::OptionValue;
+use adbc_core::options::{ObjectDepth, OptionConnection, OptionDatabase, OptionStatement};
 use adbc_core::{Connection, Database, Driver, Optionable, Statement};
 use arrow_array::cast::AsArray;
-use arrow_array::{Date32Array, Int64Array, RecordBatch, RecordBatchReader, StringArray};
-use arrow_schema::{ArrowError, DataType, Field, Schema};
-use prost::Message;
-use spanner_adbc::{
-    OPTION_EMULATOR, OPTION_ENDPOINT, SpannerConnection, SpannerDatabase, SpannerDriver,
-    SpannerStatement,
+use arrow_array::{
+    ArrayRef, Date32Array, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
+    StringArray,
 };
+use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
+use prost::Message;
+use spanner_adbc::*;
 use spanner_grpc_mock::MockSpanner;
+use spanner_grpc_mock::google::rpc;
 use spanner_grpc_mock::google::spanner::v1;
+use v1::transaction_options::read_only::TimestampBound as WireBound;
+use v1::transaction_selector::Selector;
 
 #[path = "../src/mock_server.rs"]
 mod mock_server;
 use mock_server::{DATABASE_URI, MockServer, emulator_database};
 
-/// Serves the test's script. See the module docs for how unscripted RPCs are answered.
-fn start_server(script: impl FnOnce(&mut MockSpanner)) -> MockServer {
-    let mut mock = MockSpanner::new();
-    script(&mut mock);
-    MockServer::serve(mock)
-}
+const SELECT: &str = "SELECT c FROM MockTable";
+const INSERT: &str = "INSERT INTO MockTable (c) VALUES ('x')";
+const UPDATE: &str = "UPDATE MockTable SET c = 'x' WHERE TRUE";
+
+/// The requests a scripted RPC received, in order.
+type Log<T> = Arc<Mutex<Vec<T>>>;
 
 /// A TCP proxy in front of a [`MockServer`] that can stop answering new connections.
 ///
@@ -55,8 +59,8 @@ struct GatedEndpoint {
 impl GatedEndpoint {
     fn start(upstream: &str) -> Self {
         let upstream = upstream.trim_start_matches("http://").to_string();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind gate listener");
-        let address = listener.local_addr().expect("gate address");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
         let silent = Arc::new(AtomicBool::new(false));
 
         let gate_silent = silent.clone();
@@ -75,10 +79,7 @@ impl GatedEndpoint {
                 };
                 // Pump both directions; each half ends when its side closes.
                 for (mut from, mut to) in [
-                    (
-                        client.try_clone().expect("clone client socket"),
-                        server.try_clone().expect("clone server socket"),
-                    ),
+                    (client.try_clone().unwrap(), server.try_clone().unwrap()),
                     (server, client),
                 ] {
                     std::thread::spawn(move || {
@@ -103,10 +104,6 @@ impl GatedEndpoint {
         emulator_database(&self.endpoint).new_connection().unwrap()
     }
 }
-
-// ---------------------------------------------------------------------------
-// PartialResultSet scripting helpers
-// ---------------------------------------------------------------------------
 
 fn result_metadata(fields: &[(&str, v1::TypeCode)]) -> v1::ResultSetMetadata {
     v1::ResultSetMetadata {
@@ -157,29 +154,22 @@ fn stream_of<T>(
 ) -> tonic::Response<tokio::sync::mpsc::Receiver<tonic::Result<T>>> {
     let (tx, rx) = tokio::sync::mpsc::channel(items.len().max(1));
     for item in items {
-        tx.try_send(item)
-            .expect("scripted stream channel sized to fit");
+        tx.try_send(item).unwrap();
     }
     tonic::Response::new(rx)
 }
 
 /// The driver error that a reader wraps in `ArrowError::ExternalError`.
-fn driver_error(error: &ArrowError) -> &adbc_core::error::Error {
+fn driver_error(error: &ArrowError) -> &Error {
     let ArrowError::ExternalError(source) = error else {
         panic!("expected the reader to surface the driver error, got: {error}");
     };
-    source
-        .downcast_ref::<adbc_core::error::Error>()
-        .expect("the reader error wraps the ADBC error")
+    source.downcast_ref::<Error>().unwrap()
 }
 
 /// Returns transaction `id` in the result metadata, as Spanner does for an inline begin.
 fn set_transaction_id(result: &mut v1::PartialResultSet, id: impl Into<Vec<u8>>) {
-    result
-        .metadata
-        .as_mut()
-        .expect("first message carries metadata")
-        .transaction = Some(v1::Transaction {
+    result.metadata.as_mut().unwrap().transaction = Some(v1::Transaction {
         id: id.into(),
         ..Default::default()
     });
@@ -188,19 +178,19 @@ fn set_transaction_id(result: &mut v1::PartialResultSet, id: impl Into<Vec<u8>>)
 fn begins_inline(transaction: Option<&v1::TransactionSelector>) -> bool {
     matches!(
         transaction.and_then(|t| t.selector.as_ref()),
-        Some(v1::transaction_selector::Selector::Begin(_))
+        Some(Selector::Begin(_))
     )
 }
 
-/// Serves `ExecuteStreamingSql` with a single-message STRING result, optionally recording each
-/// request. A statement in a manual transaction begins its transaction inline, and the client
-/// requires the new transaction id in the first response, so requests with a `begin` selector get
-/// `inline-txn` back.
-fn serve_streaming_sql_begin_aware(
+/// Serves `ExecuteStreamingSql` with a single-message STRING result. A statement in a manual
+/// transaction begins its transaction inline, and the client requires the new transaction id in
+/// the first response, so requests with a `begin` selector get `inline-txn` back.
+fn serve_queries(
     mock: &mut MockSpanner,
     values: &'static [&'static str],
-    record: Option<Arc<Mutex<Vec<v1::ExecuteSqlRequest>>>>,
-) {
+) -> Log<v1::ExecuteSqlRequest> {
+    let log = Log::default();
+    let requests = log.clone();
     mock.expect_execute_streaming_sql()
         .returning(move |request| {
             let request = request.into_inner();
@@ -208,28 +198,62 @@ fn serve_streaming_sql_begin_aware(
             if begins_inline(request.transaction.as_ref()) {
                 set_transaction_id(&mut first, b"inline-txn");
             }
-            if let Some(record) = &record {
-                record.lock().unwrap().push(request);
-            }
+            requests.lock().unwrap().push(request);
             Ok(stream_of(vec![Ok(first)]))
         });
+    log
 }
 
-/// The transaction selector of each recorded request.
-fn transaction_selectors(
-    requests: &Mutex<Vec<v1::ExecuteSqlRequest>>,
-) -> Vec<Option<v1::TransactionSelector>> {
+/// A server that only answers queries, as [`serve_queries`] does.
+fn query_server(values: &'static [&'static str]) -> (MockServer, Log<v1::ExecuteSqlRequest>) {
+    let mut mock = MockSpanner::new();
+    let requests = serve_queries(&mut mock, values);
+    (MockServer::serve(mock), requests)
+}
+
+/// Answers every query with one message carrying exactly `metadata` and `values`.
+fn serve_result(
+    mock: &mut MockSpanner,
+    metadata: v1::ResultSetMetadata,
+    values: Vec<prost_types::Value>,
+) {
+    mock.expect_execute_streaming_sql().returning(move |_| {
+        Ok(stream_of(vec![Ok(v1::PartialResultSet {
+            metadata: Some(metadata.clone()),
+            values: values.clone(),
+            last: true,
+            ..Default::default()
+        })]))
+    });
+}
+
+/// The transaction selector of each logged request.
+fn selectors(requests: &Log<v1::ExecuteSqlRequest>) -> Vec<Selector> {
+    let requests = requests.lock().unwrap();
     requests
-        .lock()
-        .unwrap()
         .iter()
-        .map(|request| request.transaction.clone())
+        .map(|r| r.transaction.clone().and_then(|t| t.selector).unwrap())
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// google.rpc.Status / RetryInfo details
-// ---------------------------------------------------------------------------
+/// Asserts that the first selector begins a read-only transaction and the others reuse `id`, and
+/// returns the options it began with.
+fn assert_shared_read_only<'a>(selectors: &'a [Selector], id: &[u8]) -> &'a v1::TransactionOptions {
+    let Selector::Begin(options) = &selectors[0] else {
+        panic!("the first request must begin the transaction: {selectors:?}");
+    };
+    assert!(
+        matches!(
+            options.mode,
+            Some(v1::transaction_options::Mode::ReadOnly(_))
+        ),
+        "{options:?}"
+    );
+    for selector in &selectors[1..] {
+        assert_eq!(selector, &Selector::Id(id.to_vec()));
+    }
+    options
+}
 
 /// `google.rpc.RetryInfo`, which the mock crate does not generate.
 #[derive(Clone, PartialEq, prost::Message)]
@@ -255,7 +279,7 @@ fn aborted_with_retry_info(message: &str) -> tonic::Status {
             nanos: 50_000_000,
         }),
     };
-    let status_proto = spanner_grpc_mock::google::rpc::Status {
+    let status_proto = rpc::Status {
         code: tonic::Code::Aborted as i32,
         message: message.to_string(),
         details: vec![prost_types::Any {
@@ -270,51 +294,87 @@ fn aborted_with_retry_info(message: &str) -> tonic::Status {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Bulk-ingest scripting helpers
-// ---------------------------------------------------------------------------
+/// The ProtoJSON detail stored under `key`.
+fn error_detail(error: &Error, key: &str) -> serde_json::Value {
+    let details = error.details.as_ref().expect("the error carries details");
+    let (_, value) = details
+        .iter()
+        .find(|(k, _)| k == key)
+        .unwrap_or_else(|| panic!("no {key} in {details:?}"));
+    serde_json::from_slice(value).unwrap()
+}
+
+fn prepare(connection: &mut SpannerConnection, sql: &str) -> SpannerStatement {
+    let mut statement = connection.new_statement().unwrap();
+    statement.set_sql_query(sql).unwrap();
+    statement
+}
+
+fn update(connection: &mut SpannerConnection, sql: &str) -> Option<i64> {
+    prepare(connection, sql).execute_update().unwrap()
+}
+
+fn fetch(statement: &mut SpannerStatement) -> Vec<RecordBatch> {
+    let reader = statement.execute().unwrap();
+    reader.collect::<Result<_, _>>().unwrap()
+}
+
+fn query(connection: &mut SpannerConnection, sql: &str) -> Vec<RecordBatch> {
+    fetch(&mut prepare(connection, sql))
+}
+
+fn row_count(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+fn configure<O: Optionable>(target: &mut O, options: &[(&str, &str)])
+where
+    O::Option: for<'a> From<&'a str>,
+{
+    for (key, value) in options {
+        target.set_option((*key).into(), (*value).into()).unwrap();
+    }
+}
 
 fn disable_autocommit(connection: &mut SpannerConnection) {
     connection
-        .set_option(OptionConnection::AutoCommit, "false".into())
-        .expect("disable autocommit");
+        .set_option(OptionConnection::AutoCommit, false.into())
+        .unwrap();
 }
 
 /// A batch of `n` rows in one STRING column `c`; each row is one insert mutation.
 fn ingest_batch(n: usize) -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, false)]));
     let column = StringArray::from((0..n).map(|i| format!("v{i}")).collect::<Vec<_>>());
-    RecordBatch::try_new(schema, vec![Arc::new(column)]).expect("build ingest batch")
+    RecordBatch::try_from_iter([("c", Arc::new(column) as ArrayRef)]).unwrap()
+}
+
+fn target_mock_table(statement: &mut SpannerStatement) {
+    configure(
+        statement,
+        &[
+            ("adbc.ingest.target_table", "MockTable"),
+            ("adbc.ingest.mode", "append"),
+        ],
+    );
 }
 
 /// A statement ingesting into `MockTable` in `append` mode, which needs no admin RPCs.
 fn append_ingest_statement(connection: &mut SpannerConnection) -> SpannerStatement {
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::TargetTable,
-            OptionValue::String("MockTable".into()),
-        )
-        .expect("set target table");
-    statement
-        .set_option(
-            OptionStatement::IngestMode,
-            OptionValue::String("append".into()),
-        )
-        .expect("set ingest mode append");
+    let mut statement = connection.new_statement().unwrap();
+    target_mock_table(&mut statement);
     statement
 }
 
 /// An `append` ingest through `BatchWrite` instead of a commit.
 fn batch_write_ingest_statement(connection: &mut SpannerConnection) -> SpannerStatement {
     let mut statement = append_ingest_statement(connection);
+    configure(&mut statement, &[(OPTION_INGEST_BATCH_WRITE, "true")]);
     statement
-        .set_option(
-            OptionStatement::Other(spanner_adbc::OPTION_INGEST_BATCH_WRITE.into()),
-            OptionValue::String("true".into()),
-        )
-        .expect("route the ingest through BatchWrite");
-    statement
+}
+
+fn ingest(mut statement: SpannerStatement, rows: usize) -> AdbcResult<Option<i64>> {
+    statement.bind(ingest_batch(rows)).unwrap();
+    statement.execute_update()
 }
 
 /// Spanner's mutation-limit error; the driver recognizes it by the "too many mutations" text.
@@ -331,6 +391,49 @@ fn commit_ok() -> tonic::Result<tonic::Response<v1::CommitResponse>> {
     Ok(tonic::Response::new(v1::CommitResponse::default()))
 }
 
+fn serve_commits_with(
+    mock: &mut MockSpanner,
+    respond: impl Fn(&v1::CommitRequest) -> tonic::Result<tonic::Response<v1::CommitResponse>>
+    + Send
+    + 'static,
+) -> Log<v1::CommitRequest> {
+    let log = Log::default();
+    let requests = log.clone();
+    mock.expect_commit().returning(move |request| {
+        let request = request.into_inner();
+        let response = respond(&request);
+        requests.lock().unwrap().push(request);
+        response
+    });
+    log
+}
+
+fn serve_commits(mock: &mut MockSpanner) -> Log<v1::CommitRequest> {
+    serve_commits_with(mock, |_| commit_ok())
+}
+
+/// Answers every `BatchWrite` with `responses`.
+fn serve_batch_write(
+    mock: &mut MockSpanner,
+    responses: Vec<v1::BatchWriteResponse>,
+) -> Log<v1::BatchWriteRequest> {
+    let log = Log::default();
+    let requests = log.clone();
+    mock.expect_batch_write().returning(move |request| {
+        requests.lock().unwrap().push(request.into_inner());
+        Ok(stream_of(responses.iter().cloned().map(Ok).collect()))
+    });
+    log
+}
+
+fn ok_status() -> Option<rpc::Status> {
+    Some(rpc::Status {
+        code: 0,
+        message: "OK".into(),
+        details: vec![],
+    })
+}
+
 /// A `BatchWriteResponse` failing group `index` with `ALREADY_EXISTS`. BatchWrite reports
 /// per-group failures inside the response stream; the RPC itself succeeds.
 ///
@@ -343,7 +446,7 @@ fn batch_write_group_already_exists(index: i32) -> v1::BatchWriteResponse {
     };
     v1::BatchWriteResponse {
         indexes: vec![index],
-        status: Some(spanner_grpc_mock::google::rpc::Status {
+        status: Some(rpc::Status {
             code: tonic::Code::AlreadyExists as i32,
             message: "Row [v0] in table MockTable already exists".to_string(),
             details: vec![prost_types::Any {
@@ -364,17 +467,17 @@ fn batch_write_groups_ok(indexes: Vec<i32>) -> v1::BatchWriteResponse {
     }
 }
 
-type BatchDmlRequests = Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>>;
-
-/// Serves `ExecuteBatchDml`, recording each request and reporting one affected row per statement.
-/// A batch that begins its transaction inline gets the transaction id back; without it the client
-/// fails with "Transaction ID was not returned by Spanner".
-fn serve_batch_dml(mock: &mut MockSpanner, record: BatchDmlRequests) {
+/// Serves `ExecuteBatchDml`, reporting one affected row per statement. A batch that begins its
+/// transaction inline gets the transaction id back; without it the client fails with "Transaction
+/// ID was not returned by Spanner".
+fn serve_batch_dml(mock: &mut MockSpanner) -> Log<v1::ExecuteBatchDmlRequest> {
+    let log = Log::default();
+    let requests = log.clone();
     mock.expect_execute_batch_dml().returning(move |request| {
         let request = request.into_inner();
         let inline_begin = begins_inline(request.transaction.as_ref());
         let statements = request.statements.len().max(1);
-        record.lock().unwrap().push(request);
+        requests.lock().unwrap().push(request);
         let result_sets = (0..statements)
             .map(|i| v1::ResultSet {
                 metadata: Some(v1::ResultSetMetadata {
@@ -393,89 +496,70 @@ fn serve_batch_dml(mock: &mut MockSpanner, record: BatchDmlRequests) {
             .collect();
         Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
             result_sets,
-            status: Some(spanner_grpc_mock::google::rpc::Status {
-                code: 0,
-                message: "OK".into(),
-                details: vec![],
-            }),
+            status: ok_status(),
             ..Default::default()
         }))
     });
+    log
 }
 
 /// Write-only paths begin explicitly, and the client may also do so instead of beginning inline.
-fn serve_begin_transaction(mock: &mut MockSpanner) {
-    mock.expect_begin_transaction().returning(|_| {
+fn serve_begin_transaction(mock: &mut MockSpanner) -> Log<v1::BeginTransactionRequest> {
+    let log = Log::default();
+    let requests = log.clone();
+    mock.expect_begin_transaction().returning(move |request| {
+        requests.lock().unwrap().push(request.into_inner());
         Ok(tonic::Response::new(v1::Transaction {
             id: b"mock-txn".to_vec(),
             ..Default::default()
         }))
     });
+    log
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+/// The options an autocommit DML batch began its read/write transaction with.
+fn inline_begin_options(request: &v1::ExecuteBatchDmlRequest) -> &v1::TransactionOptions {
+    let selector = request
+        .transaction
+        .as_ref()
+        .and_then(|t| t.selector.as_ref());
+    let Some(Selector::Begin(options)) = selector else {
+        panic!("an autocommit DML must begin its transaction inline: {request:?}");
+    };
+    options
+}
 
 #[test]
 fn omni_connects_with_explicit_endpoint_and_default_anonymous_credentials() {
-    let server = start_server(|mock| {
-        mock.expect_execute_streaming_sql().returning(|_| {
-            Ok(stream_of(vec![Ok(partial_result_set(
-                true,
-                &["omni"],
-                b"",
-                true,
-            ))]))
-        });
-    });
+    let (server, _) = query_server(&["omni"]);
     let mut driver = SpannerDriver::try_new().unwrap();
     let database = driver
         .new_database_with_opts([
-            (OptionDatabase::Uri, DATABASE_URI.into()),
-            (
-                OptionDatabase::Other(spanner_adbc::OPTION_INSTANCE_TYPE.into()),
-                "omni".into(),
-            ),
-            (
-                OptionDatabase::Other(spanner_adbc::OPTION_ENDPOINT.into()),
-                server.endpoint.clone().into(),
-            ),
+            (OptionDatabase::Uri, OptionValue::from(DATABASE_URI)),
+            (OPTION_INSTANCE_TYPE.into(), "omni".into()),
+            (OPTION_ENDPOINT.into(), server.endpoint.clone().into()),
         ])
         .unwrap();
     assert_eq!(
-        database
-            .get_option_string(OptionDatabase::Other(spanner_adbc::OPTION_EMULATOR.into()))
-            .unwrap(),
+        database.get_option_string(OPTION_EMULATOR.into()).unwrap(),
         "false"
     );
-    let mut connection = database.new_connection().unwrap();
-    let mut statement = connection.new_statement().unwrap();
-    statement.set_sql_query("SELECT 'omni'").unwrap();
-    let batches = statement
-        .execute()
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let batches = query(&mut database.new_connection().unwrap(), "SELECT 'omni'");
     assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "omni");
 }
 
 #[test]
 fn bound_dml_strips_leading_and_trailing_terminators() {
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let recorded = requests.clone();
-    let server = start_server(move |mock| {
-        serve_batch_dml(mock, recorded);
-        mock.expect_commit().returning(|_| commit_ok());
-    });
+    let mut mock = MockSpanner::new();
+    let requests = serve_batch_dml(&mut mock);
+    serve_commits(&mut mock);
+    let server = MockServer::serve(mock);
     let mut connection = server.connect();
     for update in [false, true] {
-        let mut statement = connection.new_statement().unwrap();
-        statement
-            .set_sql_query(
-                "; -- empty\n; INSERT INTO MockTable (c) VALUES (@p);; -- trailing comment",
-            )
-            .unwrap();
+        let mut statement = prepare(
+            &mut connection,
+            "; -- empty\n; INSERT INTO MockTable (c) VALUES (@p);; -- trailing comment",
+        );
         statement.bind(ingest_batch(2)).unwrap();
         if update {
             assert_eq!(statement.execute_update().unwrap(), Some(2));
@@ -495,44 +579,38 @@ fn bound_dml_strips_leading_and_trailing_terminators() {
 
 #[test]
 fn bound_dml_returning_and_partitioned_preserve_parameters() {
-    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests = Log::default();
     let recorded = requests.clone();
-    let server = start_server(move |mock| {
-        serve_begin_transaction(mock);
-        mock.expect_execute_streaming_sql()
-            .returning(move |request| {
-                let request = request.into_inner();
-                let returning = request.sql.ends_with("THEN RETURN c");
-                recorded.lock().unwrap().push(request);
-                let mut result = partial_result_set(true, &["v"], b"dml-1", true);
-                set_transaction_id(&mut result, b"dml-txn");
-                result.stats = Some(v1::ResultSetStats {
-                    row_count: Some(if returning {
-                        v1::result_set_stats::RowCount::RowCountExact(1)
-                    } else {
-                        v1::result_set_stats::RowCount::RowCountLowerBound(1)
-                    }),
-                    ..Default::default()
-                });
-                Ok(stream_of(vec![Ok(result)]))
+    let mut mock = MockSpanner::new();
+    serve_begin_transaction(&mut mock);
+    mock.expect_execute_streaming_sql()
+        .returning(move |request| {
+            let request = request.into_inner();
+            let returning = request.sql.ends_with("THEN RETURN c");
+            recorded.lock().unwrap().push(request);
+            let mut result = partial_result_set(true, &["v"], b"dml-1", true);
+            set_transaction_id(&mut result, b"dml-txn");
+            result.stats = Some(v1::ResultSetStats {
+                row_count: Some(if returning {
+                    v1::result_set_stats::RowCount::RowCountExact(1)
+                } else {
+                    v1::result_set_stats::RowCount::RowCountLowerBound(1)
+                }),
+                ..Default::default()
             });
-        mock.expect_commit().returning(|_| commit_ok());
-    });
+            Ok(stream_of(vec![Ok(result)]))
+        });
+    serve_commits(&mut mock);
+    let server = MockServer::serve(mock);
     let mut connection = server.connect();
     for (sql, partitioned) in [
         ("INSERT INTO MockTable (c) VALUES (@p) THEN RETURN c", false),
         ("UPDATE MockTable SET c = @p WHERE TRUE", true),
     ] {
-        let mut statement = connection.new_statement().unwrap();
-        statement
-            .set_sql_query(format!("{sql};; -- comment"))
-            .unwrap();
+        let mut statement = prepare(&mut connection, &format!("{sql};; -- comment"));
         statement.bind(ingest_batch(1)).unwrap();
         statement
-            .set_option(
-                OptionStatement::Other(spanner_adbc::OPTION_DML_PARTITIONED.into()),
-                partitioned.to_string().into(),
-            )
+            .set_option(OPTION_DML_PARTITIONED.into(), partitioned.into())
             .unwrap();
         assert_eq!(statement.execute_update().unwrap(), Some(1));
         let requests = requests.lock().unwrap();
@@ -545,52 +623,33 @@ fn bound_dml_returning_and_partitioned_preserve_parameters() {
 
 #[test]
 fn bound_returning_dml_commits_with_the_explicit_transaction_id() {
-    let begins = Arc::new(Mutex::new(Vec::new()));
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let commits = Arc::new(Mutex::new(Vec::new()));
-    let (record_begins, record_requests, record_commits) =
-        (begins.clone(), requests.clone(), commits.clone());
-    let server = start_server(move |mock| {
-        mock.expect_begin_transaction()
-            .once()
-            .returning(move |request| {
-                record_begins.lock().unwrap().push(request.into_inner());
-                Ok(tonic::Response::new(v1::Transaction {
-                    id: b"original-txn".to_vec(),
-                    ..Default::default()
-                }))
+    let requests = Log::default();
+    let recorded = requests.clone();
+    let mut mock = MockSpanner::new();
+    let begins = serve_begin_transaction(&mut mock);
+    mock.expect_execute_streaming_sql()
+        .returning(move |request| {
+            let request = request.into_inner();
+            let value = format!("v{}", request.seqno - 1);
+            let mut result = partial_result_set(true, &[&value], b"dml", true);
+            // Omni can return a different opaque ID in each streaming DML response.
+            set_transaction_id(&mut result, format!("response-txn-{}", request.seqno));
+            result.precommit_token = Some(v1::MultiplexedSessionPrecommitToken {
+                precommit_token: format!("token-{}", request.seqno).into_bytes(),
+                seq_num: request.seqno.try_into().unwrap(),
             });
-        mock.expect_execute_streaming_sql()
-            .times(2)
-            .returning(move |request| {
-                let request = request.into_inner();
-                let value = format!("v{}", request.seqno - 1);
-                let mut result = partial_result_set(true, &[&value], b"dml", true);
-                // Omni can return a different opaque ID in each streaming DML response.
-                set_transaction_id(&mut result, format!("response-txn-{}", request.seqno));
-                result.precommit_token = Some(v1::MultiplexedSessionPrecommitToken {
-                    precommit_token: format!("token-{}", request.seqno).into_bytes(),
-                    seq_num: request.seqno.try_into().unwrap(),
-                });
-                record_requests.lock().unwrap().push(request);
-                Ok(stream_of(vec![Ok(result)]))
-            });
-        mock.expect_commit().once().returning(move |request| {
-            record_commits.lock().unwrap().push(request.into_inner());
-            commit_ok()
+            recorded.lock().unwrap().push(request);
+            Ok(stream_of(vec![Ok(result)]))
         });
-    });
+    let commits = serve_commits(&mut mock);
+    let server = MockServer::serve(mock);
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().unwrap();
-    statement
-        .set_sql_query("INSERT INTO MockTable (c) VALUES (@c) THEN RETURN c")
-        .unwrap();
+    let mut statement = prepare(
+        &mut connection,
+        "INSERT INTO MockTable (c) VALUES (@c) THEN RETURN c",
+    );
     statement.bind(ingest_batch(2)).unwrap();
-    let batches = statement
-        .execute()
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let batches = fetch(&mut statement);
     assert_eq!(batches.len(), 2);
     for (index, batch) in batches.iter().enumerate() {
         assert_eq!(
@@ -610,9 +669,7 @@ fn bound_returning_dml_commits_with_the_explicit_transaction_id() {
         assert_eq!(request.seqno, index as i64 + 1);
         assert_eq!(
             request.transaction.as_ref().unwrap().selector,
-            Some(v1::transaction_selector::Selector::Id(
-                b"original-txn".to_vec()
-            ))
+            Some(Selector::Id(b"mock-txn".to_vec()))
         );
         assert_eq!(
             request.params.as_ref().unwrap().fields["c"],
@@ -624,7 +681,7 @@ fn bound_returning_dml_commits_with_the_explicit_transaction_id() {
     assert_eq!(
         commits[0].transaction,
         Some(v1::commit_request::Transaction::TransactionId(
-            b"original-txn".to_vec()
+            b"mock-txn".to_vec()
         ))
     );
     assert_eq!(
@@ -638,15 +695,14 @@ fn bound_returning_dml_commits_with_the_explicit_transaction_id() {
 
 #[test]
 fn bound_dml_rejects_batches_before_buffering_manual_work() {
-    let server = start_server(|_| {});
+    let server = MockServer::serve(MockSpanner::new());
     let mut connection = server.connect();
     disable_autocommit(&mut connection);
     for sql in [
         "INSERT INTO MockTable (c) VALUES (@p); SELECT 1",
         "INSERT INTO MockTable (c) VALUES (@p); DELETE FROM MockTable WHERE c = @p",
     ] {
-        let mut statement = connection.new_statement().unwrap();
-        statement.set_sql_query(sql).unwrap();
+        let mut statement = prepare(&mut connection, sql);
         statement.bind(ingest_batch(1)).unwrap();
         let error = statement.execute_update().unwrap_err();
         assert_eq!(error.status, AdbcStatus::InvalidArguments, "{error}");
@@ -657,37 +713,10 @@ fn bound_dml_rejects_batches_before_buffering_manual_work() {
 
 #[test]
 fn mock_server_round_trips_a_query() {
-    let seen_sql: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let record_sql = seen_sql.clone();
-    let server = start_server(move |mock| {
-        mock.expect_execute_streaming_sql()
-            .returning(move |request| {
-                *record_sql.lock().unwrap() = Some(request.into_inner().sql);
-                Ok(stream_of(vec![Ok(partial_result_set(
-                    true,
-                    &["v1", "v2"],
-                    b"rt-1",
-                    true,
-                ))]))
-            });
-    });
+    let (server, requests) = query_server(&["v1", "v2"]);
+    let batches = query(&mut server.connect(), SELECT);
 
-    let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_sql_query("SELECT c FROM MockTable")
-        .expect("set query");
-    let batches: Vec<_> = statement
-        .execute()
-        .expect("query against mock server")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect batches");
-
-    assert_eq!(
-        seen_sql.lock().unwrap().as_deref(),
-        Some("SELECT c FROM MockTable"),
-        "the mock server should have received the statement's SQL verbatim"
-    );
+    assert_eq!(requests.lock().unwrap()[0].sql, SELECT);
     assert_eq!(batches.len(), 1);
     let batch = &batches[0];
     assert_eq!(batch.num_rows(), 2);
@@ -698,40 +727,35 @@ fn mock_server_round_trips_a_query() {
     assert_eq!(column.value(1), "v2");
 }
 
+fn keyed_struct_value() -> prost_types::Value {
+    prost_types::Value {
+        kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
+            fields: [("x".into(), string_value("1"))].into_iter().collect(),
+        })),
+    }
+}
+
+/// The error in the first batch of a query against `server`, past `execute`.
+fn first_batch_error(server: &MockServer) -> Error {
+    let mut reader = prepare(&mut server.connect(), SELECT).execute().unwrap();
+    driver_error(&reader.next().unwrap().unwrap_err()).clone()
+}
+
 /// Unknown wire kinds must fail even on the UTF-8 fallback, including inside lists.
 #[test]
 fn unknown_wire_values_are_not_rendered_as_json() {
-    for nested in [false, true] {
-        let server = start_server(move |mock| {
-            mock.expect_execute_streaming_sql().returning(move |_| {
-                let mut value = prost_types::Value {
-                    kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
-                        fields: [("x".into(), string_value("1"))].into_iter().collect(),
-                    })),
-                };
-                if nested {
-                    value = prost_types::Value {
-                        kind: Some(prost_types::value::Kind::ListValue(
-                            prost_types::ListValue {
-                                values: vec![value],
-                            },
-                        )),
-                    };
-                }
-                Ok(stream_of(vec![Ok(v1::PartialResultSet {
-                    metadata: Some(result_metadata(&[("c", v1::TypeCode::String)])),
-                    values: vec![value],
-                    last: true,
-                    ..Default::default()
-                })]))
-            });
-        });
-        let mut connection = server.connect();
-        let mut statement = connection.new_statement().unwrap();
-        statement.set_sql_query("SELECT c FROM MockTable").unwrap();
-        let mut reader = statement.execute().expect("query metadata");
-        let error = reader.next().unwrap().expect_err("unknown wire kind");
-        let error = driver_error(&error);
+    let nested = prost_types::Value {
+        kind: Some(prost_types::value::Kind::ListValue(
+            prost_types::ListValue {
+                values: vec![keyed_struct_value()],
+            },
+        )),
+    };
+    for value in [keyed_struct_value(), nested] {
+        let mut mock = MockSpanner::new();
+        let metadata = result_metadata(&[("c", v1::TypeCode::String)]);
+        serve_result(&mut mock, metadata, vec![value]);
+        let error = first_batch_error(&MockServer::serve(mock));
         assert_eq!(error.status, AdbcStatus::InvalidData);
         assert!(error.message.contains("column \"c\""), "{error}");
     }
@@ -740,125 +764,55 @@ fn unknown_wire_values_are_not_rendered_as_json() {
 /// A keyed protobuf Struct cannot represent positional Spanner STRUCT fields with duplicate names.
 #[test]
 fn keyed_struct_wire_value_errors() {
-    let server = start_server(|mock| {
-        mock.expect_execute_streaming_sql().returning(|_| {
-            // STRUCT<x INT64, x INT64>: a map cannot preserve both fields named x.
-            let fields =
-                result_metadata(&[("x", v1::TypeCode::Int64), ("x", v1::TypeCode::Int64)]).row_type;
-            let metadata = v1::ResultSetMetadata {
-                row_type: Some(v1::StructType {
-                    fields: vec![v1::struct_type::Field {
-                        name: "c".into(),
-                        r#type: Some(v1::Type {
-                            code: v1::TypeCode::Struct as i32,
-                            struct_type: fields,
-                            ..Default::default()
-                        }),
-                    }],
+    // STRUCT<x INT64, x INT64>: a map cannot preserve both fields named x.
+    let fields =
+        result_metadata(&[("x", v1::TypeCode::Int64), ("x", v1::TypeCode::Int64)]).row_type;
+    let metadata = v1::ResultSetMetadata {
+        row_type: Some(v1::StructType {
+            fields: vec![v1::struct_type::Field {
+                name: "c".into(),
+                r#type: Some(v1::Type {
+                    code: v1::TypeCode::Struct as i32,
+                    struct_type: fields,
+                    ..Default::default()
                 }),
-                ..Default::default()
-            };
-            let keyed = prost_types::Value {
-                kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
-                    fields: [("x".into(), string_value("1"))].into_iter().collect(),
-                })),
-            };
-            Ok(stream_of(vec![Ok(v1::PartialResultSet {
-                metadata: Some(metadata),
-                values: vec![keyed],
-                last: true,
-                ..Default::default()
-            })]))
-        });
-    });
-    let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
-    let mut reader = statement.execute().expect("query metadata");
-    let error = reader
-        .next()
-        .expect("first batch")
-        .expect_err("keyed STRUCT must be rejected");
-    let error = driver_error(&error);
+            }],
+        }),
+        ..Default::default()
+    };
+    let mut mock = MockSpanner::new();
+    serve_result(&mut mock, metadata, vec![keyed_struct_value()]);
+    let error = first_batch_error(&MockServer::serve(mock));
     assert_eq!(error.status, AdbcStatus::InvalidData);
-    assert!(error.message.contains("STRUCT"), "{}", error.message);
+    assert!(error.message.contains("STRUCT"), "{error}");
 }
 
 /// A query while DML is buffered would not see the buffered writes, so it fails with
 /// `InvalidState`. Queries in autocommit mode or in a fresh manual transaction still run.
 #[test]
 fn query_while_dml_buffered_in_manual_txn_is_rejected() {
-    let server = start_server(move |mock| {
-        serve_streaming_sql_begin_aware(mock, &["v1", "v2"], None);
-    });
+    let (server, _) = query_server(&["v1", "v2"]);
     let mut connection = server.connect();
-
-    let mut auto_q = connection.new_statement().expect("new statement");
-    auto_q.set_sql_query("SELECT c FROM MockTable").unwrap();
-    let batches: Vec<_> = auto_q
-        .execute()
-        .expect("autocommit query must run")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect autocommit batches");
-    assert_eq!(batches[0].num_rows(), 2);
+    assert_eq!(query(&mut connection, SELECT)[0].num_rows(), 2);
 
     disable_autocommit(&mut connection);
 
     // The query makes this a query transaction; roll back so the DML below starts a new one.
-    let mut empty_q = connection.new_statement().expect("new statement");
-    empty_q.set_sql_query("SELECT c FROM MockTable").unwrap();
-    let batches: Vec<_> = empty_q
-        .execute()
-        .expect("query in a fresh manual transaction must run")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect empty-buffer batches");
-    assert_eq!(batches[0].num_rows(), 2);
-    connection.rollback().expect("end the query transaction");
+    assert_eq!(query(&mut connection, SELECT)[0].num_rows(), 2);
+    connection.rollback().unwrap();
 
-    let mut insert = connection.new_statement().expect("new statement");
-    insert
-        .set_sql_query("INSERT INTO MockTable (c) VALUES ('x')")
-        .unwrap();
-    assert_eq!(
-        insert.execute_update().expect("buffered insert"),
-        None,
-        "DML in manual mode buffers (returns None), not commits"
-    );
+    assert_eq!(update(&mut connection, INSERT), None);
 
-    let mut guarded = connection.new_statement().expect("new statement");
-    guarded.set_sql_query("SELECT c FROM MockTable").unwrap();
-    let Err(error) = guarded.execute() else {
-        panic!("a query while DML is buffered must be rejected, not silently run");
-    };
-    assert_eq!(
-        error.status,
-        AdbcStatus::InvalidState,
-        "querying with buffered writes must fail with InvalidState (no read-your-writes)"
-    );
-    assert!(
-        error.message.contains("read-your-writes"),
-        "the error should explain the read-your-writes hazard: {:?}",
-        error.message
-    );
+    let error = prepare(&mut connection, SELECT).execute().err().unwrap();
+    assert_eq!(error.status, AdbcStatus::InvalidState);
+    assert!(error.message.contains("read-your-writes"), "{error}");
 
-    let mut guarded_partitions = connection.new_statement().expect("new statement");
-    guarded_partitions
-        .set_sql_query("SELECT c FROM MockTable")
-        .unwrap();
-    let Err(error) = guarded_partitions.execute_partitions() else {
-        panic!("execute_partitions while DML is buffered must be rejected");
-    };
+    let mut partitions = prepare(&mut connection, SELECT);
+    let error = partitions.execute_partitions().err().unwrap();
     assert_eq!(error.status, AdbcStatus::InvalidState);
 
-    connection.rollback().expect("rollback buffered insert");
-    let mut after = connection.new_statement().expect("new statement");
-    after.set_sql_query("SELECT c FROM MockTable").unwrap();
-    let batches: Vec<_> = after
-        .execute()
-        .expect("query after rollback must run")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect post-rollback batches");
-    assert_eq!(batches[0].num_rows(), 2);
+    connection.rollback().unwrap();
+    assert_eq!(query(&mut connection, SELECT)[0].num_rows(), 2);
 }
 
 /// Queries in a manual transaction share one read-only transaction: the first begins it inline and
@@ -866,245 +820,128 @@ fn query_while_dml_buffered_in_manual_txn_is_rejected() {
 /// RPC.
 #[test]
 fn manual_transaction_queries_share_one_read_only_transaction() {
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let server = {
-        let record = requests.clone();
-        start_server(move |mock| {
-            serve_streaming_sql_begin_aware(mock, &["v1"], Some(record));
-        })
-    };
-
+    let (server, requests) = query_server(&["v1"]);
     let mut connection = server.connect();
     disable_autocommit(&mut connection);
 
     for _ in 0..2 {
-        let mut query = connection.new_statement().expect("new statement");
-        query.set_sql_query("SELECT c FROM MockTable").unwrap();
-        let batches: Vec<_> = query
-            .execute()
-            .expect("manual-transaction query")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect batches");
-        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(query(&mut connection, SELECT)[0].num_rows(), 1);
     }
-
-    {
-        let seen = transaction_selectors(&requests);
-        assert_eq!(seen.len(), 2, "both queries must reach the wire");
-        let first = seen[0]
-            .as_ref()
-            .and_then(|s| s.selector.as_ref())
-            .expect("the first query must carry a transaction selector");
-        let v1::transaction_selector::Selector::Begin(options) = first else {
-            panic!("the first manual-mode query must begin the transaction, got: {first:?}");
-        };
-        assert!(
-            matches!(
-                options.mode,
-                Some(v1::transaction_options::Mode::ReadOnly(_))
-            ),
-            "the begun transaction must be read-only: {options:?}"
-        );
-        let second = seen[1]
-            .as_ref()
-            .and_then(|s| s.selector.as_ref())
-            .expect("the second query must carry a transaction selector");
-        assert_eq!(
-            second,
-            &v1::transaction_selector::Selector::Id(b"inline-txn".to_vec()),
-            "later queries must reuse the begun read-only transaction"
-        );
-    }
+    let selectors = selectors(&requests);
+    assert_eq!(selectors.len(), 2);
+    assert_shared_read_only(&selectors, b"inline-txn");
 
     // The write would commit in a separate read/write transaction, outside the reads' snapshot.
-    let mut insert = connection.new_statement().expect("new statement");
-    insert
-        .set_sql_query("INSERT INTO MockTable (c) VALUES ('x')")
-        .unwrap();
-    let Err(error) = insert.execute_update() else {
-        panic!("DML in a manual transaction that began with a query must be rejected");
-    };
+    let error = prepare(&mut connection, INSERT)
+        .execute_update()
+        .unwrap_err();
     assert_eq!(error.status, AdbcStatus::InvalidState);
-    assert!(
-        error.message.contains("began with a query"),
-        "the rejection should name the active kind: {:?}",
-        error.message
-    );
+    assert!(error.message.contains("began with a query"), "{error}");
 
     // Commit is not scripted, so this succeeds only without an RPC.
-    connection
-        .commit()
-        .expect("committing a query transaction needs no RPC");
+    connection.commit().unwrap();
 
-    let mut insert = connection.new_statement().expect("new statement");
-    insert
-        .set_sql_query("INSERT INTO MockTable (c) VALUES ('x')")
-        .unwrap();
-    assert_eq!(
-        insert
-            .execute_update()
-            .expect("fresh transaction buffers DML"),
-        None,
-        "after commit the connection must accept a DML-kind transaction again"
-    );
-    connection.rollback().expect("discard the buffered insert");
+    assert_eq!(update(&mut connection, INSERT), None);
+    connection.rollback().unwrap();
 }
 
 /// `execute_update` on a SELECT, plain or bound, drains it through `ExecuteStreamingSql` and
 /// returns no count. This backs the ADBC call with a NULL output stream.
 #[test]
 fn execute_update_routes_a_query_to_the_read_only_path() {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let record = seen.clone();
-    let server = start_server(move |mock| {
-        serve_streaming_sql_begin_aware(mock, &["v1", "v2"], Some(record));
-    });
-
+    const BOUND: &str = "SELECT c FROM MockTable WHERE c = @p";
+    let (server, requests) = query_server(&["v1", "v2"]);
     let mut connection = server.connect();
 
-    let mut statement = connection.new_statement().expect("new statement");
-    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
-    assert_eq!(
-        statement
-            .execute_update()
-            .expect("execute_update on a SELECT must run it as a read-only query"),
-        None,
-        "a read query has no affected-row count"
-    );
+    assert_eq!(update(&mut connection, SELECT), None);
+    let mut bound = prepare(&mut connection, BOUND);
+    bound.bind(ingest_batch(1)).unwrap();
+    assert_eq!(bound.execute_update().unwrap(), None);
 
-    let mut bound = connection.new_statement().expect("new statement");
-    bound
-        .set_sql_query("SELECT c FROM MockTable WHERE c = @p")
-        .unwrap();
-    let param_schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, false)]));
-    let param_batch =
-        RecordBatch::try_new(param_schema, vec![Arc::new(StringArray::from(vec!["v1"]))])
-            .expect("build bound batch");
-    bound.bind(param_batch).expect("bind parameter row");
-    assert_eq!(
-        bound
-            .execute_update()
-            .expect("execute_update on a bound SELECT must run the bound-query path"),
-        None
-    );
-
-    let seen = seen.lock().unwrap();
-    assert_eq!(
-        seen.iter().map(|r| r.sql.as_str()).collect::<Vec<_>>(),
-        vec![
-            "SELECT c FROM MockTable",
-            "SELECT c FROM MockTable WHERE c = @p",
-        ],
-        "both statements must arrive via ExecuteStreamingSql (never ExecuteBatchDml)"
-    );
-    assert_eq!(
-        seen[1]
-            .params
-            .as_ref()
-            .map(|p| p.fields.keys().map(String::as_str).collect::<Vec<_>>()),
-        Some(vec!["p"]),
-        "the bound row must be attached as the @p parameter"
-    );
+    let requests = requests.lock().unwrap();
+    let sqls: Vec<_> = requests.iter().map(|r| r.sql.as_str()).collect();
+    assert_eq!(sqls, [SELECT, BOUND]);
+    let params = requests[1].params.as_ref().unwrap();
+    assert_eq!(params.fields.keys().collect::<Vec<_>>(), ["p"]);
 }
 
 /// `execute_partitions` accepts at most one bound row. Rejected rows are still consumed so a reused
 /// statement cannot apply them later.
 #[test]
 fn execute_partitions_rejects_multiple_bound_rows_and_consumes_them() {
-    let server = start_server(|_| {});
+    let server = MockServer::serve(MockSpanner::new());
     let mut connection = server.connect();
+    let mut statement = prepare(&mut connection, "SELECT 1");
+    statement.bind(ingest_batch(2)).unwrap();
 
-    let mut statement = connection.new_statement().expect("new statement");
-    statement.set_sql_query("SELECT 1").unwrap();
-    let schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, false)]));
-    let two_rows = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["a", "b"]))])
-        .expect("build bound batch");
-    statement.bind(two_rows).expect("bind two parameter rows");
-
-    let Err(error) = statement.execute_partitions() else {
-        panic!("execute_partitions with two bound rows must be rejected, not truncated to row 0");
-    };
+    let error = statement.execute_partitions().err().unwrap();
     assert_eq!(error.status, AdbcStatus::InvalidArguments);
     assert!(
         error
             .message
             .contains("at most one bound parameter row, but 2 rows"),
-        "the error must name the limitation and the row count: {}",
-        error.message
+        "{error}"
     );
 
     // Without bound data the schema comes from the SQL, which has no parameters.
-    let params = statement.get_parameter_schema().expect("parameter schema");
-    assert_eq!(
-        params.fields().len(),
-        0,
-        "bound rows must not survive execute_partitions on a reused statement handle"
-    );
+    assert_eq!(statement.get_parameter_schema().unwrap().fields().len(), 0);
 }
 
 #[test]
 fn empty_partitions_retain_the_planned_types_at_the_readers_timestamp_precision() {
-    let partition_queries = Arc::new(Mutex::new(Vec::new()));
-    let queries = Arc::new(Mutex::new(Vec::new()));
+    let partition_queries = Log::default();
+    let queries = Log::default();
     let (record_partition_queries, record_queries) = (partition_queries.clone(), queries.clone());
-    let server = start_server(move |mock| {
-        serve_begin_transaction(mock);
-        mock.expect_partition_query()
-            .once()
-            .returning(move |request| {
-                record_partition_queries
-                    .lock()
-                    .unwrap()
-                    .push(request.into_inner().sql);
-                Ok(tonic::Response::new(v1::PartitionResponse {
-                    partitions: vec![v1::Partition {
-                        partition_token: b"empty-partition".to_vec(),
-                    }],
-                    ..Default::default()
-                }))
-            });
-        mock.expect_execute_streaming_sql()
-            .times(2)
-            .returning(move |request| {
-                let request = request.into_inner();
-                let metadata = if request.partition_token.is_empty() {
-                    Some(result_metadata(&[
-                        ("Id", v1::TypeCode::Int64),
-                        ("Ts", v1::TypeCode::Timestamp),
-                        ("Doc", v1::TypeCode::Json),
-                    ]))
-                } else {
-                    // Omni can omit the row type for a partition with no rows.
-                    Some(v1::ResultSetMetadata::default())
-                };
-                record_queries.lock().unwrap().push(request);
-                Ok(stream_of(vec![Ok(v1::PartialResultSet {
-                    metadata,
-                    last: true,
-                    ..Default::default()
-                })]))
-            });
+    let mut mock = MockSpanner::new();
+    serve_begin_transaction(&mut mock);
+    mock.expect_partition_query().returning(move |request| {
+        record_partition_queries
+            .lock()
+            .unwrap()
+            .push(request.into_inner().sql);
+        Ok(tonic::Response::new(v1::PartitionResponse {
+            partitions: vec![v1::Partition {
+                partition_token: b"empty-partition".to_vec(),
+            }],
+            ..Default::default()
+        }))
     });
+    mock.expect_execute_streaming_sql()
+        .returning(move |request| {
+            let request = request.into_inner();
+            let metadata = if request.partition_token.is_empty() {
+                Some(result_metadata(&[
+                    ("Id", v1::TypeCode::Int64),
+                    ("Ts", v1::TypeCode::Timestamp),
+                    ("Doc", v1::TypeCode::Json),
+                ]))
+            } else {
+                // Omni can omit the row type for a partition with no rows.
+                Some(v1::ResultSetMetadata::default())
+            };
+            record_queries.lock().unwrap().push(request);
+            Ok(stream_of(vec![Ok(v1::PartialResultSet {
+                metadata,
+                last: true,
+                ..Default::default()
+            })]))
+        });
+    let server = MockServer::serve(mock);
     let mut producer = server.connect();
-    let mut statement = producer.new_statement().unwrap();
-    statement
-        .set_sql_query("SELECT Id, Ts, Doc FROM MockTable")
+    let partitions = prepare(&mut producer, "SELECT Id, Ts, Doc FROM MockTable")
+        .execute_partitions()
         .unwrap();
-    let partitions = statement.execute_partitions().unwrap();
     assert_eq!(partitions.partitions.len(), 1);
     assert_eq!(
         partitions.schema.field(1).data_type(),
-        &DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("UTC".into()))
+        &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
     );
-    drop(statement);
 
     let mut consumer = server.connect();
-    consumer
-        .set_option(
-            OptionConnection::Other(spanner_adbc::OPTION_MAX_TIMESTAMP_PRECISION.into()),
-            "microseconds".into(),
-        )
-        .unwrap();
+    configure(
+        &mut consumer,
+        &[(OPTION_MAX_TIMESTAMP_PRECISION, "microseconds")],
+    );
     let reader = consumer.read_partition(&partitions.partitions[0]).unwrap();
     let schema = reader.schema();
     assert_eq!(schema.fields().len(), 3);
@@ -1113,15 +950,17 @@ fn empty_partitions_retain_the_planned_types_at_the_readers_timestamp_precision(
     assert_eq!(schema.field(1).name(), "Ts");
     assert_eq!(
         schema.field(1).data_type(),
-        &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
+        &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
     );
     assert_eq!(schema.field(2), partitions.schema.field(2));
     assert_eq!(
         schema.field(2).metadata()["ARROW:extension:name"],
         "arrow.json"
     );
-    let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    assert_eq!(
+        row_count(&reader.collect::<Result<Vec<_>, _>>().unwrap()),
+        0
+    );
     assert_eq!(
         *partition_queries.lock().unwrap(),
         ["SELECT Id, Ts, Doc FROM MockTable"]
@@ -1145,23 +984,15 @@ fn empty_partitions_retain_the_planned_types_at_the_readers_timestamp_precision(
 
 #[test]
 fn execute_schema_binds_the_first_nonempty_batch() {
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let server = start_server({
-        let requests = requests.clone();
-        move |mock| serve_streaming_sql_begin_aware(mock, &[], Some(requests))
-    });
+    let (server, requests) = query_server(&[]);
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().unwrap();
-    statement.set_sql_query("SELECT @p AS c").unwrap();
-    let schema = Arc::new(Schema::new(vec![Field::new("p", DataType::Utf8, false)]));
-    let row = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(StringArray::from(vec!["bound value"]))],
-    )
-    .unwrap();
+    let mut statement = prepare(&mut connection, "SELECT @p AS c");
+    let value = StringArray::from(vec!["bound value"]);
+    let row = RecordBatch::try_from_iter([("p", Arc::new(value) as ArrayRef)]).unwrap();
+    let schema = row.schema();
     statement
-        .bind_stream(Box::new(arrow_array::RecordBatchIterator::new(
-            vec![Ok(RecordBatch::new_empty(schema.clone())), Ok(row)],
+        .bind_stream(Box::new(RecordBatchIterator::new(
+            [Ok(RecordBatch::new_empty(schema.clone())), Ok(row)],
             schema.clone(),
         )))
         .unwrap();
@@ -1185,29 +1016,22 @@ fn execute_schema_binds_the_first_nonempty_batch() {
 
 #[test]
 fn bind_stream_rejects_schema_changes_without_replacing_previous_bindings() {
-    let server = start_server(|_| {});
+    let server = MockServer::serve(MockSpanner::new());
     let mut connection = server.connect();
     let mut statement = connection.new_statement().unwrap();
-    let original = Arc::new(Schema::new(vec![Field::new(
-        "original",
-        DataType::Int64,
-        false,
-    )]));
+    let schema = |name, data_type| Arc::new(Schema::new(vec![Field::new(name, data_type, false)]));
+    let original = schema("original", DataType::Int64);
     statement
         .bind(RecordBatch::new_empty(original.clone()))
         .unwrap();
 
-    let declared = Arc::new(Schema::new(vec![Field::new("p", DataType::Utf8, false)]));
+    let declared = schema("p", DataType::Utf8);
     for mismatched in [
-        Arc::new(Schema::new(vec![Field::new("p", DataType::Int64, false)])),
-        Arc::new(Schema::new(vec![Field::new(
-            "renamed",
-            DataType::Utf8,
-            false,
-        )])),
+        schema("p", DataType::Int64),
+        schema("renamed", DataType::Utf8),
     ] {
-        let reader = arrow_array::RecordBatchIterator::new(
-            vec![
+        let reader = RecordBatchIterator::new(
+            [
                 Ok(RecordBatch::new_empty(declared.clone())),
                 Ok(RecordBatch::new_empty(mismatched)),
             ],
@@ -1224,38 +1048,23 @@ fn bind_stream_rejects_schema_changes_without_replacing_previous_bindings() {
 /// A failed bound query still consumes its rows, so a reused statement cannot apply them later.
 #[test]
 fn failed_bound_query_still_consumes_bound_rows() {
-    let server = start_server(|mock| {
-        mock.expect_execute_streaming_sql().returning(|_| {
-            Err(tonic::Status::failed_precondition(
-                "the mock server rejected the bound query",
-            ))
-        });
-    });
+    let mut mock = MockSpanner::new();
+    mock.expect_execute_streaming_sql()
+        .returning(|_| Err(tonic::Status::failed_precondition("rejected bound query")));
+    let server = MockServer::serve(mock);
 
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_sql_query("SELECT c FROM MockTable WHERE c = @p")
-        .unwrap();
+    let mut statement = prepare(&mut connection, "SELECT c FROM MockTable WHERE c = @p");
+    statement.bind(ingest_batch(1)).unwrap();
+
+    let error = statement.execute().err().unwrap();
+    assert_eq!(error.status, AdbcStatus::InvalidState, "{error}");
+
     // While bound, the parameter schema would report `@p` as the bound column's Utf8; once the
     // rows are consumed, the rejected probe leaves it untyped.
-    let param_schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, false)]));
-    let param_batch =
-        RecordBatch::try_new(param_schema, vec![Arc::new(StringArray::from(vec!["v1"]))])
-            .expect("build bound batch");
-    statement.bind(param_batch).expect("bind parameter row");
-
-    let error = statement
-        .execute()
-        .err()
-        .expect("the bound query must fail (the server rejects it), not hang or succeed");
-    assert_eq!(error.status, AdbcStatus::InvalidState, "got error: {error}");
-
-    let params = statement.get_parameter_schema().expect("parameter schema");
     assert_eq!(
-        params,
-        Schema::new(vec![Field::new("p", DataType::Null, true)]),
-        "stale bound rows would type the parameter"
+        statement.get_parameter_schema().unwrap(),
+        Schema::new(vec![Field::new("p", DataType::Null, true)])
     );
 }
 
@@ -1264,65 +1073,31 @@ fn failed_bound_query_still_consumes_bound_rows() {
 /// read-your-writes guard as `execute`.
 #[test]
 fn execute_update_query_in_manual_mode_buffers_nothing() {
-    let server = start_server(move |mock| {
-        serve_streaming_sql_begin_aware(mock, &["v1"], None);
-    });
-
+    let (server, _) = query_server(&["v1"]);
     let mut connection = server.connect();
     disable_autocommit(&mut connection);
 
-    let mut query = connection.new_statement().expect("new statement");
-    query.set_sql_query("SELECT c FROM MockTable").unwrap();
-    assert_eq!(
-        query.execute_update().expect("query must run immediately"),
-        None
-    );
+    assert_eq!(update(&mut connection, SELECT), None);
 
-    let mut mixed = connection.new_statement().expect("new statement");
-    mixed
-        .set_sql_query("DELETE FROM MockTable WHERE true; SELECT 1")
-        .unwrap();
-    let Err(error) = mixed.execute_update() else {
-        panic!("a mixed DML/query batch must be rejected");
-    };
-    assert_eq!(
-        error.status,
-        AdbcStatus::InvalidArguments,
-        "mixed batch must fail with InvalidArguments: {:?}",
-        error.message
-    );
-    assert!(
-        error.message.contains("all-DML"),
-        "the error should explain the all-DML batch requirement: {:?}",
-        error.message
-    );
+    let error = prepare(
+        &mut connection,
+        "DELETE FROM MockTable WHERE true; SELECT 1",
+    )
+    .execute_update()
+    .unwrap_err();
+    assert_eq!(error.status, AdbcStatus::InvalidArguments, "{error}");
+    assert!(error.message.contains("all-DML"), "{error}");
 
     // Commit is not scripted, so this succeeds only if nothing was buffered.
-    connection
-        .commit()
-        .expect("commit must succeed with an empty buffer (nothing may have been buffered)");
+    connection.commit().unwrap();
 
-    let mut insert = connection.new_statement().expect("new statement");
-    insert
-        .set_sql_query("INSERT INTO MockTable (c) VALUES ('x')")
-        .unwrap();
-    assert_eq!(insert.execute_update().expect("buffered insert"), None);
-    let mut guarded = connection.new_statement().expect("new statement");
-    guarded.set_sql_query("SELECT c FROM MockTable").unwrap();
-    let Err(error) = guarded.execute_update() else {
-        panic!("execute_update on a query while DML is buffered must be rejected");
-    };
-    assert_eq!(
-        error.status,
-        AdbcStatus::InvalidState,
-        "the read-your-writes guard must fire on execute_update's query arm too"
-    );
-    assert!(
-        error.message.contains("read-your-writes"),
-        "the error should explain the read-your-writes hazard: {:?}",
-        error.message
-    );
-    connection.rollback().expect("discard the buffered insert");
+    assert_eq!(update(&mut connection, INSERT), None);
+    let error = prepare(&mut connection, SELECT)
+        .execute_update()
+        .unwrap_err();
+    assert_eq!(error.status, AdbcStatus::InvalidState);
+    assert!(error.message.contains("read-your-writes"), "{error}");
+    connection.rollback().unwrap();
 }
 
 /// An `ABORTED` query keeps gRPC code 10 in `vendor_code` and forwards its `RetryInfo` detail.
@@ -1330,121 +1105,58 @@ fn execute_update_query_in_manual_mode_buffers_nothing() {
 /// Unlike the unit tests in `src/error.rs`, this decodes the detail from a real gRPC trailer.
 #[test]
 fn aborted_surfaces_vendor_code_and_retry_info_detail() {
-    let server = start_server(|mock| {
-        mock.expect_execute_streaming_sql().returning(|_| {
-            Err(aborted_with_retry_info(
-                "Transaction was aborted by the mock server",
-            ))
-        });
-    });
+    let mut mock = MockSpanner::new();
+    mock.expect_execute_streaming_sql()
+        .returning(|_| Err(aborted_with_retry_info("aborted by the mock server")));
+    let server = MockServer::serve(mock);
 
-    let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
-    let error = statement
+    let error = prepare(&mut server.connect(), SELECT)
         .execute()
         .err()
-        .expect("an ABORTED query must fail, not hang or succeed");
-
-    assert_eq!(
-        error.vendor_code, 10,
-        "vendor_code must carry the numeric gRPC code (ABORTED = 10); got error: {error}"
-    );
-    assert_eq!(error.status, AdbcStatus::IO, "got error: {error}");
+        .unwrap();
+    assert_eq!(error.vendor_code, 10, "{error}");
+    assert_eq!(error.status, AdbcStatus::IO, "{error}");
     assert!(
         error.message.contains("aborted by the mock server"),
-        "the server's status message must survive into the ADBC error, got: {}",
-        error.message
+        "{error}"
     );
-
-    let details = error.details.as_ref().expect(
-        "the ABORTED status carried a google.rpc.RetryInfo detail; Error.details must be Some",
-    );
-    let (_, value) = details
-        .iter()
-        .find(|(key, _)| key == "google.rpc.retryinfo")
-        .unwrap_or_else(|| {
-            panic!(
-                "expected a `google.rpc.retryinfo` detail, got keys: {:?}",
-                details.iter().map(|(k, _)| k).collect::<Vec<_>>()
-            )
-        });
 
     // The value is ProtoJSON; parse it so field order does not matter.
-    let json: serde_json::Value =
-        serde_json::from_slice(value).expect("the detail value is UTF-8 ProtoJSON");
-    assert_eq!(
-        json["@type"], "type.googleapis.com/google.rpc.RetryInfo",
-        "the detail must self-describe as a RetryInfo, got: {json}"
-    );
-    assert_eq!(
-        json["retryDelay"], "0.05s",
-        "the RetryInfo's retryDelay must round-trip the 50ms the mock sent, got: {json}"
-    );
+    let json = error_detail(&error, "google.rpc.retryinfo");
+    assert_eq!(json["@type"], "type.googleapis.com/google.rpc.RetryInfo");
+    assert_eq!(json["retryDelay"], "0.05s");
 }
 
 /// After `UNAVAILABLE` mid-stream the client resumes from the last resume token. When the resume
 /// fails with a non-retryable status, that error reaches the caller.
 #[test]
 fn unavailable_mid_stream_surfaces_a_clean_error() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let resume_tokens: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-    let calls_in_mock = calls.clone();
-    let tokens_in_mock = resume_tokens.clone();
-    let server = start_server(move |mock| {
-        mock.expect_execute_streaming_sql()
-            .returning(move |request| {
-                if calls_in_mock.fetch_add(1, Ordering::SeqCst) == 0 {
-                    Ok(stream_of(vec![
-                        Ok(partial_result_set(true, &["v1"], b"resume-1", false)),
-                        Err(tonic::Status::unavailable(
-                            "mock server: connection lost mid-stream",
-                        )),
-                    ]))
-                } else {
-                    tokens_in_mock
-                        .lock()
-                        .unwrap()
-                        .push(request.into_inner().resume_token);
-                    Err(tonic::Status::internal(
-                        "mock server: resume attempt refused",
-                    ))
-                }
-            });
-    });
-
-    let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+    let requests = Log::default();
+    let recorded = requests.clone();
+    let mut mock = MockSpanner::new();
+    mock.expect_execute_streaming_sql()
+        .returning(move |request| {
+            let mut requests = recorded.lock().unwrap();
+            requests.push(request.into_inner().resume_token);
+            if requests.len() == 1 {
+                Ok(stream_of(vec![
+                    Ok(partial_result_set(true, &["v1"], b"resume-1", false)),
+                    Err(tonic::Status::unavailable("connection lost mid-stream")),
+                ]))
+            } else {
+                Err(tonic::Status::internal("resume attempt refused"))
+            }
+        });
+    let server = MockServer::serve(mock);
 
     // `execute` fetches the first batch, so the failed resume surfaces here.
-    let started = Instant::now();
-    let error = statement
+    let error = prepare(&mut server.connect(), SELECT)
         .execute()
         .err()
-        .expect("a query whose stream dies mid-flight must fail, not hang or succeed");
-    let elapsed = started.elapsed();
-
-    assert_eq!(
-        error.vendor_code, 13,
-        "the *resume* refusal (INTERNAL = 13) is what surfaces; got error: {error}"
-    );
-    assert!(
-        error.message.contains("resume attempt refused"),
-        "expected the resume refusal to surface, got: {}",
-        error.message
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        resume_tokens.lock().unwrap().as_slice(),
-        &[b"resume-1".to_vec()],
-        "the resume attempt must carry the last resume token the stream delivered"
-    );
-    // Expect one backoff sleep (about 1 s) before the resume.
-    assert!(
-        elapsed < Duration::from_secs(60),
-        "error took {elapsed:?} to surface; runaway retries?"
-    );
+        .unwrap();
+    assert_eq!(error.vendor_code, 13, "{error}");
+    assert!(error.message.contains("resume attempt refused"), "{error}");
+    assert_eq!(*requests.lock().unwrap(), [vec![], b"resume-1".to_vec()]);
 }
 
 /// Cancelling from another thread unblocks a reader waiting on a stream that sent one row and
@@ -1453,16 +1165,8 @@ fn unavailable_mid_stream_surfaces_a_clean_error() {
 fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
     let (server, _open_streams) = silent_stream_server(1);
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    // One row per batch, so `execute` returns and the next fetch blocks.
-    statement
-        .set_option(
-            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
-            OptionValue::Int(1),
-        )
-        .expect("set rows_per_batch");
-    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
-    let mut reader = statement.execute().expect("execute settles the schema");
+    let mut statement = one_row_batches(&mut connection);
+    let mut reader = statement.execute().unwrap();
 
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -1473,32 +1177,33 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
 
     std::thread::sleep(Duration::from_millis(300));
     let cancel_at = Instant::now();
-    statement.get_cancel_handle().try_cancel().expect("cancel");
+    statement.get_cancel_handle().try_cancel().unwrap();
 
-    let (first, second) = rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("cancel did not unblock the reader stuck on a silent stream");
+    let (first, second) = rx.recv_timeout(Duration::from_secs(30)).unwrap();
     let cancel_latency = cancel_at.elapsed();
-    worker.join().expect("worker thread");
+    worker.join().unwrap();
 
-    let first = first
-        .expect("first batch exists")
-        .expect("first batch is the row delivered before the server went silent");
-    assert_eq!(first.num_rows(), 1);
-
-    let error = second
-        .expect("the cancelled fetch yields an item")
-        .expect_err("the fetch blocked on the silent stream must fail with the cancel");
-    let adbc_error = driver_error(&error);
-    assert_eq!(
-        adbc_error.status,
-        AdbcStatus::Cancelled,
-        "got error: {adbc_error}"
-    );
+    assert_eq!(first.unwrap().unwrap().num_rows(), 1);
+    let error = second.unwrap().unwrap_err();
+    assert_eq!(driver_error(&error).status, AdbcStatus::Cancelled);
     assert!(
         cancel_latency < Duration::from_secs(10),
-        "cancel took {cancel_latency:?} to unblock the reader"
+        "{cancel_latency:?}"
     );
+}
+
+/// A timeout on `option` after `seconds`; a stream that died for another reason would fail sooner.
+fn assert_deadline_fired(error: &Error, option: &str, seconds: f64, started: Instant) {
+    let elapsed = started.elapsed();
+    assert_eq!(error.status, AdbcStatus::Timeout, "{error}");
+    assert!(error.message.contains(option), "{error}");
+    assert!(
+        error
+            .message
+            .contains(&format!("timed out after {seconds}s")),
+        "{error}"
+    );
+    assert!(elapsed.as_secs_f64() >= seconds, "failed after {elapsed:?}");
 }
 
 /// `spanner.rpc.timeout_seconds.update` bounds DDL, including the operation poll loop. A silent
@@ -1506,42 +1211,22 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
 /// Without the driver deadline, the admin client's own ~60 s deadline would fail with `Internal`.
 #[test]
 fn ddl_update_timeout_fires_on_a_silent_admin_endpoint() {
-    let server = start_server(|_mock| {});
+    let server = MockServer::serve(MockSpanner::new());
     let gate = GatedEndpoint::start(&server.endpoint);
     let mut connection = gate.connect();
     gate.go_silent();
 
-    let mut statement = connection.new_statement().expect("new statement");
+    let mut statement = prepare(
+        &mut connection,
+        "CREATE TABLE T (Id INT64) PRIMARY KEY (Id)",
+    );
     statement
-        .set_option(
-            OptionStatement::Other(spanner_adbc::OPTION_RPC_TIMEOUT_UPDATE.into()),
-            OptionValue::Double(0.25),
-        )
-        .expect("set the update deadline");
-    statement
-        .set_sql_query("CREATE TABLE T (Id INT64) PRIMARY KEY (Id)")
+        .set_option(OPTION_RPC_TIMEOUT_UPDATE.into(), 0.25.into())
         .unwrap();
 
     let started = Instant::now();
-    let error = statement
-        .execute_update()
-        .expect_err("an unanswerable DDL must expire its update deadline");
-    let elapsed = started.elapsed();
-
-    assert_eq!(error.status, AdbcStatus::Timeout, "got error: {error}");
-    assert!(
-        error
-            .message
-            .contains(spanner_adbc::OPTION_RPC_TIMEOUT_UPDATE),
-        "the DDL timeout error must name the update option: {}",
-        error.message
-    );
-    // A refused or reset connection would fail within milliseconds.
-    assert!(
-        elapsed >= Duration::from_millis(250),
-        "returned in {elapsed:?}, before the 0.25s deadline could fire; the DDL failed for some \
-         other reason"
-    );
+    let error = statement.execute_update().unwrap_err();
+    assert_deadline_fired(&error, OPTION_RPC_TIMEOUT_UPDATE, 0.25, started);
 }
 
 /// A server whose streams send `rows` one-row messages and then stay open without sending more.
@@ -1549,46 +1234,30 @@ fn ddl_update_timeout_fires_on_a_silent_admin_endpoint() {
 ///
 /// Hold the returned senders for as long as the streams must stay silent; dropping them ends the
 /// streams.
-fn silent_stream_server(rows: usize) -> (MockServer, Arc<Mutex<Vec<PartialResultSetSender>>>) {
-    let open_streams: Arc<Mutex<Vec<PartialResultSetSender>>> = Arc::new(Mutex::new(Vec::new()));
+fn silent_stream_server(rows: usize) -> (MockServer, Log<PartialResultSetSender>) {
+    let open_streams = Log::default();
     let streams_in_mock = open_streams.clone();
-    let server = start_server(move |mock| {
-        mock.expect_execute_streaming_sql().returning(move |_| {
-            let (tx, rx) = tokio::sync::mpsc::channel(rows.max(1));
-            for i in 0..rows {
-                tx.try_send(Ok(partial_result_set(i == 0, &["v1"], b"rt-1", false)))
-                    .expect("scripted stream channel sized to fit");
-            }
-            streams_in_mock.lock().unwrap().push(tx);
-            Ok(tonic::Response::new(rx))
-        });
+    let mut mock = MockSpanner::new();
+    mock.expect_execute_streaming_sql().returning(move |_| {
+        let (tx, rx) = tokio::sync::mpsc::channel(rows.max(1));
+        for i in 0..rows {
+            tx.try_send(Ok(partial_result_set(i == 0, &["v1"], b"rt-1", false)))
+                .unwrap();
+        }
+        streams_in_mock.lock().unwrap().push(tx);
+        Ok(tonic::Response::new(rx))
     });
-    (server, open_streams)
+    (MockServer::serve(mock), open_streams)
 }
 
-/// Queries a [`silent_stream_server`] with one row per batch, so the second batch is the first
-/// fetch after `execute` and blocks.
-fn silent_stream_reader(
-    connection: &mut SpannerConnection,
-    fetch_seconds: Option<f64>,
-) -> Box<dyn RecordBatchReader + Send + 'static> {
-    let mut statement = connection.new_statement().expect("new statement");
+/// A [`SELECT`] with one row per batch, so on a [`silent_stream_server`] `execute` returns and the
+/// second batch blocks.
+fn one_row_batches(connection: &mut SpannerConnection) -> SpannerStatement {
+    let mut statement = prepare(connection, SELECT);
     statement
-        .set_option(
-            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
-            OptionValue::Int(1),
-        )
-        .expect("set rows_per_batch");
-    if let Some(seconds) = fetch_seconds {
-        statement
-            .set_option(
-                OptionStatement::Other(spanner_adbc::OPTION_RPC_TIMEOUT_FETCH.into()),
-                OptionValue::Double(seconds),
-            )
-            .expect("set the fetch deadline");
-    }
-    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
-    statement.execute().expect("execute settles the schema")
+        .set_option(OPTION_ROWS_PER_BATCH.into(), 1_i64.into())
+        .unwrap();
+    statement
 }
 
 /// `spanner.rpc.timeout_seconds.fetch` bounds fetches after the first batch. The stream sends one
@@ -1601,43 +1270,15 @@ fn fetch_timeout_fires_on_a_silent_stream() {
 
     // The fetch deadline cannot start before `execute`, so the call must outlast it from here.
     let started = Instant::now();
-    let mut reader = silent_stream_reader(&mut connection, Some(0.5));
+    let mut statement = one_row_batches(&mut connection);
+    statement
+        .set_option(OPTION_RPC_TIMEOUT_FETCH.into(), 0.5.into())
+        .unwrap();
+    let mut reader = statement.execute().unwrap();
+    assert_eq!(reader.next().unwrap().unwrap().num_rows(), 1);
 
-    let first = reader
-        .next()
-        .expect("first batch exists")
-        .expect("first batch is the row delivered before the server went silent");
-    assert_eq!(first.num_rows(), 1);
-
-    let error = reader
-        .next()
-        .expect("the expired fetch deadline yields an item")
-        .expect_err("the fetch blocked on the silent stream must expire its deadline");
-    let elapsed = started.elapsed();
-
-    let adbc_error = driver_error(&error);
-    assert_eq!(
-        adbc_error.status,
-        AdbcStatus::Timeout,
-        "got error: {adbc_error}"
-    );
-    assert!(
-        adbc_error
-            .message
-            .contains(spanner_adbc::OPTION_RPC_TIMEOUT_FETCH),
-        "the chunk-fetch timeout error must name the fetch option: {}",
-        adbc_error.message
-    );
-    assert!(
-        adbc_error.message.contains("timed out after 0.5s"),
-        "the error must report the deadline that fired: {}",
-        adbc_error.message
-    );
-    assert!(
-        elapsed >= Duration::from_millis(500),
-        "the reader failed after {elapsed:?}, before the 0.5s fetch deadline could fire; the \
-         stream died for some other reason"
-    );
+    let error = reader.next().unwrap().unwrap_err();
+    assert_deadline_fired(driver_error(&error), OPTION_RPC_TIMEOUT_FETCH, 0.5, started);
 }
 
 /// Control for [`fetch_timeout_fires_on_a_silent_stream`]: without the fetch deadline, nothing
@@ -1646,7 +1287,7 @@ fn fetch_timeout_fires_on_a_silent_stream() {
 fn silent_stream_without_the_fetch_deadline_never_times_out() {
     let (server, _open_streams) = silent_stream_server(1);
     let mut connection = server.connect();
-    let mut reader = silent_stream_reader(&mut connection, None);
+    let mut reader = one_row_batches(&mut connection).execute().unwrap();
 
     // Not joined: the thread stays blocked until the server is dropped.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1672,41 +1313,14 @@ fn silent_stream_without_the_fetch_deadline_never_times_out() {
 fn query_timeout_fires_on_a_stream_that_is_silent_from_the_start() {
     let (server, _open_streams) = silent_stream_server(0);
     let mut connection = server.connect();
-
-    let mut statement = connection.new_statement().expect("new statement");
+    let mut statement = prepare(&mut connection, SELECT);
     statement
-        .set_option(
-            OptionStatement::Other(spanner_adbc::OPTION_RPC_TIMEOUT_QUERY.into()),
-            OptionValue::Double(0.5),
-        )
-        .expect("set the query deadline");
-    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+        .set_option(OPTION_RPC_TIMEOUT_QUERY.into(), 0.5.into())
+        .unwrap();
 
     let started = Instant::now();
-    let error = statement
-        .execute()
-        .err()
-        .expect("an execute blocked on a silent stream must expire its query deadline");
-    let elapsed = started.elapsed();
-
-    assert_eq!(error.status, AdbcStatus::Timeout, "got error: {error}");
-    assert!(
-        error
-            .message
-            .contains(spanner_adbc::OPTION_RPC_TIMEOUT_QUERY),
-        "the execute timeout error must name the query option (and so not the fetch one): {}",
-        error.message
-    );
-    assert!(
-        error.message.contains("timed out after 0.5s"),
-        "the error must report the deadline that fired: {}",
-        error.message
-    );
-    assert!(
-        elapsed >= Duration::from_millis(500),
-        "execute failed after {elapsed:?}, before the 0.5s query deadline could fire; the stream \
-         died for some other reason"
-    );
+    let error = statement.execute().err().unwrap();
+    assert_deadline_fired(&error, OPTION_RPC_TIMEOUT_QUERY, 0.5, started);
 }
 
 /// A new operation on the statement must not clear the cancel on an earlier reader. If it did, the
@@ -1714,61 +1328,19 @@ fn query_timeout_fires_on_a_stream_that_is_silent_from_the_start() {
 #[test]
 fn new_operation_does_not_uncancel_an_earlier_streamed_reader() {
     // With one row per batch, the old reader has row 2 buffered and row 3 pending at the cancel.
-    let server = start_server(move |mock| {
-        mock.expect_execute_streaming_sql().returning(move |_| {
-            Ok(stream_of(vec![Ok(partial_result_set(
-                true,
-                &["v1", "v2", "v3"],
-                b"rt-1",
-                true,
-            ))]))
-        });
-    });
-
+    let (server, _) = query_server(&["v1", "v2", "v3"]);
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
-            OptionValue::Int(1),
-        )
-        .expect("set rows_per_batch");
-    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
-    let mut old_reader = statement.execute().expect("first execute");
-
-    let first = old_reader
-        .next()
-        .expect("first batch exists")
-        .expect("first batch is clean");
-    assert_eq!(first.num_rows(), 1);
+    let mut statement = one_row_batches(&mut connection);
+    let mut old_reader = statement.execute().unwrap();
+    assert_eq!(old_reader.next().unwrap().unwrap().num_rows(), 1);
 
     // Start a new operation before the old reader observes the cancel.
-    statement.get_cancel_handle().try_cancel().expect("cancel");
-    let new_batches: Vec<_> = statement
-        .execute()
-        .expect("a new operation after a cancel must start uncancelled")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("the new operation's reader must stream to completion");
-    assert_eq!(
-        new_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
-        3,
-        "the new reader must deliver the full result"
-    );
+    statement.get_cancel_handle().try_cancel().unwrap();
+    assert_eq!(row_count(&fetch(&mut statement)), 3);
 
-    let item = old_reader
-        .next()
-        .expect("the cancelled reader must yield an error item, not a clean end of stream");
-    let error = item.expect_err("the cancelled reader must not resume streaming rows");
-    let adbc_error = driver_error(&error);
-    assert_eq!(
-        adbc_error.status,
-        AdbcStatus::Cancelled,
-        "got error: {adbc_error}"
-    );
-    assert!(
-        old_reader.next().is_none(),
-        "a cancelled reader must not yield further batches"
-    );
+    let error = old_reader.next().unwrap().unwrap_err();
+    assert_eq!(driver_error(&error).status, AdbcStatus::Cancelled);
+    assert!(old_reader.next().is_none());
 }
 
 /// Secondary indexes count toward Spanner's mutation limit, so a chunk within the driver's budget
@@ -1776,86 +1348,46 @@ fn new_operation_does_not_uncancel_an_earlier_streamed_reader() {
 /// with more than 40 mutations.
 #[test]
 fn ingest_bisects_a_chunk_that_overshoots_the_mutation_limit() {
-    let commit_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
-    let sizes_in_mock = commit_sizes.clone();
-    let server = start_server(move |mock| {
-        serve_begin_transaction(mock);
-        mock.expect_commit().returning(move |request| {
-            let mutations = request.into_inner().mutations.len();
-            sizes_in_mock.lock().unwrap().push(mutations);
-            if mutations > 40 {
-                Err(too_many_mutations_status())
-            } else {
-                commit_ok()
-            }
-        });
+    let mut mock = MockSpanner::new();
+    serve_begin_transaction(&mut mock);
+    let commits = serve_commits_with(&mut mock, |request| {
+        if request.mutations.len() > 40 {
+            Err(too_many_mutations_status())
+        } else {
+            commit_ok()
+        }
     });
+    let server = MockServer::serve(mock);
 
     let mut connection = server.connect();
-    let mut statement = append_ingest_statement(&mut connection);
-    statement.bind(ingest_batch(100)).expect("bind ingest data");
-
-    let count = statement
-        .execute_update()
-        .expect("the ingest must self-heal, not fail on the over-limit chunk");
-
-    assert_eq!(
-        count,
-        Some(100),
-        "every bound row must land once the chunk is bisected under the limit"
-    );
+    let count = ingest(append_ingest_statement(&mut connection), 100);
+    assert_eq!(count.unwrap(), Some(100));
 
     // 100 rows bisect to 50, then 25.
-    let sizes = commit_sizes.lock().unwrap();
-    assert!(
-        sizes.len() > 1,
-        "the driver must have retried with smaller commits; saw commit sizes {sizes:?}"
-    );
-    let accepted: usize = sizes.iter().copied().filter(|&n| n <= 40).sum();
-    assert_eq!(
-        accepted, 100,
-        "the accepted (<=40-mutation) commits must cover all 100 rows; saw {sizes:?}"
-    );
-    assert!(
-        sizes.iter().any(|&n| n > 40),
-        "the test must actually exercise an over-limit commit; saw {sizes:?}"
-    );
+    let commits = commits.lock().unwrap();
+    let sizes: Vec<_> = commits.iter().map(|c| c.mutations.len()).collect();
+    let accepted: usize = sizes.iter().filter(|&&n| n <= 40).sum();
+    assert_eq!(accepted, 100, "{sizes:?}");
+    assert!(sizes.iter().any(|&n| n > 40), "{sizes:?}");
 }
 
 /// Other commit errors propagate after a single attempt.
 #[test]
 fn ingest_does_not_bisect_a_non_mutation_limit_error() {
-    let commits = Arc::new(AtomicUsize::new(0));
-    let commits_in_mock = commits.clone();
-    let server = start_server(move |mock| {
-        serve_begin_transaction(mock);
-        mock.expect_commit().returning(move |_| {
-            commits_in_mock.fetch_add(1, Ordering::SeqCst);
-            Err(tonic::Status::already_exists(
-                "Row [v0] in table MockTable already exists",
-            ))
-        });
+    let mut mock = MockSpanner::new();
+    serve_begin_transaction(&mut mock);
+    let commits = serve_commits_with(&mut mock, |_| {
+        Err(tonic::Status::already_exists(
+            "Row [v0] in table MockTable already exists",
+        ))
     });
+    let server = MockServer::serve(mock);
 
     let mut connection = server.connect();
-    let mut statement = append_ingest_statement(&mut connection);
-    statement.bind(ingest_batch(100)).expect("bind ingest data");
-
-    let error = statement
-        .execute_update()
-        .expect_err("a duplicate-key commit must fail the ingest, not be bisected away");
-
-    assert_eq!(error.status, AdbcStatus::Integrity, "got error: {error}");
-    assert!(
-        error.message.contains("MockTable"),
-        "the append remap should name the target table; got: {}",
-        error.message
-    );
-    assert_eq!(
-        commits.load(Ordering::SeqCst),
-        1,
-        "a non-mutation-limit error must not trigger the bisect retry"
-    );
+    let error = ingest(append_ingest_statement(&mut connection), 100).unwrap_err();
+    assert_eq!(error.status, AdbcStatus::Integrity, "{error}");
+    assert!(error.message.contains("MockTable"), "{error}");
+    assert_eq!(commits.lock().unwrap().len(), 1);
 }
 
 /// A cancelled commit may still apply on the server, so the error must say the outcome is unknown
@@ -1863,36 +1395,21 @@ fn ingest_does_not_bisect_a_non_mutation_limit_error() {
 /// annotated error unchanged.
 #[test]
 fn cancelled_ingest_commit_reports_ambiguous_outcome() {
-    let commits = Arc::new(AtomicUsize::new(0));
-    let commits_in_mock = commits.clone();
-    let server = start_server(move |mock| {
-        serve_begin_transaction(mock);
-        mock.expect_commit().returning(move |_| {
-            commits_in_mock.fetch_add(1, Ordering::SeqCst);
-            Err(tonic::Status::cancelled("commit cancelled by peer"))
-        });
+    let mut mock = MockSpanner::new();
+    serve_begin_transaction(&mut mock);
+    let commits = serve_commits_with(&mut mock, |_| {
+        Err(tonic::Status::cancelled("commit cancelled by peer"))
     });
+    let server = MockServer::serve(mock);
 
-    let mut connection = server.connect();
-    let mut statement = append_ingest_statement(&mut connection);
     // A single chunk, so no rows were committed before it.
-    statement.bind(ingest_batch(1)).expect("bind ingest data");
-
-    let error = statement
-        .execute_update()
-        .expect_err("a cancelled commit must fail the ingest");
-
-    assert_eq!(error.status, AdbcStatus::Cancelled, "got error: {error}");
-    assert!(
-        error.message.contains("outcome is unknown") && error.message.contains("duplicate rows"),
-        "a cancelled chunk commit must flag its ambiguous outcome, not imply exact accounting: {}",
-        error.message
-    );
-    assert_eq!(
-        commits.load(Ordering::SeqCst),
-        1,
-        "a cancelled chunk commit must not be retried; it could duplicate rows"
-    );
+    let mut connection = server.connect();
+    let error = ingest(append_ingest_statement(&mut connection), 1).unwrap_err();
+    assert_eq!(error.status, AdbcStatus::Cancelled, "{error}");
+    assert!(error.message.contains("outcome is unknown"), "{error}");
+    assert!(error.message.contains("duplicate rows"), "{error}");
+    // A retry could duplicate rows.
+    assert_eq!(commits.lock().unwrap().len(), 1);
 }
 
 /// A failed `append` commit triggers an `INFORMATION_SCHEMA.TABLES` probe to choose between
@@ -1902,55 +1419,33 @@ fn cancelled_ingest_commit_reports_ambiguous_outcome() {
 fn ingest_append_keeps_the_original_error_when_the_exists_probe_fails() {
     let probes = Arc::new(AtomicUsize::new(0));
     let probes_in_mock = probes.clone();
-    let server = start_server(move |mock| {
-        serve_begin_transaction(mock);
-        // Neither a constraint violation nor the mutation limit, both of which skip the probe.
-        mock.expect_commit().returning(|_| {
-            Err(tonic::Status::invalid_argument(
-                "Invalid value for column c in table MockTable",
-            ))
-        });
-        // The probe is the only query; rows are sent as mutations.
-        mock.expect_execute_streaming_sql().returning(move |_| {
-            probes_in_mock.fetch_add(1, Ordering::SeqCst);
-            Err(tonic::Status::permission_denied(
-                "spanner.databases.select denied on INFORMATION_SCHEMA",
-            ))
-        });
+    let mut mock = MockSpanner::new();
+    serve_begin_transaction(&mut mock);
+    // Neither a constraint violation nor the mutation limit, both of which skip the probe.
+    serve_commits_with(&mut mock, |_| {
+        Err(tonic::Status::invalid_argument(
+            "Invalid value for column c in table MockTable",
+        ))
     });
+    // The probe is the only query; rows are sent as mutations.
+    mock.expect_execute_streaming_sql().returning(move |_| {
+        probes_in_mock.fetch_add(1, Ordering::SeqCst);
+        Err(tonic::Status::permission_denied(
+            "spanner.databases.select denied on INFORMATION_SCHEMA",
+        ))
+    });
+    let server = MockServer::serve(mock);
 
     let mut connection = server.connect();
-    let mut statement = append_ingest_statement(&mut connection);
-    statement.bind(ingest_batch(1)).expect("bind ingest data");
-
-    let error = statement
-        .execute_update()
-        .expect_err("the failing commit must fail the ingest");
-
-    assert_eq!(
-        probes.load(Ordering::SeqCst),
-        1,
-        "the append remap must run the exists probe"
-    );
-    assert_eq!(
-        error.status,
-        AdbcStatus::InvalidArguments,
-        "the probe's own failure must not replace the ingest error; got: {error}"
-    );
+    let error = ingest(append_ingest_statement(&mut connection), 1).unwrap_err();
+    assert_eq!(probes.load(Ordering::SeqCst), 1);
+    assert_eq!(error.status, AdbcStatus::InvalidArguments, "{error}");
     assert!(
         error.message.contains("Invalid value for column c"),
-        "the original commit error's message must survive; got: {}",
-        error.message
+        "{error}"
     );
-    assert!(
-        !error.message.contains("INFORMATION_SCHEMA"),
-        "the probe's error must not surface in the ingest error; got: {}",
-        error.message
-    );
-    assert_eq!(
-        error.vendor_code, 3,
-        "the untouched original error keeps INVALID_ARGUMENT = 3; got: {error}"
-    );
+    assert!(!error.message.contains("INFORMATION_SCHEMA"), "{error}");
+    assert_eq!(error.vendor_code, 3, "{error}");
 }
 
 /// BatchWrite reports a failed group as a status inside the response stream, which takes a
@@ -1958,103 +1453,47 @@ fn ingest_append_keeps_the_original_error_when_the_exists_probe_fails() {
 /// details the same way.
 #[test]
 fn batch_write_group_failure_forwards_status_details() {
-    let batch_writes = Arc::new(AtomicUsize::new(0));
-    let writes_in_mock = batch_writes.clone();
-    let server = start_server(move |mock| {
-        mock.expect_batch_write().returning(move |_| {
-            writes_in_mock.fetch_add(1, Ordering::SeqCst);
-            Ok(stream_of(vec![Ok(batch_write_group_already_exists(0))]))
-        });
-    });
+    let mut mock = MockSpanner::new();
+    let writes = serve_batch_write(&mut mock, vec![batch_write_group_already_exists(0)]);
+    let server = MockServer::serve(mock);
 
-    let mut connection = server.connect();
-    let mut statement = batch_write_ingest_statement(&mut connection);
     // One row per mutation group.
-    statement.bind(ingest_batch(1)).expect("bind ingest data");
+    let mut connection = server.connect();
+    let error = ingest(batch_write_ingest_statement(&mut connection), 1).unwrap_err();
+    assert_eq!(writes.lock().unwrap().len(), 1);
+    assert_eq!(error.status, AdbcStatus::Integrity, "{error}");
+    assert_eq!(error.vendor_code, 6, "{error}");
+    assert!(error.message.contains("MockTable"), "{error}");
 
-    let error = statement
-        .execute_update()
-        .expect_err("a failed mutation group must fail the ingest");
-
-    assert_eq!(
-        batch_writes.load(Ordering::SeqCst),
-        1,
-        "the ingest must have gone through the BatchWrite RPC, not a write-only Commit"
-    );
-    assert_eq!(error.status, AdbcStatus::Integrity, "got error: {error}");
-    assert_eq!(
-        error.vendor_code, 6,
-        "vendor_code must carry ALREADY_EXISTS = 6; got error: {error}"
-    );
-    assert!(
-        error.message.contains("MockTable"),
-        "the append remap should name the target table; got: {}",
-        error.message
-    );
-
-    let details = error.details.as_ref().unwrap_or_else(|| {
-        panic!(
-            "the failing group carried a google.rpc.ErrorInfo detail; Error.details must be Some"
-        )
-    });
-    let (_, value) = details
-        .iter()
-        .find(|(key, _)| key == "google.rpc.errorinfo")
-        .unwrap_or_else(|| {
-            panic!(
-                "expected a `google.rpc.errorinfo` detail, got keys: {:?}",
-                details.iter().map(|(k, _)| k).collect::<Vec<_>>()
-            )
-        });
-    let json: serde_json::Value =
-        serde_json::from_slice(value).expect("the detail value is UTF-8 ProtoJSON");
-    assert_eq!(
-        json["@type"], "type.googleapis.com/google.rpc.ErrorInfo",
-        "the detail must self-describe as an ErrorInfo, got: {json}"
-    );
-    assert_eq!(
-        json["reason"], "DUPLICATE_KEY",
-        "the ErrorInfo's reason must round-trip what the mock sent, got: {json}"
-    );
-    assert_eq!(
-        json["domain"], "spanner.googleapis.com",
-        "the ErrorInfo's domain must round-trip what the mock sent, got: {json}"
-    );
+    let json = error_detail(&error, "google.rpc.errorinfo");
+    assert_eq!(json["@type"], "type.googleapis.com/google.rpc.ErrorInfo");
+    assert_eq!(json["reason"], "DUPLICATE_KEY");
+    assert_eq!(json["domain"], "spanner.googleapis.com");
 }
 
 /// BatchWrite is not atomic, so groups that applied before a failure in the same chunk count as
 /// committed.
 #[test]
 fn batch_write_folds_same_chunk_applied_rows_into_committed_count() {
-    let server = start_server(move |mock| {
-        mock.expect_batch_write().returning(move |_| {
-            Ok(stream_of(vec![
-                Ok(batch_write_groups_ok(vec![0, 1])),
-                Ok(batch_write_group_already_exists(2)),
-            ]))
-        });
-    });
+    let mut mock = MockSpanner::new();
+    serve_batch_write(
+        &mut mock,
+        vec![
+            batch_write_groups_ok(vec![0, 1]),
+            batch_write_group_already_exists(2),
+        ],
+    );
+    let server = MockServer::serve(mock);
 
     let mut connection = server.connect();
-    let mut statement = batch_write_ingest_statement(&mut connection);
-    statement.bind(ingest_batch(3)).expect("bind ingest data");
-
-    let error = statement
-        .execute_update()
-        .expect_err("a failed mutation group must fail the ingest");
-
-    assert_eq!(error.status, AdbcStatus::Integrity, "got error: {error}");
-    assert!(
-        error.message.contains("MockTable"),
-        "the append remap should name the target table; got: {}",
-        error.message
-    );
+    let error = ingest(batch_write_ingest_statement(&mut connection), 3).unwrap_err();
+    assert_eq!(error.status, AdbcStatus::Integrity, "{error}");
+    assert!(error.message.contains("MockTable"), "{error}");
     assert!(
         error
             .message
             .contains("2 row(s) from this bulk ingest were already committed"),
-        "the same-chunk applied groups must be reported; got: {}",
-        error.message
+        "{error}"
     );
 }
 
@@ -2062,74 +1501,36 @@ fn batch_write_folds_same_chunk_applied_rows_into_committed_count() {
 /// later commit would apply a partial batch.
 #[test]
 fn manual_ingest_conversion_failure_leaves_txn_buffer_untouched() {
-    let commit_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
-    let sizes_in_mock = commit_sizes.clone();
-    let server = start_server(move |mock| {
-        // Serves the append target's column probe and the query after the failure.
-        serve_streaming_sql_begin_aware(mock, &["d"], None);
-        serve_begin_transaction(mock);
-        mock.expect_commit().returning(move |request| {
-            sizes_in_mock
-                .lock()
-                .unwrap()
-                .push(request.into_inner().mutations.len());
-            commit_ok()
-        });
-    });
+    let mut mock = MockSpanner::new();
+    // Serves the append target's column probe and the query after the failure.
+    serve_queries(&mut mock, &["d"]);
+    serve_begin_transaction(&mut mock);
+    let commits = serve_commits(&mut mock);
+    let server = MockServer::serve(mock);
 
     let mut connection = server.connect();
     disable_autocommit(&mut connection);
-
     let mut statement = append_ingest_statement(&mut connection);
+    let dates = |days: Vec<i32>| {
+        RecordBatch::try_from_iter([("d", Arc::new(Date32Array::from(days)) as ArrayRef)]).unwrap()
+    };
 
-    let date_schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, false)]));
     // Row 1 is outside Spanner's DATE range, so conversion fails after row 0 was built.
-    let poisoned = RecordBatch::try_new(
-        date_schema.clone(),
-        vec![Arc::new(Date32Array::from(vec![0, i32::MAX]))],
-    )
-    .expect("build poisoned ingest batch");
-    statement.bind(poisoned).expect("bind poisoned batch");
-
-    let error = statement
-        .execute_update()
-        .expect_err("an out-of-range date must fail the ingest");
-    assert!(
-        error.message.contains("out of range"),
-        "the conversion failure must surface (folded into the append remap): {}",
-        error.message
-    );
+    statement.bind(dates(vec![0, i32::MAX])).unwrap();
+    let error = statement.execute_update().unwrap_err();
+    assert!(error.message.contains("out of range"), "{error}");
 
     // A query is rejected while DML is buffered, so this succeeds only with an empty buffer.
-    let mut probe = connection.new_statement().expect("new statement");
-    probe.set_sql_query("SELECT c FROM MockTable").unwrap();
-    let batches: Vec<_> = probe
-        .execute()
-        .expect("a query after the failed ingest must run; nothing may be buffered")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect probe batches");
-    assert_eq!(batches[0].num_rows(), 1);
-    connection
-        .rollback()
-        .expect("end the probe's query transaction");
+    assert_eq!(query(&mut connection, SELECT)[0].num_rows(), 1);
+    connection.rollback().unwrap();
 
-    let fixed = RecordBatch::try_new(date_schema, vec![Arc::new(Date32Array::from(vec![0, 1]))])
-        .expect("build fixed ingest batch");
-    statement.bind(fixed).expect("bind fixed batch");
-    assert_eq!(
-        statement
-            .execute_update()
-            .expect("re-ingest of fixed data must buffer"),
-        None,
-        "a manual-mode ingest buffers (returns None), not commits"
-    );
+    statement.bind(dates(vec![0, 1])).unwrap();
+    assert_eq!(statement.execute_update().unwrap(), None);
 
-    connection.commit().expect("commit the fixed batch");
-    assert_eq!(
-        *commit_sizes.lock().unwrap(),
-        [2],
-        "the commit must carry only the fixed batch's rows, none from the failed batch"
-    );
+    connection.commit().unwrap();
+    let commits = commits.lock().unwrap();
+    let sizes: Vec<_> = commits.iter().map(|c| c.mutations.len()).collect();
+    assert_eq!(sizes, [2], "only the fixed batch's rows");
 }
 
 /// `spanner.commit_stats` requests commit stats and exposes the server's mutation count. The
@@ -2140,80 +1541,48 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
     // Not derivable from the two ingested rows.
     const SCRIPTED_MUTATION_COUNT: i64 = 4242;
 
-    let commits: Arc<Mutex<Vec<v1::CommitRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let record_commits = commits.clone();
-    let server = start_server(move |mock| {
-        mock.expect_begin_transaction().returning(|_| {
-            Ok(tonic::Response::new(v1::Transaction {
-                id: b"mock-txn-1".to_vec(),
-                ..Default::default()
-            }))
-        });
-        // Without a precommit token the client commits once.
-        mock.expect_commit().returning(move |request| {
-            record_commits.lock().unwrap().push(request.into_inner());
-            Ok(tonic::Response::new(v1::CommitResponse {
-                commit_stats: Some(v1::commit_response::CommitStats {
-                    mutation_count: SCRIPTED_MUTATION_COUNT,
-                }),
-                ..Default::default()
-            }))
-        });
+    let mut mock = MockSpanner::new();
+    serve_begin_transaction(&mut mock);
+    // Without a precommit token the client commits once.
+    let commits = serve_commits_with(&mut mock, |_| {
+        Ok(tonic::Response::new(v1::CommitResponse {
+            commit_stats: Some(v1::commit_response::CommitStats {
+                mutation_count: SCRIPTED_MUTATION_COUNT,
+            }),
+            ..Default::default()
+        }))
     });
+    let server = MockServer::serve(mock);
 
     let mut connection = server.connect();
     let mut statement = append_ingest_statement(&mut connection);
-    statement
-        .set_option(
-            OptionStatement::Other(spanner_adbc::OPTION_COMMIT_STATS.into()),
-            OptionValue::String("true".into()),
-        )
-        .expect("enable commit stats");
-    statement
-        .set_option(
-            OptionStatement::Other(spanner_adbc::OPTION_MAX_COMMIT_DELAY.into()),
-            OptionValue::String("100ms".into()),
-        )
-        .expect("set the commit delay");
-
-    let rows = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("Id", DataType::Int64, false)])),
-        vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
-    )
-    .expect("build ingest batch");
-    statement.bind(rows).expect("bind ingest rows");
-
-    assert_eq!(
-        statement.execute_update().expect("append ingest"),
-        Some(2),
-        "the ingest reports the number of rows it applied"
+    configure(
+        &mut statement,
+        &[
+            (OPTION_COMMIT_STATS, "true"),
+            (OPTION_MAX_COMMIT_DELAY, "100ms"),
+        ],
     );
+    let ids = Int64Array::from(vec![1_i64, 2]);
+    let rows = RecordBatch::try_from_iter([("Id", Arc::new(ids) as ArrayRef)]).unwrap();
+    statement.bind(rows).unwrap();
+    assert_eq!(statement.execute_update().unwrap(), Some(2));
 
-    {
-        let commits = commits.lock().unwrap();
-        assert_eq!(commits.len(), 1, "the ingest chunk commits exactly once");
-        assert!(
-            commits[0].return_commit_stats,
-            "spanner.commit_stats=true must make the driver set return_commit_stats on the \
-             CommitRequest"
-        );
-        assert_eq!(
-            commits[0].max_commit_delay,
-            Some(prost_types::Duration {
-                seconds: 0,
-                nanos: 100_000_000,
-            }),
-            "spanner.commit.max_delay=100ms must reach the write-only ingest CommitRequest verbatim"
-        );
-    }
+    let commits = commits.lock().unwrap();
+    assert_eq!(commits.len(), 1);
+    assert!(commits[0].return_commit_stats);
+    assert_eq!(
+        commits[0].max_commit_delay,
+        Some(prost_types::Duration {
+            seconds: 0,
+            nanos: 100_000_000,
+        })
+    );
     assert_eq!(
         statement
-            .get_option_int(OptionStatement::Other(
-                spanner_adbc::OPTION_COMMIT_STATS_MUTATION_COUNT.into()
-            ))
-            .expect("mutation count must be readable after a stats-bearing commit"),
-        SCRIPTED_MUTATION_COUNT,
-        "the driver must read back the server's mutation_count verbatim"
+            .get_option_int(OPTION_COMMIT_STATS_MUTATION_COUNT.into())
+            .unwrap(),
+        SCRIPTED_MUTATION_COUNT
     );
 }
 
@@ -2221,92 +1590,34 @@ fn commit_stats_mutation_count_is_captured_from_the_commit_response() {
 /// connection, overridden per statement, and the connection's value on a manual commit.
 #[test]
 fn max_commit_delay_reaches_the_wire_on_runner_commits() {
-    const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
+    let mut mock = MockSpanner::new();
+    serve_begin_transaction(&mut mock);
+    serve_batch_dml(&mut mock);
+    let commits = serve_commits(&mut mock);
+    let server = MockServer::serve(mock);
+    let mut connection = server.connect();
 
-    fn delay_millis(millis: i32) -> Option<prost_types::Duration> {
+    assert_eq!(update(&mut connection, INSERT), Some(1));
+
+    configure(&mut connection, &[(OPTION_MAX_COMMIT_DELAY, "100ms")]);
+    assert_eq!(update(&mut connection, INSERT), Some(1));
+    let mut overriding = prepare(&mut connection, INSERT);
+    configure(&mut overriding, &[(OPTION_MAX_COMMIT_DELAY, "250ms")]);
+    assert_eq!(overriding.execute_update().unwrap(), Some(1));
+
+    disable_autocommit(&mut connection);
+    assert_eq!(update(&mut connection, INSERT), None);
+    connection.commit().unwrap();
+
+    let delay = |millis| {
         Some(prost_types::Duration {
             seconds: 0,
             nanos: millis * 1_000_000,
         })
-    }
-
-    let commits: Arc<Mutex<Vec<v1::CommitRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let record = commits.clone();
-    let server = start_server(move |mock| {
-        serve_begin_transaction(mock);
-        serve_batch_dml(mock, BatchDmlRequests::default());
-        mock.expect_commit().returning(move |request| {
-            record.lock().unwrap().push(request.into_inner());
-            commit_ok()
-        });
-    });
-
-    let mut connection = server.connect();
-
-    let run_autocommit_dml = |connection: &mut SpannerConnection, delay: Option<&str>| {
-        let mut statement = connection.new_statement().expect("new statement");
-        if let Some(value) = delay {
-            statement
-                .set_option(
-                    OptionStatement::Other(spanner_adbc::OPTION_MAX_COMMIT_DELAY.into()),
-                    OptionValue::String(value.into()),
-                )
-                .expect("set statement-level commit delay");
-        }
-        statement.set_sql_query(DML_SQL).unwrap();
-        assert_eq!(
-            statement.execute_update().expect("autocommit DML"),
-            Some(1),
-            "the scripted DML affects one row"
-        );
     };
-
-    run_autocommit_dml(&mut connection, None);
-
-    connection
-        .set_option(
-            OptionConnection::Other(spanner_adbc::OPTION_MAX_COMMIT_DELAY.into()),
-            OptionValue::String("100ms".into()),
-        )
-        .expect("set connection-level commit delay");
-    run_autocommit_dml(&mut connection, None);
-    run_autocommit_dml(&mut connection, Some("250ms"));
-
-    disable_autocommit(&mut connection);
-    let mut buffered = connection.new_statement().expect("new statement");
-    buffered.set_sql_query(DML_SQL).unwrap();
-    assert_eq!(
-        buffered.execute_update().expect("manual-mode DML buffers"),
-        None,
-        "manual-mode DML buffers (returns None), not commits"
-    );
-    connection.commit().expect("commit the buffered DML");
-
     let commits = commits.lock().unwrap();
-    assert_eq!(
-        commits.len(),
-        4,
-        "one commit per transaction: three autocommit DMLs, then the manual commit"
-    );
-    assert_eq!(
-        commits[0].max_commit_delay, None,
-        "with spanner.commit.max_delay unset, the driver must send no max_commit_delay at all"
-    );
-    assert_eq!(
-        commits[1].max_commit_delay,
-        delay_millis(100),
-        "an autocommit DML must commit with the connection's inherited 100ms delay"
-    );
-    assert_eq!(
-        commits[2].max_commit_delay,
-        delay_millis(250),
-        "the statement-level 250ms must override the connection's 100ms"
-    );
-    assert_eq!(
-        commits[3].max_commit_delay,
-        delay_millis(100),
-        "the manual-mode commit must carry the connection's 100ms delay"
-    );
+    let delays: Vec<_> = commits.iter().map(|c| c.max_commit_delay).collect();
+    assert_eq!(delays, [None, delay(100), delay(250), delay(100)]);
 }
 
 /// The ADBC isolation level reaches the inline begin of autocommit DML. Spanner implements
@@ -2317,19 +1628,15 @@ fn isolation_level_reaches_transaction_options_on_the_begin() {
     use adbc_core::constants::*;
     use v1::transaction_options::IsolationLevel;
 
-    const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
-
-    let batches: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let record = batches.clone();
-    let server = start_server(move |mock| {
-        serve_begin_transaction(mock);
-        serve_batch_dml(mock, record.clone());
-        mock.expect_commit().returning(|_| commit_ok());
-    });
+    let mut mock = MockSpanner::new();
+    serve_begin_transaction(&mut mock);
+    let batches = serve_batch_dml(&mut mock);
+    serve_commits(&mut mock);
+    let server = MockServer::serve(mock);
 
     // The requested level (`None` = never set) and the expected wire level. Unit tests in
     // src/connection/tests.rs cover the mapping of every ADBC level.
-    let cases: [(Option<&str>, IsolationLevel); 4] = [
+    let cases = [
         (None, IsolationLevel::Unspecified),
         (
             Some(ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ),
@@ -2346,45 +1653,20 @@ fn isolation_level_reaches_transaction_options_on_the_begin() {
     ];
 
     let mut connection = server.connect();
-    for (requested, _) in &cases {
+    for (requested, expected) in cases {
         if let Some(level) = requested {
             connection
-                .set_option(
-                    OptionConnection::IsolationLevel,
-                    OptionValue::String((*level).into()),
-                )
-                .expect("set the connection's isolation level");
+                .set_option(OptionConnection::IsolationLevel, level.into())
+                .unwrap();
         }
-        let mut statement = connection.new_statement().expect("new statement");
-        statement.set_sql_query(DML_SQL).unwrap();
+        assert_eq!(update(&mut connection, INSERT), Some(1));
         assert_eq!(
-            statement.execute_update().expect("autocommit DML"),
-            Some(1),
-            "the scripted DML affects one row"
+            inline_begin_options(batches.lock().unwrap().last().unwrap()).isolation_level,
+            expected as i32,
+            "{requested:?}"
         );
     }
-
-    let batches = batches.lock().unwrap();
-    assert_eq!(
-        batches.len(),
-        cases.len(),
-        "one ExecuteBatchDml per autocommit DML"
-    );
-    for ((requested, expected), request) in cases.iter().zip(batches.iter()) {
-        let Some(v1::transaction_selector::Selector::Begin(options)) = request
-            .transaction
-            .as_ref()
-            .and_then(|t| t.selector.as_ref())
-        else {
-            panic!("an autocommit DML must begin its read/write transaction inline: {request:?}");
-        };
-        assert_eq!(
-            options.isolation_level,
-            *expected as i32,
-            "isolation level {requested:?} must reach TransactionOptions as {}",
-            expected.as_str_name()
-        );
-    }
+    assert_eq!(batches.lock().unwrap().len(), cases.len());
 }
 
 /// A manual transaction with only mutations commits through the client's replay-protected
@@ -2392,115 +1674,51 @@ fn isolation_level_reaches_transaction_options_on_the_begin() {
 /// read/write runner, which begins inline.
 #[test]
 fn mutations_only_manual_commit_uses_the_write_only_path() {
-    let begins: Arc<Mutex<Vec<v1::BeginTransactionRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let commits: Arc<Mutex<Vec<v1::CommitRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let batch_dml: BatchDmlRequests = Arc::new(Mutex::new(Vec::new()));
-    let record_begins = begins.clone();
-    let record_commits = commits.clone();
-    let record_batch_dml = batch_dml.clone();
-    let server = start_server(move |mock| {
-        mock.expect_begin_transaction().returning(move |request| {
-            record_begins.lock().unwrap().push(request.into_inner());
-            Ok(tonic::Response::new(v1::Transaction {
-                id: b"mock-txn".to_vec(),
-                ..Default::default()
-            }))
-        });
-        serve_batch_dml(mock, record_batch_dml.clone());
-        mock.expect_commit().returning(move |request| {
-            record_commits.lock().unwrap().push(request.into_inner());
-            commit_ok()
-        });
-    });
+    let mut mock = MockSpanner::new();
+    let begins = serve_begin_transaction(&mut mock);
+    let batch_dml = serve_batch_dml(&mut mock);
+    let commits = serve_commits(&mut mock);
+    let server = MockServer::serve(mock);
 
     let mut connection = server.connect();
     disable_autocommit(&mut connection);
 
     let mut ingest = append_ingest_statement(&mut connection);
-
-    ingest.bind(ingest_batch(2)).expect("bind ingest rows");
-    assert_eq!(
-        ingest.execute_update().expect("manual-mode ingest buffers"),
-        None,
-        "a manual-mode ingest buffers (returns None), not commits"
-    );
-    connection
-        .commit()
-        .expect("commit the mutations-only transaction");
+    ingest.bind(ingest_batch(2)).unwrap();
+    assert_eq!(ingest.execute_update().unwrap(), None);
+    connection.commit().unwrap();
 
     {
         let begins = begins.lock().unwrap();
-        assert_eq!(
-            begins.len(),
-            1,
-            "a mutations-only commit begins exactly one (write-only) transaction"
-        );
-        assert!(
-            begins[0].mutation_key.is_some(),
-            "the write-only begin must carry a mutation_key: {:?}",
-            begins[0]
-        );
+        assert_eq!(begins.len(), 1);
+        assert!(begins[0].mutation_key.is_some(), "{:?}", begins[0]);
     }
-    assert_eq!(
-        batch_dml.lock().unwrap().len(),
-        0,
-        "a mutations-only commit must not issue ExecuteBatchDml"
-    );
+    assert_eq!(batch_dml.lock().unwrap().len(), 0);
     {
         let commits = commits.lock().unwrap();
-        assert_eq!(commits.len(), 1, "exactly one commit so far");
-        assert_eq!(
-            commits[0].mutations.len(),
-            2,
-            "the write-only commit must carry the ingest's two mutations"
-        );
-        assert!(
-            matches!(
-                commits[0].transaction,
-                Some(v1::commit_request::Transaction::TransactionId(_))
-            ),
-            "the replay-protected write commits by transaction id (never single-use): {:?}",
-            commits[0].transaction
-        );
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].mutations.len(), 2);
+        // A replay-protected write commits by transaction id, never single-use.
+        assert!(matches!(
+            commits[0].transaction,
+            Some(v1::commit_request::Transaction::TransactionId(_))
+        ));
     }
 
-    let mut dml = connection.new_statement().expect("new statement");
-    dml.set_sql_query("UPDATE MockTable SET c = 'x' WHERE TRUE")
-        .expect("set DML");
-    assert_eq!(
-        dml.execute_update().expect("manual-mode DML buffers"),
-        None,
-        "manual-mode DML buffers (returns None), not commits"
-    );
-    ingest.bind(ingest_batch(1)).expect("bind second ingest");
-    assert_eq!(
-        ingest.execute_update().expect("second ingest buffers"),
-        None
-    );
-    connection.commit().expect("commit the DML transaction");
+    assert_eq!(update(&mut connection, UPDATE), None);
+    ingest.bind(ingest_batch(1)).unwrap();
+    assert_eq!(ingest.execute_update().unwrap(), None);
+    connection.commit().unwrap();
 
+    assert_eq!(batch_dml.lock().unwrap().len(), 1);
     assert_eq!(
-        batch_dml.lock().unwrap().len(),
+        begins.lock().unwrap().len(),
         1,
-        "a commit with buffered DML must run it via ExecuteBatchDml (the read/write runner)"
+        "the DML commit begins inline"
     );
-    {
-        let begins = begins.lock().unwrap();
-        assert_eq!(
-            begins.len(),
-            1,
-            "the DML commit must begin inline, not with a second BeginTransaction: {begins:?}"
-        );
-    }
-    {
-        let commits = commits.lock().unwrap();
-        assert_eq!(commits.len(), 2, "the DML transaction adds a second commit");
-        assert_eq!(
-            commits[1].mutations.len(),
-            1,
-            "the runner's commit must carry the second ingest's buffered mutation"
-        );
-    }
+    let commits = commits.lock().unwrap();
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[1].mutations.len(), 1);
 }
 
 /// `adbc.connection.readonly` also blocks committing DML buffered before it was set, whether by
@@ -2508,395 +1726,185 @@ fn mutations_only_manual_commit_uses_the_write_only_path() {
 /// rollback, queries and query-transaction commits still work.
 #[test]
 fn read_only_connection_rejects_the_commit_of_buffered_dml() {
-    let batch_dml: BatchDmlRequests = Arc::new(Mutex::new(Vec::new()));
-    let commits = Arc::new(AtomicUsize::new(0));
-    let record_batch_dml = batch_dml.clone();
-    let count_commits = commits.clone();
-    let server = start_server(move |mock| {
-        serve_streaming_sql_begin_aware(mock, &["v0"], None);
-        serve_begin_transaction(mock);
-        serve_batch_dml(mock, record_batch_dml.clone());
-        mock.expect_commit().returning(move |_| {
-            count_commits.fetch_add(1, Ordering::SeqCst);
-            commit_ok()
-        });
-    });
+    let mut mock = MockSpanner::new();
+    serve_queries(&mut mock, &["v0"]);
+    serve_begin_transaction(&mut mock);
+    let batch_dml = serve_batch_dml(&mut mock);
+    let commits = serve_commits(&mut mock);
+    let server = MockServer::serve(mock);
 
     let dml_sqls = || {
-        batch_dml
-            .lock()
-            .unwrap()
-            .iter()
-            .flat_map(|request| request.statements.iter().map(|s| s.sql.clone()))
-            .collect::<Vec<_>>()
+        let requests = batch_dml.lock().unwrap();
+        let statements = requests.iter().flat_map(|request| &request.statements);
+        statements.map(|s| s.sql.clone()).collect::<Vec<_>>()
+    };
+    let set_read_only = |connection: &mut SpannerConnection, value: bool| {
+        connection
+            .set_option(OptionConnection::ReadOnly, value.into())
+            .unwrap();
     };
 
     let mut connection = server.connect();
     disable_autocommit(&mut connection);
 
-    let mut dml = connection.new_statement().expect("new statement");
-    dml.set_sql_query("UPDATE MockTable SET c = 'x' WHERE TRUE")
-        .expect("set DML");
-    assert_eq!(
-        dml.execute_update().expect("manual-mode DML buffers"),
-        None,
-        "manual-mode DML buffers (returns None), not commits"
-    );
-    let set_read_only = |connection: &mut SpannerConnection, value: &str| {
-        connection
-            .set_option(
-                OptionConnection::ReadOnly,
-                OptionValue::String(value.into()),
-            )
-            .expect("set adbc.connection.readonly");
-    };
-    set_read_only(&mut connection, "true");
+    let mut dml = prepare(&mut connection, UPDATE);
+    assert_eq!(dml.execute_update().unwrap(), None);
+    set_read_only(&mut connection, true);
 
-    let error = connection
-        .commit()
-        .expect_err("a read-only connection must not commit buffered DML");
+    let error = connection.commit().unwrap_err();
     assert_eq!(error.status, AdbcStatus::InvalidState);
-    assert!(
-        error.message.contains("read-only"),
-        "the rejection must name the read-only flag: {}",
-        error.message
-    );
+    assert!(error.message.contains("read-only"), "{error}");
 
     // Enabling autocommit would commit the pending work.
     let error = connection
-        .set_option(
-            OptionConnection::AutoCommit,
-            OptionValue::String("true".into()),
-        )
-        .expect_err("enabling autocommit must not commit buffered DML on a read-only connection");
+        .set_option(OptionConnection::AutoCommit, true.into())
+        .unwrap_err();
     assert_eq!(error.status, AdbcStatus::InvalidState);
     assert_eq!(
         connection
             .get_option_string(OptionConnection::AutoCommit)
-            .expect("read back autocommit"),
-        "false",
-        "a rejected toggle must leave the connection in manual mode"
+            .unwrap(),
+        "false"
     );
 
-    assert!(
-        dml_sqls().is_empty(),
-        "no DML may reach the wire while the connection is read-only: {:?}",
-        dml_sqls()
-    );
-    assert_eq!(
-        commits.load(Ordering::SeqCst),
-        0,
-        "no CommitRequest may reach the wire while the connection is read-only"
-    );
+    assert!(dml_sqls().is_empty());
+    assert_eq!(commits.lock().unwrap().len(), 0);
 
-    set_read_only(&mut connection, "false");
-    connection
-        .commit()
-        .expect("a writable connection commits the still-buffered DML");
-    assert_eq!(
-        dml_sqls(),
-        ["UPDATE MockTable SET c = 'x' WHERE TRUE"],
-        "the commit must replay exactly the DML buffered before the flag was set"
-    );
-    assert_eq!(commits.load(Ordering::SeqCst), 1, "exactly one commit");
+    set_read_only(&mut connection, false);
+    connection.commit().unwrap();
+    assert_eq!(dml_sqls(), [UPDATE]);
+    assert_eq!(commits.lock().unwrap().len(), 1);
 
-    dml.execute_update().expect("buffer DML again");
-    set_read_only(&mut connection, "true");
-    connection
-        .rollback()
-        .expect("rollback must work on a read-only connection");
+    dml.execute_update().unwrap();
+    set_read_only(&mut connection, true);
+    connection.rollback().unwrap();
 
-    let mut query = connection.new_statement().expect("new statement");
-    query
-        .set_sql_query("SELECT c FROM MockTable")
-        .expect("set query");
-    let batches: Vec<_> = query
-        .execute()
-        .expect("queries still run on a read-only connection")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect query batches");
-    assert_eq!(batches[0].num_rows(), 1);
-    connection
-        .commit()
-        .expect("committing a query transaction writes nothing, so read-only must allow it");
+    assert_eq!(query(&mut connection, SELECT)[0].num_rows(), 1);
+    // A query transaction writes nothing, so read-only allows its commit.
+    connection.commit().unwrap();
 
-    assert_eq!(
-        dml_sqls(),
-        ["UPDATE MockTable SET c = 'x' WHERE TRUE"],
-        "the rolled-back DML must never reach the wire"
-    );
-    assert_eq!(
-        commits.load(Ordering::SeqCst),
-        1,
-        "neither the rollback nor the query transaction's commit issues a CommitRequest"
-    );
+    assert_eq!(dml_sqls(), [UPDATE]);
+    assert_eq!(commits.lock().unwrap().len(), 1);
 }
 
-// ---------------------------------------------------------------------------
-// Read options on the wire: spanner.read.staleness and spanner.directed_read
-// ---------------------------------------------------------------------------
-
 const READ_TIMESTAMP_RFC3339: &str = "2026-07-07T00:00:00Z";
-const READ_TIMESTAMP_UNIX: i64 = 1_783_382_400;
+const READ_TIMESTAMP: prost_types::Timestamp = prost_types::Timestamp {
+    seconds: 1_783_382_400,
+    nanos: 0,
+};
+const HALF_A_SECOND: prost_types::Duration = prost_types::Duration {
+    seconds: 0,
+    nanos: 500_000_000,
+};
+const TEN_SECONDS: prost_types::Duration = prost_types::Duration {
+    seconds: 10,
+    nanos: 0,
+};
 
-fn single_use_read_only_bound(
-    selector: Option<&v1::TransactionSelector>,
-) -> v1::transaction_options::read_only::TimestampBound {
-    let selector = selector
-        .and_then(|s| s.selector.as_ref())
-        .expect("the query must carry a transaction selector");
-    let v1::transaction_selector::Selector::SingleUse(options) = selector else {
+fn single_use_read_only_bound(selector: &Selector) -> WireBound {
+    let Selector::SingleUse(options) = selector else {
         panic!("a plain autocommit query must run single-use, got: {selector:?}");
     };
     read_only_bound(options)
 }
 
-fn read_only_bound(
-    options: &v1::TransactionOptions,
-) -> v1::transaction_options::read_only::TimestampBound {
+fn read_only_bound(options: &v1::TransactionOptions) -> WireBound {
     let Some(v1::transaction_options::Mode::ReadOnly(read_only)) = &options.mode else {
         panic!("expected read-only transaction options, got: {options:?}");
     };
-    read_only
-        .timestamp_bound
-        .expect("the read-only transaction options must carry a timestamp bound")
+    read_only.timestamp_bound.unwrap()
 }
 
 /// Each `spanner.read.staleness` form reaches the single-use selector, inherited from the
 /// connection or set on the statement.
 #[test]
 fn read_staleness_reaches_the_wire_on_single_use_queries() {
-    use v1::transaction_options::read_only::TimestampBound as WireBound;
-
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let record = requests.clone();
-    let server = start_server(move |mock| {
-        serve_streaming_sql_begin_aware(mock, &["v1"], Some(record));
-    });
-
+    let (server, requests) = query_server(&["v1"]);
     let mut connection = server.connect();
-    connection
-        .set_option(
-            OptionConnection::Other(spanner_adbc::OPTION_READ_STALENESS.into()),
-            OptionValue::String("exact:10s".into()),
-        )
-        .expect("set connection-level staleness");
+    configure(&mut connection, &[(OPTION_READ_STALENESS, "exact:10s")]);
 
-    let mut run_query = |staleness: Option<&str>| {
-        let mut statement = connection.new_statement().expect("new statement");
+    let cases = [
+        (None, WireBound::ExactStaleness(TEN_SECONDS)),
+        (
+            Some("max:500ms".to_string()),
+            WireBound::MaxStaleness(HALF_A_SECOND),
+        ),
+        (
+            Some(format!("read:{READ_TIMESTAMP_RFC3339}")),
+            WireBound::ReadTimestamp(READ_TIMESTAMP),
+        ),
+        (
+            Some(format!("min:{READ_TIMESTAMP_RFC3339}")),
+            WireBound::MinReadTimestamp(READ_TIMESTAMP),
+        ),
+    ];
+    for (index, (staleness, expected)) in cases.iter().enumerate() {
+        let mut statement = prepare(&mut connection, SELECT);
         if let Some(value) = staleness {
-            statement
-                .set_option(
-                    OptionStatement::Other(spanner_adbc::OPTION_READ_STALENESS.into()),
-                    OptionValue::String(value.into()),
-                )
-                .expect("set statement-level staleness");
+            configure(&mut statement, &[(OPTION_READ_STALENESS, value)]);
         }
-        statement.set_sql_query("SELECT c FROM MockTable").unwrap();
-        statement
-            .execute()
-            .expect("query against mock server")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect batches");
-    };
-    run_query(None);
-    run_query(Some("max:500ms"));
-    run_query(Some(&format!("read:{READ_TIMESTAMP_RFC3339}")));
-    run_query(Some(&format!("min:{READ_TIMESTAMP_RFC3339}")));
-
-    let selectors = transaction_selectors(&requests);
-    assert_eq!(selectors.len(), 4, "one request per staleness form");
-    let bounds: Vec<WireBound> = selectors
-        .iter()
-        .map(|s| single_use_read_only_bound(s.as_ref()))
-        .collect();
-    assert_eq!(
-        bounds[0],
-        WireBound::ExactStaleness(prost_types::Duration {
-            seconds: 10,
-            nanos: 0,
-        }),
-        "exact:10s (inherited from the connection) must arrive as exact_staleness"
-    );
-    assert_eq!(
-        bounds[1],
-        WireBound::MaxStaleness(prost_types::Duration {
-            seconds: 0,
-            nanos: 500_000_000,
-        }),
-        "max:500ms (the statement's override of the connection value) must arrive as max_staleness"
-    );
-    assert_eq!(
-        bounds[2],
-        WireBound::ReadTimestamp(prost_types::Timestamp {
-            seconds: READ_TIMESTAMP_UNIX,
-            nanos: 0,
-        }),
-        "read:<rfc3339> must arrive as read_timestamp"
-    );
-    assert_eq!(
-        bounds[3],
-        WireBound::MinReadTimestamp(prost_types::Timestamp {
-            seconds: READ_TIMESTAMP_UNIX,
-            nanos: 0,
-        }),
-        "min:<rfc3339> must arrive as min_read_timestamp"
-    );
+        fetch(&mut statement);
+        assert_eq!(
+            single_use_read_only_bound(&selectors(&requests)[index]),
+            *expected,
+            "{staleness:?}"
+        );
+    }
+    assert_eq!(selectors(&requests).len(), cases.len());
 }
 
 /// Staleness also applies to `execute_schema` (single-use) and to the `get_objects` snapshot,
 /// which begins a read-only transaction inline.
 #[test]
 fn read_staleness_reaches_the_wire_on_metadata_reads() {
-    use adbc_core::options::ObjectDepth;
-    use v1::transaction_options::read_only::TimestampBound as WireBound;
-
-    let expected = WireBound::ExactStaleness(prost_types::Duration {
-        seconds: 10,
-        nanos: 0,
-    });
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let server = start_server({
-        let record = requests.clone();
-        move |mock| serve_streaming_sql_begin_aware(mock, &["default"], Some(record))
-    });
-
+    let expected = WireBound::ExactStaleness(TEN_SECONDS);
+    let (server, requests) = query_server(&["default"]);
     let mut connection = server.connect();
-    connection
-        .set_option(
-            OptionConnection::Other(spanner_adbc::OPTION_READ_STALENESS.into()),
-            OptionValue::String("exact:10s".into()),
-        )
-        .expect("set connection-level staleness");
+    configure(&mut connection, &[(OPTION_READ_STALENESS, "exact:10s")]);
 
-    let mut statement = connection.new_statement().expect("new statement");
-    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
-    statement.execute_schema().expect("execute_schema probe");
-    {
-        let selectors = transaction_selectors(&requests);
-        assert_eq!(selectors.len(), 1, "one PLAN probe request");
-        assert_eq!(
-            single_use_read_only_bound(selectors[0].as_ref()),
-            expected,
-            "the execute_schema PLAN probe must carry the connection's exact:10s staleness"
-        );
-    }
+    prepare(&mut connection, SELECT).execute_schema().unwrap();
+    let probes = selectors(&requests);
+    assert_eq!(probes.len(), 1);
+    assert_eq!(single_use_read_only_bound(&probes[0]), expected);
 
     // At `Schemas` depth, get_objects issues only the SCHEMATA query.
     let reader = connection
         .get_objects(ObjectDepth::Schemas, None, None, None, None, None)
-        .expect("get_objects");
-    reader
-        .collect::<Result<Vec<_>, _>>()
-        .expect("drain get_objects");
-    {
-        let selectors = transaction_selectors(&requests);
-        let begin = selectors
-            .iter()
-            .find_map(|s| match s.as_ref().and_then(|s| s.selector.as_ref()) {
-                Some(v1::transaction_selector::Selector::Begin(options)) => Some(options),
-                _ => None,
-            })
-            .expect("get_objects must begin its read-only transaction inline");
-        assert_eq!(
-            read_only_bound(begin),
-            expected,
-            "the get_objects snapshot must carry the connection's exact:10s staleness"
-        );
-    }
-}
-
-/// Runs a query with two bound rows and returns each request's transaction selector. Multiple rows
-/// share a multi-use read-only transaction that the first request begins inline.
-fn bound_query_transaction_selectors(staleness: &str) -> Vec<Option<v1::TransactionSelector>> {
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let record = requests.clone();
-    let server = start_server(move |mock| {
-        serve_streaming_sql_begin_aware(mock, &["v"], Some(record));
+        .unwrap();
+    reader.collect::<Result<Vec<_>, _>>().unwrap();
+    let begin = selectors(&requests).into_iter().find_map(|s| match s {
+        Selector::Begin(options) => Some(options),
+        _ => None,
     });
-
-    let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(
-            OptionStatement::Other(spanner_adbc::OPTION_READ_STALENESS.into()),
-            OptionValue::String(staleness.into()),
-        )
-        .expect("set staleness");
-    statement
-        .set_sql_query("SELECT c FROM MockTable WHERE c = @val")
-        .expect("set query");
-    let rows = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("val", DataType::Utf8, false)])),
-        vec![Arc::new(StringArray::from(vec!["a", "b"]))],
-    )
-    .expect("build bound batch");
-    statement.bind(rows).expect("bind rows");
-    let total: usize = statement
-        .execute()
-        .expect("bound query against mock server")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect batches")
-        .iter()
-        .map(RecordBatch::num_rows)
-        .sum();
-    assert_eq!(total, 2, "one result row per bound row ({staleness})");
-
-    transaction_selectors(&requests)
+    assert_eq!(read_only_bound(&begin.unwrap()), expected);
 }
 
 /// Spanner allows bounded staleness only on single-use transactions, so a multi-row bound query
-/// pins `max:<d>` to exact staleness `<d>` and `min:<t>` to read timestamp `<t>`.
+/// pins `max:<d>` to exact staleness `<d>` and `min:<t>` to read timestamp `<t>`. Multiple rows
+/// share a multi-use read-only transaction that the first request begins inline.
 #[test]
 fn bounded_staleness_is_pinned_for_multi_use_bound_queries() {
-    use v1::transaction_options::read_only::TimestampBound as WireBound;
-
-    let cases = [
+    for (staleness, expected_pin) in [
         (
-            "max:500ms",
-            WireBound::ExactStaleness(prost_types::Duration {
-                seconds: 0,
-                nanos: 500_000_000,
-            }),
+            "max:500ms".to_string(),
+            WireBound::ExactStaleness(HALF_A_SECOND),
         ),
         (
-            &format!("min:{READ_TIMESTAMP_RFC3339}") as &str,
-            WireBound::ReadTimestamp(prost_types::Timestamp {
-                seconds: READ_TIMESTAMP_UNIX,
-                nanos: 0,
-            }),
+            format!("min:{READ_TIMESTAMP_RFC3339}"),
+            WireBound::ReadTimestamp(READ_TIMESTAMP),
         ),
-    ];
-    for (staleness, expected_pin) in cases {
-        let selectors = bound_query_transaction_selectors(staleness);
-        assert_eq!(
-            selectors.len(),
-            2,
-            "two bound rows must produce two statements ({staleness})"
-        );
+    ] {
+        let (server, requests) = query_server(&["v"]);
+        let mut connection = server.connect();
+        let mut statement = prepare(&mut connection, "SELECT c FROM MockTable WHERE c = @val");
+        configure(&mut statement, &[(OPTION_READ_STALENESS, &staleness)]);
+        statement.bind(ingest_batch(2)).unwrap();
+        assert_eq!(row_count(&fetch(&mut statement)), 2, "{staleness}");
 
-        let first = selectors[0]
-            .as_ref()
-            .and_then(|s| s.selector.as_ref())
-            .expect("the first statement must carry a transaction selector");
-        let v1::transaction_selector::Selector::Begin(options) = first else {
-            panic!("the first bound-row statement must begin the transaction, got: {first:?}");
-        };
-        assert_eq!(
-            read_only_bound(options),
-            expected_pin,
-            "{staleness} must be pinned to its most-stale legal multi-use equivalent"
-        );
-
-        let second = selectors[1]
-            .as_ref()
-            .and_then(|s| s.selector.as_ref())
-            .expect("the second statement must carry a transaction selector");
-        assert_eq!(
-            second,
-            &v1::transaction_selector::Selector::Id(b"inline-txn".to_vec()),
-            "later bound-row statements must reuse the begun transaction ({staleness})"
-        );
+        let selectors = selectors(&requests);
+        assert_eq!(selectors.len(), 2, "{staleness}");
+        let options = assert_shared_read_only(&selectors, b"inline-txn");
+        assert_eq!(read_only_bound(options), expected_pin, "{staleness}");
     }
 }
 
@@ -2907,88 +1915,40 @@ fn bounded_staleness_is_pinned_for_multi_use_bound_queries() {
 fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
     use v1::directed_read_options as dro;
 
-    const QUERY_SQL: &str = "SELECT c FROM MockTable";
     const OVERRIDE_QUERY_SQL: &str = "SELECT c FROM OtherMockTable";
-    const INSERT_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
     const RETURNING_SQL: &str = "INSERT INTO MockTable (c) VALUES ('y') THEN RETURN c";
 
-    let streaming = Arc::new(Mutex::new(Vec::new()));
-    let batch_dml: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let record_streaming = streaming.clone();
-    let record_batch_dml = batch_dml.clone();
-    let server = start_server(move |mock| {
-        serve_begin_transaction(mock);
-        serve_streaming_sql_begin_aware(mock, &["v"], Some(record_streaming));
-        serve_batch_dml(mock, record_batch_dml.clone());
-        mock.expect_commit().returning(|_| commit_ok());
-    });
+    let mut mock = MockSpanner::new();
+    serve_begin_transaction(&mut mock);
+    let streaming = serve_queries(&mut mock, &["v"]);
+    let batch_dml = serve_batch_dml(&mut mock);
+    serve_commits(&mut mock);
+    let server = MockServer::serve(mock);
 
     let mut connection = server.connect();
-    connection
-        .set_option(
-            OptionConnection::Other(spanner_adbc::OPTION_DIRECTED_READ.into()),
-            OptionValue::String("include:us-east1:read_only".into()),
-        )
-        .expect("set connection-level directed read");
-
-    let mut query = connection.new_statement().expect("new statement");
-    query.set_sql_query(QUERY_SQL).unwrap();
-    query
-        .execute()
-        .expect("query against mock server")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect batches");
-
-    let mut override_query = connection.new_statement().expect("new statement");
-    override_query
-        .set_option(
-            OptionStatement::Other(spanner_adbc::OPTION_DIRECTED_READ.into()),
-            OptionValue::String("exclude:eu-west1".into()),
-        )
-        .expect("set statement-level directed read");
-    override_query.set_sql_query(OVERRIDE_QUERY_SQL).unwrap();
-    override_query
-        .execute()
-        .expect("override query against mock server")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect batches");
-
-    let mut insert = connection.new_statement().expect("new statement");
-    insert.set_sql_query(INSERT_SQL).unwrap();
-    assert_eq!(
-        insert.execute_update().expect("autocommit insert"),
-        Some(1),
-        "the scripted batch-DML row count must surface"
+    configure(
+        &mut connection,
+        &[(OPTION_DIRECTED_READ, "include:us-east1:read_only")],
     );
 
-    let mut returning = connection.new_statement().expect("new statement");
-    returning.set_sql_query(RETURNING_SQL).unwrap();
-    assert_eq!(
-        returning.execute_update().expect("THEN RETURN insert"),
-        Some(1),
-        "the drained THEN RETURN row count must surface"
+    query(&mut connection, SELECT);
+    let mut override_query = prepare(&mut connection, OVERRIDE_QUERY_SQL);
+    configure(
+        &mut override_query,
+        &[(OPTION_DIRECTED_READ, "exclude:eu-west1")],
     );
+    fetch(&mut override_query);
+    assert_eq!(update(&mut connection, INSERT), Some(1));
+    assert_eq!(update(&mut connection, RETURNING_SQL), Some(1));
 
     let streaming = streaming.lock().unwrap();
-    let directed_for = |sql: &str| -> Option<v1::DirectedReadOptions> {
-        streaming
-            .iter()
-            .find(|request| request.sql == sql)
-            .unwrap_or_else(|| {
-                panic!(
-                    "no ExecuteSql request seen for {sql:?}; saw: {:?}",
-                    streaming
-                        .iter()
-                        .map(|request| &request.sql)
-                        .collect::<Vec<_>>()
-                )
-            })
-            .directed_read_options
-            .clone()
+    let directed_for = |sql: &str| {
+        let request = streaming.iter().find(|request| request.sql == sql);
+        request.unwrap().directed_read_options.clone()
     };
 
     assert_eq!(
-        directed_for(QUERY_SQL),
+        directed_for(SELECT),
         Some(v1::DirectedReadOptions {
             replicas: Some(dro::Replicas::IncludeReplicas(dro::IncludeReplicas {
                 replica_selections: vec![dro::ReplicaSelection {
@@ -2997,10 +1957,8 @@ fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
                 }],
                 auto_failover_disabled: false,
             })),
-        }),
-        "the connection-level include list must land on ExecuteSqlRequest.directed_read_options"
+        })
     );
-
     assert_eq!(
         directed_for(OVERRIDE_QUERY_SQL),
         Some(v1::DirectedReadOptions {
@@ -3010,120 +1968,53 @@ fn directed_read_reaches_the_wire_on_queries_but_never_on_dml() {
                     r#type: dro::replica_selection::Type::Unspecified as i32,
                 }],
             })),
-        }),
-        "a statement-level value must override the inherited connection-level one on the wire"
+        })
     );
-
-    assert_eq!(
-        directed_for(RETURNING_SQL),
-        None,
-        "DML must never carry directed-read options, even with the connection option set"
-    );
+    assert_eq!(directed_for(RETURNING_SQL), None);
 
     let batch_dml = batch_dml.lock().unwrap();
-    assert_eq!(
-        batch_dml.len(),
-        1,
-        "the plain INSERT must ride a single ExecuteBatchDml"
-    );
+    assert_eq!(batch_dml.len(), 1);
     assert_eq!(batch_dml[0].statements.len(), 1);
-    assert_eq!(batch_dml[0].statements[0].sql, INSERT_SQL);
+    assert_eq!(batch_dml[0].statements[0].sql, INSERT);
 }
 
 /// The optimizer version and statistics package reach `query_options`, inherited, overridden and
 /// partly overridden.
 #[test]
 fn query_optimizer_options_reach_the_wire_on_queries() {
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let record = requests.clone();
-    let server = start_server(move |mock| {
-        serve_streaming_sql_begin_aware(mock, &["v1"], Some(record));
-    });
+    const VERSION: &str = OPTION_QUERY_OPTIMIZER_VERSION;
+    const PACKAGE: &str = OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE;
 
+    let (server, requests) = query_server(&["v1"]);
     let mut connection = server.connect();
-    for (key, value) in [
-        (spanner_adbc::OPTION_QUERY_OPTIMIZER_VERSION, "6"),
+    configure(
+        &mut connection,
+        &[(VERSION, "6"), (PACKAGE, "auto_20260101")],
+    );
+
+    let cases: [(&[_], _, _); 3] = [
+        (&[], "6", "auto_20260101"),
         (
-            spanner_adbc::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE,
-            "auto_20260101",
+            &[(VERSION, "latest"), (PACKAGE, "custom_package")],
+            "latest",
+            "custom_package",
         ),
-    ] {
-        connection
-            .set_option(
-                OptionConnection::Other(key.into()),
-                OptionValue::String(value.into()),
-            )
-            .expect("set the connection-level query optimizer option");
+        (&[(VERSION, "7")], "7", "auto_20260101"),
+    ];
+    for (overrides, version, package) in cases {
+        let mut statement = prepare(&mut connection, SELECT);
+        configure(&mut statement, overrides);
+        fetch(&mut statement);
+        assert_eq!(
+            requests.lock().unwrap().last().unwrap().query_options,
+            Some(v1::execute_sql_request::QueryOptions {
+                optimizer_version: version.to_string(),
+                optimizer_statistics_package: package.to_string(),
+            }),
+            "{overrides:?}"
+        );
     }
-
-    let mut run_query = |sql: &str, overrides: &[(&str, &str)]| {
-        let mut statement = connection.new_statement().expect("new statement");
-        for (key, value) in overrides {
-            statement
-                .set_option(
-                    OptionStatement::Other((*key).into()),
-                    OptionValue::String((*value).into()),
-                )
-                .expect("set the statement-level query optimizer option");
-        }
-        statement.set_sql_query(sql).unwrap();
-        statement
-            .execute()
-            .expect("query against mock server")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect batches");
-    };
-    run_query("SELECT c FROM Inherited", &[]);
-    run_query(
-        "SELECT c FROM Overridden",
-        &[
-            (spanner_adbc::OPTION_QUERY_OPTIMIZER_VERSION, "latest"),
-            (
-                spanner_adbc::OPTION_QUERY_OPTIMIZER_STATISTICS_PACKAGE,
-                "custom_package",
-            ),
-        ],
-    );
-    run_query(
-        "SELECT c FROM PartlyOverridden",
-        &[(spanner_adbc::OPTION_QUERY_OPTIMIZER_VERSION, "7")],
-    );
-
-    let requests = requests.lock().unwrap();
-    let options_for = |sql: &str| {
-        requests
-            .iter()
-            .find(|request| request.sql == sql)
-            .unwrap_or_else(|| panic!("no ExecuteSqlRequest for {sql:?}"))
-            .query_options
-            .clone()
-    };
-    assert_eq!(requests.len(), 3, "one request per query");
-    assert_eq!(
-        options_for("SELECT c FROM Inherited"),
-        Some(v1::execute_sql_request::QueryOptions {
-            optimizer_version: "6".to_string(),
-            optimizer_statistics_package: "auto_20260101".to_string(),
-        }),
-        "both connection-level values must be inherited onto the request's query_options"
-    );
-    assert_eq!(
-        options_for("SELECT c FROM Overridden"),
-        Some(v1::execute_sql_request::QueryOptions {
-            optimizer_version: "latest".to_string(),
-            optimizer_statistics_package: "custom_package".to_string(),
-        }),
-        "statement-level values must override the inherited connection-level ones on the wire"
-    );
-    assert_eq!(
-        options_for("SELECT c FROM PartlyOverridden"),
-        Some(v1::execute_sql_request::QueryOptions {
-            optimizer_version: "7".to_string(),
-            optimizer_statistics_package: "auto_20260101".to_string(),
-        }),
-        "the two knobs are independent: overriding the version must leave the inherited \
-         statistics package in place"
-    );
+    assert_eq!(requests.lock().unwrap().len(), cases.len());
 }
 
 /// An autocommit DML batch is the whole transaction, so it sets `last_statements`. DML replayed by
@@ -3133,239 +2024,96 @@ fn autocommit_batch_dml_is_flagged_last_statements_but_manual_commit_is_not() {
     const BATCH_SQL: &str =
         "DELETE FROM MockTable WHERE TRUE; INSERT INTO MockTable (c) VALUES ('x')";
 
-    let batch_dml: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let record = batch_dml.clone();
-    let server = start_server(move |mock| {
-        serve_begin_transaction(mock);
-        serve_batch_dml(mock, record.clone());
-        mock.expect_commit().returning(|_| commit_ok());
-    });
+    let mut mock = MockSpanner::new();
+    serve_begin_transaction(&mut mock);
+    let batch_dml = serve_batch_dml(&mut mock);
+    serve_commits(&mut mock);
+    let server = MockServer::serve(mock);
 
     let mut connection = server.connect();
-
-    let mut batch = connection.new_statement().expect("new statement");
-    batch.set_sql_query(BATCH_SQL).unwrap();
-    assert_eq!(
-        batch.execute_update().expect("autocommit `;`-batch"),
-        Some(2),
-        "the summed batch-DML row count must surface"
-    );
+    assert_eq!(update(&mut connection, BATCH_SQL), Some(2));
 
     disable_autocommit(&mut connection);
-    let mut buffered = connection.new_statement().expect("new statement");
-    buffered.set_sql_query(BATCH_SQL).unwrap();
-    assert_eq!(
-        buffered.execute_update().expect("buffered `;`-batch"),
-        None,
-        "DML in manual mode buffers (returns None), not commits"
-    );
-    connection.commit().expect("commit the buffered DML");
+    assert_eq!(update(&mut connection, BATCH_SQL), None);
+    connection.commit().unwrap();
 
     let seen = batch_dml.lock().unwrap();
-    assert_eq!(
-        seen.len(),
-        2,
-        "one ExecuteBatchDml per transaction: the autocommit batch, then the manual commit"
-    );
-    assert_eq!(
-        seen[0].statements.len(),
-        2,
-        "both statements ride one batch"
-    );
-    assert!(
-        seen[0].last_statements,
-        "a mutation-free autocommit `;`-batch is the transaction's entire content, so it must \
-         be flagged as the transaction's last request"
-    );
-    assert_eq!(seen[1].statements.len(), 2, "the commit replays the buffer");
-    assert!(
-        !seen[1].last_statements,
-        "buffered manual-mode DML replayed at commit must NOT be flagged; the commit may still \
-         apply buffered mutations after the batch executes"
-    );
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].statements.len(), 2);
+    assert!(seen[0].last_statements);
+    assert_eq!(seen[1].statements.len(), 2);
+    assert!(!seen[1].last_statements);
 }
 
 /// BatchWrite carries the priority, transaction tag and change-stream exclusion. Spanner ignores
 /// request tags on BatchWrite, so none is sent.
 #[test]
 fn batch_write_carries_the_request_options_and_change_stream_exclusion() {
-    let requests: Arc<Mutex<Vec<v1::BatchWriteRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let record = requests.clone();
-    let server = start_server(move |mock| {
-        mock.expect_batch_write().returning(move |request| {
-            record.lock().unwrap().push(request.into_inner());
-            Ok(stream_of(vec![Ok(v1::BatchWriteResponse {
-                indexes: vec![0],
-                status: Some(spanner_grpc_mock::google::rpc::Status {
-                    code: 0,
-                    message: "OK".into(),
-                    details: vec![],
-                }),
-                ..Default::default()
-            })]))
-        });
-    });
+    let mut mock = MockSpanner::new();
+    let requests = serve_batch_write(
+        &mut mock,
+        vec![v1::BatchWriteResponse {
+            indexes: vec![0],
+            status: ok_status(),
+            ..Default::default()
+        }],
+    );
+    let server = MockServer::serve(mock);
 
     let mut connection = server.connect();
-    for (key, value) in [
-        (spanner_adbc::OPTION_REQUEST_PRIORITY, "high"),
-        (spanner_adbc::OPTION_TRANSACTION_TAG, "nightly-etl"),
-        (spanner_adbc::OPTION_REQUEST_TAG, "ignored-by-batch-write"),
-    ] {
-        connection
-            .set_option(
-                OptionConnection::Other(key.into()),
-                OptionValue::String(value.into()),
-            )
-            .expect("set the connection-level request option");
-    }
+    configure(
+        &mut connection,
+        &[
+            (OPTION_REQUEST_PRIORITY, "high"),
+            (OPTION_TRANSACTION_TAG, "nightly-etl"),
+            (OPTION_REQUEST_TAG, "ignored-by-batch-write"),
+        ],
+    );
 
-    let run_ingest = |connection: &mut SpannerConnection| {
-        let mut statement = batch_write_ingest_statement(connection);
-        statement.bind(ingest_batch(1)).expect("bind ingest data");
-        assert_eq!(
-            statement.execute_update().expect("BatchWrite ingest"),
-            Some(1)
-        );
-    };
-
-    run_ingest(&mut connection);
+    let statement = batch_write_ingest_statement(&mut connection);
+    assert_eq!(ingest(statement, 1).unwrap(), Some(1));
     {
         let seen = requests.lock().unwrap();
-        assert_eq!(seen.len(), 1, "one chunk, one BatchWrite request");
-        let options = seen[0]
-            .request_options
-            .as_ref()
-            .expect("the BatchWrite must carry RequestOptions");
-        assert_eq!(
-            options.priority,
-            v1::request_options::Priority::High as i32,
-            "spanner.request.priority must reach the BatchWrite request"
-        );
-        assert_eq!(
-            options.transaction_tag, "nightly-etl",
-            "spanner.transaction.tag must tag the transactions the BatchWrite creates"
-        );
-        assert_eq!(
-            options.request_tag, "",
-            "spanner.request.tag must NOT be sent; Spanner ignores per-request tags on BatchWrite"
-        );
-        assert!(
-            !seen[0].exclude_txn_from_change_streams,
-            "with spanner.transaction.exclude_from_change_streams unset, the default (false) must \
-             go out"
-        );
+        assert_eq!(seen.len(), 1);
+        let options = seen[0].request_options.as_ref().unwrap();
+        assert_eq!(options.priority, v1::request_options::Priority::High as i32);
+        assert_eq!(options.transaction_tag, "nightly-etl");
+        assert_eq!(options.request_tag, "");
+        assert!(!seen[0].exclude_txn_from_change_streams);
     }
 
-    connection
-        .set_option(
-            OptionConnection::Other(spanner_adbc::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS.into()),
-            OptionValue::String("true".into()),
-        )
-        .expect("exclude the transaction from change streams");
-    run_ingest(&mut connection);
-    {
-        let seen = requests.lock().unwrap();
-        assert_eq!(seen.len(), 2, "the second ingest adds a second BatchWrite");
-        assert!(
-            seen[1].exclude_txn_from_change_streams,
-            "spanner.transaction.exclude_from_change_streams=true must set \
-             exclude_txn_from_change_streams on the BatchWrite request"
-        );
-    }
+    configure(
+        &mut connection,
+        &[(OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS, "true")],
+    );
+    let statement = batch_write_ingest_statement(&mut connection);
+    assert_eq!(ingest(statement, 1).unwrap(), Some(1));
+    let seen = requests.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[1].exclude_txn_from_change_streams);
 }
 
 /// The change-stream exclusion reaches the transaction options of autocommit DML.
 #[test]
 fn exclude_from_change_streams_reaches_the_wire_on_runner_commits() {
-    const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
-
-    // Options from each begin, whether inline on `ExecuteBatchDml` or an explicit
-    // `BeginTransaction`.
-    let begins: Arc<Mutex<Vec<v1::TransactionOptions>>> = Arc::new(Mutex::new(Vec::new()));
-    let record_explicit = begins.clone();
-    let record_inline = begins.clone();
-    let server = start_server(move |mock| {
-        mock.expect_begin_transaction().returning(move |request| {
-            if let Some(options) = request.into_inner().options {
-                record_explicit.lock().unwrap().push(options);
-            }
-            Ok(tonic::Response::new(v1::Transaction {
-                id: b"dml-txn".to_vec(),
-                ..Default::default()
-            }))
-        });
-        mock.expect_execute_batch_dml().returning(move |request| {
-            let request = request.into_inner();
-            if let Some(v1::transaction_selector::Selector::Begin(options)) = request
-                .transaction
-                .as_ref()
-                .and_then(|t| t.selector.as_ref())
-            {
-                record_inline.lock().unwrap().push(options.clone());
-            }
-            Ok(tonic::Response::new(v1::ExecuteBatchDmlResponse {
-                result_sets: vec![v1::ResultSet {
-                    metadata: Some(v1::ResultSetMetadata {
-                        transaction: Some(v1::Transaction {
-                            id: b"dml-txn".to_vec(),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    stats: Some(v1::ResultSetStats {
-                        row_count: Some(v1::result_set_stats::RowCount::RowCountExact(1)),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                status: Some(spanner_grpc_mock::google::rpc::Status {
-                    code: 0,
-                    message: "OK".into(),
-                    details: vec![],
-                }),
-                ..Default::default()
-            }))
-        });
-        mock.expect_commit().returning(|_| commit_ok());
-    });
+    let mut mock = MockSpanner::new();
+    serve_begin_transaction(&mut mock);
+    let batch_dml = serve_batch_dml(&mut mock);
+    serve_commits(&mut mock);
+    let server = MockServer::serve(mock);
 
     let mut connection = server.connect();
-
-    let run_dml = |connection: &mut SpannerConnection| {
-        let mut statement = connection.new_statement().expect("new statement");
-        statement.set_sql_query(DML_SQL).unwrap();
-        assert_eq!(
-            statement.execute_update().expect("autocommit DML"),
-            Some(1),
-            "the scripted DML affects one row"
-        );
-    };
-
-    run_dml(&mut connection);
-    connection
-        .set_option(
-            OptionConnection::Other(spanner_adbc::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS.into()),
-            OptionValue::String("true".into()),
-        )
-        .expect("exclude the transaction from change streams");
-    run_dml(&mut connection);
-
-    let seen = begins.lock().unwrap();
-    assert_eq!(
-        seen.len(),
-        2,
-        "each autocommit DML begins its read/write transaction inline on ExecuteBatchDml"
+    assert_eq!(update(&mut connection, INSERT), Some(1));
+    configure(
+        &mut connection,
+        &[(OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS, "true")],
     );
-    assert!(
-        !seen[0].exclude_txn_from_change_streams,
-        "with the option unset, the inline-begin options must carry the default (false)"
-    );
-    assert!(
-        seen[1].exclude_txn_from_change_streams,
-        "spanner.transaction.exclude_from_change_streams=true must set \
-         exclude_txn_from_change_streams on the runner's inline-begin TransactionOptions"
-    );
+    assert_eq!(update(&mut connection, INSERT), Some(1));
+
+    let seen = batch_dml.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(!inline_begin_options(&seen[0]).exclude_txn_from_change_streams);
+    assert!(inline_begin_options(&seen[1]).exclude_txn_from_change_streams);
 }
 
 /// Priority and tags reach user queries, DML and commits. Metadata reads get the priority but no
@@ -3373,91 +2121,58 @@ fn exclude_from_change_streams_reaches_the_wire_on_runner_commits() {
 /// transaction statistics. The emulator ignores `RequestOptions`, so only the mock covers this.
 #[test]
 fn request_priority_reaches_metadata_reads_but_tags_do_not() {
-    const USER_QUERY: &str = "SELECT c FROM MockTable";
-    const DML_SQL: &str = "INSERT INTO MockTable (c) VALUES ('x')";
-
-    let queries = Arc::new(Mutex::new(Vec::new()));
-    let batch_dml: Arc<Mutex<Vec<v1::ExecuteBatchDmlRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let commits: Arc<Mutex<Vec<v1::CommitRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let (rec_q, rec_b, rec_c) = (queries.clone(), batch_dml.clone(), commits.clone());
-    let server = start_server(move |mock| {
-        serve_begin_transaction(mock);
-        mock.expect_execute_streaming_sql()
-            .returning(move |request| {
-                let request = request.into_inner();
-                // get_table_schema's INFORMATION_SCHEMA lookup reads names and nullability.
-                let result = if request.sql.contains("INFORMATION_SCHEMA") {
-                    v1::PartialResultSet {
-                        metadata: Some(result_metadata(&[
-                            ("COLUMN_NAME", v1::TypeCode::String),
-                            ("IS_NULLABLE", v1::TypeCode::String),
-                        ])),
-                        last: true,
-                        ..Default::default()
-                    }
-                } else {
-                    partial_result_set(true, &["v"], b"r-1", true)
-                };
-                rec_q.lock().unwrap().push(request);
-                Ok(stream_of(vec![Ok(result)]))
-            });
-        serve_batch_dml(mock, rec_b.clone());
-        mock.expect_commit().returning(move |request| {
-            rec_c.lock().unwrap().push(request.into_inner());
-            commit_ok()
+    let queries = Log::default();
+    let recorded = queries.clone();
+    let mut mock = MockSpanner::new();
+    serve_begin_transaction(&mut mock);
+    mock.expect_execute_streaming_sql()
+        .returning(move |request| {
+            let request = request.into_inner();
+            // get_table_schema's INFORMATION_SCHEMA lookup reads names and nullability.
+            let result = if request.sql.contains("INFORMATION_SCHEMA") {
+                v1::PartialResultSet {
+                    metadata: Some(result_metadata(&[
+                        ("COLUMN_NAME", v1::TypeCode::String),
+                        ("IS_NULLABLE", v1::TypeCode::String),
+                    ])),
+                    last: true,
+                    ..Default::default()
+                }
+            } else {
+                partial_result_set(true, &["v"], b"r-1", true)
+            };
+            recorded.lock().unwrap().push(request);
+            Ok(stream_of(vec![Ok(result)]))
         });
-    });
+    let batch_dml = serve_batch_dml(&mut mock);
+    let commits = serve_commits(&mut mock);
+    let server = MockServer::serve(mock);
 
     let mut connection = server.connect();
-    for (key, value) in [
-        (spanner_adbc::OPTION_REQUEST_PRIORITY, "high"),
-        (spanner_adbc::OPTION_REQUEST_TAG, "user-req"),
-        (spanner_adbc::OPTION_TRANSACTION_TAG, "user-txn"),
-    ] {
-        connection
-            .set_option(
-                OptionConnection::Other(key.into()),
-                OptionValue::String(value.into()),
-            )
-            .unwrap_or_else(|_| panic!("set {key}"));
-    }
+    configure(
+        &mut connection,
+        &[
+            (OPTION_REQUEST_PRIORITY, "high"),
+            (OPTION_REQUEST_TAG, "user-req"),
+            (OPTION_TRANSACTION_TAG, "user-txn"),
+        ],
+    );
 
-    let mut query = connection.new_statement().expect("new statement");
-    query.set_sql_query(USER_QUERY).unwrap();
-    let reader = query.execute().expect("run the user query");
-    for batch in reader {
-        batch.expect("scripted query batch");
-    }
-
-    let mut dml = connection.new_statement().expect("new statement");
-    dml.set_sql_query(DML_SQL).unwrap();
-    assert_eq!(dml.execute_update().expect("autocommit DML"), Some(1));
-
+    query(&mut connection, SELECT);
+    assert_eq!(update(&mut connection, INSERT), Some(1));
     connection
         .get_table_schema(None, None, "MockTable")
-        .expect("get_table_schema");
+        .unwrap();
 
     let high = v1::request_options::Priority::High as i32;
 
     let queries = queries.lock().unwrap();
-    let user = queries
-        .iter()
-        .find(|q| q.sql == USER_QUERY)
-        .expect("the user query reached ExecuteStreamingSql");
-    let user_options = user
-        .request_options
-        .as_ref()
-        .expect("the user query must carry RequestOptions");
-    assert_eq!(
-        user_options.priority, high,
-        "spanner.request.priority must reach the query's ExecuteStreamingSql RequestOptions"
-    );
-    assert_eq!(
-        user_options.request_tag, "user-req",
-        "spanner.request.tag must reach the query's ExecuteStreamingSql RequestOptions"
-    );
+    let user = queries.iter().find(|q| q.sql == SELECT);
+    let user_options = user.unwrap().request_options.as_ref().unwrap();
+    assert_eq!(user_options.priority, high);
+    assert_eq!(user_options.request_tag, "user-req");
 
-    let metadata: Vec<_> = queries.iter().filter(|q| q.sql != USER_QUERY).collect();
+    let metadata: Vec<_> = queries.iter().filter(|q| q.sql != SELECT).collect();
     assert_eq!(
         metadata.len(),
         2,
@@ -3465,158 +2180,92 @@ fn request_priority_reaches_metadata_reads_but_tags_do_not() {
     );
     for read in metadata {
         let metadata_options = read.request_options.clone().unwrap_or_default();
-        assert_eq!(
-            metadata_options.priority, high,
-            "spanner.request.priority must reach a driver-internal metadata read"
-        );
-        assert_eq!(
-            metadata_options.request_tag, "",
-            "spanner.request.tag must NOT leak onto a driver-internal metadata read"
-        );
-        assert_eq!(
-            metadata_options.transaction_tag, "",
-            "spanner.transaction.tag must NOT leak onto a driver-internal metadata read"
-        );
+        assert_eq!(metadata_options.priority, high);
+        assert_eq!(metadata_options.request_tag, "");
+        assert_eq!(metadata_options.transaction_tag, "");
     }
 
     let batch_dml = batch_dml.lock().unwrap();
-    assert_eq!(
-        batch_dml.len(),
-        1,
-        "the INSERT rides a single ExecuteBatchDml"
-    );
-    let dml_options = batch_dml[0]
-        .request_options
-        .as_ref()
-        .expect("the ExecuteBatchDml must carry RequestOptions");
+    assert_eq!(batch_dml.len(), 1);
+    let dml_options = batch_dml[0].request_options.as_ref().unwrap();
     assert_eq!(dml_options.priority, high);
     assert_eq!(dml_options.request_tag, "user-req");
 
     let commits = commits.lock().unwrap();
-    assert_eq!(commits.len(), 1, "one autocommit DML, one Commit");
-    let commit_options = commits[0]
-        .request_options
-        .as_ref()
-        .expect("the Commit must carry RequestOptions");
-    assert_eq!(
-        commit_options.priority, high,
-        "spanner.request.priority must reach the Commit as the commit priority"
-    );
-    assert_eq!(
-        commit_options.transaction_tag, "user-txn",
-        "spanner.transaction.tag must tag the read/write transaction's Commit"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Shared client stack
-// ---------------------------------------------------------------------------
-
-/// A server that counts `CreateSession` calls. The client creates one session per
-/// `DatabaseClient`, so this counts client stacks.
-fn start_counting_sessions(sessions: Arc<AtomicUsize>) -> MockServer {
-    let mut mock = MockSpanner::new();
-    mock.expect_create_session().returning(move |request| {
-        sessions.fetch_add(1, Ordering::SeqCst);
-        let database = request.into_inner().database;
-        Ok(tonic::Response::new(v1::Session {
-            name: format!(
-                "{database}/sessions/mock-session-{}",
-                sessions.load(Ordering::SeqCst)
-            ),
-            multiplexed: true,
-            ..Default::default()
-        }))
-    });
-    MockServer::serve(mock)
+    assert_eq!(commits.len(), 1);
+    let commit_options = commits[0].request_options.as_ref().unwrap();
+    assert_eq!(commit_options.priority, high);
+    assert_eq!(commit_options.transaction_tag, "user-txn");
 }
 
 /// The client stack (channel pool, credentials, session, maintenance task) is expensive, so a
 /// database builds it lazily and shares it between connections. Setting any database option
-/// discards it.
+/// discards it. The client creates one session per `DatabaseClient`, so sessions count stacks.
 #[test]
 fn connections_share_one_client_stack_until_an_option_is_set() {
     let sessions = Arc::new(AtomicUsize::new(0));
-    let server = start_counting_sessions(sessions.clone());
+    let count = sessions.clone();
+    let mut mock = MockSpanner::new();
+    mock.expect_create_session().returning(move |request| {
+        let n = count.fetch_add(1, Ordering::SeqCst) + 1;
+        let database = request.into_inner().database;
+        Ok(tonic::Response::new(v1::Session {
+            name: format!("{database}/sessions/mock-session-{n}"),
+            multiplexed: true,
+            ..Default::default()
+        }))
+    });
+    let server = MockServer::serve(mock);
     let mut database = emulator_database(&server.endpoint);
 
-    assert_eq!(
-        sessions.load(Ordering::SeqCst),
-        0,
-        "no client stack may be built before the first connection"
-    );
+    assert_eq!(sessions.load(Ordering::SeqCst), 0);
 
-    let _first = database.new_connection().expect("first connection");
-    let _second = database.new_connection().expect("second connection");
-    assert_eq!(
-        sessions.load(Ordering::SeqCst),
-        1,
-        "two connections on one database must share one client stack (one CreateSession)"
-    );
+    let _first = database.new_connection().unwrap();
+    let _second = database.new_connection().unwrap();
+    assert_eq!(sessions.load(Ordering::SeqCst), 1);
 
     let rendered = format!("{database:?}");
     assert!(
         rendered.contains(r#"connected: Some("<client stack>")"#),
-        "the cached stack must render presence-only: {rendered}"
+        "{rendered}"
     );
-    assert!(
-        !rendered.contains("DatabaseClient"),
-        "Debug must not delegate to the client's own Debug: {rendered}"
-    );
+    assert!(!rendered.contains("DatabaseClient"), "{rendered}");
 
     // Even re-setting the same value invalidates the cache.
     database
-        .set_option(
-            OptionDatabase::Other(spanner_adbc::OPTION_ENDPOINT.into()),
-            OptionValue::String(server.endpoint.clone()),
-        )
-        .expect("re-set endpoint");
-    let _third = database.new_connection().expect("third connection");
-    assert_eq!(
-        sessions.load(Ordering::SeqCst),
-        2,
-        "set_option must invalidate the cached stack (second CreateSession on the next connection)"
-    );
+        .set_option(OPTION_ENDPOINT.into(), server.endpoint.clone().into())
+        .unwrap();
+    let _third = database.new_connection().unwrap();
+    assert_eq!(sessions.load(Ordering::SeqCst), 2);
 }
 
 /// Generic clients set every option to its default, so `adbc.statement.exec.incremental=false` is
 /// accepted. Enabling it is not implemented.
 #[test]
 fn exec_incremental_spec_default_is_a_no_op() {
-    let server = start_server(|_| {});
+    let server = MockServer::serve(MockSpanner::new());
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
+    let mut statement = connection.new_statement().unwrap();
 
     statement
-        .set_option(
-            OptionStatement::Incremental,
-            OptionValue::String("false".into()),
-        )
-        .expect("setting adbc.statement.exec.incremental=false is a no-op");
-
+        .set_option(OptionStatement::Incremental, false.into())
+        .unwrap();
     assert_eq!(
         statement
             .get_option_string(OptionStatement::Incremental)
-            .expect("incremental getter must report the default"),
+            .unwrap(),
         "false"
     );
 
     let error = statement
-        .set_option(
-            OptionStatement::Incremental,
-            OptionValue::String("true".into()),
-        )
-        .expect_err("adbc.statement.exec.incremental=true must be rejected");
+        .set_option(OptionStatement::Incremental, true.into())
+        .unwrap_err();
     assert_eq!(error.status, AdbcStatus::NotImplemented);
     assert!(
         error.message.contains("adbc.statement.exec.incremental"),
         "{error}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Retry-limit accounting per RPC path
-// ---------------------------------------------------------------------------
 
 // The pinned client retries unary RPCs in gax's retry loop, where both limits are exact. Stream
 // resumption builds a fresh `RetryState` per resume, so the attempt limit is exact but the
@@ -3626,113 +2275,79 @@ fn exec_incremental_spec_default_is_a_no_op() {
 /// Attempts a probe serves before failing permanently, so an inert limit cannot hang the test.
 const RETRY_PROBE_CAP: usize = 20;
 
-/// A constant 50 ms backoff instead of the default 1 s doubling. With full jitter, the probe cap
-/// takes about half a second to reach, well beyond the elapsed budgets tested below.
-fn set_constant_backoff(statement: &mut impl Statement) {
-    for (key, value) in [
-        (spanner_adbc::OPTION_RETRY_BACKOFF_INITIAL_SECONDS, 0.05),
-        (spanner_adbc::OPTION_RETRY_BACKOFF_MULTIPLIER, 1.0),
-    ] {
-        statement
-            .set_option(
-                OptionStatement::Other(key.into()),
-                OptionValue::Double(value),
-            )
-            .expect("set backoff knob");
+/// A probe's statement with `options` over a constant 50 ms backoff instead of the default 1 s
+/// doubling. With full jitter, the probe cap takes about half a second to reach.
+fn retry_probe(
+    connection: &mut SpannerConnection,
+    sql: &str,
+    options: Vec<(&str, OptionValue)>,
+) -> SpannerStatement {
+    let mut statement = prepare(connection, sql);
+    let backoff = [
+        (OPTION_RETRY_BACKOFF_INITIAL_SECONDS, 0.05.into()),
+        (OPTION_RETRY_BACKOFF_MULTIPLIER, 1.0.into()),
+    ];
+    for (key, value) in backoff.into_iter().chain(options) {
+        statement.set_option(key.into(), value).unwrap();
     }
+    statement
 }
 
-/// Counts `ExecuteStreamingSql` attempts with retry option `key` set to `value`.
-fn streaming_attempts(key: &str, value: OptionValue) -> usize {
+/// Counts `ExecuteStreamingSql` attempts with retry `options`.
+fn streaming_attempts(options: Vec<(&str, OptionValue)>) -> usize {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_in_mock = calls.clone();
-    let server = start_server(move |mock| {
-        mock.expect_execute_streaming_sql().returning(move |_| {
-            let n = calls_in_mock.fetch_add(1, Ordering::SeqCst);
-            if n >= RETRY_PROBE_CAP {
-                return Err(tonic::Status::internal("mock server: probe cap reached"));
-            }
-            // A resumed stream does not repeat the metadata.
-            Ok(stream_of(vec![
-                Ok(partial_result_set(n == 0, &["v1"], b"rt-1", false)),
-                Err(tonic::Status::unavailable(
-                    "mock server: connection lost mid-stream",
-                )),
-            ]))
-        });
+    let mut mock = MockSpanner::new();
+    mock.expect_execute_streaming_sql().returning(move |_| {
+        let n = calls_in_mock.fetch_add(1, Ordering::SeqCst);
+        if n >= RETRY_PROBE_CAP {
+            return Err(tonic::Status::internal("probe cap reached"));
+        }
+        // A resumed stream does not repeat the metadata.
+        Ok(stream_of(vec![
+            Ok(partial_result_set(n == 0, &["v1"], b"rt-1", false)),
+            Err(tonic::Status::unavailable("connection lost mid-stream")),
+        ]))
     });
-
-    let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(OptionStatement::Other(key.into()), value)
-        .expect("set retry option");
-    set_constant_backoff(&mut statement);
-    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
-    statement
-        .execute()
-        .err()
-        .expect("every attempt fails, so the query must fail");
+    let server = MockServer::serve(mock);
+    let mut statement = retry_probe(&mut server.connect(), SELECT, options);
+    statement.execute().err().unwrap();
     calls.load(Ordering::SeqCst)
 }
 
-/// Counts `ExecuteBatchDml` attempts with retry option `key` set to `value`.
-fn unary_attempts(key: &str, value: OptionValue) -> usize {
+/// Counts `ExecuteBatchDml` attempts with retry `options`.
+fn unary_attempts(options: Vec<(&str, OptionValue)>) -> usize {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_in_mock = calls.clone();
-    let server = start_server(move |mock| {
-        mock.expect_execute_batch_dml().returning(move |_| {
-            let n = calls_in_mock.fetch_add(1, Ordering::SeqCst);
-            if n >= RETRY_PROBE_CAP {
-                return Err(tonic::Status::internal("mock server: probe cap reached"));
-            }
-            Err(tonic::Status::unavailable(
-                "mock server: backend unavailable",
-            ))
-        });
+    let mut mock = MockSpanner::new();
+    mock.expect_execute_batch_dml().returning(move |_| {
+        if calls_in_mock.fetch_add(1, Ordering::SeqCst) >= RETRY_PROBE_CAP {
+            return Err(tonic::Status::internal("probe cap reached"));
+        }
+        Err(tonic::Status::unavailable("backend unavailable"))
     });
-
-    let mut connection = server.connect();
-    let mut statement = connection.new_statement().expect("new statement");
-    statement
-        .set_option(OptionStatement::Other(key.into()), value)
-        .expect("set retry option");
-    set_constant_backoff(&mut statement);
-    statement
-        .set_sql_query("UPDATE MockTable SET c = 'x' WHERE TRUE")
-        .unwrap();
-    statement
-        .execute_update()
-        .expect_err("every attempt fails, so the DML must fail");
+    let server = MockServer::serve(mock);
+    let mut statement = retry_probe(&mut server.connect(), UPDATE, options);
+    statement.execute_update().unwrap_err();
     calls.load(Ordering::SeqCst)
 }
 
 #[test]
 fn retry_max_attempts_is_exact_on_unary_rpcs() {
     for max_attempts in [1_i64, 2, 3] {
-        let attempts = unary_attempts(
-            spanner_adbc::OPTION_RETRY_MAX_ATTEMPTS,
-            OptionValue::Int(max_attempts),
-        );
-        assert_eq!(
-            attempts, max_attempts as usize,
-            "max_attempts={max_attempts} must permit {max_attempts} ExecuteBatchDml attempts"
-        );
+        let attempts = unary_attempts(vec![(OPTION_RETRY_MAX_ATTEMPTS, max_attempts.into())]);
+        assert_eq!(attempts, max_attempts as usize);
     }
 }
 
 #[test]
 fn retry_max_attempts_is_exact_on_the_streaming_path() {
     for max_attempts in [1_i64, 2, 3] {
-        let attempts = streaming_attempts(
-            spanner_adbc::OPTION_RETRY_MAX_ATTEMPTS,
-            OptionValue::Int(max_attempts),
-        );
+        let attempts = streaming_attempts(vec![(OPTION_RETRY_MAX_ATTEMPTS, max_attempts.into())]);
         assert_eq!(
             attempts, max_attempts as usize,
-            "max_attempts={max_attempts} must permit exactly {max_attempts} ExecuteStreamingSql \
-             attempts; a change here means the pinned client's stream-resume accounting moved, \
-             so update src/retry.rs and docs/options.md to match"
+            "a change here means the pinned client's stream-resume accounting moved, so update \
+             src/retry.rs and docs/options.md to match"
         );
     }
 }
@@ -3741,38 +2356,20 @@ fn retry_max_attempts_is_exact_on_the_streaming_path() {
 /// callers can use `spanner.rpc.timeout_seconds.{query,fetch}` instead.
 #[test]
 fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_path() {
-    let unbounded = unary_attempts(
-        spanner_adbc::OPTION_RETRY_MAX_ELAPSED_SECONDS,
-        OptionValue::String(String::new()),
-    );
-    assert_eq!(
-        unbounded,
-        RETRY_PROBE_CAP + 1,
-        "with no elapsed budget the unary retry loop must run until the mock's cap ends it"
-    );
+    let unbounded = unary_attempts(vec![(OPTION_RETRY_MAX_ELAPSED_SECONDS, "".into())]);
+    assert_eq!(unbounded, RETRY_PROBE_CAP + 1);
 
     // With full jitter the count varies. At least two attempts shows the budget is not so small
     // that it stops at the first failure.
-    let unary = unary_attempts(
-        spanner_adbc::OPTION_RETRY_MAX_ELAPSED_SECONDS,
-        OptionValue::Double(0.15),
-    );
-    assert!(
-        (2..unbounded).contains(&unary),
-        "a 150ms elapsed budget must bound the unary retry loop without collapsing it to a single \
-         attempt, but it ran {unary} (unbounded: {unbounded})"
-    );
+    let unary = unary_attempts(vec![(OPTION_RETRY_MAX_ELAPSED_SECONDS, 0.15.into())]);
+    assert!((2..unbounded).contains(&unary), "{unary} of {unbounded}");
 
-    let streaming = streaming_attempts(
-        spanner_adbc::OPTION_RETRY_MAX_ELAPSED_SECONDS,
-        OptionValue::Double(0.05),
-    );
+    let streaming = streaming_attempts(vec![(OPTION_RETRY_MAX_ELAPSED_SECONDS, 0.05.into())]);
     assert_eq!(
         streaming,
         RETRY_PROBE_CAP + 1,
-        "a 50ms elapsed budget currently never exhausts the streaming retry loop, so the \
-         mock's own cap is what stops it; a change here means the pinned client's stream-resume \
-         accounting moved, so update src/retry.rs and docs/options.md to match"
+        "a change here means the pinned client's stream-resume accounting moved, so update \
+         src/retry.rs and docs/options.md to match"
     );
 }
 
@@ -3780,127 +2377,82 @@ fn retry_max_elapsed_seconds_bounds_unary_rpcs_but_is_inert_on_the_streaming_pat
 /// concurrently created table cannot fail the call and all counts share a timestamp.
 #[test]
 fn get_statistics_shares_one_read_only_transaction() {
-    let selectors: Arc<Mutex<Vec<Option<v1::TransactionSelector>>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let server = {
-        let record = selectors.clone();
-        start_server(move |mock| {
-            let record = record.clone();
-            mock.expect_execute_streaming_sql()
-                .returning(move |request| {
-                    let request = request.into_inner();
-                    let inline_begin = begins_inline(request.transaction.as_ref());
-                    record.lock().unwrap().push(request.transaction);
-                    // Columns are read by position, so only their count and types matter.
-                    let (fields, values): (Vec<(&str, v1::TypeCode)>, Vec<&str>) =
-                        if request.sql.contains("INFORMATION_SCHEMA") {
-                            (
-                                vec![
-                                    ("TABLE_SCHEMA", v1::TypeCode::String),
-                                    ("TABLE_NAME", v1::TypeCode::String),
-                                    ("COLUMN_NAME", v1::TypeCode::String),
-                                    ("SPANNER_TYPE", v1::TypeCode::String),
-                                ],
-                                vec!["", "MockTable", "c", "STRING(MAX)"],
-                            )
-                        } else {
-                            // COUNT(*), COUNTIF(c IS NULL), COUNT(DISTINCT c)
-                            (
-                                vec![
-                                    ("n", v1::TypeCode::Int64),
-                                    ("nulls", v1::TypeCode::Int64),
-                                    ("distinct", v1::TypeCode::Int64),
-                                ],
-                                vec!["3", "0", "3"],
-                            )
-                        };
-                    let mut metadata = result_metadata(&fields);
-                    if inline_begin {
-                        metadata.transaction = Some(v1::Transaction {
-                            id: b"stats-ro-txn".to_vec(),
-                            ..Default::default()
-                        });
-                    }
-                    let result = v1::PartialResultSet {
-                        metadata: Some(metadata),
-                        values: values.iter().map(|s| string_value(s)).collect(),
-                        resume_token: b"stat-1".to_vec(),
-                        last: true,
-                        ..Default::default()
-                    };
-                    Ok(stream_of(vec![Ok(result)]))
-                });
-        })
-    };
+    let requests = Log::default();
+    let recorded = requests.clone();
+    let mut mock = MockSpanner::new();
+    mock.expect_execute_streaming_sql()
+        .returning(move |request| {
+            let request = request.into_inner();
+            let inline_begin = begins_inline(request.transaction.as_ref());
+            // Columns are read by position, so only their count and types matter.
+            let (fields, values): (&[(&str, v1::TypeCode)], &[&str]) =
+                if request.sql.contains("INFORMATION_SCHEMA") {
+                    (
+                        &[
+                            ("TABLE_SCHEMA", v1::TypeCode::String),
+                            ("TABLE_NAME", v1::TypeCode::String),
+                            ("COLUMN_NAME", v1::TypeCode::String),
+                            ("SPANNER_TYPE", v1::TypeCode::String),
+                        ],
+                        &["", "MockTable", "c", "STRING(MAX)"],
+                    )
+                } else {
+                    // COUNT(*), COUNTIF(c IS NULL), COUNT(DISTINCT c)
+                    (
+                        &[
+                            ("n", v1::TypeCode::Int64),
+                            ("nulls", v1::TypeCode::Int64),
+                            ("distinct", v1::TypeCode::Int64),
+                        ],
+                        &["3", "0", "3"],
+                    )
+                };
+            recorded.lock().unwrap().push(request);
+            let mut result = v1::PartialResultSet {
+                metadata: Some(result_metadata(fields)),
+                values: values.iter().map(|s| string_value(s)).collect(),
+                resume_token: b"stat-1".to_vec(),
+                last: true,
+                ..Default::default()
+            };
+            if inline_begin {
+                set_transaction_id(&mut result, b"stats-ro-txn");
+            }
+            Ok(stream_of(vec![Ok(result)]))
+        });
+    let server = MockServer::serve(mock);
 
-    let connection = server.connect();
-    let reader = connection
+    let reader = server
+        .connect()
         .get_statistics(None, None, None, false)
-        .expect("get_statistics");
-    let batches: Vec<_> = reader
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect statistics");
-    assert_eq!(batches.len(), 1, "one catalog batch");
+        .unwrap();
+    assert_eq!(reader.collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
 
-    let seen = selectors.lock().unwrap();
-    assert!(
-        seen.len() >= 2,
-        "discovery plus at least one aggregate scan, got {}",
-        seen.len()
-    );
-    let first = seen[0]
-        .as_ref()
-        .and_then(|s| s.selector.as_ref())
-        .expect("the first query must carry a transaction selector");
-    let v1::transaction_selector::Selector::Begin(options) = first else {
-        panic!("the first get_statistics query must begin the transaction, got: {first:?}");
-    };
-    assert!(
-        matches!(
-            options.mode,
-            Some(v1::transaction_options::Mode::ReadOnly(_))
-        ),
-        "the begun transaction must be read-only: {options:?}"
-    );
-    for (i, selector) in seen.iter().enumerate().skip(1) {
-        let sel = selector
-            .as_ref()
-            .and_then(|s| s.selector.as_ref())
-            .unwrap_or_else(|| panic!("query {i} must carry a transaction selector"));
-        assert_eq!(
-            sel,
-            &v1::transaction_selector::Selector::Id(b"stats-ro-txn".to_vec()),
-            "query {i} must reuse the begun read-only transaction, not open its own"
-        );
-    }
+    let selectors = selectors(&requests);
+    assert!(selectors.len() >= 2, "discovery and an aggregate scan");
+    assert_shared_read_only(&selectors, b"stats-ro-txn");
 }
 
 /// The catalog is the database id, and catalog arguments accept it. `get_objects` at `Catalogs`
 /// depth issues no RPC.
 #[test]
 fn the_catalog_level_reports_the_database_id_and_filters_round_trip() {
-    use adbc_core::options::ObjectDepth;
-
-    let server = start_server(|_mock| {});
+    let server = MockServer::serve(MockSpanner::new());
     let mut connection = server.connect();
 
     let catalogs = |connection: &SpannerConnection, filter: Option<&str>| -> Vec<String> {
         let reader = connection
             .get_objects(ObjectDepth::Catalogs, filter, None, None, None, None)
-            .expect("get_objects at Catalogs depth");
-        reader
-            .collect::<Result<Vec<_>, _>>()
-            .expect("drain get_objects")
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(0)
-                    .as_string::<i32>()
-                    .iter()
-                    .map(|name| name.expect("catalog_name is never null").to_owned())
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+            .unwrap();
+        let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        let names = batches.iter().flat_map(|batch| {
+            let column = batch.column(0).as_string::<i32>();
+            column
+                .iter()
+                .map(|name| name.unwrap().to_owned())
+                .collect::<Vec<_>>()
+        });
+        names.collect()
     };
 
     assert_eq!(catalogs(&connection, None), ["d"]);
@@ -3913,36 +2465,24 @@ fn the_catalog_level_reports_the_database_id_and_filters_round_trip() {
     assert_eq!(
         connection
             .get_option_string(OptionConnection::CurrentCatalog)
-            .expect("read the current catalog"),
+            .unwrap(),
         "d"
     );
     connection
-        .set_option(
-            OptionConnection::CurrentCatalog,
-            OptionValue::String("d".into()),
-        )
-        .expect("setting the current catalog to its own value is a no-op");
+        .set_option(OptionConnection::CurrentCatalog, "d".into())
+        .unwrap();
     let rejected = connection
-        .set_option(
-            OptionConnection::CurrentCatalog,
-            OptionValue::String("other-db".into()),
-        )
-        .expect_err("no other catalog is reachable");
+        .set_option(OptionConnection::CurrentCatalog, "other-db".into())
+        .unwrap_err();
     assert_eq!(rejected.status, AdbcStatus::NotImplemented);
 
-    let mut statement = connection.new_statement().expect("new statement");
+    let mut statement = connection.new_statement().unwrap();
     statement
-        .set_option(
-            OptionStatement::TargetCatalog,
-            OptionValue::String("d".into()),
-        )
-        .expect("ingest into the connection's own catalog");
+        .set_option(OptionStatement::TargetCatalog, "d".into())
+        .unwrap();
     let rejected = statement
-        .set_option(
-            OptionStatement::TargetCatalog,
-            OptionValue::String(String::new()),
-        )
-        .expect_err("\"\" is no longer a catalog this connection has");
+        .set_option(OptionStatement::TargetCatalog, "".into())
+        .unwrap_err();
     assert_eq!(rejected.status, AdbcStatus::NotImplemented);
 }
 
@@ -3958,64 +2498,41 @@ fn ingest_operational_errors_keep_status_and_details_without_metadata_probes() {
         (tonic::Code::Aborted, AdbcStatus::IO),
         (tonic::Code::Internal, AdbcStatus::Internal),
     ] {
-        let probes = Arc::new(AtomicUsize::new(0));
-        let record_probes = probes.clone();
-        let server = start_server(move |mock| {
-            mock.expect_batch_write().returning(move |_| {
-                let mut response = batch_write_group_already_exists(0);
-                let status = response.status.as_mut().unwrap();
-                status.code = code as i32;
-                status.message = "injected operational failure".into();
-                Ok(stream_of(vec![Ok(response)]))
-            });
-            // An existence probe must not replace an operational error with AlreadyExists
-            // or discard its vendor code and structured details.
-            mock.expect_execute_streaming_sql().returning(move |_| {
-                record_probes.fetch_add(1, Ordering::SeqCst);
-                Ok(stream_of(vec![Ok(partial_result_set(
-                    true,
-                    &["MockTable"],
-                    b"",
-                    true,
-                ))]))
-            });
-        });
+        let mut response = batch_write_group_already_exists(0);
+        let status = response.status.as_mut().unwrap();
+        status.code = code as i32;
+        status.message = "injected operational failure".into();
+
+        let mut mock = MockSpanner::new();
+        serve_batch_write(&mut mock, vec![response]);
+        // An existence probe must not replace an operational error with AlreadyExists or discard
+        // its vendor code and structured details.
+        let probes = serve_queries(&mut mock, &["MockTable"]);
+        let server = MockServer::serve(mock);
+
         let mut connection = server.connect();
-        let mut statement = batch_write_ingest_statement(&mut connection);
-        statement.bind(ingest_batch(1)).unwrap();
-        let error = statement.execute_update().unwrap_err();
+        let error = ingest(batch_write_ingest_statement(&mut connection), 1).unwrap_err();
         assert_eq!(error.status, expected, "{code:?}: {error}");
         assert_eq!(error.vendor_code, code as i32, "{error}");
-        assert!(error.message.contains("injected operational failure"));
-        assert!(error.details.as_ref().is_some_and(|details| {
-            details.iter().any(|(key, _)| key == "google.rpc.errorinfo")
-        }));
-        assert_eq!(probes.load(Ordering::SeqCst), 0, "{code:?}");
+        assert!(
+            error.message.contains("injected operational failure"),
+            "{code:?}: {error}"
+        );
+        let detail = error_detail(&error, "google.rpc.errorinfo");
+        assert_eq!(detail["reason"], "DUPLICATE_KEY", "{code:?}");
+        assert_eq!(probes.lock().unwrap().len(), 0, "{code:?}");
     }
 }
 
 #[test]
 fn cancel_before_first_batch_discards_rows_fetched_by_execute() {
-    let server = start_server(|mock| {
-        mock.expect_execute_streaming_sql().returning(|_| {
-            Ok(stream_of(vec![Ok(partial_result_set(
-                true,
-                &["first", "second"],
-                b"rt",
-                true,
-            ))]))
-        });
-    });
+    let (server, _) = query_server(&["first", "second"]);
     let mut connection = server.connect();
-    let mut statement = connection.new_statement().unwrap();
-    statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+    let mut statement = prepare(&mut connection, SELECT);
     let mut reader = statement.execute().unwrap();
     statement.get_cancel_handle().try_cancel().unwrap();
 
-    let error = reader
-        .next()
-        .expect("cancel must yield an error")
-        .unwrap_err();
+    let error = reader.next().unwrap().unwrap_err();
     assert_eq!(driver_error(&error).status, AdbcStatus::Cancelled);
     assert!(reader.next().is_none());
 }
@@ -4023,40 +2540,23 @@ fn cancel_before_first_batch_discards_rows_fetched_by_execute() {
 #[test]
 fn conversion_error_ends_the_reader_in_first_and_later_batches() {
     for bad_row in 0..2 {
-        let server = start_server(move |mock| {
-            mock.expect_execute_streaming_sql().returning(move |_| {
-                let mut values = vec![string_value("1"), string_value("2"), string_value("3")];
-                values[bad_row] = string_value("invalid integer");
-                Ok(stream_of(vec![Ok(v1::PartialResultSet {
-                    metadata: Some(result_metadata(&[("c", v1::TypeCode::Int64)])),
-                    values,
-                    last: true,
-                    ..Default::default()
-                })]))
-            });
-        });
+        let mut values = vec![string_value("1"), string_value("2"), string_value("3")];
+        values[bad_row] = string_value("invalid integer");
+        let mut mock = MockSpanner::new();
+        serve_result(
+            &mut mock,
+            result_metadata(&[("c", v1::TypeCode::Int64)]),
+            values,
+        );
+        let server = MockServer::serve(mock);
         let mut connection = server.connect();
-        let mut statement = connection.new_statement().unwrap();
-        statement
-            .set_option(
-                OptionStatement::Other(spanner_adbc::OPTION_ROWS_PER_BATCH.into()),
-                OptionValue::Int(1),
-            )
-            .unwrap();
-        statement.set_sql_query("SELECT c FROM MockTable").unwrap();
-        let mut reader = statement.execute().unwrap();
+        let mut reader = one_row_batches(&mut connection).execute().unwrap();
         for _ in 0..bad_row {
             assert_eq!(reader.next().unwrap().unwrap().num_rows(), 1);
         }
-        let error = reader
-            .next()
-            .expect("invalid row must yield an error")
-            .unwrap_err();
+        let error = reader.next().unwrap().unwrap_err();
         assert!(error.to_string().contains("INT64"), "{error}");
-        assert!(
-            reader.next().is_none(),
-            "rows after a conversion error must not be returned"
-        );
+        assert!(reader.next().is_none(), "bad row {bad_row}");
     }
 }
 
@@ -4064,24 +2564,22 @@ fn conversion_error_ends_the_reader_in_first_and_later_batches() {
 fn interrupted_batch_write_reports_confirmed_rows_and_unknown_outcome() {
     for cancel_operation in [false, true] {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let server = start_server(move |mock| {
-            mock.expect_batch_write().returning(move |_| {
-                let (tx, rx) = tokio::sync::mpsc::channel(1);
-                tx.try_send(Ok(batch_write_groups_ok(vec![0, 1]))).unwrap();
-                let _ = started_tx.send(());
-                // Keep the stream open after two confirmed writes; group 2 has no outcome yet.
-                tokio::spawn(async move { tx.closed().await });
-                Ok(tonic::Response::new(rx))
-            });
+        let mut mock = MockSpanner::new();
+        mock.expect_batch_write().returning(move |_| {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(Ok(batch_write_groups_ok(vec![0, 1]))).unwrap();
+            let _ = started_tx.send(());
+            // Keep the stream open after two confirmed writes; group 2 has no outcome yet.
+            tokio::spawn(async move { tx.closed().await });
+            Ok(tonic::Response::new(rx))
         });
+        let server = MockServer::serve(mock);
         let mut connection = server.connect();
         let mut statement = batch_write_ingest_statement(&mut connection);
         // The cancel case gets a deadline it cannot reach, so a slow cancel cannot turn into Timeout.
+        let deadline = if cancel_operation { 60.0 } else { 1.0 };
         statement
-            .set_option(
-                OptionStatement::Other(spanner_adbc::OPTION_RPC_TIMEOUT_UPDATE.into()),
-                OptionValue::Double(if cancel_operation { 60.0 } else { 1.0 }),
-            )
+            .set_option(OPTION_RPC_TIMEOUT_UPDATE.into(), deadline.into())
             .unwrap();
         statement.bind(ingest_batch(3)).unwrap();
         let cancel = statement.get_cancel_handle();
@@ -4095,15 +2593,12 @@ fn interrupted_batch_write_reports_confirmed_rows_and_unknown_outcome() {
         });
         let error = statement.execute_update().unwrap_err();
         canceller.join().unwrap();
-        assert_eq!(
-            error.status,
-            if cancel_operation {
-                AdbcStatus::Cancelled
-            } else {
-                AdbcStatus::Timeout
-            },
-            "{error}"
-        );
+        let expected = if cancel_operation {
+            AdbcStatus::Cancelled
+        } else {
+            AdbcStatus::Timeout
+        };
+        assert_eq!(error.status, expected, "{error}");
         assert!(
             error
                 .message
@@ -4116,29 +2611,20 @@ fn interrupted_batch_write_reports_confirmed_rows_and_unknown_outcome() {
 
 #[test]
 fn ingest_table_probe_inherits_read_options_without_tags() {
-    let queries = Arc::new(Mutex::new(Vec::new()));
-    let recorded = queries.clone();
-    let server = start_server(move |mock| {
-        // The probe finds the ingested column.
-        serve_streaming_sql_begin_aware(mock, &["c"], Some(recorded));
-    });
+    // The probe finds the ingested column.
+    let (server, queries) = query_server(&["c"]);
     let mut connection = server.connect();
-    for (key, value) in [
-        (spanner_adbc::OPTION_REQUEST_PRIORITY, "high"),
-        (spanner_adbc::OPTION_REQUEST_TAG, "user-request"),
-        (spanner_adbc::OPTION_TRANSACTION_TAG, "user-transaction"),
-        (spanner_adbc::OPTION_DIRECTED_READ, "include:us-east1"),
-    ] {
-        connection
-            .set_option(
-                OptionConnection::Other(key.into()),
-                OptionValue::String(value.into()),
-            )
-            .unwrap();
-    }
-    let mut statement = append_ingest_statement(&mut connection);
-    statement.bind(ingest_batch(0)).unwrap();
-    assert_eq!(statement.execute_update().unwrap(), Some(0));
+    configure(
+        &mut connection,
+        &[
+            (OPTION_REQUEST_PRIORITY, "high"),
+            (OPTION_REQUEST_TAG, "user-request"),
+            (OPTION_TRANSACTION_TAG, "user-transaction"),
+            (OPTION_DIRECTED_READ, "include:us-east1"),
+        ],
+    );
+    let count = ingest(append_ingest_statement(&mut connection), 0);
+    assert_eq!(count.unwrap(), Some(0));
     let queries = queries.lock().unwrap();
     assert_eq!(queries.len(), 1);
     let query = &queries[0];
@@ -4161,116 +2647,71 @@ fn ingest_table_probe_inherits_read_options_without_tags() {
 fn ingest_table_probe_honors_retry_limit() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let recorded = attempts.clone();
-    let server = start_server(move |mock| {
-        mock.expect_execute_streaming_sql().returning(move |_| {
-            if recorded.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err(tonic::Status::unavailable("probe unavailable"))
-            } else {
-                Ok(stream_of(vec![Ok(partial_result_set(
-                    true,
-                    &["MockTable"],
-                    b"t",
-                    true,
-                ))]))
-            }
-        });
+    let mut mock = MockSpanner::new();
+    mock.expect_execute_streaming_sql().returning(move |_| {
+        if recorded.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(tonic::Status::unavailable("probe unavailable"))
+        } else {
+            let result = partial_result_set(true, &["MockTable"], b"t", true);
+            Ok(stream_of(vec![Ok(result)]))
+        }
     });
+    let server = MockServer::serve(mock);
     let mut connection = server.connect();
     connection
-        .set_option(
-            OptionConnection::Other(spanner_adbc::OPTION_RETRY_MAX_ATTEMPTS.into()),
-            OptionValue::Int(1),
-        )
+        .set_option(OPTION_RETRY_MAX_ATTEMPTS.into(), 1_i64.into())
         .unwrap();
-    let mut statement = append_ingest_statement(&mut connection);
-    statement.bind(ingest_batch(0)).unwrap();
     // A failed existence probe preserves the empty ingest's success, but must not retry.
-    assert_eq!(statement.execute_update().unwrap(), Some(0));
+    let count = ingest(append_ingest_statement(&mut connection), 0);
+    assert_eq!(count.unwrap(), Some(0));
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
 #[test]
 fn batch_write_honors_retry_attempt_limit() {
-    for limit in [1, 3] {
+    for limit in [1_i64, 3] {
         let attempts = Arc::new(AtomicUsize::new(0));
         let recorded = attempts.clone();
-        let server = start_server(move |mock| {
-            mock.expect_batch_write().returning(move |_| {
-                recorded.fetch_add(1, Ordering::SeqCst);
-                Err(tonic::Status::unavailable("batch write unavailable"))
-            });
+        let mut mock = MockSpanner::new();
+        mock.expect_batch_write().returning(move |_| {
+            recorded.fetch_add(1, Ordering::SeqCst);
+            Err(tonic::Status::unavailable("batch write unavailable"))
         });
+        let server = MockServer::serve(mock);
         let mut connection = server.connect();
         let mut statement = batch_write_ingest_statement(&mut connection);
         for (key, value) in [
-            (
-                spanner_adbc::OPTION_RETRY_MAX_ATTEMPTS,
-                OptionValue::Int(limit as i64),
-            ),
-            (
-                spanner_adbc::OPTION_RETRY_BACKOFF_INITIAL_SECONDS,
-                OptionValue::Double(0.001),
-            ),
-            (
-                spanner_adbc::OPTION_RPC_TIMEOUT_UPDATE,
-                OptionValue::Double(2.0),
-            ),
+            (OPTION_RETRY_MAX_ATTEMPTS, limit.into()),
+            (OPTION_RETRY_BACKOFF_INITIAL_SECONDS, 0.001.into()),
+            (OPTION_RPC_TIMEOUT_UPDATE, 2.0.into()),
         ] {
-            statement
-                .set_option(OptionStatement::Other(key.into()), value)
-                .unwrap();
+            statement.set_option(key.into(), value).unwrap();
         }
-        statement.bind(ingest_batch(1)).unwrap();
-        let error = statement.execute_update().unwrap_err();
+        let error = ingest(statement, 1).unwrap_err();
         assert_eq!(error.status, AdbcStatus::IO, "{error}");
-        assert_eq!(attempts.load(Ordering::SeqCst), limit);
+        assert_eq!(attempts.load(Ordering::SeqCst), limit as usize);
     }
 }
 
 #[test]
 fn query_consumes_empty_stream_ingest_schema() {
-    let server = start_server(|mock| {
-        mock.expect_execute_streaming_sql().returning(|_| {
-            Ok(stream_of(vec![Ok(partial_result_set(
-                true,
-                &["row"],
-                b"",
-                true,
-            ))]))
-        });
-    });
+    let (server, _) = query_server(&["row"]);
     let mut connection = server.connect();
     for discard in [false, true] {
         let mut statement = connection.new_statement().unwrap();
         statement
-            .bind_stream(Box::new(arrow_array::RecordBatchIterator::new(
+            .bind_stream(Box::new(RecordBatchIterator::new(
                 std::iter::empty::<Result<RecordBatch, ArrowError>>(),
                 ingest_batch(0).schema(),
             )))
             .unwrap();
-        statement.set_sql_query("SELECT c FROM MockTable").unwrap();
+        statement.set_sql_query(SELECT).unwrap();
         if discard {
             assert_eq!(statement.execute_update().unwrap(), None);
         } else {
-            let batches = statement
-                .execute()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            assert_eq!(row_count(&fetch(&mut statement)), 1);
         }
-        statement
-            .set_option(
-                OptionStatement::TargetTable,
-                OptionValue::String("MockTable".into()),
-            )
-            .unwrap();
-        statement
-            .set_option(
-                OptionStatement::IngestMode,
-                OptionValue::String("append".into()),
-            )
-            .unwrap();
+        target_mock_table(&mut statement);
         let error = statement.execute_update().unwrap_err();
         assert_eq!(error.status, AdbcStatus::InvalidState, "{error}");
         assert!(error.message.contains("no data has been bound"), "{error}");
