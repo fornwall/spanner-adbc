@@ -247,32 +247,27 @@ async fn prefetch_loop<S: ChunkSource>(
     tx: mpsc::Sender<Result<Vec<S::Row>>>,
     cancel: CancelSignal,
 ) {
-    loop {
-        let chunk = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                // Best effort: with a full channel, the consumer's cancel-aware `recv` sees the
-                // latched signal before the buffered chunk.
-                let _ = tx.try_send(Err(cancelled_err()));
+    let pump = async {
+        loop {
+            let chunk = source.next_chunk().await;
+            if chunk.as_ref().is_ok_and(Vec::is_empty) {
                 return;
             }
-            pulled = source.next_chunk() => pulled,
-        };
-        if chunk.as_ref().is_ok_and(Vec::is_empty) {
-            return;
-        }
-        let failed = chunk.is_err();
-        // Also watch the signal while parked on a full channel, so a cancel is not stalled behind
-        // a consumer that has stopped draining.
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return,
-            sent = tx.send(chunk) => {
-                if sent.is_err() || failed {
-                    return;
-                }
+            let failed = chunk.is_err();
+            if tx.send(chunk).await.is_err() || failed {
+                return;
             }
         }
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            // Closing the channel silently would read as the end of the stream to a consumer that
+            // checked the signal just before it was set. Best effort: with a full channel, that
+            // consumer gets the buffered chunk and sees the latched signal on its next call.
+            let _ = tx.try_send(Err(cancelled_err()));
+        }
+        () = pump => {}
     }
 }
 

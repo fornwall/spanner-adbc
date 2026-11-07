@@ -246,6 +246,29 @@ fn prefetch_cancel_aborts_an_in_flight_fetch() {
     runtime.block_on(task).unwrap();
 }
 
+/// Cancels from inside a fetch that still returns rows.
+struct CancelledMidFetch(CancelSignal);
+
+impl ChunkSource for CancelledMidFetch {
+    type Row = i32;
+
+    async fn next_chunk(&mut self) -> Result<Vec<i32>> {
+        self.0.signal();
+        Ok(vec![1])
+    }
+}
+
+/// A consumer that checked the signal just before the cancel must not read the closed channel as
+/// the end of the stream.
+#[test]
+fn prefetch_cancel_after_a_fetch_is_not_end_of_stream() {
+    let runtime = new_runtime().unwrap();
+    let cancel = CancelSignal::new();
+    let (mut rx, task) = spawn_prefetch(&runtime, cancel.clone(), CancelledMidFetch(cancel));
+    assert!(rx.blocking_recv().is_some());
+    runtime.block_on(task).unwrap();
+}
+
 #[test]
 fn prefetch_cancel_unblocks_a_fetch_error_waiting_on_a_full_channel() {
     let runtime = tokio::runtime::Builder::new_current_thread()
