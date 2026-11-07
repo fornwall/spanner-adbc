@@ -87,3 +87,44 @@ fn typed_getters_propagate_the_string_lookup_error_unchanged() {
     assert_eq!(error.status, Status::NotFound);
     assert_eq!(error.message, expected);
 }
+
+/// Every option key the driver handles must appear in `docs/options.md`.
+#[test]
+fn every_handled_option_key_is_documented() {
+    use adbc_core::constants;
+
+    let doc = include_str!("../../docs/options.md");
+    // Split so that this needle does not match itself.
+    let driver_keys = include_str!("../lib.rs")
+        .split(concat!("pub const ", "OPTION_"))
+        .skip(1)
+        .map(|rest| {
+            rest.split('"')
+                .nth(1)
+                .expect("an option constant is a string")
+        });
+    let standard_keys = [
+        constants::ADBC_OPTION_URI,
+        constants::ADBC_CONNECTION_OPTION_AUTOCOMMIT,
+        constants::ADBC_CONNECTION_OPTION_READ_ONLY,
+        constants::ADBC_CONNECTION_OPTION_ISOLATION_LEVEL,
+        constants::ADBC_CONNECTION_OPTION_CURRENT_CATALOG,
+        constants::ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
+        constants::ADBC_STATEMENT_OPTION_INCREMENTAL,
+        constants::ADBC_INGEST_OPTION_TARGET_TABLE,
+        constants::ADBC_INGEST_OPTION_TARGET_DB_SCHEMA,
+        constants::ADBC_INGEST_OPTION_TARGET_CATALOG,
+        constants::ADBC_INGEST_OPTION_TEMPORARY,
+        constants::ADBC_INGEST_OPTION_MODE,
+    ];
+    let mut count = 0;
+    for key in driver_keys.chain(standard_keys) {
+        count += 1;
+        // Backticks keep a short key like `uri` from matching inside another word.
+        assert!(
+            doc.contains(&format!("`{key}`")),
+            "option key `{key}` is handled by the driver but missing from docs/options.md"
+        );
+    }
+    assert!(count > standard_keys.len(), "found no OPTION_ constants");
+}
