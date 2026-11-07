@@ -3826,18 +3826,29 @@ fn zero_row_schema_fidelity() {
     );
 }
 
+/// Asserts that `attempt`, run under a microsecond deadline, fails with a timeout naming `option`.
+/// The deadline fires on the next ~1ms timer tick, and `tokio::time::timeout` polls the operation
+/// before the timer, so a response that is already in wins. On a loaded runner a query did that
+/// more than 100 times in a row. Attempts stop at the first failure, so the bound costs nothing
+/// unless the deadline is ignored.
+fn assert_deadline_expires(
+    what: &str,
+    option: &str,
+    mut attempt: impl FnMut() -> Option<adbc_core::error::Error>,
+) {
+    let error = (0..2000)
+        .find_map(|_| attempt())
+        .unwrap_or_else(|| panic!("{what}: {option} never expired"));
+    assert_eq!(error.status, Status::Timeout, "{what}: {error}");
+    assert!(error.message.contains(option), "{what}: {error}");
+}
+
 /// RPC timeout options: generous deadlines do not affect operations, and expired ones report
 /// `Timeout`. The DDL deadline is tested in `tests/mock_spanner.rs`.
 #[test]
 fn rpc_timeouts() {
     let Some(mut fx) = fixture() else { return };
     let connection = &mut fx.connection;
-
-    let assert_timeout = |error: Option<adbc_core::error::Error>, option: &str| {
-        let error = error.expect("a microsecond deadline must expire");
-        assert_eq!(error.status, Status::Timeout, "{error}");
-        assert!(error.message.contains(option), "{error}");
-    };
 
     // The streamed query uses the query deadline for its first chunk and the fetch deadline after.
     for key in [
@@ -3861,13 +3872,8 @@ fn rpc_timeouts() {
 
     let mut tiny = prepare(connection, "SELECT Id FROM AdbcRpcTimeout ORDER BY Id");
     configure(&mut tiny, &[(OPTION_RPC_TIMEOUT_QUERY, "0.000001")]);
-    // The query deadline covers the first chunk, so `execute` itself fails. A microsecond
-    // deadline fires on the next ~1ms timer tick, which a fast backend occasionally beats, so
-    // each microsecond deadline below gets a few attempts.
-    assert_timeout(
-        (0..5).find_map(|_| tiny.execute().err()),
-        OPTION_RPC_TIMEOUT_QUERY,
-    );
+    // The query deadline covers the first chunk, so `execute` itself fails.
+    assert_deadline_expires("query", OPTION_RPC_TIMEOUT_QUERY, || tiny.execute().err());
 
     let mut tiny_dml = prepare(
         connection,
@@ -3876,10 +3882,9 @@ fn rpc_timeouts() {
     tiny_dml
         .set_option(OPTION_RPC_TIMEOUT_UPDATE.into(), 0.000001.into())
         .unwrap();
-    assert_timeout(
-        (0..5).find_map(|_| tiny_dml.execute_update().err()),
-        OPTION_RPC_TIMEOUT_UPDATE,
-    );
+    assert_deadline_expires("DML", OPTION_RPC_TIMEOUT_UPDATE, || {
+        tiny_dml.execute_update().err()
+    });
 
     tiny.set_option(OPTION_RPC_TIMEOUT_QUERY.into(), 30_i64.into())
         .unwrap();
@@ -3894,14 +3899,11 @@ fn rpc_timeouts() {
 
     // The query deadline also bounds internal metadata reads.
     configure(connection, &[(OPTION_RPC_TIMEOUT_QUERY, "0.000001")]);
-    assert_timeout(
-        (0..5).find_map(|_| {
-            connection
-                .get_objects(ObjectDepth::All, None, None, None, None, None)
-                .err()
-        }),
-        OPTION_RPC_TIMEOUT_QUERY,
-    );
+    assert_deadline_expires("metadata read", OPTION_RPC_TIMEOUT_QUERY, || {
+        connection
+            .get_objects(ObjectDepth::All, None, None, None, None, None)
+            .err()
+    });
     connection
         .set_option(OPTION_RPC_TIMEOUT_QUERY.into(), 30_i64.into())
         .unwrap();
