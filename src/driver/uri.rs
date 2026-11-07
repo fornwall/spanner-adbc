@@ -61,7 +61,7 @@ pub(super) fn is_plaintext_endpoint(endpoint: &str) -> bool {
 }
 
 /// Database options allowed in URI query parameters; the URI path supplies the database.
-const URI_QUERY_OPTIONS: [&str; 10] = [
+pub(crate) const URI_QUERY_OPTIONS: [&str; 10] = [
     OPTION_ENDPOINT,
     OPTION_EMULATOR,
     OPTION_INSTANCE_TYPE,
@@ -75,7 +75,7 @@ const URI_QUERY_OPTIONS: [&str; 10] = [
 ];
 
 /// Secret values must use dedicated, write-only options, since URIs are commonly logged.
-const URI_SECRET_OPTIONS: [&str; 2] = [OPTION_KEYFILE_JSON, OPTION_ACCESS_TOKEN];
+pub(crate) const URI_SECRET_OPTIONS: [&str; 2] = [OPTION_KEYFILE_JSON, OPTION_ACCESS_TOKEN];
 
 /// The URI form that error messages suggest.
 pub(super) const URI_FORM: &str =

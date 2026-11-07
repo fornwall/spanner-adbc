@@ -5,8 +5,8 @@ mod credentials;
 mod uri;
 
 use credentials::{CredentialChoice, first_token};
-pub(crate) use uri::ensure_scheme;
 use uri::{URI_FORM, is_plaintext_endpoint};
+pub(crate) use uri::{URI_QUERY_OPTIONS, URI_SECRET_OPTIONS, ensure_scheme};
 
 use adbc_core::constants::{ADBC_OPTION_PASSWORD, ADBC_OPTION_URI, ADBC_OPTION_USERNAME};
 use adbc_core::error::{Result, Status};

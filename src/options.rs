@@ -330,22 +330,12 @@ impl SharedConfig {
 
 /// The objects that accept `key`, so that setting it on the wrong one can say where it belongs.
 pub(crate) fn option_level(key: &str) -> Option<&'static str> {
+    use crate::driver::{URI_QUERY_OPTIONS, URI_SECRET_OPTIONS};
     use crate::*;
     use adbc_core::constants::*;
     let level = match key {
-        ADBC_OPTION_URI
-        | OPTION_ENDPOINT
-        | OPTION_EMULATOR
-        | OPTION_INSTANCE_TYPE
-        | OPTION_KEYFILE
-        | OPTION_KEYFILE_JSON
-        | OPTION_IMPERSONATE_TARGET_PRINCIPAL
-        | OPTION_IMPERSONATE_DELEGATES
-        | OPTION_IMPERSONATE_SCOPES
-        | OPTION_IMPERSONATE_LIFETIME
-        | OPTION_ACCESS_TOKEN
-        | OPTION_QUOTA_PROJECT
-        | OPTION_RPC_TIMEOUT_CONNECT => "database",
+        ADBC_OPTION_URI => "database",
+        _ if URI_QUERY_OPTIONS.contains(&key) || URI_SECRET_OPTIONS.contains(&key) => "database",
         ADBC_CONNECTION_OPTION_AUTOCOMMIT
         | ADBC_CONNECTION_OPTION_READ_ONLY
         | ADBC_CONNECTION_OPTION_ISOLATION_LEVEL
