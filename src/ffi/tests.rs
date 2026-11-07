@@ -1,5 +1,5 @@
 use super::*;
-use crate::ffi::test_support::{null, zeroed_error};
+use crate::ffi::test_support::{null, zeroed, zeroed_error};
 
 /// Every operation slot in header order, and whether it is populated.
 fn slots(table: &AdbcDriver) -> Vec<(&'static str, bool)> {
@@ -145,10 +145,7 @@ fn the_vtable_slots_do_what_their_names_say() {
     let table = unsafe { table.assume_init() };
     let name = |value: &str| std::ffi::CString::new(value).unwrap();
 
-    let mut database = abi::AdbcDatabase {
-        private_data: null(),
-        private_driver: null(),
-    };
+    let mut database: abi::AdbcDatabase = zeroed();
     // New allocates; Init and Release on an unallocated handle would not.
     assert_eq!(
         unsafe { table.DatabaseNew.unwrap()(&raw mut database, null()) },
@@ -219,10 +216,7 @@ fn the_vtable_slots_do_what_their_names_say() {
     assert!(database.private_data.is_null());
 
     // The same for the connection.
-    let mut connection = abi::AdbcConnection {
-        private_data: null(),
-        private_driver: null(),
-    };
+    let mut connection: abi::AdbcConnection = zeroed();
     assert_eq!(
         unsafe { table.ConnectionNew.unwrap()(&raw mut connection, null()) },
         ADBC_STATUS_OK

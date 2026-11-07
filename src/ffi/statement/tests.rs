@@ -17,16 +17,13 @@ use crate::ffi::options::{
     get_option_bytes, get_option_double, get_option_int, get_option_string, set_option_bytes,
     set_option_double, set_option_int, set_option_string,
 };
-use crate::ffi::test_support::null;
+use crate::ffi::test_support::{null, zeroed};
 
 const TARGET_TABLE: &str = "adbc.ingest.target_table";
 
 /// A statement after `AdbcStatementRelease`, or one never passed to `AdbcStatementNew`.
 fn released_handle() -> AdbcStatement {
-    AdbcStatement {
-        private_data: null(),
-        private_driver: null(),
-    }
+    zeroed()
 }
 
 fn key(name: &str) -> CString {
@@ -224,10 +221,7 @@ impl MockStatement {
             .block_on(spanner_grpc_mock::start("127.0.0.1:0", mock))
             .unwrap();
 
-        let mut database = AdbcDatabase {
-            private_data: null(),
-            private_driver: null(),
-        };
+        let mut database: AdbcDatabase = zeroed();
         assert_eq!(
             unsafe { new_handle(&raw mut database, null()) },
             ADBC_STATUS_OK
@@ -250,10 +244,7 @@ impl MockStatement {
             ADBC_STATUS_OK
         );
 
-        let mut connection = AdbcConnection {
-            private_data: null(),
-            private_driver: null(),
-        };
+        let mut connection: AdbcConnection = zeroed();
         assert_eq!(
             unsafe { new_handle(&raw mut connection, null()) },
             ADBC_STATUS_OK

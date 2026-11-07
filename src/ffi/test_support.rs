@@ -7,6 +7,11 @@ pub(super) fn zeroed_error() -> AdbcError {
     AdbcError::default()
 }
 
+/// A zero-initialized ABI struct, as `New` expects and `Release` leaves behind.
+pub(super) fn zeroed<T>() -> T {
+    unsafe { std::mem::zeroed() }
+}
+
 /// Run the error's release callback, if set.
 pub(super) fn release_error(error: &mut AdbcError) {
     if let Some(release) = error.release {

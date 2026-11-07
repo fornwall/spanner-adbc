@@ -7,16 +7,13 @@ use crate::ffi::abi::{
 };
 use crate::ffi::handle::{new_handle, release_handle};
 use crate::ffi::options::{get_option_string, set_option_int, set_option_string};
-use crate::ffi::test_support::{null, release_error, zeroed_error};
+use crate::ffi::test_support::{null, release_error, zeroed, zeroed_error};
 
 /// Nothing here connects, so the database need not exist.
 const DATABASE: &str = "projects/a-project/instances/an-instance/databases/a-database";
 
 fn pending() -> AdbcDatabase {
-    let mut database = AdbcDatabase {
-        private_data: null(),
-        private_driver: null(),
-    };
+    let mut database: AdbcDatabase = zeroed();
     let mut error = zeroed_error();
     assert_eq!(
         unsafe { new_handle(&raw mut database, &raw mut error) },

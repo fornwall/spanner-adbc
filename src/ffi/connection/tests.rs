@@ -9,15 +9,12 @@ use super::super::options::{
     set_option_double, set_option_int, set_option_string,
 };
 use super::*;
-use crate::ffi::test_support::{error_message, null, release_error, zeroed_error};
+use crate::ffi::test_support::{error_message, null, release_error, zeroed, zeroed_error};
 
 /// A connection after `AdbcConnectionNew`. Argument validation and the readiness check need no
 /// backend.
 fn pending() -> AdbcConnection {
-    let mut connection = AdbcConnection {
-        private_data: null(),
-        private_driver: null(),
-    };
+    let mut connection: AdbcConnection = zeroed();
     assert_eq!(
         unsafe { new_handle(&raw mut connection, null()) },
         ADBC_STATUS_OK
@@ -50,10 +47,7 @@ fn a_null_handle_is_a_bad_argument_not_a_crash() {
         ADBC_STATUS_INVALID_ARGUMENT
     );
     // An unpopulated `private_data` is an object used out of order, not a bad argument.
-    let mut connection = AdbcConnection {
-        private_data: null(),
-        private_driver: null(),
-    };
+    let mut connection: AdbcConnection = zeroed();
     assert_eq!(
         unsafe { connection_commit(&raw mut connection, null()) },
         ADBC_STATUS_INVALID_STATE
@@ -324,17 +318,11 @@ fn every_key_is_buffered_before_init_whether_the_driver_knows_it_or_not() {
 /// A released handle has null `private_data`, which every entry point must check before use.
 #[test]
 fn every_entry_point_refuses_a_released_handle() {
-    let mut handle = AdbcConnection {
-        private_data: null(),
-        private_driver: null(),
-    };
+    let mut handle: AdbcConnection = zeroed();
     let c = &raw mut handle;
     let name = CString::new(adbc_core::constants::ADBC_CONNECTION_OPTION_AUTOCOMMIT).unwrap();
     let (mut length, mut integer, mut double) = (0_usize, 0_i64, 0.0_f64);
-    let mut database = AdbcDatabase {
-        private_data: null(),
-        private_driver: null(),
-    };
+    let mut database: AdbcDatabase = zeroed();
 
     for (label, status) in [
         ("init", unsafe {
@@ -398,10 +386,7 @@ fn every_entry_point_refuses_a_released_handle() {
 #[test]
 fn creating_a_statement_needs_an_initialized_connection() {
     let mut connection = pending();
-    let mut statement = crate::ffi::abi::AdbcStatement {
-        private_data: null(),
-        private_driver: null(),
-    };
+    let mut statement: crate::ffi::abi::AdbcStatement = zeroed();
     let mut error = zeroed_error();
     assert_eq!(
         unsafe {
@@ -424,10 +409,7 @@ fn creating_a_statement_needs_an_initialized_connection() {
 #[test]
 fn init_against_an_allocated_but_uninitialized_database_is_refused() {
     let mut connection = pending();
-    let mut database = AdbcDatabase {
-        private_data: null(),
-        private_driver: null(),
-    };
+    let mut database: AdbcDatabase = zeroed();
     assert_eq!(
         unsafe { new_handle(&raw mut database, null()) },
         ADBC_STATUS_OK
