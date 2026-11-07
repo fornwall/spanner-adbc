@@ -9,7 +9,7 @@
 //! the state alive until cancellation returns.
 
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use adbc_core::CancelHandle;
 use adbc_core::error::{Error, Result, Status};
@@ -97,7 +97,7 @@ impl<K, S> Staged<K, S> {
 pub(crate) struct Exported<S> {
     /// Set once the state is initialized. Kept outside `state` so [`cancel`] works while another
     /// call holds the state lock.
-    cancel: Mutex<Option<Box<dyn CancelHandle>>>,
+    cancel: OnceLock<Box<dyn CancelHandle>>,
     /// Taken by every call except [`cancel`].
     state: Mutex<S>,
 }
@@ -113,7 +113,7 @@ fn _exported_is_shareable<S: Send>(exported: &Exported<S>) -> &(dyn Send + Sync)
 impl<S: Send> Exported<S> {
     pub(crate) fn into_private_data(state: S) -> *mut c_void {
         Arc::into_raw(Arc::new(Self {
-            cancel: Mutex::new(None),
+            cancel: OnceLock::new(),
             state: Mutex::new(state),
         }))
         .cast::<c_void>()
@@ -232,11 +232,7 @@ pub(super) unsafe extern "C" fn cancel<H: FfiHandle>(
             Arc::increment_strong_count(pointer);
             Arc::from_raw(pointer)
         };
-        let cancel = exported
-            .cancel
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        match cancel.as_ref() {
+        match exported.cancel.get() {
             Some(cancel) => cancel.try_cancel(),
             None => Err(uninitialized(H::KIND)),
         }
@@ -244,7 +240,7 @@ pub(super) unsafe extern "C" fn cancel<H: FfiHandle>(
     unsafe { finish(outcome, error) }
 }
 
-/// Install the cancel handle of a newly initialized state.
+/// Install the cancel handle of a newly initialized state, which happens at most once.
 ///
 /// # Safety
 /// `handle` must point to a valid ABI struct holding an object.
@@ -252,10 +248,7 @@ pub(super) unsafe fn install_cancel_handle<H: FfiHandle>(
     handle: *mut H,
     cancel: Box<dyn CancelHandle>,
 ) {
-    *unsafe { &*object(handle) }
-        .cancel
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = Some(cancel);
+    let _ = unsafe { &*object(handle) }.cancel.set(cancel);
 }
 
 /// `AdbcDatabaseNew`/`AdbcConnectionNew`. Statements have no `Init` and are built by
