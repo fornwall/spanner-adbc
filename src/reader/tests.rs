@@ -16,7 +16,7 @@ fn background_fetch_panic_is_an_error_not_end_of_stream() {
         crate::runtime::new_runtime().unwrap(),
         CancelSignal::new(),
         Arc::new(Schema::empty()),
-        None,
+        Vec::new(),
         PanickingSource,
     );
     let error = reader

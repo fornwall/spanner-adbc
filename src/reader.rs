@@ -12,7 +12,7 @@ use arrow_schema::{ArrowError, Schema, SchemaRef};
 use google_cloud_spanner::result::{ResultSet, Row};
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
-use google_cloud_spanner::value::{Kind, Value};
+use google_cloud_spanner::value::Value;
 
 use crate::conversion::{TimestampPrecision, build_batch, build_schema};
 use crate::error::{err, from_spanner};
@@ -58,15 +58,9 @@ fn approx_row_bytes(row: &Row) -> usize {
 /// Counts each value's own storage, even for nulls and empty containers; counting only payload
 /// bytes would leave large arrays of nulls or small scalars unbounded.
 fn approx_value_bytes(value: &Value) -> usize {
-    let payload = match value.kind() {
-        Kind::String => value.as_str().expect("string kind").len(),
-        Kind::List => value
-            .as_list()
-            .expect("list kind")
-            .iter()
-            .map(approx_value_bytes)
-            .sum(),
-        _ => 0,
+    let payload = match value.as_list() {
+        Some(list) => list.iter().map(approx_value_bytes).sum(),
+        None => value.as_str().map_or(0, str::len),
     };
     size_of::<Value>() + payload
 }
@@ -91,36 +85,14 @@ pub(crate) async fn stream_query(
         _ => build_schema(rs.metadata(), precision)?,
     };
     let source = ResultSetChunks {
-        result_set: rs,
+        result_set: Some(rs),
+        bound: None,
         batch_size,
         fetch_timeout,
     };
     Ok(SpannerBatchReader::new(
-        runtime,
-        cancel,
-        schema,
-        Some(first),
-        source,
+        runtime, cancel, schema, first, source,
     ))
-}
-
-/// Prefetch source for a single result set.
-struct ResultSetChunks {
-    result_set: ResultSet,
-    batch_size: usize,
-    fetch_timeout: Option<Duration>,
-}
-
-impl ChunkSource for ResultSetChunks {
-    type Row = Row;
-
-    fn next_chunk(&mut self) -> impl std::future::Future<Output = Result<Vec<Row>>> + Send {
-        with_timeout(
-            self.fetch_timeout,
-            crate::OPTION_RPC_TIMEOUT_FETCH,
-            pull_chunk(&mut self.result_set, self.batch_size),
-        )
-    }
 }
 
 /// A streaming [`RecordBatchReader`] over Spanner rows.
@@ -134,7 +106,7 @@ pub(crate) struct SpannerBatchReader {
     cancel: CancelSignal,
     schema: SchemaRef,
     /// The chunk pulled up front to settle the schema.
-    first: Option<Vec<Row>>,
+    first: Vec<Row>,
     /// `None` once the stream has ended, failed or been cancelled.
     chunks: Option<crate::runtime::ChunkReceiver<Row>>,
     task: tokio::task::JoinHandle<()>,
@@ -146,7 +118,7 @@ impl SpannerBatchReader {
         runtime: SharedRuntime,
         cancel: CancelSignal,
         schema: SchemaRef,
-        first: Option<Vec<Row>>,
+        first: Vec<Row>,
         source: S,
     ) -> Self {
         let (chunks, task) = spawn_prefetch(&runtime, cancel.clone(), source);
@@ -180,14 +152,12 @@ impl Iterator for SpannerBatchReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         let rx = self.chunks.as_mut()?;
-        let first = &mut self.first;
+        let first = std::mem::take(&mut self.first);
         let task = &mut self.task;
         // Check cancellation before yielding any rows, including the chunk fetched by execute().
         let rows = block_on_cancellable(&self.runtime, &self.cancel, async {
-            if let Some(rows) = first.take()
-                && !rows.is_empty()
-            {
-                return Ok(Some(rows));
+            if !first.is_empty() {
+                return Ok(Some(first));
             }
             let chunk = rx.recv().await;
             if chunk.is_none() {
@@ -212,7 +182,6 @@ impl Iterator for SpannerBatchReader {
             }
             Ok(Some(batch)) => Some(Ok(batch)),
             Err(e) => {
-                self.first = None;
                 self.chunks = None;
                 self.task.abort();
                 Some(Err(to_arrow_error(e)))
@@ -227,6 +196,9 @@ impl RecordBatchReader for SpannerBatchReader {
     }
 }
 
+/// A bound query's per-row statements.
+type Statements = Box<dyn Iterator<Item = Result<SpannerSql>> + Send>;
+
 /// Stream the results of a bound query's per-row statements as one reader, executing them all in
 /// `transaction` so every row sees the same snapshot.
 ///
@@ -238,7 +210,7 @@ pub(crate) async fn stream_bound_query(
     runtime: SharedRuntime,
     cancel: CancelSignal,
     transaction: Arc<MultiUseReadOnlyTransaction>,
-    mut statements: Box<dyn Iterator<Item = Result<SpannerSql>> + Send>,
+    mut statements: Statements,
     batch_size: usize,
     precision: TimestampPrecision,
     fetch_timeout: Option<Duration>,
@@ -257,14 +229,13 @@ pub(crate) async fn stream_bound_query(
         Some(rs) => {
             let rows = pull_chunk(rs, batch_size).await?;
             let schema = build_schema(rs.metadata(), precision)?;
-            (Some(rows), schema)
+            (rows, schema)
         }
-        None => (None, Arc::new(Schema::empty())),
+        None => (Vec::new(), Arc::new(Schema::empty())),
     };
-    let source = BoundQueryChunks {
-        transaction,
-        statements,
+    let source = ResultSetChunks {
         result_set,
+        bound: Some((transaction, statements)),
         batch_size,
         fetch_timeout,
     };
@@ -273,18 +244,18 @@ pub(crate) async fn stream_bound_query(
     ))
 }
 
-/// Prefetch source for a bound query. The fetch timeout bounds each `next_chunk`, including any
+/// Prefetch source for a result set. The fetch timeout bounds each `next_chunk`, including any
 /// execution of the next row's statement.
-struct BoundQueryChunks {
-    transaction: Arc<MultiUseReadOnlyTransaction>,
-    statements: Box<dyn Iterator<Item = Result<SpannerSql>> + Send>,
+struct ResultSetChunks {
     /// The result set currently being drained.
     result_set: Option<ResultSet>,
+    /// A bound query's transaction and the statements it has yet to run.
+    bound: Option<(Arc<MultiUseReadOnlyTransaction>, Statements)>,
     batch_size: usize,
     fetch_timeout: Option<Duration>,
 }
 
-impl BoundQueryChunks {
+impl ResultSetChunks {
     /// Pull the next non-empty chunk, executing further statements as result sets drain so a row
     /// with an empty result yields no empty batch. Empty, ending the stream, once all are drained.
     async fn pull(&mut self) -> Result<Vec<Row>> {
@@ -296,16 +267,19 @@ impl BoundQueryChunks {
                 }
                 self.result_set = None;
             }
-            let Some(statement) = self.statements.next() else {
+            let Some((transaction, statements)) = self.bound.as_mut() else {
                 return Ok(Vec::new());
             };
-            let rs = self.transaction.execute_query(statement?).await;
+            let Some(statement) = statements.next() else {
+                return Ok(Vec::new());
+            };
+            let rs = transaction.execute_query(statement?).await;
             self.result_set = Some(rs.map_err(from_spanner)?);
         }
     }
 }
 
-impl ChunkSource for BoundQueryChunks {
+impl ChunkSource for ResultSetChunks {
     type Row = Row;
 
     fn next_chunk(&mut self) -> impl std::future::Future<Output = Result<Vec<Row>>> + Send {
