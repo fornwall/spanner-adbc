@@ -93,17 +93,12 @@ pub(crate) unsafe fn optional_str_list<'a>(
     if ptr.is_null() {
         return Ok(None);
     }
-    let mut items = Vec::new();
-    let mut cursor = ptr;
-    loop {
-        let entry = unsafe { *cursor };
-        if entry.is_null() {
-            break;
-        }
-        items.push(unsafe { required_str(entry, name) }?);
-        cursor = unsafe { cursor.add(1) };
-    }
-    Ok(Some(items))
+    (0..)
+        .map(|index| unsafe { *ptr.add(index) })
+        .take_while(|entry| !entry.is_null())
+        .map(|entry| unsafe { required_str(entry, name) })
+        .collect::<Result<_>>()
+        .map(Some)
 }
 
 /// Borrow a pointer/length byte argument. A null pointer is accepted only with a zero length.

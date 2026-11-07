@@ -11,7 +11,7 @@ use arrow_array::{Array, RecordBatch, RecordBatchOptions, RecordBatchReader, Str
 use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType, Schema, SchemaRef};
 
-use super::guard::{drop_panic_payload, panic_message};
+use super::guard::{drop_panic_payload, missing_argument, panic_message};
 use crate::error::invalid_argument;
 
 /// # Safety
@@ -21,15 +21,11 @@ pub(super) unsafe fn import_batch(
     values: *mut FFI_ArrowArray,
     schema: *mut FFI_ArrowSchema,
 ) -> Result<RecordBatch> {
-    let Some(values_ref) = (unsafe { values.as_ref() }) else {
-        return Err(invalid_argument("values must not be null"));
-    };
+    let values_ref = unsafe { values.as_ref() }.ok_or_else(|| missing_argument("values"))?;
     if values_ref.release().is_none() {
         return Err(invalid_argument("values has already been released"));
     }
-    let Some(schema_ref) = (unsafe { schema.as_ref() }) else {
-        return Err(invalid_argument("schema must not be null"));
-    };
+    let schema_ref = unsafe { schema.as_ref() }.ok_or_else(|| missing_argument("schema"))?;
     if schema_ref.release().is_none() {
         return Err(invalid_argument("schema has already been released"));
     }
@@ -56,9 +52,7 @@ impl BoundStreamReader {
     /// `stream` must be null or point to a valid Arrow C stream. The reader takes ownership once
     /// the callbacks are validated; a stream with missing callbacks stays with the caller.
     pub(super) unsafe fn from_raw(stream: *mut FFI_ArrowArrayStream) -> Result<Self> {
-        let Some(stream_ref) = (unsafe { stream.as_ref() }) else {
-            return Err(invalid_argument("stream must not be null"));
-        };
+        let stream_ref = unsafe { stream.as_ref() }.ok_or_else(|| missing_argument("stream"))?;
         if stream_ref.release().is_none() {
             return Err(invalid_argument("stream has already been released"));
         }

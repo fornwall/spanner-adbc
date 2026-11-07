@@ -67,21 +67,25 @@ unsafe fn parse_key<H: FfiHandle<State: OptionTarget>>(key: *const c_char) -> Re
     Ok(KeyOf::<H>::from(unsafe { required_str(key, "key") }?))
 }
 
-/// Apply an already-converted option value.
+/// Apply an already-converted option value. A value that failed to convert is reported before
+/// the handle is consulted, so it is a bad argument even on a released handle.
 ///
 /// # Safety
 /// `handle` and `key` must be null or valid for the call.
 unsafe fn set_option<H: FfiHandle<State: OptionTarget>>(
     handle: *mut H,
     key: *const c_char,
-    value: OptionValue,
+    value: Result<OptionValue>,
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
-    unsafe {
-        with_state(handle, error, |state| {
-            let key = parse_key::<H>(key)?;
-            state.set(key, value)
-        })
+    match value {
+        Ok(value) => unsafe {
+            with_state(handle, error, |state| {
+                let key = parse_key::<H>(key)?;
+                state.set(key, value)
+            })
+        },
+        Err(failure) => unsafe { finish(Err(failure), error) },
     }
 }
 
@@ -93,11 +97,7 @@ pub(super) unsafe extern "C" fn set_option_string<H: FfiHandle<State: OptionTarg
     value: *const c_char,
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
-    // Checked before the handle, so a null value is a bad argument even on a released handle.
-    let value = match unsafe { required_str(value, "value") } {
-        Ok(value) => OptionValue::String(value.to_string()),
-        Err(failure) => return unsafe { finish(Err(failure), error) },
-    };
+    let value = unsafe { required_str(value, "value") }.map(OptionValue::from);
     unsafe { set_option(handle, key, value, error) }
 }
 
@@ -111,10 +111,7 @@ pub(super) unsafe extern "C" fn set_option_bytes<H: FfiHandle<State: OptionTarge
     length: usize,
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
-    let value = match unsafe { byte_slice(value, length, "value") } {
-        Ok(value) => OptionValue::Bytes(value.to_vec()),
-        Err(failure) => return unsafe { finish(Err(failure), error) },
-    };
+    let value = unsafe { byte_slice(value, length, "value") }.map(OptionValue::from);
     unsafe { set_option(handle, key, value, error) }
 }
 
@@ -126,7 +123,7 @@ pub(super) unsafe extern "C" fn set_option_int<H: FfiHandle<State: OptionTarget>
     value: i64,
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
-    unsafe { set_option(handle, key, OptionValue::Int(value), error) }
+    unsafe { set_option(handle, key, Ok(value.into()), error) }
 }
 
 /// # Safety
@@ -137,7 +134,7 @@ pub(super) unsafe extern "C" fn set_option_double<H: FfiHandle<State: OptionTarg
     value: f64,
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
-    unsafe { set_option(handle, key, OptionValue::Double(value), error) }
+    unsafe { set_option(handle, key, Ok(value.into()), error) }
 }
 
 /// # Safety
