@@ -148,7 +148,7 @@ pub(super) unsafe extern "C" fn error_from_array_stream(
     stream: *mut FFI_ArrowArrayStream,
     status: *mut AdbcStatusCode,
 ) -> *const AdbcError {
-    if stream.is_null() {
+    if stream.is_null() || unsafe { (*stream).private_data().is_null() } {
         return std::ptr::null();
     }
     let ours = unsafe { (*stream).release() }.is_some_and(|callback| {

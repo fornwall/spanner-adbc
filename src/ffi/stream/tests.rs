@@ -194,6 +194,13 @@ fn error_from_array_stream_rejects_foreign_and_null_streams() {
         status, 0xEE,
         "status must stay untouched for unrecognized streams"
     );
+
+    // Our callback without our state, which the other callbacks tolerate too.
+    let owner = error_stream(ArrowError::MemoryError("no room".to_owned()));
+    let mut stateless =
+        unsafe { FFI_ArrowArrayStream::new_unchecked(None, None, None, owner.release(), null()) };
+    assert!(unsafe { error_from_array_stream(&raw mut stateless, &raw mut status) }.is_null());
+    assert_eq!(status, 0xEE);
 }
 
 #[test]
