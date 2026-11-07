@@ -18,11 +18,10 @@ use adbc_core::options::OptionValue;
 use arrow_array::builder::{BinaryBuilder, BooleanBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::types::{
     ArrowPrimitiveType, Date32Type, Decimal128Type, Float32Type, Float64Type, Int64Type,
-    TimestampMicrosecondType,
+    TimestampMicrosecondType, TimestampNanosecondType,
 };
 use arrow_array::{
     ArrayRef, ListArray, PrimitiveArray, RecordBatch, RecordBatchOptions, StructArray,
-    TimestampNanosecondArray,
 };
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
@@ -312,13 +311,21 @@ fn arrow_err(e: ArrowError) -> adbc_core::error::Error {
 /// Error for a non-NULL value that cannot be decoded as its type. Mapping it to NULL instead would
 /// silently corrupt data.
 fn decode_error(spanner_type: &str, value: &Value) -> adbc_core::error::Error {
-    err(
-        format!(
+    let message = match value.as_str() {
+        // A well-formed TIMESTAMP can only have failed on the narrower Arrow range. A value out of
+        // range for its type is a data error, as in PEP 249.
+        Some(s) if spanner_type == "TIMESTAMP" && parse_timestamp(s).is_some() => format!(
+            "TIMESTAMP {s:?} is outside the Arrow Timestamp(Nanosecond) range (1677-09-21 to \
+             2262-04-11); set {}={} to read it",
+            crate::OPTION_MAX_TIMESTAMP_PRECISION,
+            TimestampPrecision::MICROSECONDS,
+        ),
+        _ => format!(
             "cannot decode Spanner {spanner_type} wire value {}",
             value_to_json(value).map_or_else(|_| format!("{value:?}"), |json| json.to_string())
         ),
-        Status::InvalidData,
-    )
+    };
+    err(message, Status::InvalidData)
 }
 
 /// Fill `builder` from one value per row: NULLs go to `append_null`, other values to `append`.
@@ -386,32 +393,9 @@ pub(crate) fn build_array(data_type: &DataType, values: &[Option<&Value>]) -> Re
             v.as_str().and_then(parse_date_days)
         })?),
         DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
-            // Distinguish malformed strings from valid instants outside the i64 nanosecond range.
-            let array = build_with(
-                values,
-                TimestampNanosecondArray::builder(values.len()),
-                PrimitiveBuilder::append_null,
-                |builder, v| {
-                    let s = v.as_str().ok_or_else(|| decode_error("TIMESTAMP", v))?;
-                    builder.append_value(parse_timestamp_nanos(s).ok_or_else(|| {
-                        if parse_timestamp(s).is_none() {
-                            return decode_error("TIMESTAMP", v);
-                        }
-                        // A value out of range for its type is a data error, as in PEP 249.
-                        err(
-                            format!(
-                                "TIMESTAMP {s:?} is outside the Arrow Timestamp(Nanosecond) \
-                                 range (1677-09-21 to 2262-04-11); set {}={} to read it",
-                                crate::OPTION_MAX_TIMESTAMP_PRECISION,
-                                TimestampPrecision::MICROSECONDS,
-                            ),
-                            Status::InvalidData,
-                        )
-                    })?);
-                    Ok(())
-                },
-            )?
-            .finish();
+            let array = build_primitive::<TimestampNanosecondType>(values, "TIMESTAMP", |v| {
+                v.as_str().and_then(parse_timestamp_nanos)
+            })?;
             Arc::new(array.with_timezone_opt(tz.clone()))
         }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {

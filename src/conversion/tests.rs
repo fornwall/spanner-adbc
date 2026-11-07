@@ -2,7 +2,7 @@ use super::*;
 use arrow_array::types::Int64Type;
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int64Array, StringArray, TimestampMicrosecondArray,
+    Int64Array, StringArray, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow_buffer::NullBuffer;
 use google_cloud_spanner::model;
