@@ -25,8 +25,7 @@ use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
 use crate::metadata::{column, filtered_query, like_match, query_txn, str_cols};
 use crate::nested::{arrow_err, field, list_item, list_of, strings, struct_list};
 use crate::options::SharedConfig;
-use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
-use crate::timeout::with_timeout;
+use crate::runtime::{CancelSignal, SharedRuntime};
 
 /// A column of a table, as returned by `get_objects`.
 pub(crate) struct Column {
@@ -220,31 +219,25 @@ pub(crate) fn collect_objects(
 
     let client = client.clone();
     let bound = config.read_staleness.multi_use_timestamp_bound();
-    let batches = block_on_cancellable(
-        runtime,
-        cancel,
-        with_timeout(
-            config.timeouts.query_timeout(),
-            crate::OPTION_RPC_TIMEOUT_QUERY,
-            async move {
-                // The queries run concurrently on one snapshot. The client's inline begin makes
-                // concurrent first statements wait for the transaction id.
-                let txn = crate::staleness::multi_use(&client, bound).await?;
-                let (schemata, tables, columns, constraints) = try_join!(
-                    query_txn(&txn, schemata),
-                    query_txn_opt(&txn, tables),
-                    query_txn_opt(&txn, columns),
-                    query_txn_opt(&txn, constraints),
-                )?;
-                Ok(ObjectBatches {
-                    schemata,
-                    tables,
-                    columns,
-                    constraints,
-                })
-            },
-        ),
-    )?;
+    let batches = config
+        .timeouts
+        .block_on_query(runtime, cancel, async move {
+            // The queries run concurrently on one snapshot. The client's inline begin makes
+            // concurrent first statements wait for the transaction id.
+            let txn = crate::staleness::multi_use(&client, bound).await?;
+            let (schemata, tables, columns, constraints) = try_join!(
+                query_txn(&txn, schemata),
+                query_txn_opt(&txn, tables),
+                query_txn_opt(&txn, columns),
+                query_txn_opt(&txn, constraints),
+            )?;
+            Ok(ObjectBatches {
+                schemata,
+                tables,
+                columns,
+                constraints,
+            })
+        })?;
 
     assemble_objects(&batches, filters)
 }

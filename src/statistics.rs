@@ -18,9 +18,8 @@ use crate::error::err;
 use crate::metadata::{filtered_query, like_match, metadata_sql_builder, query_txn, str_cols};
 use crate::nested::{arrow_err, dense_union, field, shape_err, strings, struct_list};
 use crate::options::SharedConfig;
-use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
+use crate::runtime::{CancelSignal, SharedRuntime};
 use crate::sql::{qualified_table, quote_ident};
-use crate::timeout::with_timeout;
 
 /// The `int64` branch of the `statistic_value` union (see `STATISTIC_VALUE_SCHEMA`).
 const INT64_BRANCH: i8 = 0;
@@ -78,29 +77,23 @@ pub(crate) fn collect_statistics(
             && table_name.is_none_or(|p| like_match(p, table))
     };
     // One cancel signal and query deadline cover discovery and every scan, as for `get_objects`.
-    let (prepared, batches) = block_on_cancellable(
-        runtime,
-        cancel,
-        with_timeout(
-            config.timeouts.query_timeout(),
-            crate::OPTION_RPC_TIMEOUT_QUERY,
-            async move {
-                // Discovery and aggregate scans share one snapshot, including for stale reads.
-                let txn = crate::staleness::multi_use(&client, bound).await?;
-                let prepared = prepare_tables(&query_txn(&txn, discovery).await?, matches)?;
-                // `buffered` keeps input order.
-                let batches: Vec<RecordBatch> = stream::iter(
-                    prepared
-                        .iter()
-                        .map(|p| query_txn(&txn, metadata_sql_builder(config, p.sql.as_str()))),
-                )
-                .buffered(STATISTICS_SCAN_CONCURRENCY)
-                .try_collect()
-                .await?;
-                Ok::<_, Error>((prepared, batches))
-            },
-        ),
-    )?;
+    let (prepared, batches) = config
+        .timeouts
+        .block_on_query(runtime, cancel, async move {
+            // Discovery and aggregate scans share one snapshot, including for stale reads.
+            let txn = crate::staleness::multi_use(&client, bound).await?;
+            let prepared = prepare_tables(&query_txn(&txn, discovery).await?, matches)?;
+            // `buffered` keeps input order.
+            let batches: Vec<RecordBatch> = stream::iter(
+                prepared
+                    .iter()
+                    .map(|p| query_txn(&txn, metadata_sql_builder(config, p.sql.as_str()))),
+            )
+            .buffered(STATISTICS_SCAN_CONCURRENCY)
+            .try_collect()
+            .await?;
+            Ok::<_, Error>((prepared, batches))
+        })?;
 
     // Discovery orders by schema, so each schema's tables are adjacent.
     let mut schemas: Vec<SchemaStatistics> = Vec::new();

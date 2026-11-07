@@ -13,8 +13,7 @@ use crate::error::{from_spanner, invalid_argument};
 use crate::options::{SharedConfig, string_option};
 use crate::request::RequestConfig;
 use crate::retry::RetryConfig;
-use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
-use crate::timeout::with_timeout;
+use crate::runtime::{CancelSignal, SharedRuntime};
 
 /// Configure a read/write transaction runner with isolation, request options and retry bounds.
 /// `Unspecified` is the wire default, so it leaves Spanner's SERIALIZABLE default.
@@ -123,15 +122,9 @@ pub(crate) fn run_batch_txn(
             .record(stats.map(|stats| stats.mutation_count));
         Ok(outcome.result)
     };
-    block_on_cancellable(
-        runtime,
-        cancel,
-        with_timeout(
-            config.timeouts.update_timeout(),
-            crate::OPTION_RPC_TIMEOUT_UPDATE,
-            transaction,
-        ),
-    )
+    config
+        .timeouts
+        .block_on_update(runtime, cancel, transaction)
 }
 
 /// Commit `mutations` without DML in one write-only transaction. Used by mutations-only manual
@@ -174,13 +167,5 @@ where
             .record(response.commit_stats.map(|stats| stats.mutation_count));
         Ok(())
     };
-    block_on_cancellable(
-        runtime,
-        cancel,
-        with_timeout(
-            config.timeouts.update_timeout(),
-            crate::OPTION_RPC_TIMEOUT_UPDATE,
-            commit,
-        ),
-    )
+    config.timeouts.block_on_update(runtime, cancel, commit)
 }

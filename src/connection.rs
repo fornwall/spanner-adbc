@@ -24,10 +24,9 @@ use crate::error::{
 };
 use crate::options::{SharedConfig, impl_typed_option_getters, non_empty_string_option};
 use crate::reader::stream_query;
-use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable};
+use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle};
 use crate::sql::qualified_table;
 use crate::statement::{DEFAULT_ROWS_PER_BATCH, SpannerStatement};
-use crate::timeout::with_timeout;
 
 mod exec;
 mod txn;
@@ -305,13 +304,10 @@ impl Connection for SpannerConnection {
         let bound = self.config.read_staleness.timestamp_bound();
         // The query's result metadata has the types, at the precision the connection's queries
         // stream, and INFORMATION_SCHEMA the NOT NULL columns. Both read at the same bound.
-        let (selected, columns) = block_on_cancellable(
-            &self.runtime,
-            &self.cancel.current(),
-            with_timeout(
-                self.config.timeouts.query_timeout(),
-                crate::OPTION_RPC_TIMEOUT_QUERY,
-                async {
+        let (selected, columns) =
+            self.config
+                .timeouts
+                .block_on_query(&self.runtime, &self.cancel.current(), async {
                     Ok(futures_util::join!(
                         query_single_use(
                             &self.client,
@@ -326,9 +322,7 @@ impl Connection for SpannerConnection {
                             TimestampPrecision::default()
                         ),
                     ))
-                },
-            ),
-        )?;
+                })?;
         match selected {
             Ok(batch) => with_declared_nullability(batch.schema_ref(), &columns?),
             // A missing table is INVALID_ARGUMENT ("Table not found") from the query analyzer, but
@@ -453,26 +447,22 @@ impl Connection for SpannerConnection {
         let fallback_schema = descriptor.schema(precision)?;
         let partition = self.config.retry.apply_to_partition(descriptor.partition);
         let fetch_timeout = self.config.timeouts.fetch_timeout();
-        let reader = block_on_cancellable(
+        let reader = self.config.timeouts.block_on_query(
             &self.runtime,
             &self.cancel.current(),
-            with_timeout(
-                self.config.timeouts.query_timeout(),
-                crate::OPTION_RPC_TIMEOUT_QUERY,
-                async move {
-                    let result_set = partition.execute(&client).await.map_err(from_spanner)?;
-                    stream_query(
-                        runtime,
-                        cancel,
-                        result_set,
-                        DEFAULT_ROWS_PER_BATCH,
-                        precision,
-                        fetch_timeout,
-                        fallback_schema,
-                    )
-                    .await
-                },
-            ),
+            async move {
+                let result_set = partition.execute(&client).await.map_err(from_spanner)?;
+                stream_query(
+                    runtime,
+                    cancel,
+                    result_set,
+                    DEFAULT_ROWS_PER_BATCH,
+                    precision,
+                    fetch_timeout,
+                    fallback_schema,
+                )
+                .await
+            },
         )?;
         Ok(Box::new(reader))
     }

@@ -39,7 +39,6 @@ use crate::options::{
 };
 use crate::reader::{stream_bound_query, stream_query};
 use crate::runtime::{CancelSlot, SharedRuntime, SlotCancelHandle, block_on_cancellable};
-use crate::timeout::with_timeout;
 
 /// Default for [`OPTION_ROWS_PER_BATCH`](crate::OPTION_ROWS_PER_BATCH). Also used by
 /// `Connection::read_partition`, which has no per-statement batch size.
@@ -118,16 +117,16 @@ impl SpannerStatement {
 
     /// Run `future` within the query timeout, cancellable through this statement.
     fn block_on_query<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
-        let timeout = self.config.timeouts.query_timeout();
-        let future = with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_QUERY, future);
-        block_on_cancellable(&self.runtime, &self.cancel.current(), future)
+        self.config
+            .timeouts
+            .block_on_query(&self.runtime, &self.cancel.current(), future)
     }
 
     /// Run `future` within the update timeout, cancellable through this statement.
     fn block_on_update<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
-        let timeout = self.config.timeouts.update_timeout();
-        let future = with_timeout(timeout, crate::OPTION_RPC_TIMEOUT_UPDATE, future);
-        block_on_cancellable(&self.runtime, &self.cancel.current(), future)
+        self.config
+            .timeouts
+            .block_on_update(&self.runtime, &self.cancel.current(), future)
     }
 
     /// The connection's database id: the only catalog, as `get_objects` reports it.

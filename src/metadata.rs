@@ -10,8 +10,7 @@ use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, TimestampBo
 use crate::conversion::{TimestampPrecision, result_set_to_batch};
 use crate::error::{err, from_spanner};
 use crate::options::SharedConfig;
-use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
-use crate::timeout::with_timeout;
+use crate::runtime::{CancelSignal, SharedRuntime};
 
 /// The catalog name for a database path: the `<d>` of `projects/<p>/instances/<i>/databases/<d>`,
 /// or the whole string otherwise.
@@ -72,19 +71,10 @@ pub(crate) fn table_exists(
     table_name: &str,
 ) -> Result<bool> {
     let lookup = table_columns_query(config, db_schema, table_name);
-    block_on_cancellable(
-        runtime,
-        cancel,
-        with_timeout(
-            config.timeouts.query_timeout(),
-            crate::OPTION_RPC_TIMEOUT_QUERY,
-            async {
-                let columns =
-                    query_single_use(client, None, lookup, TimestampPrecision::default()).await?;
-                Ok(columns.num_rows() > 0)
-            },
-        ),
-    )
+    config.timeouts.block_on_query(runtime, cancel, async {
+        let columns = query_single_use(client, None, lookup, TimestampPrecision::default()).await?;
+        Ok(columns.num_rows() > 0)
+    })
 }
 
 /// Run a statement as one single-use read at `bound`, where `None` is a strong read.

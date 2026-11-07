@@ -8,6 +8,7 @@ use std::time::Duration;
 use adbc_core::error::{Result, Status};
 
 use crate::error::err;
+use crate::runtime::{CancelSignal, DriverRuntime, block_on_cancellable};
 
 /// The `spanner.rpc.timeout_seconds.*` settings of a connection or statement, in seconds. Values
 /// are stored as configured so `get_option` round-trips them; the accessors return `None` for
@@ -30,6 +31,36 @@ impl RpcTimeouts {
 
     pub(crate) fn fetch_timeout(&self) -> Option<Duration> {
         as_duration(self.fetch)
+    }
+
+    /// Run `future` on `runtime` within the query deadline, unless `cancel` fires first.
+    pub(crate) fn block_on_query<T>(
+        &self,
+        runtime: &DriverRuntime,
+        cancel: &CancelSignal,
+        future: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let deadline = with_timeout(
+            self.query_timeout(),
+            crate::OPTION_RPC_TIMEOUT_QUERY,
+            future,
+        );
+        block_on_cancellable(runtime, cancel, deadline)
+    }
+
+    /// Run `future` on `runtime` within the update deadline, unless `cancel` fires first.
+    pub(crate) fn block_on_update<T>(
+        &self,
+        runtime: &DriverRuntime,
+        cancel: &CancelSignal,
+        future: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let deadline = with_timeout(
+            self.update_timeout(),
+            crate::OPTION_RPC_TIMEOUT_UPDATE,
+            future,
+        );
+        block_on_cancellable(runtime, cancel, deadline)
     }
 }
 
