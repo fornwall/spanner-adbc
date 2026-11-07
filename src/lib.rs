@@ -129,7 +129,7 @@ pub mod bench_support {
 pub const OPTION_ENDPOINT: &str = "spanner.endpoint";
 
 /// Database option: `true` connects with anonymous credentials, as the emulator expects. A
-/// non-empty `SPANNER_EMULATOR_HOST` also turns it on. Connecting fails without an endpoint, or
+/// non-blank `SPANNER_EMULATOR_HOST` also turns it on. Connecting fails without an endpoint, or
 /// with a credential option or [`OPTION_QUOTA_PROJECT`] set.
 pub const OPTION_EMULATOR: &str = "spanner.emulator";
 
