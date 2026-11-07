@@ -9,11 +9,17 @@ use std::time::Duration;
 use google_cloud_gax::exponential_backoff::ExponentialBackoffBuilder;
 use google_cloud_gax::options::RequestOptions;
 use google_cloud_gax::options::internal::set_default_idempotency;
+use google_cloud_gax::polling_error_policy::PollingErrorPolicy;
+use google_cloud_gax::polling_state::PollingState;
 use google_cloud_gax::response::{Parts, Response};
+use google_cloud_gax::retry_policy::RetryPolicy;
+use google_cloud_gax::retry_result::RetryResult;
+use google_cloud_gax::retry_state::RetryState;
 use google_cloud_gax::{Result, error::Error};
 use google_cloud_gax_internal::grpc::{Client, status::any_from_prost, tonic};
 use google_cloud_gax_internal::options::ClientConfig;
 use google_cloud_longrunning::model::{GetOperationRequest, Operation};
+use google_cloud_spanner::retry_policy::SpannerRetryPolicy;
 use google_cloud_spanner_admin_database_v1::{
     client::DatabaseAdmin, model::UpdateDatabaseDdlRequest,
 };
@@ -34,8 +40,20 @@ pub(crate) async fn database_admin(
         .with_scaling(1.5)
         .clamp();
     config.polling_backoff_policy = Some(Arc::new(polling));
+    config.polling_error_policy = Some(Arc::new(PollThroughFaults));
     let transport = Client::new(config, "https://spanner.googleapis.com").await?;
     Ok(DatabaseAdmin::from_stub(DdlTransport(transport)))
+}
+
+/// Keep polling through whatever the data plane retries. Each poll is a single attempt, and the
+/// default policy gives up on a lost connection, which says nothing about the running operation.
+#[derive(Debug)]
+struct PollThroughFaults;
+
+impl PollingErrorPolicy for PollThroughFaults {
+    fn on_error(&self, _: &PollingState, error: Error) -> RetryResult {
+        SpannerRetryPolicy::new().on_error(&RetryState::new(true), error)
+    }
 }
 
 #[derive(Debug)]

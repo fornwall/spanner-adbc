@@ -23,6 +23,8 @@ struct Recorded {
 struct State {
     requests: Vec<Recorded>,
     responses: VecDeque<std::result::Result<WireOperation, tonic::Status>>,
+    /// Polls left to answer by resetting their stream, as a lost connection would.
+    reset_polls: usize,
 }
 
 // Both requests use a string field numbered 1 (database/name). Decode with the DDL
@@ -50,6 +52,11 @@ impl<const POLLING: bool> tonic::server::UnaryService<WireUpdateDatabaseDdl> for
             request,
             metadata,
         });
+        if POLLING && state.reset_polls > 0 {
+            state.reset_polls -= 1;
+            drop(state);
+            panic!("the server task's panic resets the stream");
+        }
         let response = state.responses.pop_front().expect("unexpected admin RPC");
         Box::pin(async move { response.map(tonic::Response::new) })
     }
@@ -85,6 +92,13 @@ impl<const POLLING: bool> Service<http::Request<tonic::body::Body>> for Mock<POL
 fn run(
     responses: Vec<std::result::Result<WireOperation, tonic::Status>>,
 ) -> (Result<()>, Vec<Recorded>) {
+    run_resetting_polls(responses, 0)
+}
+
+fn run_resetting_polls(
+    responses: Vec<std::result::Result<WireOperation, tonic::Status>>,
+    reset_polls: usize,
+) -> (Result<()>, Vec<Recorded>) {
     let runtime = crate::runtime::new_runtime().unwrap();
     let mut database = crate::driver::SpannerDatabase::new(runtime.clone());
     database.access_token = Some("admin-test-token".into());
@@ -102,6 +116,7 @@ fn run(
         config.cred = Some(credentials);
         let state = Arc::new(Mutex::new(State {
             responses: responses.into(),
+            reset_polls,
             ..Default::default()
         }));
         let incoming = futures_util::stream::unfold(listener, |listener| async {
@@ -219,4 +234,27 @@ fn ambiguous_ddl_failures_are_not_retried() {
         google_cloud_gax::error::rpc::Code::Unavailable
     );
     assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn polling_outlasts_a_reset_stream() {
+    let (result, requests) = run_resetting_polls(
+        vec![
+            Ok(WireOperation {
+                name: OPERATION.into(),
+                ..Default::default()
+            }),
+            Ok(WireOperation {
+                name: OPERATION.into(),
+                done: true,
+                result: Some(OperationResult::Response(prost_types::Any {
+                    type_url: "type.googleapis.com/google.protobuf.Empty".into(),
+                    value: Vec::new(),
+                })),
+            }),
+        ],
+        1,
+    );
+    result.unwrap();
+    assert_eq!(requests.len(), 3);
 }
