@@ -2,7 +2,6 @@
 
 use adbc_core::Optionable;
 use adbc_core::error::Result;
-use adbc_core::options::{OptionDatabase, OptionValue};
 
 use super::SpannerDatabase;
 use crate::error::invalid_argument;
@@ -25,23 +24,17 @@ impl SpannerDatabase {
                  `spanner://<host>:<port>/projects/...` for an emulator or another endpoint"
             ))
         })?;
-        let parsed = parse_connection_uri(remainder)?;
+        let (database, params) = parse_connection_uri(remainder)?;
         // Validate values against a scratch database before touching the real configuration.
         let mut scratch = SpannerDatabase::new(self.runtime.clone());
-        for (key, value) in &parsed.params {
-            scratch.set_option(
-                OptionDatabase::Other(key.clone()),
-                OptionValue::String(value.clone()),
-            )?;
+        for (key, value) in &params {
+            scratch.set_option(key.as_str().into(), value.as_str().into())?;
         }
 
-        self.database = Some(parsed.database);
-        if let Some(endpoint) = parsed.endpoint {
-            self.endpoint = Some(endpoint);
-        }
-        for (key, value) in parsed.params {
+        self.database = Some(database);
+        for (key, value) in params {
             // These identical calls succeeded on the scratch database.
-            self.set_option(OptionDatabase::Other(key), OptionValue::String(value))?;
+            self.set_option(key.as_str().into(), value.into())?;
         }
         self.uri = Some(value);
         Ok(())
@@ -97,15 +90,9 @@ fn connection_uri_remainder(value: &str) -> Option<&str> {
         .map(|_| &value[PREFIX.len()..])
 }
 
-struct ParsedConnectionUri {
-    database: String,
-    endpoint: Option<String>,
-    params: Vec<(String, String)>,
-}
-
-/// Parse the portion after `spanner://`. Require a full database path and known query keys.
-/// Empty authority means no endpoint; query parameters retain their source order.
-fn parse_connection_uri(remainder: &str) -> Result<ParsedConnectionUri> {
+/// Parse the portion after `spanner://` into the database path and the options to set, in order.
+/// Require a full database path and known query keys. A host authority is an endpoint option.
+fn parse_connection_uri(remainder: &str) -> Result<(String, Vec<(String, String)>)> {
     if remainder.contains('#') {
         return Err(invalid_argument(
             "connection URI must not carry a #fragment",
@@ -119,7 +106,6 @@ fn parse_connection_uri(remainder: &str) -> Result<ParsedConnectionUri> {
              `spanner.auth.*` database options instead",
         ));
     }
-    let endpoint = (!authority.is_empty()).then(|| authority.to_owned());
 
     let bad_path = || {
         invalid_argument(
@@ -145,6 +131,9 @@ fn parse_connection_uri(remainder: &str) -> Result<ParsedConnectionUri> {
     };
 
     let mut params = Vec::new();
+    if !authority.is_empty() {
+        params.push((OPTION_ENDPOINT.to_owned(), authority.to_owned()));
+    }
     for pair in query.split('&').filter(|s| !s.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         let key = percent_decode(key)?;
@@ -163,18 +152,11 @@ fn parse_connection_uri(remainder: &str) -> Result<ParsedConnectionUri> {
         params.push((key, percent_decode(value)?));
     }
 
-    Ok(ParsedConnectionUri {
-        database,
-        endpoint,
-        params,
-    })
+    Ok((database, params))
 }
 
 /// Decode RFC 3986 `%XX` escapes, preserving literal `+`. Reject malformed escapes and UTF-8.
 fn percent_decode(s: &str) -> Result<String> {
-    if !s.contains('%') {
-        return Ok(s.to_owned());
-    }
     let bytes = s.as_bytes();
     let digit = |i: usize| bytes.get(i).and_then(|&b| char::from(b).to_digit(16));
     let mut out = Vec::with_capacity(bytes.len());

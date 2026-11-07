@@ -1,6 +1,7 @@
 use super::*;
 use crate::driver::tests::new_database;
 use adbc_core::error::Status;
+use adbc_core::options::{OptionDatabase, OptionValue};
 
 const DB_PATH: &str = "projects/p/instances/i/databases/d";
 
@@ -84,6 +85,8 @@ fn a_host_authority_becomes_the_endpoint() {
     set_uri(&mut db, &format!("spanner://emu-host:9010/{DB_PATH}")).unwrap();
     assert_eq!(db.database.as_deref(), Some(DB_PATH));
     assert_eq!(db.endpoint.as_deref(), Some("emu-host:9010"));
+    set_uri(&mut db, &format!("spanner:// /{DB_PATH}")).unwrap();
+    assert_eq!(db.endpoint, None, "a blank endpoint unsets it");
 }
 
 #[test]

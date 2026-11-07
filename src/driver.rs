@@ -311,10 +311,7 @@ impl SpannerDatabase {
             ))
         })?;
 
-        let mut endpoint = self
-            .endpoint
-            .clone()
-            .filter(|endpoint| !endpoint.trim().is_empty());
+        let mut endpoint = self.endpoint.clone();
         let mut emulator = self.emulator;
         let mut endpoint_from_env = false;
         let omni = self.instance_type == InstanceType::Omni;
