@@ -33,7 +33,7 @@ use crate::{
     OPTION_INSTANCE_TYPE, OPTION_KEYFILE, OPTION_KEYFILE_JSON, OPTION_QUOTA_PROJECT,
     OPTION_RPC_TIMEOUT_CONNECT,
 };
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::time::Duration;
 use tokio::sync::OnceCell;
 
@@ -412,8 +412,12 @@ impl SpannerDatabase {
     /// Return the shared client stack, building it on first use. A failed build is not cached.
     fn connect_shared(&self) -> Result<Connected> {
         // Holding the lock through the build avoids duplicate client stacks. Only caller threads
-        // take it, so the build cannot deadlock with tasks on the driver's runtime.
-        let mut cached = self.connected.lock().unwrap();
+        // take it, so the build cannot deadlock with tasks on the driver's runtime. A build that
+        // panicked stored nothing, so its poison doesn't matter.
+        let mut cached = self
+            .connected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(connected) = cached.as_ref() {
             return Ok(connected.clone());
         }
@@ -481,7 +485,10 @@ impl Optionable for SpannerDatabase {
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
         // Any option may change what the cached stack was built from. Dropping it even when the
         // set fails below only costs a rebuild.
-        *self.connected.get_mut().unwrap() = None;
+        *self
+            .connected
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         let name = key.as_ref();
         match name {
             ADBC_OPTION_URI => self.set_uri_option(string_option(value, name)?)?,

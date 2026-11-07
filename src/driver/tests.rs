@@ -5,6 +5,25 @@ pub(super) fn new_database() -> SpannerDatabase {
     SpannerDatabase::new(new_runtime().unwrap())
 }
 
+/// Blocking on a current-thread runtime's own thread panics, and Tokio catches a task's panic, so
+/// the application can go on to connect correctly.
+#[test]
+fn a_panic_while_connecting_leaves_the_database_usable() {
+    let server = crate::mock_server::MockServer::serve(spanner_grpc_mock::MockSpanner::new());
+    let mut database = crate::mock_server::emulator_database(&server.endpoint);
+    let outer = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let panicked = outer.block_on(async {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| database.new_connection()))
+    });
+    assert!(panicked.is_err());
+    database.new_connection().unwrap();
+    database
+        .set_option(OptionDatabase::Uri, crate::mock_server::DATABASE_URI.into())
+        .unwrap();
+}
+
 #[test]
 fn omni_options_validate_before_connecting() {
     let mut db = new_database();
