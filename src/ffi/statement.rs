@@ -13,10 +13,11 @@ use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::Schema;
 
 use super::abi::{AdbcConnection, AdbcError, AdbcPartitions, AdbcStatement, AdbcStatusCode};
-use super::guard::{byte_slice, catch, missing_argument, required_output, required_str, write_out};
-use super::handle::{Exported, finish};
+use super::guard::{byte_slice, catch, required_output, required_str, write_out};
+use super::handle::{
+    Exported, FfiHandle, finish, install_cancel_handle, lock_state, unpopulated, with_state,
+};
 use super::import::{BoundStreamReader, import_batch};
-use super::options::{FfiHandle, already_populated, slot_of, with_state};
 use crate::statement::SpannerStatement;
 
 pub(super) const KIND: &str = "statement";
@@ -27,12 +28,8 @@ impl FfiHandle for AdbcStatement {
     type State = State;
     const KIND: &'static str = KIND;
 
-    fn private_data(&self) -> *mut c_void {
-        self.private_data
-    }
-
-    fn private_data_mut(&mut self) -> &mut *mut c_void {
-        &mut self.private_data
+    fn private_data(handle: *mut Self) -> *mut *mut c_void {
+        unsafe { &raw mut (*handle).private_data }
     }
 }
 
@@ -59,15 +56,12 @@ pub(super) unsafe extern "C" fn statement_new(
 ) -> AdbcStatusCode {
     // A panic here poisons the borrowed connection; the statement has no state yet.
     let outcome = catch(|| {
-        let statement = unsafe { statement.as_mut() }.ok_or_else(|| missing_argument(KIND))?;
-        if !statement.private_data.is_null() {
-            return Err(already_populated(KIND));
-        }
-        let mut connection = unsafe { super::options::borrow(connection) }?;
+        let slot = unsafe { unpopulated(statement) }?;
+        let mut connection = unsafe { lock_state(connection) }?;
         let state = connection.ready(super::connection::KIND)?.new_statement()?;
-        // Stored outside the state lock so a running call can be cancelled.
         let cancel = state.get_cancel_handle();
-        statement.private_data = Exported::into_private_data_with_cancel(state, Some(cancel));
+        *slot = Exported::into_private_data(state);
+        unsafe { install_cancel_handle(statement, cancel) };
         Ok(())
     });
     unsafe { finish(outcome, error) }
@@ -111,17 +105,6 @@ pub(super) unsafe extern "C" fn statement_prepare(
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
     unsafe { with_state(statement, error, State::prepare) }
-}
-
-/// # Safety
-/// `statement` must be null or point to a valid `AdbcStatement`.
-pub(super) unsafe extern "C" fn statement_cancel(
-    statement: *mut AdbcStatement,
-    error: *mut AdbcError,
-) -> AdbcStatusCode {
-    // Bypasses `dispatch` so it can interrupt a running call. A released handle reports
-    // `InvalidState`; with nothing in flight it returns OK (see `SlotCancelHandle`).
-    unsafe { super::handle::cancel::<State>(slot_of(statement), KIND, error) }
 }
 
 /// # Safety

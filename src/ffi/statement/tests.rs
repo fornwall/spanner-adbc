@@ -12,9 +12,10 @@ use arrow_array::{Array, ArrayRef, Int64Array, StructArray};
 
 use super::*;
 use crate::ffi::abi::{ADBC_STATUS_OK, AdbcDatabase};
+use crate::ffi::handle::{cancel, release_handle};
 use crate::ffi::options::{
-    get_option_bytes, get_option_double, get_option_int, get_option_string, release_handle,
-    set_option_bytes, set_option_double, set_option_int, set_option_string,
+    get_option_bytes, get_option_double, get_option_int, get_option_string, set_option_bytes,
+    set_option_double, set_option_int, set_option_string,
 };
 use crate::ffi::test_support::null;
 
@@ -58,7 +59,7 @@ fn every_entry_point_refuses_a_released_handle() {
 
     for (label, status) in [
         ("prepare", unsafe { statement_prepare(s, null()) }),
-        ("cancel", unsafe { statement_cancel(s, null()) }),
+        ("cancel", unsafe { cancel(s, null()) }),
         ("set_sql_query", unsafe {
             statement_set_sql_query(s, name.as_ptr(), null())
         }),
@@ -203,7 +204,7 @@ impl MockStatement {
         use spanner_grpc_mock::google::spanner::v1;
 
         use crate::ffi::database::database_init;
-        use crate::ffi::options::new_handle;
+        use crate::ffi::handle::new_handle;
 
         let mut mock = MockSpanner::new();
         mock.expect_create_session().returning(|request| {

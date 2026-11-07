@@ -1,8 +1,8 @@
 //! The object behind each handle's `private_data`, and how entry points reach it.
 //!
 //! Each handle owns an [`Arc<Exported<S>>`]. Calls serialize on its state mutex, and a panic
-//! poisons every state the panicking call locked. [`cancel`] uses a separate lock so it can
-//! interrupt a blocked call.
+//! poisons every state the panicking call locked. [`cancel`] avoids that lock so it can interrupt
+//! a blocked call.
 //!
 //! Callers must not overlap `Release` with any other call, including `Cancel`: reading
 //! `private_data` and taking a reference are not atomic. Once taken, the cancel reference keeps
@@ -17,7 +17,18 @@ use adbc_core::options::OptionValue;
 
 use super::abi::{ADBC_STATUS_OK, AdbcError, AdbcStatusCode};
 use super::error::export_error;
-use super::guard::catch;
+use super::guard::{catch, missing_argument};
+use crate::error::invalid_state;
+
+/// An ABI handle struct: `AdbcDatabase`, `AdbcConnection` or `AdbcStatement`.
+pub(super) trait FfiHandle {
+    /// What lives behind `private_data`.
+    type State: Send;
+    /// The object's name in diagnostics: "database", "connection" or "statement".
+    const KIND: &'static str;
+    /// The `private_data` field, as a raw place because calls on a handle can overlap.
+    fn private_data(handle: *mut Self) -> *mut *mut c_void;
+}
 
 /// Options set before `Init`, ordered by each key's latest set.
 ///
@@ -49,7 +60,7 @@ pub(crate) enum Staged<K, S> {
 }
 
 /// The state `New` installs.
-impl<K: PartialEq, S> Default for Staged<K, S> {
+impl<K, S> Default for Staged<K, S> {
     fn default() -> Self {
         Self::Pending(OptionBuffer {
             entries: Vec::new(),
@@ -57,7 +68,7 @@ impl<K: PartialEq, S> Default for Staged<K, S> {
     }
 }
 
-impl<K: PartialEq, S> Staged<K, S> {
+impl<K, S> Staged<K, S> {
     /// The initialized state, or `InvalidState` before `Init`.
     pub(crate) fn ready(&mut self, kind: &str) -> Result<&mut S> {
         match self {
@@ -67,7 +78,7 @@ impl<K: PartialEq, S> Staged<K, S> {
     }
 
     /// The buffered options, or `InvalidState` after `Init`.
-    pub(crate) fn pending(&mut self, kind: &str) -> Result<&mut OptionBuffer<K>> {
+    pub(crate) fn pending(&self, kind: &str) -> Result<&OptionBuffer<K>> {
         match self {
             Self::Pending(options) => Ok(options),
             Self::Ready(_) => Err(Error::with_message_and_status(
@@ -101,29 +112,12 @@ fn _exported_is_shareable<S: Send>(exported: &Exported<S>) -> &(dyn Send + Sync)
 // concurrent access, so `S: Sync` is not needed.
 impl<S: Send> Exported<S> {
     pub(crate) fn into_private_data(state: S) -> *mut c_void {
-        Self::into_private_data_with_cancel(state, None)
-    }
-
-    /// Store a cancel handle separately so [`cancel`] can run while the state is locked.
-    /// Objects initialized later use [`install_cancel_handle`] instead.
-    pub(crate) fn into_private_data_with_cancel(
-        state: S,
-        cancel: Option<Box<dyn CancelHandle>>,
-    ) -> *mut c_void {
         Arc::into_raw(Arc::new(Self {
-            cancel: Mutex::new(cancel),
+            cancel: Mutex::new(None),
             state: Mutex::new(state),
         }))
         .cast::<c_void>()
         .cast_mut()
-    }
-}
-
-impl<S> Exported<S> {
-    /// Take the state lock, refusing a state poisoned by a panic, including one in another
-    /// handle's call that borrowed it.
-    fn lock_state(&self, kind: &str) -> Result<MutexGuard<'_, S>> {
-        self.state.lock().map_err(|_| poisoned(kind))
     }
 }
 
@@ -146,131 +140,164 @@ fn poisoned(kind: &str) -> Error {
     )
 }
 
-/// Borrow the object behind `slot` without taking a reference count.
+/// The object behind `handle`, or null for a null handle or an unpopulated slot.
 ///
 /// # Safety
-/// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
-/// been released, and the reference must not outlive the object.
-unsafe fn borrowed<'a, S>(slot: *mut c_void, kind: &str) -> Result<&'a Exported<S>> {
-    unsafe { slot.cast::<Exported<S>>().as_ref() }.ok_or_else(|| uninitialized(kind))
+/// `handle` must be null or point to a valid ABI struct.
+unsafe fn object<H: FfiHandle>(handle: *mut H) -> *const Exported<H::State> {
+    if handle.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { *H::private_data(handle) }.cast_const().cast()
 }
 
-/// Take an owned reference to the object behind `slot`, which keeps it alive through a later
-/// `Release`.
+/// The `private_data` field of `handle`, rejecting a null pointer as a bad argument. A null field
+/// is instead an object used out of order.
 ///
 /// # Safety
-/// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
-/// been released.
-unsafe fn strong<S>(slot: *mut c_void, kind: &str) -> Result<Arc<Exported<S>>> {
-    let pointer = slot.cast_const().cast::<Exported<S>>();
-    if pointer.is_null() {
-        return Err(uninitialized(kind));
+/// `handle` must be null or point to a valid ABI struct that outlives `'a`.
+unsafe fn slot<'a, H: FfiHandle>(handle: *mut H) -> Result<&'a mut *mut c_void> {
+    if handle.is_null() {
+        return Err(missing_argument(H::KIND));
     }
-    // The handle keeps its own count; this adds one for the returned `Arc`.
-    unsafe {
-        Arc::increment_strong_count(pointer);
-        Ok(Arc::from_raw(pointer))
-    }
+    Ok(unsafe { &mut *H::private_data(handle) })
 }
 
-/// Run `f` against the object behind `slot`, containing panics and reporting errors through
+/// The empty `private_data` field that a `New` call populates. A populated handle is refused, as
+/// overwriting it would leak its object; ADBC requires a zero-initialized struct.
+///
+/// # Safety
+/// `handle` must be null or point to a valid ABI struct that outlives `'a`.
+pub(super) unsafe fn unpopulated<'a, H: FfiHandle>(handle: *mut H) -> Result<&'a mut *mut c_void> {
+    let slot = unsafe { slot(handle) }?;
+    if !slot.is_null() {
+        return Err(invalid_state(format!(
+            "{} already holds a driver object; release it before creating another, and pass a \
+             zero-initialized struct to a first one",
+            H::KIND
+        )));
+    }
+    Ok(slot)
+}
+
+/// Lock the state behind `handle`, refusing a state poisoned by a panic, including one in another
+/// handle's call that borrowed it. `AdbcConnectionInit` borrows its database this way and
+/// `AdbcStatementNew` its connection, which must serialize with calls on the borrowed object.
+///
+/// # Safety
+/// `handle` must be null or point to a valid ABI struct, and the guard must not outlive it.
+pub(super) unsafe fn lock_state<'a, H: FfiHandle>(
+    handle: *mut H,
+) -> Result<MutexGuard<'a, H::State>> {
+    let exported = unsafe { object(handle).as_ref() }.ok_or_else(|| uninitialized(H::KIND))?;
+    exported.state.lock().map_err(|_| poisoned(H::KIND))
+}
+
+/// Run `f` against the state behind `handle`, containing panics and reporting errors through
 /// `error`.
 ///
 /// # Safety
-/// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
-/// been released.
-pub(crate) unsafe fn dispatch<S, F>(
-    slot: *mut c_void,
-    kind: &'static str,
-    error: *mut AdbcError,
-    f: F,
-) -> AdbcStatusCode
+/// `handle` must be null or point to a valid ABI struct.
+pub(super) unsafe fn with_state<H, F>(handle: *mut H, error: *mut AdbcError, f: F) -> AdbcStatusCode
 where
-    F: FnOnce(&mut S) -> Result<()>,
+    H: FfiHandle,
+    F: FnOnce(&mut H::State) -> Result<()>,
 {
     let outcome = catch(|| {
-        let exported = unsafe { borrowed::<S>(slot, kind) }?;
-        let mut state = exported.lock_state(kind)?;
+        let mut state = unsafe { lock_state(handle) }?;
         // The guard must unwind before `catch` handles a panic so the mutex records poisoning.
         f(&mut state)
     });
     unsafe { finish(outcome, error) }
 }
 
-/// Cancel the object's in-flight operation without taking its state lock, so a blocked call can
-/// be cancelled, even after a panic poisoned the state.
+/// Every `*Cancel`. Avoids the state lock so a blocked call can be cancelled, even after a panic
+/// poisoned the state. Before `Init` there is no cancel handle (`InvalidState`); with nothing in
+/// flight it returns OK (see `SlotCancelHandle`).
 ///
 /// # Safety
-/// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
-/// been released.
-pub(crate) unsafe fn cancel<S>(
-    slot: *mut c_void,
-    kind: &'static str,
+/// `handle` must be null or point to a valid ABI struct.
+pub(super) unsafe extern "C" fn cancel<H: FfiHandle>(
+    handle: *mut H,
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
     let outcome = catch(|| {
-        // Owned, so a `Release` after this point cannot free the object mid-cancel.
-        let exported = unsafe { strong::<S>(slot, kind) }?;
-        let handle = exported
+        let pointer = unsafe { object(handle) };
+        if pointer.is_null() {
+            return Err(uninitialized(H::KIND));
+        }
+        // Owned, so a `Release` after this point cannot free the object mid-cancel. The handle
+        // keeps its own count; this adds one for the `Arc`.
+        let exported = unsafe {
+            Arc::increment_strong_count(pointer);
+            Arc::from_raw(pointer)
+        };
+        let cancel = exported
             .cancel
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        match handle.as_ref() {
-            Some(handle) => handle.try_cancel(),
-            None => Err(uninitialized(kind)),
+        match cancel.as_ref() {
+            Some(cancel) => cancel.try_cancel(),
+            None => Err(uninitialized(H::KIND)),
         }
     });
     unsafe { finish(outcome, error) }
 }
 
-/// Install the cancel handle of a newly initialized state. Statements pass theirs to
-/// [`Exported::into_private_data_with_cancel`] instead.
+/// Install the cancel handle of a newly initialized state.
 ///
 /// # Safety
-/// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
-/// been released.
-pub(crate) unsafe fn install_cancel_handle<S>(slot: *mut c_void, handle: Box<dyn CancelHandle>) {
-    if let Some(exported) = unsafe { slot.cast::<Exported<S>>().as_ref() } {
-        *exported
-            .cancel
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(handle);
-    }
+/// `handle` must point to a valid ABI struct holding an object.
+pub(super) unsafe fn install_cancel_handle<H: FfiHandle>(
+    handle: *mut H,
+    cancel: Box<dyn CancelHandle>,
+) {
+    *unsafe { &*object(handle) }
+        .cancel
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(cancel);
 }
 
-/// Lock the state behind `slot` without dispatching a call on it.
-///
-/// `AdbcConnectionInit` borrows its database and `AdbcStatementNew` its connection; both must
-/// serialize with calls on the borrowed object and respect its poisoning.
+/// `AdbcDatabaseNew`/`AdbcConnectionNew`. Statements have no `Init` and are built by
+/// [`super::statement::statement_new`] instead.
 ///
 /// # Safety
-/// `slot` must be null or a pointer produced by [`Exported::<S>::into_private_data`] that has not
-/// been released, and the guard must not outlive it.
-pub(crate) unsafe fn lock_state<'a, S>(slot: *mut c_void, kind: &str) -> Result<MutexGuard<'a, S>> {
-    unsafe { borrowed::<S>(slot, kind) }?.lock_state(kind)
+/// `handle` must be null or point to a valid ABI struct.
+// Guard-exempt: relies on the `Staged` default allocating nothing; allocation failure for
+// `Exported` aborts rather than panics.
+pub(super) unsafe extern "C" fn new_handle<H: FfiHandle>(
+    handle: *mut H,
+    error: *mut AdbcError,
+) -> AdbcStatusCode
+where
+    H::State: Default,
+{
+    let outcome = unsafe { unpopulated(handle) }
+        .map(|slot| *slot = Exported::into_private_data(H::State::default()));
+    unsafe { finish(outcome, error) }
 }
 
-/// Drop the handle's reference and null the slot, so a second release is an error instead of a
-/// double free. An in-flight [`cancel`] can defer destruction until it returns.
+/// Every `*Release`. Drops the handle's reference and nulls the slot, so a second release is an
+/// error instead of a double free. An in-flight [`cancel`] can defer destruction until it returns.
 ///
 /// # Safety
-/// `slot` must point to a handle field holding null or a pointer produced by
-/// [`Exported::<S>::into_private_data`]. No borrowed state or new acquisition may be in flight.
-pub(crate) unsafe fn release<S>(
-    slot: &mut *mut c_void,
-    kind: &'static str,
+/// `handle` must be null or point to a valid ABI struct, and no other call on the object may be
+/// in flight.
+pub(super) unsafe extern "C" fn release_handle<H: FfiHandle>(
+    handle: *mut H,
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
-    let taken = std::mem::replace(slot, std::ptr::null_mut());
-    let outcome = if taken.is_null() {
-        Err(uninitialized(kind))
-    } else {
+    let outcome = unsafe { slot(handle) }.and_then(|slot| {
+        let taken = std::mem::replace(slot, std::ptr::null_mut());
+        if taken.is_null() {
+            return Err(uninitialized(H::KIND));
+        }
         // Dropping driver state runs arbitrary code, such as closing clients.
         catch(|| {
-            drop(unsafe { Arc::from_raw(taken.cast_const().cast::<Exported<S>>()) });
+            drop(unsafe { Arc::from_raw(taken.cast_const().cast::<Exported<H::State>>()) });
             Ok(())
         })
-    };
+    });
     unsafe { finish(outcome, error) }
 }
 

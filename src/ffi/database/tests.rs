@@ -5,9 +5,8 @@ use crate::ffi::abi::{
     ADBC_STATUS_INVALID_ARGUMENT, ADBC_STATUS_INVALID_STATE, ADBC_STATUS_NOT_FOUND,
     ADBC_STATUS_NOT_IMPLEMENTED, ADBC_STATUS_OK,
 };
-use crate::ffi::options::{
-    get_option_string, new_handle, release_handle, set_option_int, set_option_string,
-};
+use crate::ffi::handle::{new_handle, release_handle};
+use crate::ffi::options::{get_option_string, set_option_int, set_option_string};
 use crate::ffi::test_support::{null, release_error, zeroed_error};
 
 /// Nothing here connects, so the database need not exist.

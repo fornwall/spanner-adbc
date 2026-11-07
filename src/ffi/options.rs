@@ -1,29 +1,16 @@
-//! `New`, `Release` and the eight option entry points, shared by all three objects as generic
-//! `extern "C"` functions over [`FfiHandle`] and [`OptionTarget`].
+//! The eight option entry points, shared by all three objects as generic `extern "C"` functions
+//! over [`FfiHandle`] and [`OptionTarget`].
 
-use std::ffi::{c_char, c_void};
-use std::sync::MutexGuard;
+use std::ffi::c_char;
 
 use adbc_core::Optionable;
 use adbc_core::error::Result;
 use adbc_core::options::OptionValue;
 
 use super::abi::{AdbcError, AdbcStatusCode};
-use super::guard::{
-    byte_slice, missing_argument, required_str, write_bytes, write_out, write_string,
-};
-use super::handle::{Exported, Staged, dispatch, finish};
-use crate::error::{invalid_state, not_found};
-
-/// An ABI handle struct: `AdbcDatabase`, `AdbcConnection` or `AdbcStatement`.
-pub(super) trait FfiHandle {
-    /// What lives behind `private_data`.
-    type State: OptionTarget + Send;
-    /// The object's name in diagnostics: "database", "connection" or "statement".
-    const KIND: &'static str;
-    fn private_data(&self) -> *mut c_void;
-    fn private_data_mut(&mut self) -> &mut *mut c_void;
-}
+use super::guard::{byte_slice, required_str, write_bytes, write_out, write_string};
+use super::handle::{FfiHandle, Staged, finish, with_state};
+use crate::error::not_found;
 
 /// How options reach the state behind a handle. A [`Staged`] object buffers sets and refuses gets
 /// until `Init`; a statement has no `Init` and does neither.
@@ -73,97 +60,9 @@ where
 
 type KeyOf<H> = <<H as FfiHandle>::State as OptionTarget>::Key;
 
-/// The handle's `private_data`, or null for a null handle.
-///
-/// # Safety
-/// `handle` must be null or point to a valid ABI struct.
-pub(super) unsafe fn slot_of<H: FfiHandle>(handle: *mut H) -> *mut c_void {
-    unsafe { handle.as_ref() }.map_or(std::ptr::null_mut(), FfiHandle::private_data)
-}
-
-/// Reject a null handle pointer as a bad argument. A null `private_data` is instead an object
-/// used out of order.
-///
-/// # Safety
-/// `handle` must be null or point to a valid ABI struct.
-unsafe fn checked<'a, H: FfiHandle>(handle: *mut H) -> Result<&'a mut H> {
-    unsafe { handle.as_mut() }.ok_or_else(|| missing_argument(H::KIND))
-}
-
-/// Run `f` on the state behind `handle` through [`dispatch`].
-///
-/// # Safety
-/// `handle` must be null or point to a valid ABI struct.
-pub(super) unsafe fn with_state<H, F>(handle: *mut H, error: *mut AdbcError, f: F) -> AdbcStatusCode
-where
-    H: FfiHandle,
-    F: FnOnce(&mut H::State) -> Result<()>,
-{
-    unsafe { dispatch::<H::State, _>(slot_of(handle), H::KIND, error, f) }
-}
-
-/// Refuse `*New` on a populated handle, which would leak its object. ADBC requires a
-/// zero-initialized struct.
-pub(super) fn already_populated(kind: &str) -> adbc_core::error::Error {
-    invalid_state(format!(
-        "{kind} already holds a driver object; release it before creating another, and pass a \
-         zero-initialized struct to a first one"
-    ))
-}
-
-/// `AdbcDatabaseNew`/`AdbcConnectionNew`. Statements have no `Init` and are built by
-/// [`super::statement::statement_new`] instead.
-///
-/// # Safety
-/// `handle` must be null or point to a valid ABI struct.
-// Guard-exempt: relies on the `Staged` default allocating nothing; allocation failure for
-// `Exported` aborts rather than panics.
-pub(super) unsafe extern "C" fn new_handle<H: FfiHandle>(
-    handle: *mut H,
-    error: *mut AdbcError,
-) -> AdbcStatusCode
-where
-    H::State: Default,
-{
-    let outcome = unsafe { checked(handle) }.and_then(|handle| {
-        if !handle.private_data().is_null() {
-            return Err(already_populated(H::KIND));
-        }
-        *handle.private_data_mut() = Exported::into_private_data(H::State::default());
-        Ok(())
-    });
-    unsafe { finish(outcome, error) }
-}
-
-/// Every `*Release`.
-///
-/// # Safety
-/// `handle` must be null or point to a valid ABI struct, and no other call on the object may be
-/// in flight.
-pub(super) unsafe extern "C" fn release_handle<H: FfiHandle>(
-    handle: *mut H,
-    error: *mut AdbcError,
-) -> AdbcStatusCode {
-    match unsafe { checked(handle) } {
-        Ok(handle) => unsafe {
-            super::handle::release::<H::State>(handle.private_data_mut(), H::KIND, error)
-        },
-        Err(failure) => unsafe { finish(Err(failure), error) },
-    }
-}
-
-/// Lock the state behind a second handle that an entry point needs besides the one it dispatches
-/// on. The caller must still check that the state is ready.
-///
-/// # Safety
-/// `handle` must be null or point to a valid ABI struct, and the guard must not outlive it.
-pub(super) unsafe fn borrow<'a, H: FfiHandle>(handle: *mut H) -> Result<MutexGuard<'a, H::State>> {
-    unsafe { super::handle::lock_state::<H::State>(slot_of(handle), H::KIND) }
-}
-
 /// # Safety
 /// `key` must be null or a NUL-terminated string.
-unsafe fn parse_key<H: FfiHandle>(key: *const c_char) -> Result<KeyOf<H>> {
+unsafe fn parse_key<H: FfiHandle<State: OptionTarget>>(key: *const c_char) -> Result<KeyOf<H>> {
     Ok(KeyOf::<H>::from(unsafe { required_str(key, "key") }?))
 }
 
@@ -171,7 +70,7 @@ unsafe fn parse_key<H: FfiHandle>(key: *const c_char) -> Result<KeyOf<H>> {
 ///
 /// # Safety
 /// `handle` and `key` must be null or valid for the call.
-unsafe fn set_option<H: FfiHandle>(
+unsafe fn set_option<H: FfiHandle<State: OptionTarget>>(
     handle: *mut H,
     key: *const c_char,
     value: OptionValue,
@@ -187,7 +86,7 @@ unsafe fn set_option<H: FfiHandle>(
 
 /// # Safety
 /// `handle`, `key` and `value` must be null or valid for the call.
-pub(super) unsafe extern "C" fn set_option_string<H: FfiHandle>(
+pub(super) unsafe extern "C" fn set_option_string<H: FfiHandle<State: OptionTarget>>(
     handle: *mut H,
     key: *const c_char,
     value: *const c_char,
@@ -204,7 +103,7 @@ pub(super) unsafe extern "C" fn set_option_string<H: FfiHandle>(
 /// # Safety
 /// `handle` and `key` must be null or valid for the call, and `value` null or point to `length`
 /// initialized bytes.
-pub(super) unsafe extern "C" fn set_option_bytes<H: FfiHandle>(
+pub(super) unsafe extern "C" fn set_option_bytes<H: FfiHandle<State: OptionTarget>>(
     handle: *mut H,
     key: *const c_char,
     value: *const u8,
@@ -220,7 +119,7 @@ pub(super) unsafe extern "C" fn set_option_bytes<H: FfiHandle>(
 
 /// # Safety
 /// `handle` and `key` must be null or valid for the call.
-pub(super) unsafe extern "C" fn set_option_int<H: FfiHandle>(
+pub(super) unsafe extern "C" fn set_option_int<H: FfiHandle<State: OptionTarget>>(
     handle: *mut H,
     key: *const c_char,
     value: i64,
@@ -231,7 +130,7 @@ pub(super) unsafe extern "C" fn set_option_int<H: FfiHandle>(
 
 /// # Safety
 /// `handle` and `key` must be null or valid for the call.
-pub(super) unsafe extern "C" fn set_option_double<H: FfiHandle>(
+pub(super) unsafe extern "C" fn set_option_double<H: FfiHandle<State: OptionTarget>>(
     handle: *mut H,
     key: *const c_char,
     value: f64,
@@ -242,7 +141,7 @@ pub(super) unsafe extern "C" fn set_option_double<H: FfiHandle>(
 
 /// # Safety
 /// `handle`, `key`, `value` and `length` must be null or valid for the call.
-pub(super) unsafe extern "C" fn get_option_string<H: FfiHandle>(
+pub(super) unsafe extern "C" fn get_option_string<H: FfiHandle<State: OptionTarget>>(
     handle: *mut H,
     key: *const c_char,
     value: *mut c_char,
@@ -260,7 +159,7 @@ pub(super) unsafe extern "C" fn get_option_string<H: FfiHandle>(
 
 /// # Safety
 /// `handle`, `key`, `value` and `length` must be null or valid for the call.
-pub(super) unsafe extern "C" fn get_option_bytes<H: FfiHandle>(
+pub(super) unsafe extern "C" fn get_option_bytes<H: FfiHandle<State: OptionTarget>>(
     handle: *mut H,
     key: *const c_char,
     value: *mut u8,
@@ -278,7 +177,7 @@ pub(super) unsafe extern "C" fn get_option_bytes<H: FfiHandle>(
 
 /// # Safety
 /// `handle`, `key` and `value` must be null or valid for the call.
-pub(super) unsafe extern "C" fn get_option_int<H: FfiHandle>(
+pub(super) unsafe extern "C" fn get_option_int<H: FfiHandle<State: OptionTarget>>(
     handle: *mut H,
     key: *const c_char,
     value: *mut i64,
@@ -295,7 +194,7 @@ pub(super) unsafe extern "C" fn get_option_int<H: FfiHandle>(
 
 /// # Safety
 /// `handle`, `key` and `value` must be null or valid for the call.
-pub(super) unsafe extern "C" fn get_option_double<H: FfiHandle>(
+pub(super) unsafe extern "C" fn get_option_double<H: FfiHandle<State: OptionTarget>>(
     handle: *mut H,
     key: *const c_char,
     value: *mut f64,

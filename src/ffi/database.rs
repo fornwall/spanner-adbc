@@ -8,8 +8,7 @@ use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::OptionDatabase;
 
 use super::abi::{AdbcDatabase, AdbcError, AdbcStatusCode};
-use super::handle::Staged;
-use super::options::{FfiHandle, with_state};
+use super::handle::{FfiHandle, Staged, with_state};
 use crate::driver::{SpannerDatabase, SpannerDriver};
 
 pub(super) const KIND: &str = "database";
@@ -20,12 +19,8 @@ impl FfiHandle for AdbcDatabase {
     type State = State;
     const KIND: &'static str = KIND;
 
-    fn private_data(&self) -> *mut c_void {
-        self.private_data
-    }
-
-    fn private_data_mut(&mut self) -> &mut *mut c_void {
-        &mut self.private_data
+    fn private_data(handle: *mut Self) -> *mut *mut c_void {
+        unsafe { &raw mut (*handle).private_data }
     }
 }
 

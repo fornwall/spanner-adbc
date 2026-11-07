@@ -164,7 +164,7 @@ impl RecordBatchReader for BoundStreamReader {
 
 /// Run an Arrow C data import and its validation. Arrow asserts instead of returning an error on
 /// some malformed input, such as a struct whose children disagree with its fields at any depth.
-/// Catching the panic here keeps a caller's mistake from poisoning the statement in `dispatch`.
+/// Catching the panic here keeps a caller's mistake from poisoning the statement in `with_state`.
 /// Unwinding drops the imported structs, which runs their release callbacks.
 fn contain_import<T>(
     import: impl FnOnce() -> std::result::Result<T, ArrowError>,

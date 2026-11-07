@@ -14,8 +14,7 @@ use super::abi::{AdbcConnection, AdbcDatabase, AdbcError, AdbcStatusCode};
 use super::guard::{
     byte_slice, optional_str, optional_str_list, required_output, required_str, write_out,
 };
-use super::handle::{Staged, install_cancel_handle};
-use super::options::{FfiHandle, slot_of, with_state};
+use super::handle::{FfiHandle, Staged, install_cancel_handle, lock_state, with_state};
 use crate::connection::SpannerConnection;
 use crate::error::invalid_argument;
 
@@ -27,12 +26,8 @@ impl FfiHandle for AdbcConnection {
     type State = State;
     const KIND: &'static str = KIND;
 
-    fn private_data(&self) -> *mut c_void {
-        self.private_data
-    }
-
-    fn private_data_mut(&mut self) -> &mut *mut c_void {
-        &mut self.private_data
+    fn private_data(handle: *mut Self) -> *mut *mut c_void {
+        unsafe { &raw mut (*handle).private_data }
     }
 }
 
@@ -44,15 +39,14 @@ pub(super) unsafe extern "C" fn connection_init(
     database: *mut AdbcDatabase,
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
-    let slot = unsafe { slot_of(connection) };
     unsafe {
         with_state(connection, error, |state| {
             let options = state.pending(KIND)?;
-            let mut database = super::options::borrow(database)?;
+            let mut database = lock_state(database)?;
             let database = database.ready(super::database::KIND)?;
             let ready = database.new_connection_with_opts(options.entries.clone())?;
             // Install cancellation before publishing a state that can start operations.
-            install_cancel_handle::<State>(slot, ready.get_cancel_handle());
+            install_cancel_handle(connection, ready.get_cancel_handle());
             *state = State::Ready(ready);
             Ok(())
         })
@@ -85,17 +79,6 @@ pub(super) unsafe extern "C" fn connection_rollback(
     error: *mut AdbcError,
 ) -> AdbcStatusCode {
     unsafe { with_state(connection, error, |state| state.ready(KIND)?.rollback()) }
-}
-
-/// # Safety
-/// `connection` must be null or point to a valid `AdbcConnection`.
-pub(super) unsafe extern "C" fn connection_cancel(
-    connection: *mut AdbcConnection,
-    error: *mut AdbcError,
-) -> AdbcStatusCode {
-    // Bypasses `dispatch` so it can interrupt a running call. Before `Init` there is no cancel
-    // handle (`InvalidState`); with nothing in flight it returns OK (see `SlotCancelHandle`).
-    unsafe { super::handle::cancel::<State>(slot_of(connection), KIND, error) }
 }
 
 /// # Safety

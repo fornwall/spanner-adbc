@@ -201,15 +201,9 @@ fn the_vtable_slots_do_what_their_names_say() {
         },
         ADBC_STATUS_OK
     );
-    let buffered = {
-        let mut state =
-            unsafe { handle::lock_state::<database::State>(database.private_data, database::KIND) }
-                .unwrap();
-        match &mut *state {
-            handle::Staged::Pending(options) => options.entries.clone(),
-            handle::Staged::Ready(_) => panic!("the database must still be pending"),
-        }
-    };
+    let state = unsafe { handle::lock_state(&raw mut database) }.unwrap();
+    let buffered = state.pending(database::KIND).unwrap().entries.clone();
+    drop(state);
     assert_eq!(buffered.len(), 4);
     assert!(matches!(&buffered[0].1, OptionValue::String(v) if v == "http://127.0.0.1:1"));
     assert_eq!(buffered[1].0, OptionDatabase::Uri);
@@ -278,16 +272,9 @@ fn the_vtable_slots_do_what_their_names_say() {
         },
         ADBC_STATUS_OK
     );
-    let buffered = {
-        let mut state = unsafe {
-            handle::lock_state::<connection::State>(connection.private_data, connection::KIND)
-        }
-        .unwrap();
-        match &mut *state {
-            handle::Staged::Pending(options) => options.entries.clone(),
-            handle::Staged::Ready(_) => panic!("the connection must still be pending"),
-        }
-    };
+    let state = unsafe { handle::lock_state(&raw mut connection) }.unwrap();
+    let buffered = state.pending(connection::KIND).unwrap().entries.clone();
+    drop(state);
     assert_eq!(buffered.len(), 4);
     assert_eq!(buffered[0].0, OptionConnection::AutoCommit);
     assert!(matches!(&buffered[0].1, OptionValue::String(v) if v == "true"));

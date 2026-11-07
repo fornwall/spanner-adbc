@@ -3,9 +3,10 @@ use std::ffi::CString;
 use adbc_core::options::OptionValue;
 
 use super::super::abi::{ADBC_STATUS_INVALID_ARGUMENT, ADBC_STATUS_INVALID_STATE, ADBC_STATUS_OK};
+use super::super::handle::{cancel, new_handle, release_handle};
 use super::super::options::{
-    get_option_bytes, get_option_double, get_option_int, get_option_string, new_handle,
-    release_handle, set_option_bytes, set_option_double, set_option_int, set_option_string,
+    get_option_bytes, get_option_double, get_option_int, get_option_string, set_option_bytes,
+    set_option_double, set_option_int, set_option_string,
 };
 use super::*;
 use crate::ffi::test_support::{error_message, null, release_error, zeroed_error};
@@ -34,13 +35,8 @@ fn drop_pending(connection: &mut AdbcConnection) {
 
 /// The options buffered by a pending connection.
 fn buffered(connection: &mut AdbcConnection) -> Vec<(OptionConnection, OptionValue)> {
-    let mut state =
-        unsafe { super::super::handle::lock_state::<State>(connection.private_data, KIND) }
-            .unwrap();
-    match &mut *state {
-        State::Pending(options) => options.entries.clone(),
-        State::Ready(_) => panic!("expected a pending connection"),
-    }
+    let state = unsafe { lock_state(&raw mut *connection) }.unwrap();
+    state.pending(KIND).unwrap().entries.clone()
 }
 
 #[test]
@@ -96,7 +92,7 @@ fn transaction_cancel_and_init_entry_points_check_their_state() {
     for status in [
         unsafe { connection_commit(&raw mut connection, null()) },
         unsafe { connection_rollback(&raw mut connection, null()) },
-        unsafe { connection_cancel(&raw mut connection, null()) },
+        unsafe { cancel(&raw mut connection, null()) },
         // A null database.
         unsafe { connection_init(&raw mut connection, null(), null()) },
     ] {
@@ -346,7 +342,7 @@ fn every_entry_point_refuses_a_released_handle() {
         }),
         ("commit", unsafe { connection_commit(c, null()) }),
         ("rollback", unsafe { connection_rollback(c, null()) }),
-        ("cancel", unsafe { connection_cancel(c, null()) }),
+        ("cancel", unsafe { cancel(c, null()) }),
         ("get_info", unsafe {
             connection_get_info(c, null(), 0, null(), null())
         }),
@@ -398,7 +394,7 @@ fn every_entry_point_refuses_a_released_handle() {
     }
 }
 
-/// `AdbcStatementNew` borrows the connection without `dispatch`, so it checks readiness itself.
+/// `AdbcStatementNew` borrows the connection without `with_state`, so it checks readiness itself.
 #[test]
 fn creating_a_statement_needs_an_initialized_connection() {
     let mut connection = pending();
@@ -424,7 +420,7 @@ fn creating_a_statement_needs_an_initialized_connection() {
     drop_pending(&mut connection);
 }
 
-/// `AdbcConnectionInit` borrows the database without `dispatch`, so it checks readiness itself.
+/// `AdbcConnectionInit` borrows the database without `with_state`, so it checks readiness itself.
 #[test]
 fn init_against_an_allocated_but_uninitialized_database_is_refused() {
     let mut connection = pending();
@@ -448,8 +444,7 @@ fn init_against_an_allocated_but_uninitialized_database_is_refused() {
 
     // The connection stays pending, so `Init` can be retried.
     assert!(matches!(
-        &*unsafe { super::super::handle::lock_state::<State>(connection.private_data, KIND) }
-            .unwrap(),
+        &*unsafe { lock_state(&raw mut connection) }.unwrap(),
         State::Pending(_)
     ));
 

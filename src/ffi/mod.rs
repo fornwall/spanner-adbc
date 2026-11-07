@@ -6,12 +6,15 @@
 //! * [`abi`]: the C header, transcribed. Declarations only.
 //! * [`error`]: writes driver errors into the caller's `AdbcError` at the revision it allocated.
 //! * [`guard`]: panic containment and conversion of pointer and string arguments.
-//! * [`handle`]: the object behind each handle's `private_data`, and how calls reach it.
-//! * [`options`]: `New`, `Release` and the option entry points, written once as generic
-//!   `extern "C"` functions that the vtable instantiates per object.
+//! * [`handle`]: the object behind each handle's `private_data`, how calls reach it, and the
+//!   `New`, `Release` and `Cancel` entry points.
+//! * [`options`]: the option entry points.
 //! * [`database`], [`connection`], [`statement`]: the remaining entry points, each a thin
 //!   translation onto the driver's own types.
 //! * [`stream`], [`import`]: Arrow C stream export and import.
+//!
+//! Entry points shared by the objects are generic `extern "C"` functions that the vtable
+//! instantiates per object.
 //!
 //! Each handle's `private_data` holds an `Arc` to its driver object behind a mutex, so calls on
 //! one handle serialize and a panic poisons only the objects its call locked. Entry points contain
@@ -55,19 +58,19 @@ fn vtable() -> AdbcDriver {
 
         // --- ADBC 1.0.0 ---
         DatabaseInit: Some(database::database_init),
-        DatabaseNew: Some(options::new_handle::<AdbcDatabase>),
+        DatabaseNew: Some(handle::new_handle::<AdbcDatabase>),
         DatabaseSetOption: Some(options::set_option_string::<AdbcDatabase>),
-        DatabaseRelease: Some(options::release_handle::<AdbcDatabase>),
+        DatabaseRelease: Some(handle::release_handle::<AdbcDatabase>),
         ConnectionCommit: Some(connection::connection_commit),
         ConnectionGetInfo: Some(connection::connection_get_info),
         ConnectionGetObjects: Some(connection::connection_get_objects),
         ConnectionGetTableSchema: Some(connection::connection_get_table_schema),
         ConnectionGetTableTypes: Some(connection::connection_get_table_types),
         ConnectionInit: Some(connection::connection_init),
-        ConnectionNew: Some(options::new_handle::<AdbcConnection>),
+        ConnectionNew: Some(handle::new_handle::<AdbcConnection>),
         ConnectionSetOption: Some(options::set_option_string::<AdbcConnection>),
         ConnectionReadPartition: Some(connection::connection_read_partition),
-        ConnectionRelease: Some(options::release_handle::<AdbcConnection>),
+        ConnectionRelease: Some(handle::release_handle::<AdbcConnection>),
         ConnectionRollback: Some(connection::connection_rollback),
         StatementBind: Some(statement::statement_bind),
         StatementBindStream: Some(statement::statement_bind_stream),
@@ -76,7 +79,7 @@ fn vtable() -> AdbcDriver {
         StatementGetParameterSchema: Some(statement::statement_get_parameter_schema),
         StatementNew: Some(statement::statement_new),
         StatementPrepare: Some(statement::statement_prepare),
-        StatementRelease: Some(options::release_handle::<AdbcStatement>),
+        StatementRelease: Some(handle::release_handle::<AdbcStatement>),
         StatementSetOption: Some(options::set_option_string::<AdbcStatement>),
         StatementSetSqlQuery: Some(statement::statement_set_sql_query),
         StatementSetSubstraitPlan: Some(statement::statement_set_substrait_plan),
@@ -92,7 +95,7 @@ fn vtable() -> AdbcDriver {
         DatabaseSetOptionBytes: Some(options::set_option_bytes::<AdbcDatabase>),
         DatabaseSetOptionDouble: Some(options::set_option_double::<AdbcDatabase>),
         DatabaseSetOptionInt: Some(options::set_option_int::<AdbcDatabase>),
-        ConnectionCancel: Some(connection::connection_cancel),
+        ConnectionCancel: Some(handle::cancel::<AdbcConnection>),
         ConnectionGetOption: Some(options::get_option_string::<AdbcConnection>),
         ConnectionGetOptionBytes: Some(options::get_option_bytes::<AdbcConnection>),
         ConnectionGetOptionDouble: Some(options::get_option_double::<AdbcConnection>),
@@ -102,7 +105,7 @@ fn vtable() -> AdbcDriver {
         ConnectionSetOptionBytes: Some(options::set_option_bytes::<AdbcConnection>),
         ConnectionSetOptionDouble: Some(options::set_option_double::<AdbcConnection>),
         ConnectionSetOptionInt: Some(options::set_option_int::<AdbcConnection>),
-        StatementCancel: Some(statement::statement_cancel),
+        StatementCancel: Some(handle::cancel::<AdbcStatement>),
         StatementExecuteSchema: Some(statement::statement_execute_schema),
         StatementGetOption: Some(options::get_option_string::<AdbcStatement>),
         StatementGetOptionBytes: Some(options::get_option_bytes::<AdbcStatement>),

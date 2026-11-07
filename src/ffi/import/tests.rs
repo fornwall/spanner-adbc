@@ -328,7 +328,7 @@ fn a_nested_column_that_disagrees_with_the_bound_schema_is_an_error_not_a_panic(
 }
 
 /// Validation can panic as well as import: Arrow expects a fixed-size list's value count to fit in
-/// a `usize`. The panic must not reach `dispatch`, where it would poison the statement.
+/// a `usize`. The panic must not reach `with_state`, where it would poison the statement.
 #[test]
 fn a_panic_during_validation_is_an_error() {
     use arrow_schema::Field;
