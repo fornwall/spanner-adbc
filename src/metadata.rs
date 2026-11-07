@@ -190,57 +190,35 @@ pub(crate) fn str_cols<const N: usize>(batch: &RecordBatch) -> Result<[&StringAr
     Ok(columns.try_into().expect("collected N columns"))
 }
 
-/// A compiled ADBC `LIKE` pattern, where `%` matches any run and `_` one character.
+/// Match `value` against an ADBC `LIKE` pattern, where `%` matches any run and `_` one character.
 /// Case-sensitive.
 ///
 /// Matching backtracks iteratively in O(pattern * value) time, so patterns like `%a%a%a` cannot
 /// blow up or overflow the stack.
-pub(crate) struct LikeMatcher {
-    pattern: Vec<char>,
-}
-
-impl LikeMatcher {
-    pub(crate) fn new(pattern: &str) -> Self {
-        Self {
-            pattern: pattern.chars().collect(),
-        }
-    }
-
-    pub(crate) fn matches(&self, value: &str) -> bool {
-        let p = &self.pattern;
-        // Walk `value` by byte offset to avoid allocating; each step advances one character.
-        let (mut pi, mut vi) = (0usize, 0usize);
-        // Pattern index / value byte offset to backtrack to after the most recent `%`.
-        let mut star: Option<(usize, usize)> = None;
-        while vi < value.len() {
-            let ch = value[vi..].chars().next().expect("vi is a char boundary");
-            // Check `%` first so it stays a wildcard when the value char is also `%`.
-            if pi < p.len() && p[pi] == '%' {
-                star = Some((pi, vi));
-                pi += 1;
-            } else if pi < p.len() && (p[pi] == '_' || p[pi] == ch) {
-                pi += 1;
-                vi += ch.len_utf8();
-            } else if let Some((sp, sv)) = star {
-                // Let the last `%` consume one more character and retry.
-                let skipped = value[sv..].chars().next().expect("sv is a char boundary");
-                pi = sp + 1;
-                vi = sv + skipped.len_utf8();
-                star = Some((sp, vi));
-            } else {
-                return false;
-            }
-        }
-        while pi < p.len() && p[pi] == '%' {
-            pi += 1;
-        }
-        pi == p.len()
-    }
-}
-
-/// Match one value against an ADBC `LIKE` pattern; see [`LikeMatcher`].
 pub(crate) fn like_match(pattern: &str, value: &str) -> bool {
-    LikeMatcher::new(pattern).matches(value)
+    let (mut p, mut v) = (pattern.chars(), value.chars());
+    // The rest of the pattern after the last `%`, and the value from where that `%` stopped.
+    let mut retry = None;
+    loop {
+        let (mut next_p, mut next_v) = (p.clone(), v.clone());
+        match (next_p.next(), next_v.next()) {
+            (None, None) => return true,
+            // Checked first so `%` stays a wildcard when the value char is also `%`.
+            (Some('%'), _) => {
+                retry = Some((next_p.clone(), v.clone()));
+                p = next_p;
+            }
+            (Some(c), Some(ch)) if c == '_' || c == ch => (p, v) = (next_p, next_v),
+            // Let the last `%` consume one more character and retry.
+            _ => match &mut retry {
+                Some((after_star, resume)) if !resume.as_str().is_empty() => {
+                    resume.next();
+                    (p, v) = (after_star.clone(), resume.clone());
+                }
+                _ => return false,
+            },
+        }
+    }
 }
 
 #[cfg(test)]

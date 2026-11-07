@@ -15,7 +15,7 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use google_cloud_spanner::client::DatabaseClient;
 
 use crate::error::err;
-use crate::metadata::{LikeMatcher, filtered_query, metadata_sql_builder, query_txn, str_cols};
+use crate::metadata::{filtered_query, like_match, metadata_sql_builder, query_txn, str_cols};
 use crate::nested::{arrow_err, dense_union, field, shape_err, strings, struct_list};
 use crate::options::SharedConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
@@ -73,13 +73,9 @@ pub(crate) fn collect_statistics(
         &[("t.TABLE_SCHEMA", db_schema), ("t.TABLE_NAME", table_name)],
         "t.TABLE_SCHEMA, t.TABLE_NAME, c.ORDINAL_POSITION",
     );
-    let (schema_matcher, table_matcher) = (
-        db_schema.map(LikeMatcher::new),
-        table_name.map(LikeMatcher::new),
-    );
-    let matches = move |schema: &str, table: &str| {
-        schema_matcher.as_ref().is_none_or(|m| m.matches(schema))
-            && table_matcher.as_ref().is_none_or(|m| m.matches(table))
+    let matches = |schema: &str, table: &str| {
+        db_schema.is_none_or(|p| like_match(p, schema))
+            && table_name.is_none_or(|p| like_match(p, table))
     };
     // One cancel signal and query deadline cover discovery and every scan, as for `get_objects`.
     let (prepared, batches) = block_on_cancellable(

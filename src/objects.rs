@@ -22,7 +22,7 @@ use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement as SpannerSql;
 use google_cloud_spanner::transaction::MultiUseReadOnlyTransaction;
 
-use crate::metadata::{LikeMatcher, column, filtered_query, query_txn, str_cols};
+use crate::metadata::{column, filtered_query, like_match, query_txn, str_cols};
 use crate::nested::{arrow_err, field, list_item, list_of, strings, struct_list};
 use crate::options::SharedConfig;
 use crate::runtime::{CancelSignal, SharedRuntime, block_on_cancellable};
@@ -263,15 +263,7 @@ async fn query_txn_opt(
 /// Assemble the hierarchy from the fetched batches, in their order, and apply the filters. Kept
 /// apart from the I/O in [`collect_objects`] so it can be tested offline.
 fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Result<Vec<DbSchema>> {
-    let matcher = |pattern: Option<&str>| {
-        let matcher = pattern.map(LikeMatcher::new);
-        move |value: &str| matcher.as_ref().is_none_or(|m| m.matches(value))
-    };
-    let (schema_matches, table_matches, column_matches) = (
-        matcher(filters.db_schema),
-        matcher(filters.table_name),
-        matcher(filters.column_name),
-    );
+    let matches = |pattern: Option<&str>, value| pattern.is_none_or(|p| like_match(p, value));
 
     let mut columns: HashMap<(&str, &str), Vec<Column>> = HashMap::new();
     if let Some(batch) = &batches.columns {
@@ -286,7 +278,7 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
             identity,
         ] = str_cols(batch)?;
         let ordinal = column::<Int64Array>(batch, 8)?;
-        for r in (0..batch.num_rows()).filter(|&r| column_matches(name.value(r))) {
+        for r in (0..batch.num_rows()).filter(|&r| matches(filters.column_name, name.value(r))) {
             columns
                 .entry((schema.value(r), table.value(r)))
                 .or_default()
@@ -353,7 +345,7 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
         let [schema, name, table_type] = str_cols(batch)?;
         for r in 0..batch.num_rows() {
             let (schema, name, table_type) = (schema.value(r), name.value(r), table_type.value(r));
-            if !table_matches(name)
+            if !matches(filters.table_name, name)
                 || filters
                     .table_type
                     .is_some_and(|types| !types.is_empty() && !types.contains(&table_type))
@@ -373,7 +365,7 @@ fn assemble_objects(batches: &ObjectBatches, filters: &ObjectFilters<'_>) -> Res
     Ok(names
         .iter()
         .flatten()
-        .filter(|name| schema_matches(name))
+        .filter(|name| matches(filters.db_schema, name))
         .map(|name| DbSchema {
             name: name.to_string(),
             tables: tables.remove(name).unwrap_or_default(),

@@ -34,7 +34,7 @@ fn like_matching() {
 
 #[test]
 fn like_matching_multibyte_utf8() {
-    // The matcher walks bytes, but `_` and `%` backtracking must step over whole characters.
+    // `_` and `%` backtracking step over whole characters, not bytes.
     assert!(like_match("_", "é")); // 2-byte char is one `_`
     assert!(!like_match("__", "é")); // ... not two
     assert!(like_match("caf_", "café"));
