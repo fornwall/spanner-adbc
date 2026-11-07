@@ -107,11 +107,11 @@ fn rejects_malformed_and_out_of_range_bounds() {
 #[test]
 fn set_staleness_round_trips_and_unsets() {
     let mut s = ReadStaleness::default();
+    let set = |s: &mut ReadStaleness, value: &str| s.set(value.into(), "o", parse_read_bound);
     assert_eq!(s.timestamp_bound(), None);
 
-    s.set_staleness(OptionValue::String(" max:10s ".into()))
-        .unwrap();
-    assert_eq!(s.staleness_string(), Some("max:10s"));
+    set(&mut s, " max:10s ").unwrap();
+    assert_eq!(s.raw(), Some("max:10s"));
     assert_eq!(
         s.timestamp_bound(),
         Some(TimestampBound::max_staleness(Duration::from_secs(10)))
@@ -122,12 +122,11 @@ fn set_staleness_round_trips_and_unsets() {
     );
 
     // A rejected value keeps the previous one.
-    s.set_staleness(OptionValue::String("exact:1e12".into()))
-        .unwrap_err();
-    assert_eq!(s.staleness_string(), Some("max:10s"));
+    set(&mut s, "exact:1e12").unwrap_err();
+    assert_eq!(s.raw(), Some("max:10s"));
 
-    s.set_staleness(OptionValue::String(String::new())).unwrap();
-    assert_eq!(s.staleness_string(), None);
+    set(&mut s, "").unwrap();
+    assert_eq!(s.raw(), None);
     assert_eq!(s.multi_use_timestamp_bound(), None);
 }
 

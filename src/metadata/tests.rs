@@ -126,8 +126,10 @@ fn configured() -> SharedConfig {
         .set_transaction_tag(OptionValue::String("user-txn-tag".into()))
         .unwrap();
     config
-        .directed_read
-        .set(OptionValue::String("include:eu-west1:read_only".into()))
+        .set_option(
+            crate::OPTION_DIRECTED_READ,
+            "include:eu-west1:read_only".into(),
+        )
         .unwrap();
     config.retry.set_max_attempts(OptionValue::Int(3)).unwrap();
     config

@@ -1,5 +1,6 @@
 use super::*;
 use adbc_core::error::Status;
+use adbc_core::options::OptionValue;
 
 fn selections(list: &[(&str, Type)]) -> Vec<ReplicaSelection> {
     list.iter()
@@ -111,16 +112,16 @@ fn rejects_malformed_values_naming_the_problem() {
 
 #[test]
 fn set_round_trips_the_trimmed_value_and_unsets() {
-    let s = |v: &str| OptionValue::String(v.to_string());
     let mut config = DirectedRead::default();
-    config.set(s("  include:us-east1:read_only  ")).unwrap();
-    assert_eq!(config.option_string(), Some("include:us-east1:read_only"));
+    let set = |config: &mut DirectedRead, value: OptionValue| config.set(value, "o", parse);
+    set(&mut config, "  include:us-east1:read_only  ".into()).unwrap();
+    assert_eq!(config.raw(), Some("include:us-east1:read_only"));
 
     // A rejected value keeps the previous one.
-    config.set(s("prefer:us-east1")).unwrap_err();
-    config.set(OptionValue::Int(1)).unwrap_err();
-    assert_eq!(config.option_string(), Some("include:us-east1:read_only"));
+    set(&mut config, "prefer:us-east1".into()).unwrap_err();
+    set(&mut config, OptionValue::Int(1)).unwrap_err();
+    assert_eq!(config.raw(), Some("include:us-east1:read_only"));
 
-    config.set(s("")).unwrap();
-    assert_eq!(config.option_string(), None);
+    set(&mut config, "".into()).unwrap();
+    assert_eq!(config.raw(), None);
 }

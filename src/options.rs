@@ -11,12 +11,12 @@ use adbc_core::options::OptionValue;
 use google_cloud_spanner::model::transaction_options::IsolationLevel;
 
 use crate::conversion::TimestampPrecision;
-use crate::directed_read::DirectedRead;
+use crate::directed_read::{self, DirectedRead};
 use crate::error::invalid_argument;
 use crate::query_options::QueryOptionsConfig;
 use crate::request::{CommitStats, RequestConfig};
 use crate::retry::RetryConfig;
-use crate::staleness::ReadStaleness;
+use crate::staleness::{ReadStaleness, parse_read_bound};
 use crate::timeout::RpcTimeouts;
 
 /// Describe a rejected value for an error message.
@@ -242,10 +242,14 @@ impl SharedConfig {
     /// Apply a shared option. Returns `false` for keys this configuration does not handle.
     pub(crate) fn set_option(&mut self, key: &str, value: OptionValue) -> Result<bool> {
         match key {
-            crate::OPTION_READ_STALENESS => self.read_staleness.set_staleness(value)?,
+            crate::OPTION_READ_STALENESS => {
+                self.read_staleness.set(value, key, parse_read_bound)?
+            }
             crate::OPTION_REQUEST_PRIORITY => self.request.set_priority(value)?,
             crate::OPTION_REQUEST_TAG => self.request.set_request_tag(value)?,
-            crate::OPTION_DIRECTED_READ => self.directed_read.set(value)?,
+            crate::OPTION_DIRECTED_READ => {
+                self.directed_read.set(value, key, directed_read::parse)?
+            }
             crate::OPTION_MAX_COMMIT_DELAY => self.request.set_max_commit_delay(value)?,
             crate::OPTION_COMMIT_STATS => self.request.set_commit_stats(value)?,
             crate::OPTION_EXCLUDE_TXN_FROM_CHANGE_STREAMS => {
@@ -292,12 +296,10 @@ impl SharedConfig {
     /// Return a shared option, or `NotFound` when it is unset or unknown.
     pub(crate) fn option_string(&self, key: &str) -> Result<String> {
         let value: Option<String> = match key {
-            crate::OPTION_READ_STALENESS => {
-                self.read_staleness.staleness_string().map(str::to_string)
-            }
+            crate::OPTION_READ_STALENESS => self.read_staleness.raw().map(str::to_string),
             crate::OPTION_REQUEST_PRIORITY => self.request.priority_string().map(str::to_string),
             crate::OPTION_REQUEST_TAG => self.request.request_tag_string().map(str::to_string),
-            crate::OPTION_DIRECTED_READ => self.directed_read.option_string().map(str::to_string),
+            crate::OPTION_DIRECTED_READ => self.directed_read.raw().map(str::to_string),
             crate::OPTION_MAX_COMMIT_DELAY => {
                 self.request.max_commit_delay_string().map(str::to_string)
             }

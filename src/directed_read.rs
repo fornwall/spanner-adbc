@@ -3,7 +3,6 @@
 //! it is applied only to read-only queries.
 
 use adbc_core::error::Result;
-use adbc_core::options::OptionValue;
 use google_cloud_spanner::model::DirectedReadOptions;
 use google_cloud_spanner::model::directed_read_options::replica_selection::Type;
 use google_cloud_spanner::model::directed_read_options::{
@@ -15,22 +14,13 @@ use crate::error::invalid_argument;
 use crate::options::RawParsed;
 
 /// The `spanner.directed_read` setting of a connection or statement.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct DirectedRead(RawParsed<DirectedReadOptions>);
+pub(crate) type DirectedRead = RawParsed<DirectedReadOptions>;
 
 impl DirectedRead {
-    pub(crate) fn set(&mut self, value: OptionValue) -> Result<()> {
-        self.0.set(value, crate::OPTION_DIRECTED_READ, parse)
-    }
-
-    pub(crate) fn option_string(&self) -> Option<&str> {
-        self.0.raw()
-    }
-
     /// Apply the selection to a read-only query.
     #[must_use]
     pub(crate) fn apply_to_statement(&self, builder: StatementBuilder) -> StatementBuilder {
-        match self.0.parsed() {
+        match self.parsed() {
             Some(options) => builder.set_directed_read_options(options.clone()),
             None => builder,
         }

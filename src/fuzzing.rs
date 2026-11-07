@@ -122,10 +122,10 @@ pub fn ensure_scheme(host: &str) -> String {
 
 /// Parse a `spanner.read.staleness` value into client `TimestampBound`s.
 pub fn parse_read_staleness(value: &str) {
-    use adbc_core::options::OptionValue;
-    let mut staleness = crate::staleness::ReadStaleness::default();
+    use crate::staleness::{ReadStaleness, parse_read_bound};
+    let mut staleness = ReadStaleness::default();
     if staleness
-        .set_staleness(OptionValue::String(value.to_string()))
+        .set(value.into(), crate::OPTION_READ_STALENESS, parse_read_bound)
         .is_ok()
     {
         assert_eq!(

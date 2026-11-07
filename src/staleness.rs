@@ -4,7 +4,6 @@
 use std::time::Duration;
 
 use adbc_core::error::Result;
-use adbc_core::options::OptionValue;
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::transaction::{
     MultiUseReadOnlyTransaction, SingleUseReadOnlyTransaction, TimestampBound,
@@ -46,7 +45,7 @@ pub(crate) async fn multi_use(
 /// A parsed read bound, for single-use reads and for transactions that begin explicitly or
 /// serve several reads.
 #[derive(Debug, Clone, PartialEq)]
-struct Bounds {
+pub(crate) struct Bounds {
     single_use: TimestampBound,
     /// `BeginTransaction` rejects the bounded-staleness kinds, so they are pinned to the most
     /// stale timestamp they allow, which satisfies the original bound.
@@ -54,29 +53,17 @@ struct Bounds {
 }
 
 /// The `spanner.read.staleness` setting of a connection or statement.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ReadStaleness {
-    bound: RawParsed<Bounds>,
-}
+pub(crate) type ReadStaleness = RawParsed<Bounds>;
 
 impl ReadStaleness {
-    pub(crate) fn set_staleness(&mut self, value: OptionValue) -> Result<()> {
-        self.bound
-            .set(value, crate::OPTION_READ_STALENESS, parse_read_bound)
-    }
-
-    pub(crate) fn staleness_string(&self) -> Option<&str> {
-        self.bound.raw()
-    }
-
     /// The bound for a single-use read, or `None` for a strong read.
     pub(crate) fn timestamp_bound(&self) -> Option<TimestampBound> {
-        self.bound.parsed().map(|b| b.single_use.clone())
+        self.parsed().map(|b| b.single_use.clone())
     }
 
     /// The bound for a multi-use or batch read-only transaction, or `None` for a strong read.
     pub(crate) fn multi_use_timestamp_bound(&self) -> Option<TimestampBound> {
-        self.bound.parsed().map(|b| b.multi_use.clone())
+        self.parsed().map(|b| b.multi_use.clone())
     }
 }
 
@@ -86,7 +73,7 @@ const GRAMMAR_FORMS: &str = "\"exact:<duration>\" (e.g. \"exact:10s\"), \"max:<d
 
 /// Parse a `spanner.read.staleness` value. Prefixes are case-sensitive, like other ADBC option
 /// values.
-fn parse_read_bound(value: &str) -> Result<Bounds> {
+pub(crate) fn parse_read_bound(value: &str) -> Result<Bounds> {
     // A timestamp's colons all follow its date, so the first colon ends any prefix. For a bare
     // timestamp the "prefix" is `2026-07-07T00`, which matches no kind.
     if let Some((kind, arg)) = value.split_once(':') {
