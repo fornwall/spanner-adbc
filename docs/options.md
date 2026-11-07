@@ -305,9 +305,10 @@ RPC, so it needs none.
 ### DDL polling
 
 Without an `update` timeout, nothing limits how long a schema change is waited on while its polls
-succeed. A failed poll with a transport error or `UNAVAILABLE` is followed by another, because it
-says nothing about the running operation. So is a reply that isn't gRPC, such as a proxy's 502
-during a restart, unless it's a 401, 403 or 404, which fails the call at once.
+succeed. A poll that fails with a transport error or `UNAVAILABLE`, or gets no answer within 30
+seconds, is followed by another, because that says nothing about the running operation. So is a
+reply that isn't gRPC, such as a proxy's 502 during a restart, unless it's a 401, 403 or 404, which
+fails the call at once.
 
 That lasts for 24 hours from submission. After that, the first such failure ends the wait with
 that poll's error, even a single failure on an operation that was polling normally. The schema

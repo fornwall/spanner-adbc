@@ -27,6 +27,10 @@ struct State {
     reset_polls: usize,
     /// HTTP statuses to answer the next polls with instead of gRPC, as a proxy would.
     proxy_replies: VecDeque<u16>,
+    /// Polls left to leave unanswered, as a silent network would.
+    silent_polls: usize,
+    submission_delay: Duration,
+    poll_timeout: Option<Duration>,
 }
 
 // Both requests use a string field numbered 1 (database/name). Decode with the DDL
@@ -59,8 +63,20 @@ impl<const POLLING: bool> tonic::server::UnaryService<WireUpdateDatabaseDdl> for
             drop(state);
             panic!("the server task's panic resets the stream");
         }
+        if POLLING && state.silent_polls > 0 {
+            state.silent_polls -= 1;
+            return Box::pin(std::future::pending());
+        }
+        let delay = if POLLING {
+            Duration::ZERO
+        } else {
+            state.submission_delay
+        };
         let response = state.responses.pop_front().expect("unexpected admin RPC");
-        Box::pin(async move { response.map(tonic::Response::new) })
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            response.map(tonic::Response::new)
+        })
     }
 }
 
@@ -124,6 +140,7 @@ fn run_with(state: State) -> (Result<()>, Vec<Recorded>) {
         let mut config = ClientConfig::default();
         config.endpoint = Some(format!("http://{}", listener.local_addr().unwrap()));
         config.cred = Some(credentials);
+        let poll_timeout = state.poll_timeout.unwrap_or(POLL_TIMEOUT);
         let state = Arc::new(Mutex::new(state));
         let incoming = futures_util::stream::unfold(listener, |listener| async {
             Some((listener.accept().await.map(|(stream, _)| stream), listener))
@@ -134,7 +151,7 @@ fn run_with(state: State) -> (Result<()>, Vec<Recorded>) {
                 .add_service(Mock::<true>(state.clone()))
                 .serve_with_incoming(incoming),
         );
-        let client = database_admin(config).await.unwrap();
+        let client = database_admin(config, poll_timeout).await.unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(10),
             client
@@ -253,6 +270,22 @@ fn polling_outlasts_a_reset_stream() {
     });
     result.unwrap();
     assert_eq!(requests.len(), 3);
+}
+
+/// Polling can repeat a read, so a poll gets a deadline. The submission can't be repeated.
+#[test]
+fn a_silent_poll_is_followed_by_another_and_only_polls_have_a_deadline() {
+    let poll_timeout = Duration::from_millis(200);
+    let (result, requests) = run_with(State {
+        // Spares in case a loaded runner times out a poll that was answered.
+        responses: vec![pending(), done(), done(), done()].into(),
+        silent_polls: 1,
+        submission_delay: poll_timeout * 3,
+        poll_timeout: Some(poll_timeout),
+        ..Default::default()
+    });
+    result.unwrap();
+    assert!(requests.len() >= 3, "{}", requests.len());
 }
 
 #[test]

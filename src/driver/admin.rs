@@ -32,8 +32,13 @@ use wire::{OperationResult, WireGetOperation, WireOperation, WireUpdateDatabaseD
 /// How long a schema change may be waited on through failing polls, as in the .NET client.
 const FAILING_POLLS_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Generous for a quick read. A poll held up by a silent network never reaches the error policy,
+/// so without a deadline it would stall polling for good.
+pub(crate) const POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) async fn database_admin(
     mut config: ClientConfig,
+    poll_timeout: Duration,
 ) -> google_cloud_gax::client_builder::Result<DatabaseAdmin> {
     // Cloud schema changes take seconds to minutes and callers block on each one. The default
     // poll interval doubles up to a minute, which can nearly double the wait.
@@ -44,8 +49,11 @@ pub(crate) async fn database_admin(
         .clamp();
     config.polling_backoff_policy = Some(Arc::new(polling));
     config.polling_error_policy = Some(Arc::new(PollThroughFaults));
-    let transport = Client::new(config, "https://spanner.googleapis.com").await?;
-    Ok(DatabaseAdmin::from_stub(DdlTransport(transport)))
+    let client = Client::new(config, "https://spanner.googleapis.com").await?;
+    Ok(DatabaseAdmin::from_stub(DdlTransport {
+        client,
+        poll_timeout,
+    }))
 }
 
 /// Keep polling through whatever the data plane retries. Each poll is a single attempt, and the
@@ -61,7 +69,12 @@ impl PollingErrorPolicy for PollThroughFaults {
         if refused_by_proxy(&error) {
             return RetryResult::Permanent(error);
         }
-        match SpannerRetryPolicy::new().on_error(&RetryState::new(true), error) {
+        let result = if error.is_timeout() {
+            RetryResult::Continue(error)
+        } else {
+            SpannerRetryPolicy::new().on_error(&RetryState::new(true), error)
+        };
+        match result {
             RetryResult::Continue(error) if state.start.elapsed() >= FAILING_POLLS_LIMIT => {
                 RetryResult::Exhausted(error)
             }
@@ -85,7 +98,10 @@ fn refused_by_proxy(error: &Error) -> bool {
 }
 
 #[derive(Debug)]
-struct DdlTransport(Client);
+struct DdlTransport {
+    client: Client,
+    poll_timeout: Duration,
+}
 
 impl DdlTransport {
     async fn call<T: Message + Clone + 'static>(
@@ -96,7 +112,7 @@ impl DdlTransport {
         request_params: &str,
     ) -> Result<Response<Operation>> {
         let response = self
-            .0
+            .client
             .execute::<T, WireOperation>(
                 tonic::Extensions::new(),
                 http::uri::PathAndQuery::from_static(path),
@@ -147,27 +163,31 @@ impl google_cloud_spanner_admin_database_v1::stub::DatabaseAdmin for DdlTranspor
             "name",
             request.name.as_str(),
         ))]);
-        self.call(
+        let poll = self.call(
             "/google.longrunning.Operations/GetOperation",
             WireGetOperation { name: request.name },
             set_default_idempotency(options, true),
             &routing,
-        )
-        .await
+        );
+        // An `attempt_timeout` only starts once the channel has a connection, so it wouldn't cover
+        // a stalled reconnect.
+        tokio::time::timeout(self.poll_timeout, poll)
+            .await
+            .unwrap_or_else(|elapsed| Err(Error::timeout(elapsed)))
     }
 
     fn get_polling_error_policy(
         &self,
         options: &RequestOptions,
     ) -> Arc<dyn google_cloud_gax::polling_error_policy::PollingErrorPolicy> {
-        self.0.get_polling_error_policy(options)
+        self.client.get_polling_error_policy(options)
     }
 
     fn get_polling_backoff_policy(
         &self,
         options: &RequestOptions,
     ) -> Arc<dyn google_cloud_gax::polling_backoff_policy::PollingBackoffPolicy> {
-        self.0.get_polling_backoff_policy(options)
+        self.client.get_polling_backoff_policy(options)
     }
 }
 

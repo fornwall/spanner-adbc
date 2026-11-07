@@ -473,7 +473,7 @@ impl DatabaseAdminState {
     pub(crate) async fn client(&self) -> Result<&DatabaseAdmin> {
         self.client
             .get_or_try_init(|| async {
-                admin::database_admin(self.config.clone())
+                admin::database_admin(self.config.clone(), admin::POLL_TIMEOUT)
                     .await
                     .map_err(from_builder)
             })
