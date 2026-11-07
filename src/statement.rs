@@ -28,7 +28,7 @@ use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, ReadWriteTr
 
 use crate::bind;
 use crate::connection::{SharedTxn, TxnKind, lock_txn, runner_builder};
-use crate::conversion::result_set_to_batch;
+use crate::conversion::build_schema;
 use crate::driver::SharedDatabaseAdmin;
 use crate::error::{
     err, from_spanner, invalid_argument, invalid_state, option_not_set, unknown_option, unsupported,
@@ -417,7 +417,7 @@ impl SpannerStatement {
                             .set_type(google_cloud_spanner::model::Type::from(ty.clone()))
                     }),
             );
-            let schema = result_set_to_batch(plan_rs, precision).await?.schema();
+            let schema = build_schema(metadata, precision)?;
 
             let mut txn_builder = self.client.batch_read_only_transaction();
             if let Some(b) = bound {
@@ -554,10 +554,8 @@ impl SpannerStatement {
             }
         }
         let bound = self.config.read_staleness.multi_use_timestamp_bound();
-        let client = self.client.clone();
-        let built = block_on_cancellable(&self.runtime, &self.cancel.current(), async move {
-            crate::staleness::multi_use(&client, bound).await
-        })?;
+        let build = crate::staleness::multi_use(&self.client, bound);
+        let built = block_on_cancellable(&self.runtime, &self.cancel.current(), build)?;
         let mut st = lock_txn(&self.txn);
         if st.autocommit() {
             // Autocommit was enabled while building; the unused transaction issued no RPC.
