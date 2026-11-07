@@ -104,7 +104,7 @@ The implementation is in [connection.rs](../src/connection.rs),
 | `Rollback` | Sent by the client to clean up a read/write transaction with a known ID when its body fails with an error other than `ABORTED`, or when a cancel or timeout drops it. |
 | `PartitionQuery` | Descriptors for `execute_partitions`. |
 | `BatchWrite` | Opt-in autocommit ingest. |
-| `UpdateDatabaseDdl` | Schema changes through the gRPC Database Admin API, followed by polling the operation at most every 2 seconds, through any transport failure. |
+| `UpdateDatabaseDdl` | Schema changes through the gRPC Database Admin API, followed by polling the operation at most every 2 seconds, through any transport failure; see [DDL polling](options.md#ddl-polling). |
 
 The driver doesn't use unary `ExecuteSql`, the key-based `Read`, `StreamingRead` and
 `PartitionRead`, or the session pool RPCs (`BatchCreateSessions`, `GetSession`, `ListSessions`,

@@ -29,6 +29,9 @@ use prost::Message;
 mod wire;
 use wire::{OperationResult, WireGetOperation, WireOperation, WireUpdateDatabaseDdl};
 
+/// How long a schema change may be waited on through failing polls, as in the .NET client.
+const FAILING_POLLS_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
+
 pub(crate) async fn database_admin(
     mut config: ClientConfig,
 ) -> google_cloud_gax::client_builder::Result<DatabaseAdmin> {
@@ -47,12 +50,20 @@ pub(crate) async fn database_admin(
 
 /// Keep polling through whatever the data plane retries. Each poll is a single attempt, and the
 /// default policy gives up on a lost connection, which says nothing about the running operation.
+///
+/// The limit is applied here because `with_time_limit` also stops polls that succeed. The polling
+/// state keeps no failure history, so past the limit a single failed poll ends the wait.
 #[derive(Debug)]
 struct PollThroughFaults;
 
 impl PollingErrorPolicy for PollThroughFaults {
-    fn on_error(&self, _: &PollingState, error: Error) -> RetryResult {
-        SpannerRetryPolicy::new().on_error(&RetryState::new(true), error)
+    fn on_error(&self, state: &PollingState, error: Error) -> RetryResult {
+        match SpannerRetryPolicy::new().on_error(&RetryState::new(true), error) {
+            RetryResult::Continue(error) if state.start.elapsed() >= FAILING_POLLS_LIMIT => {
+                RetryResult::Exhausted(error)
+            }
+            result => result,
+        }
     }
 }
 

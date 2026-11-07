@@ -4,6 +4,26 @@ use super::*;
 mod transport;
 
 #[test]
+fn failing_polls_stop_after_a_day_but_successful_ones_never_do() {
+    use google_cloud_gax::error::rpc::{Code, Status};
+    use std::time::Instant;
+
+    let unavailable = || Error::service(Status::default().set_code(Code::Unavailable));
+    let day = Duration::from_secs(24 * 60 * 60);
+    let started = |age| PollingState::default().set_start(Instant::now() - age);
+    let policy = PollThroughFaults;
+    assert!(
+        policy
+            .on_error(&started(day - Duration::from_secs(60)), unavailable())
+            .is_continue()
+    );
+    assert!(policy.on_error(&started(day), unavailable()).is_exhausted());
+    policy
+        .on_in_progress(&started(day * 30), "operation")
+        .unwrap();
+}
+
+#[test]
 fn pending_operations_keep_their_polling_name() {
     let operation = WireOperation {
         name: "projects/p/instances/i/databases/d/operations/ddl".to_owned(),

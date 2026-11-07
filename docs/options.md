@@ -302,6 +302,16 @@ Creating the client stack falls under the [connect timeout](#connect-timeout) in
 background session maintenance has no deadline. Starting a manual read-only transaction sends no
 RPC, so it needs none.
 
+### DDL polling
+
+Without an `update` timeout, nothing limits how long a schema change is waited on while its polls
+succeed. A failed poll with a transport error or `UNAVAILABLE` is followed by another, because it
+says nothing about the running operation.
+
+That lasts for 24 hours from submission. After that, the first such failure ends the wait with
+that poll's error, even a single failure on an operation that was polling normally. The schema
+change keeps running and may still be applied.
+
 ### Connect timeout
 
 `spanner.rpc.timeout_seconds.connect` is a database option that bounds building the client
