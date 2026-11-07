@@ -300,6 +300,8 @@ fn a_uri_with_a_bad_database_path_is_rejected() {
         "spanner:///projects/p/instances/i/databases/d/",
         "spanner:///projects/p%2Fx/instances/i/databases/d",
         "spanner:///projects/p/instances/i/databases/%2F",
+        "spanner:///projects/p/instances/i/databases/d\n",
+        "spanner:///projects/p/instances/i/databases/d%0A",
     ] {
         let error = set_uri(&mut db, bad).unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments, "uri: {bad}");

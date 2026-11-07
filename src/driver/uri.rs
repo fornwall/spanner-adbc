@@ -119,9 +119,11 @@ fn parse_connection_uri(remainder: &str) -> Result<(String, Vec<(String, String)
         ["projects", p, "instances", i, "databases", d] => {
             // URI builders encode `:` in domain-scoped project IDs such as `example.com:p`.
             let (p, i, d) = (percent_decode(p)?, percent_decode(i)?, percent_decode(d)?);
+            // A control character would only fail later, as an invalid request header.
+            let invalid = |c: char| c == '/' || c.is_control();
             if [&p, &i, &d]
                 .iter()
-                .any(|id| id.is_empty() || id.contains('/'))
+                .any(|id| id.is_empty() || id.contains(invalid))
             {
                 return Err(bad_path());
             }
