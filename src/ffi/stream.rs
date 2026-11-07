@@ -18,7 +18,7 @@ use libc::{EACCES, ECANCELED, EEXIST, EINVAL, EIO, ENOENT, ENOMEM, ENOSYS, ENOTS
 use super::abi::{ADBC_STATUS_OK, AdbcError, AdbcStatusCode};
 use super::error::export_error;
 use super::guard::{drop_panic_payload, panic_message, sanitized_cstring};
-use crate::error::{chain, invalid_argument};
+use crate::error::{chain, err, invalid_argument};
 
 /// A callback failure, as the C string `get_last_error` returns and as the structured error
 /// [`error_from_array_stream`] exports.
@@ -47,7 +47,7 @@ impl Drop for PrivateData {
 /// Export a driver-produced schema. Failure is a driver bug, hence `Internal`.
 pub(super) fn export_schema(schema: &Schema) -> Result<FFI_ArrowSchema, Error> {
     FFI_ArrowSchema::try_from(schema).map_err(|failure| {
-        Error::with_message_and_status(
+        err(
             format!("failed to export a schema over the C data interface: {failure}"),
             Status::Internal,
         )
@@ -225,7 +225,7 @@ unsafe fn catch_callback(
                 panic_message(cause.as_ref())
             );
             drop_panic_payload(cause);
-            private.set_error(Error::with_message_and_status(message, Status::Internal));
+            private.set_error(err(message, Status::Internal));
             EINVAL
         }
     }
@@ -262,8 +262,7 @@ impl PrivateData {
         let errno = embedded
             .as_ref()
             .map_or(errno, |embedded| adbc_status_to_errno(embedded.status));
-        let structured =
-            embedded.unwrap_or_else(|| Error::with_message_and_status(error.to_string(), status));
+        let structured = embedded.unwrap_or_else(|| err(error.to_string(), status));
         // `get_last_error` shows the whole Arrow chain; the structured error keeps the embedded
         // driver error's message and details.
         self.last_error = Some(LastError {

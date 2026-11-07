@@ -4,12 +4,13 @@ use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
 use adbc_core::Driver;
-use adbc_core::error::{Error, Result, Status};
+use adbc_core::error::{Result, Status};
 use adbc_core::options::OptionDatabase;
 
 use super::abi::{AdbcDatabase, AdbcError, AdbcStatusCode};
 use super::handle::{FfiHandle, Staged, with_state};
 use crate::driver::{SpannerDatabase, SpannerDriver};
+use crate::error::err;
 
 pub(super) const KIND: &str = "database";
 
@@ -49,7 +50,7 @@ pub(super) unsafe extern "C" fn database_init(
             let options = state.pending(KIND)?;
             let driver = shared_driver()?;
             let mut driver = driver.lock().map_err(|_| {
-                Error::with_message_and_status(
+                err(
                     "the shared Spanner driver is unusable after an earlier panic",
                     Status::Internal,
                 )

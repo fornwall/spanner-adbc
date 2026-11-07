@@ -10,7 +10,7 @@ use std::panic::AssertUnwindSafe;
 
 use adbc_core::error::{Error, Result, Status};
 
-use crate::error::invalid_argument;
+use crate::error::{err, invalid_argument};
 
 /// Run `f`, turning a panic into an `Internal` error.
 pub(crate) fn catch<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -21,7 +21,7 @@ pub(crate) fn catch<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 #[cold]
 #[inline(never)]
 fn caught_panic(cause: Box<dyn Any + Send>) -> Error {
-    let failure = crate::error::err(
+    let failure = err(
         format!(
             "Uncaught panic in the Spanner driver: {}",
             panic_message(cause.as_ref())
@@ -146,7 +146,7 @@ pub(crate) unsafe fn write_string(value: &str, dst: *mut c_char, length: *mut us
     let available = unsafe { available_space(dst.cast::<c_void>(), length) }?;
     let bytes = value.as_bytes();
     if let Some(position) = bytes.iter().position(|&byte| byte == 0) {
-        return Err(Error::with_message_and_status(
+        return Err(err(
             format!("option value contains an interior NUL at byte {position}"),
             Status::Internal,
         ));

@@ -41,13 +41,13 @@ mod tests;
 use std::ffi::{c_int, c_void};
 use std::sync::Once;
 
-use adbc_core::error::{Error, Status};
-
 use abi::{
     ADBC_DRIVER_1_0_0_SIZE, ADBC_STATUS_OK, ADBC_VERSION_1_0_0, ADBC_VERSION_1_1_0, AdbcConnection,
     AdbcDatabase, AdbcDriver, AdbcError, AdbcStatement, AdbcStatusCode,
 };
 use handle::finish;
+
+use crate::error::{invalid_state, unsupported};
 
 /// Every slot is populated; unsupported operations report `NOT_IMPLEMENTED` from their callback.
 fn vtable() -> AdbcDriver {
@@ -130,9 +130,7 @@ unsafe extern "C" fn release_driver(
     // A field place rather than `&mut AdbcDriver`, which would span the 1.1.0 tail that a 1.0.0
     // caller did not allocate.
     if unsafe { (*driver).release.take() }.is_none() {
-        let failure =
-            Error::with_message_and_status("driver is already released", Status::InvalidState);
-        return unsafe { finish(Err(failure), error) };
+        return unsafe { finish(Err(invalid_state("driver is already released")), error) };
     }
     ADBC_STATUS_OK
 }
@@ -144,8 +142,7 @@ unsafe extern "C" fn release_driver(
 // Guard-exempt, as are the two exported wrappers: builds and copies a table of function pointers.
 unsafe fn init(version: c_int, driver: *mut c_void, error: *mut AdbcError) -> AdbcStatusCode {
     if driver.is_null() {
-        let failure = crate::error::invalid_argument("driver must not be null");
-        return unsafe { finish(Err(failure), error) };
+        return unsafe { finish(Err(guard::missing_argument("driver")), error) };
     }
     let size = match version {
         ADBC_VERSION_1_1_0 => size_of::<AdbcDriver>(),
@@ -153,13 +150,10 @@ unsafe fn init(version: c_int, driver: *mut c_void, error: *mut AdbcError) -> Ad
         ADBC_VERSION_1_0_0 => ADBC_DRIVER_1_0_0_SIZE,
         _ => {
             // adbc.h tells callers to retry with an older version on NOT_IMPLEMENTED.
-            let failure = Error::with_message_and_status(
-                format!(
-                    "unsupported ADBC version {version}; this driver implements \
-                     {ADBC_VERSION_1_0_0} and {ADBC_VERSION_1_1_0}"
-                ),
-                Status::NotImplemented,
-            );
+            let failure = unsupported(format!(
+                "unsupported ADBC version {version}; this driver implements {ADBC_VERSION_1_0_0} \
+                 and {ADBC_VERSION_1_1_0}"
+            ));
             return unsafe { finish(Err(failure), error) };
         }
     };

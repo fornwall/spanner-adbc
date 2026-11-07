@@ -18,7 +18,7 @@ use adbc_core::options::OptionValue;
 use super::abi::{ADBC_STATUS_OK, AdbcError, AdbcStatusCode};
 use super::error::export_error;
 use super::guard::{catch, missing_argument};
-use crate::error::invalid_state;
+use crate::error::{err, invalid_state};
 
 /// An ABI handle struct: `AdbcDatabase`, `AdbcConnection` or `AdbcStatement`.
 pub(super) trait FfiHandle {
@@ -60,10 +60,7 @@ impl<K, S> Staged<K, S> {
     pub(crate) fn pending(&self, kind: &str) -> Result<&[(K, OptionValue)]> {
         match self {
             Self::Pending(options) => Ok(options),
-            Self::Ready(_) => Err(Error::with_message_and_status(
-                format!("{kind} is already initialized"),
-                Status::InvalidState,
-            )),
+            Self::Ready(_) => Err(invalid_state(format!("{kind} is already initialized"))),
         }
     }
 }
@@ -104,16 +101,13 @@ impl<S: Send> Exported<S> {
 #[cold]
 #[inline(never)]
 fn uninitialized(kind: &str) -> Error {
-    Error::with_message_and_status(
-        format!("{kind} is uninitialized or already released"),
-        Status::InvalidState,
-    )
+    invalid_state(format!("{kind} is uninitialized or already released"))
 }
 
 #[cold]
 #[inline(never)]
 fn poisoned(kind: &str) -> Error {
-    Error::with_message_and_status(
+    err(
         format!("{kind} is unusable after an earlier panic in the driver"),
         Status::Internal,
     )
