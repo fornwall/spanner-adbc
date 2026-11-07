@@ -9,7 +9,6 @@
 mod dml;
 mod ingest;
 
-use dml::DmlOutcome;
 use ingest::{check_target_catalog, ingest_mode_option};
 
 use std::collections::BTreeMap;
@@ -186,13 +185,6 @@ impl SpannerStatement {
         })
     }
 
-    /// An empty result reader (empty schema, no rows), for statements that yield no result set.
-    fn empty_reader() -> ResultReader {
-        let schema = Arc::new(Schema::empty());
-        let empty: Vec<std::result::Result<RecordBatch, ArrowError>> = Vec::new();
-        Box::new(RecordBatchIterator::new(empty, schema))
-    }
-
     /// Run a query once per bound row, streaming the concatenated results. All rows share one
     /// multi-use read-only transaction, so they read the same snapshot.
     fn execute_multi_row_query(&self, sql: &str) -> Result<ResultReader> {
@@ -248,9 +240,7 @@ impl SpannerStatement {
         if bound_rows == 0 && !self.bound.is_empty() {
             // `executemany` with no parameter rows runs nothing, but the reader still has the
             // query's schema.
-            let schema = self.plan_query_schema(sql)?;
-            let empty: Vec<std::result::Result<RecordBatch, ArrowError>> = Vec::new();
-            return Ok(Box::new(RecordBatchIterator::new(empty, schema)));
+            return Ok(batch_reader(Vec::new(), self.plan_query_schema(sql)?));
         }
         // Bind before taking the manual read transaction: a bind error after it would leave the
         // transaction installed but unbegun, fixing the manual transaction's kind to queries.
@@ -352,28 +342,13 @@ impl SpannerStatement {
         check_batch(&statements)?;
         if crate::sql::is_ddl(sql) {
             self.run_ddl(statements.into_iter().map(str::to_owned).collect())?;
-            return Ok((Self::empty_reader(), None));
+            return Ok((empty_reader(), None));
         }
         // Clients such as the Python DBAPI and R send every statement through `ExecuteQuery`, so
         // DML must take the read/write path here; the read-only path would reject it.
         // `THEN RETURN` returns its rows; plain DML yields an empty result.
         if crate::sql::is_dml(sql) {
-            return match self.run_dml(sql, &statements)? {
-                DmlOutcome::Returning {
-                    batches,
-                    schema,
-                    affected,
-                } => {
-                    let batches: Vec<std::result::Result<RecordBatch, ArrowError>> =
-                        split_batches(batches, self.rows_per_batch)
-                            .into_iter()
-                            .map(Ok)
-                            .collect();
-                    let reader: ResultReader = Box::new(RecordBatchIterator::new(batches, schema));
-                    Ok((reader, Some(affected)))
-                }
-                DmlOutcome::Plain(count) => Ok((Self::empty_reader(), count)),
-            };
+            return self.run_dml(sql, &statements);
         }
         Ok((self.execute_query_reader(sql)?, None))
     }
@@ -390,7 +365,7 @@ impl SpannerStatement {
             && let Some(table) = self.target_table.clone()
         {
             let count = self.run_ingest(&table)?;
-            return Ok((Self::empty_reader(), count));
+            return Ok((empty_reader(), count));
         }
         self.check_bound_has_destination()?;
         let sql = self.sql()?;
@@ -1020,22 +995,30 @@ fn check_partitioned_dml(sql: &str, autocommit: bool, bound_rows: usize) -> Resu
     Ok(())
 }
 
+/// A reader over `batches`, which all have `schema`.
+fn batch_reader(batches: Vec<RecordBatch>, schema: SchemaRef) -> ResultReader {
+    Box::new(RecordBatchIterator::new(
+        batches.into_iter().map(Ok),
+        schema,
+    ))
+}
+
+/// An empty result reader (empty schema, no rows), for statements that yield no result set.
+fn empty_reader() -> ResultReader {
+    batch_reader(Vec::new(), Arc::new(Schema::empty()))
+}
+
 /// Slice `batches` so none exceeds `max_rows`, as query results are. Slices share buffers.
 fn split_batches(batches: Vec<RecordBatch>, max_rows: usize) -> Vec<RecordBatch> {
-    let mut out = Vec::with_capacity(batches.len());
-    for batch in batches {
-        if batch.num_rows() <= max_rows {
-            out.push(batch);
-            continue;
-        }
-        let mut offset = 0;
-        while offset < batch.num_rows() {
-            let len = max_rows.min(batch.num_rows() - offset);
-            out.push(batch.slice(offset, len));
-            offset += len;
-        }
-    }
-    out
+    batches
+        .into_iter()
+        .flat_map(|batch| {
+            let rows = batch.num_rows();
+            (0..rows.max(1))
+                .step_by(max_rows)
+                .map(move |offset| batch.slice(offset, max_rows.min(rows - offset)))
+        })
+        .collect()
 }
 
 /// Drain a query's rows, discarding them; mid-stream failures still surface. The streaming layer
@@ -1043,21 +1026,12 @@ fn split_batches(batches: Vec<RecordBatch>, max_rows: usize) -> Vec<RecordBatch>
 /// would.
 fn drain_discarding_rows(reader: ResultReader) -> Result<()> {
     for batch in reader {
-        batch.map_err(|e| {
-            if let ArrowError::ExternalError(inner) = e {
-                match inner.downcast::<Error>() {
-                    Ok(adbc_error) => *adbc_error,
-                    Err(other) => err(
-                        format!("query failed while its discarded result set was drained: {other}"),
-                        Status::Internal,
-                    ),
-                }
-            } else {
-                err(
-                    format!("query failed while its discarded result set was drained: {e}"),
-                    Status::Internal,
-                )
-            }
+        batch.map_err(|error| match error {
+            ArrowError::ExternalError(inner) => match inner.downcast::<Error>() {
+                Ok(error) => *error,
+                Err(other) => ArrowError::ExternalError(other).into(),
+            },
+            other => other.into(),
         })?;
     }
     Ok(())
