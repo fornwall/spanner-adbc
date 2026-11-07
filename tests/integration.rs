@@ -496,6 +496,7 @@ fn ingest_create_onto_a_differently_cased_table_is_already_exists() {
 }
 
 /// Recreates `AdbcBind` with two rows.
+#[track_caller]
 fn recreate_bind_table(connection: &mut SpannerConnection) {
     recreate(connection, "AdbcBind", "Id INT64, Name STRING(MAX)");
     let seed = "INSERT INTO AdbcBind (Id, Name) VALUES (1, 'Alice'), (2, 'Bob')";
@@ -1326,6 +1327,7 @@ fn get_objects_depth_and_filter_boundaries() {
 
 /// Asserts that every schema of the first catalog in `batch` survives with an empty, non-NULL
 /// table list.
+#[track_caller]
 fn assert_empty_table_lists(batch: &RecordBatch) {
     assert!(col::<ListArray>(batch.column(1)).is_valid(0));
     let schemas = list_structs(batch.column(1));
@@ -2526,6 +2528,7 @@ fn build_fixture(serial: bool) -> Option<Fixture> {
     })
 }
 
+#[track_caller]
 fn prepare<C: Connection>(connection: &mut C, sql: impl AsRef<str>) -> C::StatementType {
     let mut statement = connection.new_statement().unwrap();
     statement.set_sql_query(sql).unwrap();
@@ -2533,6 +2536,7 @@ fn prepare<C: Connection>(connection: &mut C, sql: impl AsRef<str>) -> C::Statem
 }
 
 /// Runs DML or DDL and returns the affected-row count.
+#[track_caller]
 fn run<C: Connection>(connection: &mut C, sql: impl AsRef<str>) -> Option<i64> {
     let sql = sql.as_ref();
     prepare(connection, sql)
@@ -2540,14 +2544,17 @@ fn run<C: Connection>(connection: &mut C, sql: impl AsRef<str>) -> Option<i64> {
         .unwrap_or_else(|e| panic!("failed to run {sql:?}: {e:?}"))
 }
 
+#[track_caller]
 fn drain(reader: impl Iterator<Item = Result<RecordBatch, ArrowError>>) -> Vec<RecordBatch> {
     reader.collect::<Result<_, _>>().unwrap()
 }
 
+#[track_caller]
 fn fetch(statement: &mut impl Statement) -> Vec<RecordBatch> {
     drain(statement.execute().unwrap())
 }
 
+#[track_caller]
 fn query<C: Connection>(connection: &mut C, sql: impl AsRef<str>) -> Vec<RecordBatch> {
     fetch(&mut prepare(connection, sql))
 }
@@ -2557,17 +2564,20 @@ fn row_count(batches: &[RecordBatch]) -> usize {
 }
 
 /// The non-null values of an `Int64` column across `batches`.
+#[track_caller]
 fn ints(batches: &[RecordBatch], column: usize) -> Vec<i64> {
     let columns = batches.iter().map(|b| col::<Int64Array>(b.column(column)));
     columns.flat_map(|c| c.values().to_vec()).collect()
 }
 
+#[track_caller]
 fn string_values(column: &dyn Array) -> Vec<String> {
     let column = col::<StringArray>(column);
     column.iter().map(|v| v.unwrap().to_string()).collect()
 }
 
 /// The values of a `Utf8` column across `batches`.
+#[track_caller]
 fn strings(batches: &[RecordBatch], column: usize) -> Vec<String> {
     batches
         .iter()
@@ -2604,6 +2614,7 @@ fn batch_stream(
     ))
 }
 
+#[track_caller]
 fn configure<O: Optionable>(target: &mut O, options: &[(&str, &str)])
 where
     O::Option: for<'a> From<&'a str>,
@@ -2614,6 +2625,7 @@ where
 }
 
 /// Replaces `table` with an empty table of `columns`, keyed by `Id`.
+#[track_caller]
 fn recreate(connection: &mut SpannerConnection, table: &str, columns: &str) {
     run(
         connection,
@@ -2625,6 +2637,7 @@ fn recreate(connection: &mut SpannerConnection, table: &str, columns: &str) {
 }
 
 /// Replaces `table` with one holding `Id`s from 1 to `rows`.
+#[track_caller]
 fn recreate_numbered(connection: &mut SpannerConnection, table: &str, rows: i64) {
     recreate(connection, table, "Id INT64");
     run(
@@ -2635,11 +2648,13 @@ fn recreate_numbered(connection: &mut SpannerConnection, table: &str, rows: i64)
 
 /// Drop scratch tables in one DDL batch. No `IF EXISTS`, so a test that never created a table
 /// fails here.
+#[track_caller]
 fn drop_tables(connection: &mut SpannerConnection, tables: &[&str]) {
     let drops: Vec<_> = tables.iter().map(|t| format!("DROP TABLE {t}")).collect();
     run(connection, drops.join("; "));
 }
 
+#[track_caller]
 fn set_ingest_target(statement: &mut impl Statement, table: &str, mode: &str) {
     statement
         .set_option(OptionStatement::TargetTable, table.into())
@@ -2649,6 +2664,7 @@ fn set_ingest_target(statement: &mut impl Statement, table: &str, mode: &str) {
         .unwrap();
 }
 
+#[track_caller]
 fn ingest_stmt<C: Connection>(connection: &mut C, table: &str, mode: &str) -> C::StatementType {
     let mut statement = connection.new_statement().unwrap();
     set_ingest_target(&mut statement, table, mode);
@@ -2692,6 +2708,7 @@ fn reader_error_status(error: &ArrowError) -> Status {
 }
 
 /// Downcast a column, panicking with its actual data type on mismatch.
+#[track_caller]
 fn col<T: Array + 'static>(column: &dyn Array) -> &T {
     column.as_any().downcast_ref::<T>().unwrap_or_else(|| {
         panic!(
@@ -2703,10 +2720,12 @@ fn col<T: Array + 'static>(column: &dyn Array) -> &T {
 }
 
 /// The struct elements of the first list in `array`.
+#[track_caller]
 fn list_structs(array: &dyn Array) -> StructArray {
     col::<StructArray>(&col::<ListArray>(array).value(0)).clone()
 }
 
+#[track_caller]
 fn list_item(data_type: &DataType) -> &FieldRef {
     let DataType::List(item) = data_type else {
         panic!("expected a List, got {data_type:?}");
@@ -2714,6 +2733,7 @@ fn list_item(data_type: &DataType) -> &FieldRef {
     item
 }
 
+#[track_caller]
 fn struct_fields(data_type: &DataType) -> &Fields {
     let DataType::Struct(fields) = data_type else {
         panic!("expected a Struct, got {data_type:?}");
@@ -2726,6 +2746,7 @@ fn field_names(fields: &Fields) -> Vec<&str> {
 }
 
 /// Asserts the names and types of `fields`.
+#[track_caller]
 fn assert_fields(fields: &Fields, expected: &[(&str, DataType)]) {
     let actual: Vec<_> = fields
         .iter()
@@ -2735,6 +2756,7 @@ fn assert_fields(fields: &Fields, expected: &[(&str, DataType)]) {
 }
 
 /// Column and constraint names that `get_objects` reports for `table`.
+#[track_caller]
 fn table_columns_and_constraints(
     connection: &mut SpannerConnection,
     table: &str,
@@ -2755,6 +2777,7 @@ fn table_columns_and_constraints(
     )
 }
 
+#[track_caller]
 fn count_rows<C: Connection>(connection: &mut C, table: &str) -> i64 {
     ints(
         &query(connection, format!("SELECT COUNT(*) AS n FROM {table}")),
@@ -2764,6 +2787,7 @@ fn count_rows<C: Connection>(connection: &mut C, table: &str) -> i64 {
 
 /// Count rows in a manual transaction, then end the read-only transaction the count opened so
 /// the next statement can write.
+#[track_caller]
 fn count_rows_ending_txn<C: Connection>(connection: &mut C, table: &str) -> i64 {
     let n = count_rows(connection, table);
     connection.rollback().unwrap();
@@ -2771,10 +2795,12 @@ fn count_rows_ending_txn<C: Connection>(connection: &mut C, table: &str) -> i64 
 }
 
 /// Run DML in a manual transaction, which buffers it and reports no count.
+#[track_caller]
 fn buffer_dml(connection: &mut SpannerConnection, sql: &str) {
     assert_eq!(run(connection, sql), None);
 }
 
+#[track_caller]
 fn set_autocommit<C: Optionable<Option = OptionConnection>>(connection: &mut C, enabled: bool) {
     connection
         .set_option(OptionConnection::AutoCommit, enabled.into())
@@ -2782,6 +2808,7 @@ fn set_autocommit<C: Optionable<Option = OptionConnection>>(connection: &mut C, 
 }
 
 /// Assert that a query is rejected while the manual transaction has buffered writes.
+#[track_caller]
 fn assert_query_guarded<C: Connection>(connection: &mut C, table: &str) {
     let mut q = prepare(connection, format!("SELECT COUNT(*) AS n FROM {table}"));
     let Err(error) = q.execute() else {
@@ -3014,6 +3041,7 @@ fn json_and_float32_round_trip() {
 }
 
 /// A statement running `sql` in batches of `rows`.
+#[track_caller]
 fn batched_query(connection: &mut SpannerConnection, sql: &str, rows: i64) -> SpannerStatement {
     let mut statement = connection.new_statement().unwrap();
     statement
@@ -3327,6 +3355,7 @@ fn dml_then_return_round_trip() {
 }
 
 /// The ids in every partition of `partitioned`, each of which must appear once.
+#[track_caller]
 fn read_partition_ids(
     connection: &mut SpannerConnection,
     partitioned: &adbc_core::PartitionedResult,
@@ -3428,6 +3457,7 @@ fn query_with_trailing_semicolons_returns_rows() {
     assert_fields(planned.fields(), &[("n", DataType::Int64)]);
 }
 
+#[track_caller]
 fn set_read_only<C: Optionable<Option = OptionConnection>>(connection: &mut C, enabled: bool) {
     connection
         .set_option(OptionConnection::ReadOnly, enabled.into())
@@ -3831,6 +3861,7 @@ fn zero_row_schema_fidelity() {
 /// before the timer, so a response that is already in wins. On a loaded runner a query did that
 /// more than 100 times in a row. Attempts stop at the first failure, so the bound costs nothing
 /// unless the deadline is ignored.
+#[track_caller]
 fn assert_deadline_expires(
     what: &str,
     option: &str,

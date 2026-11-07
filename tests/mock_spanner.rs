@@ -160,6 +160,7 @@ fn stream_of<T>(
 }
 
 /// The driver error that a reader wraps in `ArrowError::ExternalError`.
+#[track_caller]
 fn driver_error(error: &ArrowError) -> &Error {
     let ArrowError::ExternalError(source) = error else {
         panic!("expected the reader to surface the driver error, got: {error}");
@@ -228,6 +229,7 @@ fn serve_result(
 }
 
 /// The transaction selector of each logged request.
+#[track_caller]
 fn selectors(requests: &Log<v1::ExecuteSqlRequest>) -> Vec<Selector> {
     let requests = requests.lock().unwrap();
     requests
@@ -238,6 +240,7 @@ fn selectors(requests: &Log<v1::ExecuteSqlRequest>) -> Vec<Selector> {
 
 /// Asserts that the first selector begins a read-only transaction and the others reuse `id`, and
 /// returns the options it began with.
+#[track_caller]
 fn assert_shared_read_only<'a>(selectors: &'a [Selector], id: &[u8]) -> &'a v1::TransactionOptions {
     let Selector::Begin(options) = &selectors[0] else {
         panic!("the first request must begin the transaction: {selectors:?}");
@@ -295,6 +298,7 @@ fn aborted_with_retry_info(message: &str) -> tonic::Status {
 }
 
 /// The ProtoJSON detail stored under `key`.
+#[track_caller]
 fn error_detail(error: &Error, key: &str) -> serde_json::Value {
     let details = error.details.as_ref().expect("the error carries details");
     let (_, value) = details
@@ -304,21 +308,25 @@ fn error_detail(error: &Error, key: &str) -> serde_json::Value {
     serde_json::from_slice(value).unwrap()
 }
 
+#[track_caller]
 fn prepare(connection: &mut SpannerConnection, sql: &str) -> SpannerStatement {
     let mut statement = connection.new_statement().unwrap();
     statement.set_sql_query(sql).unwrap();
     statement
 }
 
+#[track_caller]
 fn update(connection: &mut SpannerConnection, sql: &str) -> Option<i64> {
     prepare(connection, sql).execute_update().unwrap()
 }
 
+#[track_caller]
 fn fetch(statement: &mut SpannerStatement) -> Vec<RecordBatch> {
     let reader = statement.execute().unwrap();
     reader.collect::<Result<_, _>>().unwrap()
 }
 
+#[track_caller]
 fn query(connection: &mut SpannerConnection, sql: &str) -> Vec<RecordBatch> {
     fetch(&mut prepare(connection, sql))
 }
@@ -327,6 +335,7 @@ fn row_count(batches: &[RecordBatch]) -> usize {
     batches.iter().map(RecordBatch::num_rows).sum()
 }
 
+#[track_caller]
 fn configure<O: Optionable>(target: &mut O, options: &[(&str, &str)])
 where
     O::Option: for<'a> From<&'a str>,
@@ -336,6 +345,7 @@ where
     }
 }
 
+#[track_caller]
 fn disable_autocommit(connection: &mut SpannerConnection) {
     connection
         .set_option(OptionConnection::AutoCommit, false.into())
@@ -348,6 +358,7 @@ fn ingest_batch(n: usize) -> RecordBatch {
     RecordBatch::try_from_iter([("c", Arc::new(column) as ArrayRef)]).unwrap()
 }
 
+#[track_caller]
 fn target_mock_table(statement: &mut SpannerStatement) {
     configure(
         statement,
@@ -359,6 +370,7 @@ fn target_mock_table(statement: &mut SpannerStatement) {
 }
 
 /// A statement ingesting into `MockTable` in `append` mode, which needs no admin RPCs.
+#[track_caller]
 fn append_ingest_statement(connection: &mut SpannerConnection) -> SpannerStatement {
     let mut statement = connection.new_statement().unwrap();
     target_mock_table(&mut statement);
@@ -366,6 +378,7 @@ fn append_ingest_statement(connection: &mut SpannerConnection) -> SpannerStateme
 }
 
 /// An `append` ingest through `BatchWrite` instead of a commit.
+#[track_caller]
 fn batch_write_ingest_statement(connection: &mut SpannerConnection) -> SpannerStatement {
     let mut statement = append_ingest_statement(connection);
     configure(&mut statement, &[(OPTION_INGEST_BATCH_WRITE, "true")]);
@@ -518,6 +531,7 @@ fn serve_begin_transaction(mock: &mut MockSpanner) -> Log<v1::BeginTransactionRe
 }
 
 /// The options an autocommit DML batch began its read/write transaction with.
+#[track_caller]
 fn inline_begin_options(request: &v1::ExecuteBatchDmlRequest) -> &v1::TransactionOptions {
     let selector = request
         .transaction
@@ -736,6 +750,7 @@ fn keyed_struct_value() -> prost_types::Value {
 }
 
 /// The error in the first batch of a query against `server`, past `execute`.
+#[track_caller]
 fn first_batch_error(server: &MockServer) -> Error {
     let mut reader = prepare(&mut server.connect(), SELECT).execute().unwrap();
     driver_error(&reader.next().unwrap().unwrap_err()).clone()
@@ -1188,6 +1203,7 @@ fn cancel_unblocks_a_reader_hung_on_a_silent_stream() {
 }
 
 /// A timeout on `option` after `seconds`; a stream that died for another reason would fail sooner.
+#[track_caller]
 fn assert_deadline_fired(error: &Error, option: &str, seconds: f64, started: Instant) {
     let elapsed = started.elapsed();
     assert_eq!(error.status, AdbcStatus::Timeout, "{error}");
@@ -1247,6 +1263,7 @@ fn silent_stream_server(rows: usize) -> (MockServer, Log<PartialResultSetSender>
 
 /// A [`SELECT`] with one row per batch, so on a [`silent_stream_server`] `execute` returns and the
 /// second batch blocks.
+#[track_caller]
 fn one_row_batches(connection: &mut SpannerConnection) -> SpannerStatement {
     let mut statement = prepare(connection, SELECT);
     statement
@@ -1796,6 +1813,7 @@ const TEN_SECONDS: prost_types::Duration = prost_types::Duration {
     nanos: 0,
 };
 
+#[track_caller]
 fn single_use_read_only_bound(selector: &Selector) -> WireBound {
     let Selector::SingleUse(options) = selector else {
         panic!("a plain autocommit query must run single-use, got: {selector:?}");
@@ -1803,6 +1821,7 @@ fn single_use_read_only_bound(selector: &Selector) -> WireBound {
     read_only_bound(options)
 }
 
+#[track_caller]
 fn read_only_bound(options: &v1::TransactionOptions) -> WireBound {
     let Some(v1::transaction_options::Mode::ReadOnly(read_only)) = &options.mode else {
         panic!("expected read-only transaction options, got: {options:?}");
